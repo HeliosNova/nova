@@ -42,7 +42,7 @@ Nova_ is a sovereign personal AI that runs entirely on your hardware with zero c
 
 ```bash
 # Clone and start
-git clone https://github.com/your-org/nova_.git
+git clone https://github.com/HeliosNova/nova_.git
 cd nova_
 cp .env.example .env
 docker compose up -d
