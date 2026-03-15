@@ -1,0 +1,90 @@
+# Nova — Cloud LLM mode (no GPU required)
+#
+# Uses OpenAI/Anthropic/Google for inference while keeping ALL data local.
+# Your memory, knowledge graph, lessons, training data, and conversations
+# never leave your machine.
+#
+# Usage:
+#   1. Set LLM_PROVIDER and API key in .env:
+#        LLM_PROVIDER=openai
+#        OPENAI_API_KEY=sk-...
+#   2. docker compose -f docker-compose.cloud.yml up -d
+#
+# No GPU, no Ollama, no 20GB VRAM requirement.
+
+services:
+  nova:
+    build: .
+    image: nova-app:latest
+    container_name: nova-app
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      searxng:
+        condition: service_healthy
+    env_file: .env
+    environment:
+      # No OLLAMA_URL — cloud provider handles inference
+      SEARXNG_URL: http://searxng:8080
+      DB_PATH: /data/nova.db
+      CHROMADB_PATH: /data/chromadb
+      TRAINING_DATA_PATH: /data/training_data.jsonl
+      MCP_CONFIG_DIR: /data/mcp
+      ENABLE_SHELL_EXEC: "true"
+    volumes:
+      - nova_data:/data
+      - ./mcp:/data/mcp:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 4g
+    cpus: 4.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    image: nova-frontend:latest
+    container_name: nova-frontend
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      nova:
+        condition: service_healthy
+    environment:
+      VITE_API_URL: http://nova:8000
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nova-searxng
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    mem_limit: 384m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  nova_data:

@@ -1,5 +1,10 @@
 # Nova
 
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-1%2C443%20passing-brightgreen)](tests/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
+[![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
+
 **The personal AI that actually learns from its mistakes.**
 
 Correct Nova once. It remembers forever. Correct it enough times, it fine-tunes itself into a smarter model. All on your hardware. Your data never leaves.
@@ -229,9 +234,15 @@ docker exec nova-app sh -c "python -m pytest tests/ -v"
 | Disk | 50GB | 100GB |
 | GPU | RTX 3090 | RTX 4090 / A5000 |
 
+**No GPU?** Use cloud LLM providers instead — set `LLM_PROVIDER=openai` (or `anthropic`/`google`) in `.env`. Your data (memory, KG, lessons, training pairs) stays fully local — only inference goes to the cloud.
+
 ## Configuration
 
 All settings via `.env`. See [CLAUDE.md](CLAUDE.md) for the full list of 75+ config fields.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome.
 
 ## License
 
