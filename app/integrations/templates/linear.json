@@ -1,0 +1,10 @@
+{
+  "name": "linear",
+  "description": "Linear — issue tracking",
+  "base_url": "https://api.linear.app",
+  "auth_type": "bearer",
+  "auth_env_var": "LINEAR_TOKEN",
+  "endpoints": [
+    {"name": "graphql", "method": "POST", "path": "/graphql", "required_params": ["query"]}
+  ]
+}

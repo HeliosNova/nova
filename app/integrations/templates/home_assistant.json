@@ -1,0 +1,13 @@
+{
+  "name": "home_assistant",
+  "description": "Home Assistant — smart home control",
+  "base_url": "http://homeassistant.local:8123/api",
+  "auth_type": "bearer",
+  "auth_env_var": "HASS_TOKEN",
+  "endpoints": [
+    {"name": "get_states", "method": "GET", "path": "/states"},
+    {"name": "get_state", "method": "GET", "path": "/states/{entity_id}", "required_params": ["entity_id"]},
+    {"name": "call_service", "method": "POST", "path": "/services/{domain}/{service}", "required_params": ["domain", "service"]},
+    {"name": "fire_event", "method": "POST", "path": "/events/{event_type}", "required_params": ["event_type"]}
+  ]
+}

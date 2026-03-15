@@ -1,0 +1,115 @@
+services:
+  ollama:
+    image: ollama/ollama:0.17.5
+    container_name: nova-ollama
+    ports:
+      - "127.0.0.1:11434:11434"
+    environment:
+      OLLAMA_MAX_LOADED_MODELS: "3"
+      OLLAMA_FLASH_ATTENTION: "1"
+      OLLAMA_KEEP_ALIVE: "24h"
+      OLLAMA_NUM_CTX: "16384"
+      # Required models (pull manually or via entrypoint):
+      #   ollama pull qwen3.5:27b      (main model)
+      #   ollama pull qwen3.5:9b       (vision model)
+      #   ollama pull qwen3.5:4b       (fast model for routing)
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+        limits:
+          memory: 20g
+    volumes:
+      - ollama_data:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  nova:
+    build: .
+    image: nova-app:latest
+    container_name: nova-app
+    ports:
+      - "127.0.0.1:8000:8000"
+    depends_on:
+      ollama:
+        condition: service_healthy
+      searxng:
+        condition: service_healthy
+    # env_file passes LLM_PROVIDER, API keys, DISCORD_TOKEN, TELEGRAM_TOKEN, etc.
+    env_file: .env
+    environment:
+      OLLAMA_URL: http://ollama:11434
+      SEARXNG_URL: http://searxng:8080
+      DB_PATH: /data/nova.db
+      CHROMADB_PATH: /data/chromadb
+      TRAINING_DATA_PATH: /data/training_data.jsonl
+      MCP_CONFIG_DIR: /data/mcp
+      ENABLE_SHELL_EXEC: "true"
+      # DISPLAY: ${DISPLAY:-:0}  # Uncomment for desktop automation
+    volumes:
+      - nova_data:/data
+      - ./mcp:/data/mcp:ro
+      # Uncomment for desktop automation (requires X11 on host):
+      # - /tmp/.X11-unix:/tmp/.X11-unix:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    mem_limit: 4g
+    cpus: 4.0
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped
+
+  frontend:
+    build:
+      context: ./frontend
+      target: dev
+    image: nova-frontend:latest
+    container_name: nova-frontend
+    ports:
+      - "127.0.0.1:5173:5173"
+    depends_on:
+      nova:
+        condition: service_healthy
+    environment:
+      VITE_API_URL: http://nova:8000
+    volumes:
+      - ./frontend/src:/app/src        # hot-reload source changes
+      - ./frontend/index.html:/app/index.html
+    mem_limit: 512m
+    cpus: 1.0
+    restart: unless-stopped
+
+  searxng:
+    image: searxng/searxng:latest
+    container_name: nova-searxng
+    ports:
+      - "127.0.0.1:8888:8080"
+    volumes:
+      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+    mem_limit: 384m
+    cpus: 1.0
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+volumes:
+  ollama_data:
+  nova_data:

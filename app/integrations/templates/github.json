@@ -1,0 +1,14 @@
+{
+  "name": "github",
+  "description": "GitHub API — repos, issues, pull requests",
+  "base_url": "https://api.github.com",
+  "auth_type": "bearer",
+  "auth_env_var": "GITHUB_TOKEN",
+  "endpoints": [
+    {"name": "list_repos", "method": "GET", "path": "/user/repos"},
+    {"name": "get_repo", "method": "GET", "path": "/repos/{owner}/{repo}", "required_params": ["owner", "repo"]},
+    {"name": "list_issues", "method": "GET", "path": "/repos/{owner}/{repo}/issues", "required_params": ["owner", "repo"]},
+    {"name": "create_issue", "method": "POST", "path": "/repos/{owner}/{repo}/issues", "required_params": ["owner", "repo", "title"]},
+    {"name": "list_prs", "method": "GET", "path": "/repos/{owner}/{repo}/pulls", "required_params": ["owner", "repo"]}
+  ]
+}

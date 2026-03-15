@@ -1,0 +1,10 @@
+{
+  "name": "ifttt",
+  "description": "IFTTT — trigger webhooks and applets",
+  "base_url": "https://maker.ifttt.com/trigger",
+  "auth_type": "none",
+  "auth_env_var": "IFTTT_KEY",
+  "endpoints": [
+    {"name": "trigger", "method": "POST", "path": "/{event}/with/key/{key}", "required_params": ["event", "key"]}
+  ]
+}

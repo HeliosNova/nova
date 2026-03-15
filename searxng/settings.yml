@@ -1,0 +1,44 @@
+use_default_settings: true
+
+server:
+  secret_key: "2709d60d00ac9c6c2ea2feb381001464dc624d6c92f6ac0a195d1fc3c74155a7"
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "en"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: google
+    engine: google
+    shortcut: g
+    disabled: false
+    timeout: 10.0
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+    timeout: 10.0
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+    timeout: 10.0
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+    timeout: 10.0
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+    timeout: 10.0
+
+outgoing:
+  request_timeout: 12.0

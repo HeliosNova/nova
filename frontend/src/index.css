@@ -1,0 +1,178 @@
+@import "tailwindcss";
+@plugin "@tailwindcss/typography";
+
+@theme {
+  --color-nova-bg: #0a0a0f;
+  --color-nova-surface: #12121a;
+  --color-nova-surface-elevated: #1a1a26;
+  --color-nova-border: #1e1e2e;
+  --color-nova-border-bright: #2a2a3e;
+  --color-nova-accent: #6366f1;
+  --color-nova-accent-hover: #4f46e5;
+  --color-nova-glow: #818cf8;
+  --color-nova-text: #e2e4f0;
+  --color-nova-text-dim: #64668a;
+  --color-nova-success: #34d399;
+  --color-nova-warning: #fbbf24;
+  --color-nova-error: #f87171;
+
+  /* Glassmorphism */
+  --nova-glass-bg: rgba(18, 18, 26, 0.7);
+  --nova-glass-border: rgba(99, 102, 241, 0.08);
+  --nova-glass-blur: 16px;
+
+  /* Shadows */
+  --shadow-nova-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
+  --shadow-nova-md: 0 4px 12px rgba(0, 0, 0, 0.4);
+  --shadow-nova-lg: 0 8px 30px rgba(0, 0, 0, 0.5);
+  --shadow-nova-glow: 0 0 20px rgba(99, 102, 241, 0.15);
+  --shadow-nova-glow-strong: 0 0 30px rgba(99, 102, 241, 0.25);
+
+  /* Transitions */
+  --ease-nova: cubic-bezier(0.25, 0.1, 0.25, 1);
+  --ease-nova-bounce: cubic-bezier(0.34, 1.56, 0.64, 1);
+
+  --animate-fade-in: fade-in 0.3s var(--ease-nova);
+  --animate-slide-in-left: slide-in-left 0.3s var(--ease-nova);
+  --animate-slide-in-right: slide-in-right 0.3s var(--ease-nova);
+  --animate-scale-in: scale-in 0.2s var(--ease-nova-bounce);
+  --animate-skeleton-pulse: skeleton-pulse 1.5s ease-in-out infinite;
+  --animate-glow-pulse: glow-pulse 2s ease-in-out infinite;
+  --animate-orb-spin: orb-spin 3s linear infinite;
+  --animate-breathe: breathe 3s ease-in-out infinite;
+  --animate-shimmer: shimmer 2s linear infinite;
+
+  @keyframes fade-in {
+    from { opacity: 0; transform: translateY(4px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+  @keyframes slide-in-left {
+    from { opacity: 0; transform: translateX(-16px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes slide-in-right {
+    from { opacity: 0; transform: translateX(16px); }
+    to { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes scale-in {
+    from { opacity: 0; transform: scale(0.92); }
+    to { opacity: 1; transform: scale(1); }
+  }
+  @keyframes skeleton-pulse {
+    0%, 100% { opacity: 0.4; }
+    50% { opacity: 0.1; }
+  }
+  @keyframes glow-pulse {
+    0%, 100% { box-shadow: 0 0 8px rgba(99, 102, 241, 0.2); }
+    50% { box-shadow: 0 0 20px rgba(99, 102, 241, 0.4); }
+  }
+  @keyframes orb-spin {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  @keyframes breathe {
+    0%, 100% { opacity: 0.4; transform: scale(1); }
+    50% { opacity: 1; transform: scale(1.1); }
+  }
+  @keyframes shimmer {
+    0% { background-position: -200% 0; }
+    100% { background-position: 200% 0; }
+  }
+}
+
+/* Light theme overrides */
+[data-theme="light"] {
+  --color-nova-bg: #f8f9fc;
+  --color-nova-surface: #ffffff;
+  --color-nova-surface-elevated: #f0f1f5;
+  --color-nova-border: #e2e4f0;
+  --color-nova-border-bright: #c7c9e0;
+  --color-nova-accent: #6366f1;
+  --color-nova-accent-hover: #4f46e5;
+  --color-nova-glow: #818cf8;
+  --color-nova-text: #1a1b2e;
+  --color-nova-text-dim: #6b7280;
+  --color-nova-success: #059669;
+  --color-nova-warning: #d97706;
+  --color-nova-error: #dc2626;
+
+  --nova-glass-bg: rgba(255, 255, 255, 0.8);
+  --nova-glass-border: rgba(99, 102, 241, 0.1);
+  --shadow-nova-sm: 0 1px 3px rgba(0, 0, 0, 0.08);
+  --shadow-nova-md: 0 4px 12px rgba(0, 0, 0, 0.1);
+  --shadow-nova-lg: 0 8px 30px rgba(0, 0, 0, 0.12);
+  --shadow-nova-glow: 0 0 20px rgba(99, 102, 241, 0.08);
+  --shadow-nova-glow-strong: 0 0 30px rgba(99, 102, 241, 0.15);
+}
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Custom scrollbar */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-nova-border) transparent;
+}
+
+*::-webkit-scrollbar {
+  width: 5px;
+}
+
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: var(--color-nova-border);
+  border-radius: 3px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-nova-border-bright);
+}
+
+/* Focus-visible ring for keyboard navigation */
+*:focus-visible {
+  outline: 2px solid var(--color-nova-accent);
+  outline-offset: 2px;
+}
+
+input:focus-visible,
+textarea:focus-visible,
+select:focus-visible {
+  outline: none;
+  border-color: var(--color-nova-accent);
+}
+
+/* Glass utility classes */
+.nova-glass {
+  background: var(--nova-glass-bg);
+  backdrop-filter: blur(var(--nova-glass-blur));
+  -webkit-backdrop-filter: blur(var(--nova-glass-blur));
+  border: 1px solid var(--nova-glass-border);
+}
+
+/* Code block styling */
+.prose pre {
+  background: var(--color-nova-bg) !important;
+  border: 1px solid var(--color-nova-border) !important;
+  border-radius: 0.5rem !important;
+  padding: 1rem !important;
+  font-size: 0.8rem !important;
+  line-height: 1.6 !important;
+}
+
+.prose code {
+  font-family: 'JetBrains Mono', 'Fira Code', 'SF Mono', monospace !important;
+  font-size: 0.85em !important;
+}
+
+.prose :not(pre) > code {
+  background: var(--color-nova-surface-elevated) !important;
+  padding: 0.15em 0.4em !important;
+  border-radius: 0.25rem !important;
+  border: 1px solid var(--color-nova-border) !important;
+}

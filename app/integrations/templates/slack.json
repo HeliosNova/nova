@@ -1,0 +1,12 @@
+{
+  "name": "slack",
+  "description": "Slack API — send messages, list channels",
+  "base_url": "https://slack.com/api",
+  "auth_type": "bearer",
+  "auth_env_var": "SLACK_TOKEN",
+  "endpoints": [
+    {"name": "send_message", "method": "POST", "path": "/chat.postMessage", "required_params": ["channel", "text"]},
+    {"name": "list_channels", "method": "GET", "path": "/conversations.list"},
+    {"name": "channel_history", "method": "GET", "path": "/conversations.history", "required_params": ["channel"]}
+  ]
+}

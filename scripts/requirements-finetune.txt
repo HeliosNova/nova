@@ -1,0 +1,27 @@
+# Fine-tuning dependencies — install in a separate venv
+# These are heavy and GPU-specific. Do NOT install in the Nova app container.
+#
+# Setup:
+#   python -m venv finetune_env
+#   finetune_env\Scripts\activate  (Windows) or source finetune_env/bin/activate (Linux)
+#   pip install -r scripts/requirements-finetune.txt
+#
+# Requires: CUDA 12.x, RTX 3090 (24GB)
+
+# Unsloth — optimized fine-tuning for consumer GPUs
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
+unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git
+
+# TRL — Transformers Reinforcement Learning (DPO trainer)
+trl>=0.12.0
+
+# Core ML
+torch>=2.4.0
+transformers>=4.46.0
+datasets>=3.0.0
+accelerate>=1.0.0
+peft>=0.13.0
+bitsandbytes>=0.44.0
+
+# Utilities
+safetensors

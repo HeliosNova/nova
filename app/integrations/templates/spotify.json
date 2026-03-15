@@ -1,0 +1,13 @@
+{
+  "name": "spotify",
+  "description": "Spotify — music playback and library",
+  "base_url": "https://api.spotify.com/v1",
+  "auth_type": "bearer",
+  "auth_env_var": "SPOTIFY_TOKEN",
+  "endpoints": [
+    {"name": "now_playing", "method": "GET", "path": "/me/player/currently-playing"},
+    {"name": "search", "method": "GET", "path": "/search", "required_params": ["q", "type"]},
+    {"name": "play", "method": "PUT", "path": "/me/player/play"},
+    {"name": "pause", "method": "PUT", "path": "/me/player/pause"}
+  ]
+}

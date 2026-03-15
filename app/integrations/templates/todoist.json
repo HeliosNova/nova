@@ -1,0 +1,13 @@
+{
+  "name": "todoist",
+  "description": "Todoist — task management",
+  "base_url": "https://api.todoist.com/rest/v2",
+  "auth_type": "bearer",
+  "auth_env_var": "TODOIST_TOKEN",
+  "endpoints": [
+    {"name": "list_tasks", "method": "GET", "path": "/tasks"},
+    {"name": "create_task", "method": "POST", "path": "/tasks", "required_params": ["content"]},
+    {"name": "list_projects", "method": "GET", "path": "/projects"},
+    {"name": "close_task", "method": "POST", "path": "/tasks/{task_id}/close", "required_params": ["task_id"]}
+  ]
+}

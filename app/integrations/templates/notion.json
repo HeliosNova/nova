@@ -1,0 +1,13 @@
+{
+  "name": "notion",
+  "description": "Notion — pages and databases",
+  "base_url": "https://api.notion.com/v1",
+  "auth_type": "bearer",
+  "auth_env_var": "NOTION_TOKEN",
+  "endpoints": [
+    {"name": "search", "method": "POST", "path": "/search", "required_params": ["query"]},
+    {"name": "get_page", "method": "GET", "path": "/pages/{page_id}", "required_params": ["page_id"]},
+    {"name": "list_databases", "method": "POST", "path": "/search"},
+    {"name": "query_database", "method": "POST", "path": "/databases/{database_id}/query", "required_params": ["database_id"]}
+  ]
+}

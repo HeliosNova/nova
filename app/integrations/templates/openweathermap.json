@@ -1,0 +1,11 @@
+{
+  "name": "openweathermap",
+  "description": "OpenWeatherMap — weather data",
+  "base_url": "https://api.openweathermap.org/data/2.5",
+  "auth_type": "api_key",
+  "auth_env_var": "OPENWEATHER_API_KEY",
+  "endpoints": [
+    {"name": "current_weather", "method": "GET", "path": "/weather", "required_params": ["q"]},
+    {"name": "forecast", "method": "GET", "path": "/forecast", "required_params": ["q"]}
+  ]
+}

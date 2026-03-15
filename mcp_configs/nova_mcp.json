@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "nova": {
+      "command": "python",
+      "args": ["C:/Users/sysadmin/Desktop/Helios Project/nova_/scripts/mcp_server_runner.py"],
+      "env": {
+        "DB_PATH": "C:/Users/sysadmin/Desktop/Helios Project/nova_/data/nova.db",
+        "CHROMADB_PATH": "C:/Users/sysadmin/Desktop/Helios Project/nova_/data/chromadb"
+      }
+    }
+  }
+}

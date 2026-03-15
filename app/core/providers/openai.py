@@ -1,0 +1,245 @@
+"""OpenAI LLM provider — raw httpx, no SDK dependency.
+
+Supports GPT-4o and compatible models via the /v1/chat/completions endpoint.
+Tool calls use OpenAI's native function calling (structured, no text parsing).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import AsyncGenerator
+
+import httpx
+
+from app.config import config
+from app.core.llm import (
+    GenerationResult,
+    LLMUnavailableError,
+    StreamChunk,
+    ToolCall,
+)
+from app.core.providers._retry import retry_on_transient as _retry_on_transient
+
+logger = logging.getLogger(__name__)
+
+_BASE_URL = "https://api.openai.com"
+
+
+class OpenAIProvider:
+    """OpenAI ChatCompletion provider via httpx."""
+
+    def __init__(self, api_key: str, model: str = "gpt-4o"):
+        self._api_key = api_key
+        self._model = model
+        self._client: httpx.AsyncClient | None = None
+
+    def _get_client(self) -> httpx.AsyncClient:
+        if self._client is None:
+            self._client = httpx.AsyncClient(
+                base_url=_BASE_URL,
+                headers={
+                    "Authorization": f"Bearer {self._api_key}",
+                    "Content-Type": "application/json",
+                },
+                timeout=httpx.Timeout(float(config.GENERATION_TIMEOUT), connect=10.0),
+            )
+        return self._client
+
+    async def close(self) -> None:
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def check_health(self) -> bool:
+        """Check if OpenAI API is reachable by listing models."""
+        try:
+            client = self._get_client()
+            resp = await client.get("/v1/models")
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _convert_tools(self, tools: list[dict]) -> list[dict]:
+        """Convert Nova_ tool list to OpenAI function-calling format."""
+        functions = []
+        for t in tools:
+            functions.append({
+                "type": "function",
+                "function": {
+                    "name": t["name"],
+                    "description": t.get("description", ""),
+                    "parameters": t.get("parameters", {"type": "object", "properties": {}}),
+                },
+            })
+        return functions
+
+    def _extract_tool_call(self, message: dict) -> ToolCall | None:
+        """Extract a structured tool call from an OpenAI response message."""
+        tool_calls = message.get("tool_calls")
+        if not tool_calls:
+            return None
+        tc = tool_calls[0]  # Take the first tool call
+        func = tc.get("function", {})
+        name = func.get("name", "")
+        try:
+            args = json.loads(func.get("arguments", "{}"))
+        except json.JSONDecodeError:
+            args = {}
+        return ToolCall(tool=name, args=args)
+
+    # ------------------------------------------------------------------
+    # LLMProvider interface
+    # ------------------------------------------------------------------
+
+    async def invoke_nothink(
+        self,
+        messages: list[dict],
+        *,
+        json_mode: bool = False,
+        json_prefix: str = "[{",
+        max_tokens: int = 1000,
+        temperature: float = 0.1,
+        model: str | None = None,
+    ) -> str:
+        model = model or self._model
+        client = self._get_client()
+
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+        }
+
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        try:
+            resp = await _retry_on_transient(client, "POST", "/v1/chat/completions", json=payload)
+            data = resp.json()
+            content = data["choices"][0]["message"].get("content", "")
+            return content.strip()
+        except httpx.ConnectError:
+            raise LLMUnavailableError("Cannot connect to OpenAI API.")
+        except httpx.TimeoutException:
+            raise LLMUnavailableError("OpenAI request timed out.")
+        except LLMUnavailableError:
+            raise
+        except Exception as e:
+            logger.warning("[invoke_nothink] OpenAI call failed: %s", e)
+            return ""
+
+    async def generate_with_tools(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        model: str | None = None,
+        temperature: float = 0.5,
+        max_tokens: int = 2000,
+        images: list[str] | None = None,
+    ) -> GenerationResult:
+        model = model or self._model
+        client = self._get_client()
+
+        # Convert images to OpenAI vision format
+        send_messages = list(messages)
+        if images and send_messages:
+            for i in range(len(send_messages) - 1, -1, -1):
+                if send_messages[i].get("role") == "user":
+                    text = send_messages[i].get("content", "")
+                    content_parts = [{"type": "text", "text": text}]
+                    for img in images:
+                        content_parts.append({
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{img}"},
+                        })
+                    send_messages[i] = {"role": "user", "content": content_parts}
+                    break
+
+        payload: dict = {
+            "model": model,
+            "messages": send_messages,
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+        }
+
+        if tools:
+            payload["tools"] = self._convert_tools(tools)
+            payload["tool_choice"] = "auto"
+
+        try:
+            resp = await _retry_on_transient(client, "POST", "/v1/chat/completions", json=payload)
+        except LLMUnavailableError:
+            raise
+        except httpx.ConnectError:
+            raise LLMUnavailableError("Cannot connect to OpenAI API.")
+        except httpx.TimeoutException:
+            raise LLMUnavailableError("OpenAI request timed out.")
+
+        data = resp.json()
+        message = data["choices"][0]["message"]
+        content = message.get("content", "") or ""
+        tool_call = self._extract_tool_call(message)
+        usage = data.get("usage") or None
+
+        return GenerationResult(content=content.strip(), tool_call=tool_call, raw=data, usage=usage)
+
+    async def stream_with_thinking(
+        self,
+        messages: list[dict],
+        tools: list[dict],
+        *,
+        model: str | None = None,
+        temperature: float = 0.6,
+        max_tokens: int = 4000,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream response from OpenAI. OpenAI doesn't have native thinking,
+        so we stream content only (no thinking chunks)."""
+        model = model or self._model
+        client = self._get_client()
+
+        payload: dict = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_completion_tokens": max_tokens,
+            "stream": True,
+        }
+
+        try:
+            async with client.stream(
+                "POST", "/v1/chat/completions", json=payload,
+                timeout=httpx.Timeout(float(config.GENERATION_TIMEOUT), connect=10.0, read=60.0),
+            ) as resp:
+                resp.raise_for_status()
+                async for line in resp.aiter_lines():
+                    if not line.startswith("data: "):
+                        continue
+                    data_str = line[6:]
+                    if data_str.strip() == "[DONE]":
+                        yield StreamChunk(done=True)
+                        return
+                    try:
+                        chunk = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    delta = chunk.get("choices", [{}])[0].get("delta", {})
+                    content = delta.get("content", "")
+                    if content:
+                        yield StreamChunk(content=content)
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code in (429, 500, 502, 503):
+                raise LLMUnavailableError(f"OpenAI streaming error {e.response.status_code}")
+            raise LLMUnavailableError(f"OpenAI error: {e}")
+        except LLMUnavailableError:
+            raise
+        except httpx.ConnectError:
+            raise LLMUnavailableError("Cannot connect to OpenAI API.")
+        except httpx.TimeoutException:
+            raise LLMUnavailableError("OpenAI request timed out.")

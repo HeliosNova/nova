@@ -1,0 +1,12 @@
+{
+  "name": "google_calendar",
+  "description": "Google Calendar — events and scheduling",
+  "base_url": "https://www.googleapis.com/calendar/v3",
+  "auth_type": "bearer",
+  "auth_env_var": "GOOGLE_CALENDAR_TOKEN",
+  "endpoints": [
+    {"name": "list_events", "method": "GET", "path": "/calendars/primary/events"},
+    {"name": "create_event", "method": "POST", "path": "/calendars/primary/events", "required_params": ["summary", "start", "end"]},
+    {"name": "list_calendars", "method": "GET", "path": "/users/me/calendarList"}
+  ]
+}

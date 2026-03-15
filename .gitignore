@@ -1,0 +1,36 @@
+.env
+*.db
+__pycache__/
+*.pyc
+/data/
+chromadb/
+*.egg-info/
+.pytest_cache/
+
+# Security — never commit secrets or keys
+*.key
+*.pem
+*.p12
+*.pfx
+credentials.json
+service_account.json
+*.secret
+
+# IDE / editor
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+
+# Node
+node_modules/
+
+# Build artifacts
+dist/
+build/
+*.whl
