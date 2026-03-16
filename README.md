@@ -23,6 +23,12 @@ Nova: "Canberra"  ← learned permanently
 
 No other AI assistant does this.
 
+### See it in action
+
+<p align="center">
+  <img src="docs/demo.svg" alt="Nova learning loop demo" width="700">
+</p>
+
 ---
 
 ## Why Nova
