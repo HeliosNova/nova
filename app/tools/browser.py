@@ -66,10 +66,38 @@ class BrowserTool(BaseTool):
 
         from playwright.async_api import async_playwright
         BrowserTool._playwright = await async_playwright().start()
-        BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
-            headless=True,
-            args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
-        )
+
+        # Connect to host browser (visible on desktop) or launch headless
+        cdp_url = config.BROWSER_CDP_URL
+        if cdp_url:
+            # Chrome rejects non-localhost Host headers on CDP, so we fetch
+            # the WebSocket URL manually with a spoofed Host header
+            import httpx
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.get(
+                        f"{cdp_url}/json/version",
+                        headers={"Host": "localhost"},
+                        timeout=5,
+                    )
+                    ws_url = resp.json()["webSocketDebuggerUrl"]
+                    # Rebuild ws URL with the CDP host:port so Docker can reach it
+                    from urllib.parse import urlparse
+                    cdp_parsed = urlparse(cdp_url)
+                    ws_parsed = urlparse(ws_url)
+                    host_port = f"{cdp_parsed.hostname}:{cdp_parsed.port or 9222}"
+                    ws_url = f"ws://{host_port}{ws_parsed.path}"
+            except Exception as e:
+                raise RuntimeError(f"Cannot reach host browser at {cdp_url}: {e}")
+            BrowserTool._browser = await BrowserTool._playwright.chromium.connect_over_cdp(ws_url)
+            logger.info("[Browser] Connected to host browser at %s", cdp_url)
+        else:
+            BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+            )
+            logger.info("[Browser] Launched headless browser")
+
         BrowserTool._context = await BrowserTool._browser.new_context(
             viewport={"width": 1280, "height": 720},
             user_agent=(
