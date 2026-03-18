@@ -26,12 +26,12 @@ class BrowserTool(BaseTool):
         "Control a persistent web browser. Sessions survive across calls so you can "
         "log in, navigate multi-step workflows, and interact with web apps. "
         "Actions: navigate (go to URL), click (click element), type (type into field), "
-        "get_text (read page/element text), get_links (list links), fill_form (fill multiple fields), "
-        "screenshot (capture current page), back (go back), wait (wait for element), "
-        "close_session (end browser session)."
+        "press_key (press Enter/Tab/etc.), get_text (read page/element text), get_links (list links), "
+        "fill_form (fill multiple fields), screenshot (capture current page), back (go back), "
+        "wait (wait for element), close_session (end browser session)."
     )
     parameters = (
-        "action: str (navigate|click|type|get_text|get_links|fill_form|screenshot|back|wait|close_session), "
+        "action: str (navigate|click|type|press_key|get_text|get_links|fill_form|screenshot|back|wait|close_session), "
         "url: str (only needed for navigate or first visit), "
         "selector: str (CSS selector for click/type/get_text/wait), "
         "text: str (text to type), form_data: dict (selector:value pairs), "
@@ -159,6 +159,8 @@ class BrowserTool(BaseTool):
                 return await self._click(page, url, selector)
             elif action == "type":
                 return await self._type(page, url, selector, text)
+            elif action == "press_key":
+                return await self._press_key(page, text)
             elif action == "get_text":
                 return await self._get_text(page, url, selector)
             elif action == "get_links":
@@ -181,8 +183,10 @@ class BrowserTool(BaseTool):
                 )
 
         except Exception as e:
-            await self._close_session()
             logger.warning("[Browser] Action '%s' failed: %s", action, e)
+            # Only kill session if browser itself is dead, not on action errors
+            if BrowserTool._browser and not BrowserTool._browser.is_connected():
+                await self._close_session()
             return ToolResult(
                 output="", success=False,
                 error=f"Browser action failed: {e}",
@@ -273,6 +277,40 @@ class BrowserTool(BaseTool):
         await page.fill(selector, text)
         return ToolResult(
             output=f"Typed '{text[:80]}' into '{selector}' {self._page_summary(page)}",
+            success=True,
+        )
+
+    async def _press_key(self, page, key: str) -> ToolResult:
+        """Press a keyboard key (Enter, Tab, Escape, ArrowDown, etc.)."""
+        if not key:
+            return ToolResult(
+                output="", success=False,
+                error="'text' parameter required for press_key (e.g. 'Enter', 'Tab').",
+            )
+        allowed = {
+            "enter", "tab", "escape", "backspace", "delete", "space",
+            "arrowup", "arrowdown", "arrowleft", "arrowright",
+            "home", "end", "pageup", "pagedown",
+        }
+        if key.lower() not in allowed:
+            return ToolResult(
+                output="", success=False,
+                error=f"Key '{key}' not allowed. Use: {', '.join(sorted(allowed))}",
+            )
+        await page.keyboard.press(key)
+        try:
+            await page.wait_for_load_state("domcontentloaded", timeout=5000)
+        except Exception:
+            pass  # Key may not trigger navigation
+        title = await page.title()
+        try:
+            text = await page.evaluate("() => document.body.innerText")
+        except Exception:
+            text = f"(page navigating after {key})"
+        if len(text) > 3000:
+            text = text[:3000] + "\n[... truncated]"
+        return ToolResult(
+            output=f"Pressed '{key}'. Page: {title} ({page.url})\n\n{text}",
             success=True,
         )
 
