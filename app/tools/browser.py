@@ -56,10 +56,14 @@ class BrowserTool(BaseTool):
 
         BrowserTool._last_used = now
 
-        # Reuse existing page if browser is still connected
+        # Reuse existing page if browser is still connected and page is usable
         if (BrowserTool._page and BrowserTool._browser
                 and BrowserTool._browser.is_connected()):
-            return BrowserTool._page
+            try:
+                await BrowserTool._page.evaluate("1")  # Quick liveness check
+                return BrowserTool._page
+            except Exception:
+                logger.info("[Browser] Stale session detected, reconnecting")
 
         # Clean up anything stale
         await self._close_session()
