@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import random
 import sys
 from dataclasses import dataclass, field
@@ -33,7 +34,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 JUDGE_TEMPERATURE = 0.1
 GENERATION_TIMEOUT = 120  # seconds per query
 
@@ -270,7 +271,7 @@ async def run_eval(
 
     comparisons: list[ComparisonResult] = []
 
-    async with httpx.AsyncClient() as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
         for i, query in enumerate(queries, 1):
             logger.info("  [%d/%d] Evaluating: %s", i, len(queries), query[:80])
 

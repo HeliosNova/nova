@@ -22,6 +22,10 @@ from app.database import get_db
 
 logger = logging.getLogger(__name__)
 
+# Module-level lock ensures all LearningEngine instances serialize writes to the same JSONL file.
+# Uses threading.Lock since actual writes run via asyncio.to_thread (in a thread pool).
+import threading as _threading
+_training_file_lock = _threading.Lock()
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -68,23 +72,70 @@ _CORRECTION_PATTERNS = [
     # Flexible "that ... is wrong/incomplete" (catches "that data is wrong", "that info is incomplete")
     re.compile(r"(?i)\bthat\b.{1,30}\b(?:wrong|incorrect|incomplete|inaccurate|misleading)\b"),
     # Preference / procedural corrections
-    re.compile(r"(?i)\bremember\s+that\b"),
-    re.compile(r"(?i)\binstead\s+of\b"),
+    re.compile(r"(?i)\bremember\s+that\s+.+?\b(?:is|are|was|were|not|should|always|never|prefer|use)\b"),
+    # "instead of" only counts as correction when preceded by reference to assistant's output
+    re.compile(r"(?i)(?:you|it|that|the answer|response|result).{0,30}\binstead\s+of\b"),
     re.compile(r"(?i)\b(?:you\s+should|always)\s+(?:use|check|search|try)\b"),
     # "you should also/always search/check" — allow adverbs between should and verb
     re.compile(r"(?i)\byou\s+should\s+(?:also|always|really)\s+(?:use|check|search|try)\b"),
     re.compile(r"(?i)\b(?:next\s+time|from\s+now\s+on|in\s+the\s+future)\b"),
     re.compile(r"(?i)\b(?:don'?t|do\s+not)\s+(?:use|do|say|recommend)\b"),
-    re.compile(r"(?i)\brather\b.*\bnot\b"),
+    re.compile(r"(?i)\b(?:you|nova|I)\b.{0,15}\brather\b.*\bnot\b"),
     # Data quality corrections (require context to avoid false positives like "I'm missing my dog")
-    re.compile(r"(?i)\b(?:data|info(?:rmation)?|answer|result|response|it)\b.{0,20}\b(?:missed|missing|incomplete|outdated)\b"),
-    re.compile(r"(?i)\b(?:you|that)\b.{0,30}\b(?:missed|missing|incomplete|outdated)\b"),
+    re.compile(r"(?i)\b(?:data|info(?:rmation)?|answer|result|response|it)\b.{0,15}\b(?:missed|missing|incomplete|outdated)\b"),
+    re.compile(r"(?i)\b(?:you|that)\b.{0,15}\b(?:missed|missing|incomplete|outdated)\b"),
+    # Additional correction signals
+    re.compile(r"(?i)\byou\s+got\b.*\bwrong\b"),
+    re.compile(r"(?i)\bstop\s+saying\b"),
+    re.compile(r"(?i)\bI\s+already\s+told\s+you\b"),
 ]
 
 
 def is_likely_correction(text: str) -> bool:
     """Fast regex check — is this message likely a correction?"""
     return any(p.search(text) for p in _CORRECTION_PATTERNS)
+
+
+# ---------------------------------------------------------------------------
+# Pushback detection — did Nova disagree with the user's correction?
+# ---------------------------------------------------------------------------
+
+_PUSHBACK_PATTERNS = [
+    # Direct disagreement / standing firm
+    re.compile(r"(?i)\bactually,?\s+(?:the|my|that|this|it|I)\b"),
+    re.compile(r"(?i)\bI\s+(?:need to|must|have to|should)\s+(?:stand\s+by|maintain|stick\s+with)\b"),
+    re.compile(r"(?i)\bmy\s+original\s+(?:answer|response|information)\b"),
+    re.compile(r"(?i)\b(?:the|my)\s+(?:answer|information|response)\s+(?:is|was)\s+(?:correct|accurate|right)\b"),
+    # Polite but firm corrections of the user
+    re.compile(r"(?i)\bI\s+(?:believe|think)\s+(?:the|my)\s+(?:answer|information|response)\s+(?:is|was)\s+(?:correct|accurate|right)\b"),
+    re.compile(r"(?i)\b(?:it|that|this)\s+is\s+(?:actually|indeed|in\s+fact)\s+(?:correct|accurate|right)\b"),
+    re.compile(r"(?i)\bI\s+(?:respectfully\s+)?(?:disagree|must\s+disagree)\b"),
+    re.compile(r"(?i)\b(?:however|but),?\s+(?:the\s+)?(?:capital|answer|correct|actual|right)\b.{0,40}\b(?:is|remains|was)\b"),
+    re.compile(r"(?i)\baccording\s+to\b.{0,60}\b(?:the\s+(?:capital|answer|correct)\b|is\s+(?:actually|in\s+fact))\b"),
+    # Web search vindication — Nova searched and confirmed its answer
+    re.compile(r"(?i)\b(?:search|web|results?|sources?|according)\b.{0,60}\b(?:confirm|verified|shows?|indicates?)\b"),
+    # Explicit "not X" where X is what the user claimed
+    re.compile(r"(?i)\bis\s+not\b.{0,30}\b(?:as\s+(?:you|the\s+user)\s+(?:said|suggested|mentioned|claimed))\b"),
+    re.compile(r"(?i)\b(?:rather|instead)\s+than\s+what\s+(?:you|the\s+user)\b"),
+    # Confident restatement after user disagreement
+    re.compile(r"(?i)\bI\s+can\s+confirm\b"),
+    re.compile(r"(?i)\bthis\s+is\s+(?:a\s+)?(?:common\s+)?(?:misconception|mistake|error)\b"),
+]
+
+
+def response_pushes_back(response: str) -> bool:
+    """Check if Nova's response pushes back against the user's correction.
+
+    When a user says "No, that's wrong, X is Y" but Nova's response says
+    "Actually, my answer was correct" or "According to my search, it IS Z",
+    that means Nova correctly stood its ground and we should NOT save the
+    user's incorrect correction as a lesson or DPO pair.
+
+    Returns True if the response contains disagreement/pushback signals.
+    """
+    if not response:
+        return False
+    return any(p.search(response) for p in _PUSHBACK_PATTERNS)
 
 
 # The extraction prompt — detailed with few-shot examples so Qwen doesn't leave fields empty
@@ -131,7 +182,7 @@ class LearningEngine:
     def __init__(self, db=None):
         self._db = db or get_db()
         self._lessons_collection = None
-        self._training_lock = asyncio.Lock()
+        self._training_lock = _training_file_lock
 
     def _get_lessons_collection(self):
         """Lazy-init ChromaDB collection for semantic lesson search."""
@@ -177,7 +228,7 @@ class LearningEngine:
             metadatas.append({"topic": topic, "confidence": row["confidence"]})
 
         if ids:
-            collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
             logger.info("Reindexed %d lessons into ChromaDB", len(ids))
         return len(ids)
 
@@ -201,7 +252,7 @@ class LearningEngine:
                 f"Assistant said: \"{previous_answer[:500]}\"\n\n"
                 f"User says: \"{user_message}\""
             )
-            logger.info(
+            logger.debug(
                 "Correction LLM input: assistant=%d chars, user='%s'",
                 min(len(previous_answer), 500),
                 user_message[:120],
@@ -216,13 +267,17 @@ class LearningEngine:
                     json_mode=True,
                     json_prefix="{",
                 ),
-                timeout=15.0,
+                timeout=config.INTERNAL_LLM_TIMEOUT,
             )
 
-            logger.info("Correction LLM raw output: %s", result[:500])
+            if result is None:
+                logger.warning("Correction LLM returned None — skipping")
+                return None
+
+            logger.debug("Correction LLM raw output: %s", result[:500])
 
             obj = llm.extract_json_object(result)
-            logger.info("Correction LLM parsed: %s", obj)
+            logger.debug("Correction LLM parsed: %s", obj)
 
             if not obj or not obj.get("is_correction"):
                 return None
@@ -232,9 +287,15 @@ class LearningEngine:
             topic = (obj.get("topic") or "").strip()
             lesson_text = (obj.get("lesson_text") or "").strip()
 
+            # Fallback: use previous (wrong) assistant response as wrong_answer
+            if not wrong_answer and previous_answer:
+                wrong_answer = previous_answer[:500]
+
             # Validation — if correct_answer is still empty, extract from user message
             if not correct_answer:
-                correct_answer = _extract_answer_from_message(user_message)
+                extracted = _extract_answer_from_message(user_message)
+                if extracted:
+                    correct_answer = extracted
 
             # If we still have nothing useful, build from the user message
             if not lesson_text:
@@ -260,7 +321,7 @@ class LearningEngine:
             )
 
         except asyncio.TimeoutError:
-            logger.warning("Correction LLM timed out after 15s — skipping")
+            logger.warning("Correction LLM timed out after %ds — skipping", config.INTERNAL_LLM_TIMEOUT)
             return None
         except Exception as e:
             logger.warning("LLM correction detection failed: %s — skipping", e)
@@ -333,6 +394,70 @@ class LearningEngine:
 
         return lesson_id
 
+    def add_knowledge_lesson(
+        self,
+        topic: str,
+        correct_answer: str,
+        lesson_text: str,
+        context: str = "",
+        confidence: float = 0.7,
+    ) -> int:
+        """Add a knowledge lesson directly (no Correction needed).
+
+        Used by curiosity research and recurring failure promotion where
+        there is no wrong_answer to record.  Reuses dedup and pruning.
+        Returns lesson ID, or -1 if rejected.
+        """
+        if not _is_quality_content(correct_answer):
+            logger.warning(
+                "Knowledge lesson rejected: low-quality content '%s'",
+                (correct_answer or "")[:50],
+            )
+            return -1
+
+        topic = (topic or "general").strip()
+        correct_answer = correct_answer.strip()
+
+        # Deduplication
+        existing = self._find_similar_lesson(topic, correct_answer)
+        if existing:
+            new_conf = min(1.0, existing["confidence"] + 0.1)
+            self._db.execute(
+                "UPDATE lessons SET confidence = ? WHERE id = ?",
+                (new_conf, existing["id"]),
+            )
+            logger.info("Knowledge lesson dedup: boosted #%d confidence to %.2f", existing["id"], new_conf)
+            return existing["id"]
+
+        cursor = self._db.execute(
+            """INSERT INTO lessons
+               (topic, wrong_answer, correct_answer, lesson_text, context, confidence)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (topic, "", correct_answer, lesson_text or "", context, confidence),
+        )
+        lesson_id = cursor.lastrowid
+        logger.info(
+            "Saved knowledge lesson #%d: topic='%s', lesson='%s'",
+            lesson_id, topic, (lesson_text or "")[:80],
+        )
+
+        # Add to ChromaDB for semantic search
+        try:
+            collection = self._get_lessons_collection()
+            if collection is not None:
+                searchable = f"{topic} {correct_answer} {lesson_text or ''}".strip()
+                if searchable:
+                    collection.add(
+                        ids=[str(lesson_id)],
+                        documents=[searchable],
+                        metadatas=[{"topic": topic, "confidence": confidence}],
+                    )
+        except Exception as e:
+            logger.warning("Failed to add knowledge lesson #%d to ChromaDB: %s", lesson_id, e)
+
+        self._prune_lessons()
+        return lesson_id
+
     def get_relevant_lessons(self, query: str, limit: int | None = None) -> list[Lesson]:
         """Get lessons relevant to a query using hybrid retrieval (vector + keyword + RRF)."""
         limit = limit or config.MAX_LESSONS_IN_PROMPT
@@ -402,9 +527,8 @@ class LearningEngine:
             return []
 
         # Sort by RRF score descending, then filter by minimum relevance
-        _MIN_RRF_SCORE = 0.015
         sorted_ids = sorted(rrf_scores, key=lambda lid: rrf_scores[lid], reverse=True)
-        sorted_ids = [lid for lid in sorted_ids if rrf_scores[lid] >= _MIN_RRF_SCORE]
+        sorted_ids = [lid for lid in sorted_ids if rrf_scores[lid] >= config.MIN_RRF_SCORE]
 
         lessons = []
         retrieved_ids = []
@@ -523,14 +647,20 @@ class LearningEngine:
             "timestamp": datetime.now().isoformat(),
         }
 
-        async with self._training_lock:
-            with open(path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-
-            # Rotation: keep most recent 80% when over limit
-            _rotate_training_data(path)
+        # Write + rotate under thread lock (both run via to_thread)
+        def _write_and_rotate():
+            with self._training_lock:
+                self._write_training_pair(path, entry)
+                _rotate_training_data(path)
+        await asyncio.to_thread(_write_and_rotate)
 
         logger.info("Saved training pair to %s", path)
+
+    @staticmethod
+    def _write_training_pair(path: Path, entry: dict) -> None:
+        """Write a single training pair to JSONL (blocking I/O)."""
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
     def get_all_lessons(self, limit: int = 100) -> list[Lesson]:
         """Get all lessons (for admin/API use)."""
@@ -645,6 +775,9 @@ class LearningEngine:
         """Get learning metrics."""
         lesson_count = self._db.fetchone("SELECT COUNT(*) as c FROM lessons")
         skill_count = self._db.fetchone("SELECT COUNT(*) as c FROM skills")
+        correction_count = self._db.fetchone(
+            "SELECT COUNT(*) as c FROM lessons WHERE wrong_answer IS NOT NULL AND wrong_answer != ''"
+        )
         last_correction = self._db.fetchone(
             "SELECT created_at FROM lessons ORDER BY created_at DESC LIMIT 1"
         )
@@ -658,7 +791,7 @@ class LearningEngine:
         return {
             "total_lessons": lesson_count["c"] if lesson_count else 0,
             "total_skills": skill_count["c"] if skill_count else 0,
-            "total_corrections": lesson_count["c"] if lesson_count else 0,
+            "total_corrections": correction_count["c"] if correction_count else 0,
             "training_examples": training_count,
             "last_correction_date": (
                 last_correction["created_at"] if last_correction else None
@@ -678,11 +811,32 @@ class LearningEngine:
             return True
         return False
 
+    def bulk_delete_lessons(self, ids: list[int]) -> tuple[list[int], list[int]]:
+        """Delete multiple lessons atomically. Returns (deleted_ids, not_found_ids)."""
+        deleted_ids = []
+        not_found_ids = []
+        with self._db.transaction() as tx:
+            for lesson_id in ids:
+                cursor = tx.execute("DELETE FROM lessons WHERE id = ?", (lesson_id,))
+                if cursor.rowcount > 0:
+                    deleted_ids.append(lesson_id)
+                else:
+                    not_found_ids.append(lesson_id)
+        # Clean up ChromaDB outside transaction (non-critical)
+        if deleted_ids:
+            try:
+                collection = self._get_lessons_collection()
+                if collection is not None:
+                    collection.delete(ids=[str(lid) for lid in deleted_ids])
+            except Exception as e:
+                logger.warning("Failed to delete %d lessons from ChromaDB: %s", len(deleted_ids), e)
+        return deleted_ids, not_found_ids
+
     def _find_similar_lesson(self, topic: str, correct_answer: str) -> dict | None:
         """Find an existing lesson similar enough to be a duplicate.
 
         Fast path: exact match on (topic, correct_answer).
-        Slow path: normalized word overlap (Jaccard >= 0.7).
+        Slow path: normalized word overlap (Jaccard >= 0.85).
         """
         # Fast path — exact match
         exact = self._db.fetchone(
@@ -698,7 +852,8 @@ class LearningEngine:
             return None
 
         candidates = self._db.fetchall(
-            "SELECT id, confidence, topic, correct_answer FROM lessons"
+            "SELECT id, confidence, topic, correct_answer FROM lessons "
+            "ORDER BY created_at DESC LIMIT 200"
         )
         for row in candidates:
             existing_words = (
@@ -709,7 +864,7 @@ class LearningEngine:
                 continue
             overlap = len(new_words & existing_words)
             union = len(new_words | existing_words)
-            if union > 0 and overlap / union >= 0.85:
+            if union > 0 and overlap / union >= config.DEDUP_JACCARD_THRESHOLD:
                 return row
 
         return None
@@ -795,30 +950,36 @@ def _row_get(row, key: str, default: str = "") -> str:
         return default
 
 
-from app.core.text_utils import STOP_WORDS as _STOP_WORDS, normalize_words as _normalize_words  # noqa: E402
+from app.core.text_utils import STOP_WORDS as _STOP_WORDS, normalize_words as _base_normalize_words, simple_stem as _stem  # noqa: E402
 
 
-def _extract_answer_from_message(message: str) -> str:
+def _normalize_words(text: str) -> set[str]:
+    """Normalize text into stemmed word set for keyword comparison."""
+    return _base_normalize_words(text, stem=True)
+
+
+def _extract_answer_from_message(message: str) -> str | None:
     """Try to extract the 'correct' information from a correction message.
 
     Handles patterns like:
     - "Actually, X" → X
     - "The correct answer is X" → X
     - "It should be X" → X
+
+    Returns None if no extraction pattern matches (caller should handle gracefully).
     """
     patterns = [
-        r"(?i)actually,?\s+(.+?)(?:\.|$)",
-        r"(?i)the\s+(?:correct|right|actual)\s+(?:answer|info(?:rmation)?)\s+is\s+(.+?)(?:\.|$)",
-        r"(?i)it\s+should\s+be\s+(.+?)(?:\.|$)",
-        r"(?i)(?:no|nope),?\s+(?:it'?s?|the answer is)\s+(.+?)(?:\.|$)",
-        r"(?i)remember\s+that\s+(.+?)(?:\.|$)",
+        r"(?i)actually,?\s+(.+?)(?:\.\s|$)",
+        r"(?i)the\s+(?:correct|right|actual)\s+(?:answer|info(?:rmation)?)\s+is\s+(.+?)(?:\.\s|$)",
+        r"(?i)it\s+should\s+be\s+(.+?)(?:\.\s|$)",
+        r"(?i)(?:no|nope),?\s+(?:it'?s?|the answer is)\s+(.+?)(?:\.\s|$)",
+        r"(?i)remember\s+that\s+(.+?)(?:\.\s|$)",
     ]
     for pattern in patterns:
         match = re.search(pattern, message)
         if match:
             return match.group(1).strip()
-    # Last resort: return the whole message (it IS the correction)
-    return message.strip()
+    return None
 
 
 _ERROR_PHRASES = [
@@ -829,6 +990,15 @@ _ERROR_PHRASES = [
     "could you rephrase",
     "error occurred",
     "failed to",
+    "no personal memories",
+    "no conversation history",
+    "ssl verification error",
+    "cannot determine",
+    "unable to retrieve",
+    "no access to",
+    "no retrieved context",
+    "training data cutoff",
+    "i can't reach the language model",
 ]
 
 
@@ -841,7 +1011,13 @@ def _is_quality_content(text: str) -> bool:
 
 
 def _rotate_training_data(path: Path) -> None:
-    """If training data exceeds MAX_TRAINING_PAIRS, keep most recent entries up to the limit."""
+    """If training data exceeds MAX_TRAINING_PAIRS, keep most recent entries up to the limit.
+
+    Uses atomic temp-file + os.replace so a crash mid-write won't corrupt the file.
+    """
+    import os
+    import tempfile
+
     try:
         if not path.exists():
             return
@@ -850,8 +1026,20 @@ def _rotate_training_data(path: Path) -> None:
         if len(lines) <= config.MAX_TRAINING_PAIRS:
             return
         keep = config.MAX_TRAINING_PAIRS
-        with open(path, "w", encoding="utf-8") as f:
-            f.writelines(lines[-keep:])
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(path.parent), suffix=".tmp", prefix=".training_rotate_",
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.writelines(lines[-keep:])
+            os.replace(tmp_path, str(path))
+        except BaseException:
+            # Clean up temp file on failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         logger.info("Rotated training data: %d → %d lines", len(lines), keep)
     except Exception as e:
         logger.warning("Training data rotation failed: %s", e)
@@ -861,12 +1049,15 @@ def _fallback_correction(
     user_message: str,
     previous_answer: str,
     original_query: str,
-) -> Correction:
+) -> Correction | None:
     """Build a correction when LLM extraction fails.
 
     Extracts what it can from the user message via regex.
+    Returns None if no meaningful extraction is possible.
     """
     correct_answer = _extract_answer_from_message(user_message)
+    if correct_answer is None:
+        return None
 
     # Build a reasonable lesson_text
     lesson_text = correct_answer

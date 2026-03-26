@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from app.config import config
-from app.database import get_db
-from app.tools.base import BaseTool, ToolResult
+from app.tools.action_logging import log_action as _log_action
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -24,26 +25,22 @@ _MAX_DURATION_MINUTES = 24 * 60  # 24 hours
 _MAX_DATE_RANGE_DAYS = 730       # 2 years
 
 
-def _log_action(action_type: str, params: dict, result: str, success: bool) -> None:
-    """Log an action to the action_log table."""
-    try:
-        db = get_db()
-        db.execute(
-            "INSERT INTO action_log (action_type, params, result, success) VALUES (?, ?, ?, ?)",
-            (action_type, json.dumps(params, default=str), result[:2000], 1 if success else 0),
-        )
-    except Exception as e:
-        logger.warning("Failed to log action: %s", e)
-
-
 def _safe_calendar_path() -> Path:
-    """Return the calendar path, sandboxed to /data/."""
+    """Return the calendar path, sandboxed to /data/. Resolves symlinks to prevent escapes."""
     path = Path(config.CALENDAR_PATH)
     # Sandbox: must be under /data/
     resolved = path.resolve()
     data_dir = Path("/data").resolve()
     if not str(resolved).startswith(str(data_dir)):
         # Fall back to safe default
+        path = data_dir / "calendar.ics"
+        return path
+    # Resolve symlinks and re-check that the real path is still under /data/
+    real_path = Path(os.path.realpath(resolved))
+    real_data_dir = Path(os.path.realpath(data_dir))
+    if not str(real_path).startswith(str(real_data_dir)):
+        # Symlink escape detected — fall back to safe default
+        logger.warning("Calendar path symlink escape detected: %s -> %s", resolved, real_path)
         path = data_dir / "calendar.ics"
     return path
 
@@ -68,14 +65,61 @@ def _save_calendar(cal, path: Path) -> None:
 class CalendarTool(BaseTool):
     name = "calendar"
     description = (
-        "Manage calendar events in a local .ics file. "
-        "Actions: create, list, search, delete."
+        "Manage calendar events in a local RFC 5545 .ics file. "
+        "Actions: create (new event with title, start time, duration), "
+        "list (upcoming events within N days), search (find events by keyword), "
+        "delete (remove event by UID). Returns event details including UID for later reference. "
+        "Dates use ISO8601 format. Events persist across sessions. "
+        "Do NOT use for reminders (use the reminder tool)."
     )
     parameters = (
         "action: str, title: str, start: str (ISO8601), "
         "duration_minutes: int, description: str, location: str, "
         "days: int (for list), query: str (for search), uid: str (for delete)"
     )
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "list", "search", "delete"],
+                "description": "Calendar operation to perform.",
+            },
+            "title": {
+                "type": "string",
+                "description": "Event title (required for create).",
+            },
+            "start": {
+                "type": "string",
+                "description": "Event start time in ISO8601 format, e.g., '2026-03-06T15:00:00' (required for create).",
+            },
+            "duration_minutes": {
+                "type": "integer",
+                "description": "Event duration in minutes. Defaults to 60. Max 1440 (24 hours).",
+            },
+            "description": {
+                "type": "string",
+                "description": "Optional event description.",
+            },
+            "location": {
+                "type": "string",
+                "description": "Optional event location.",
+            },
+            "days": {
+                "type": "integer",
+                "description": "Number of days to look ahead for list action. Defaults to 7.",
+            },
+            "query": {
+                "type": "string",
+                "description": "Search query for search action.",
+            },
+            "uid": {
+                "type": "string",
+                "description": "Event UID for delete action.",
+            },
+        },
+        "required": ["action"],
+    }
 
     async def execute(
         self,
@@ -95,12 +139,14 @@ class CalendarTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error="Calendar is disabled. Set ENABLE_CALENDAR=true.",
+                error_category=ErrorCategory.PERMISSION,
             )
 
         if not action:
             return ToolResult(
                 output="", success=False,
                 error="No action specified. Use: create, list, search, delete",
+                error_category=ErrorCategory.VALIDATION,
             )
 
         action = action.lower().strip()
@@ -117,6 +163,7 @@ class CalendarTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Unknown action '{action}'. Use: create, list, search, delete",
+                error_category=ErrorCategory.VALIDATION,
             )
 
     def _create(
@@ -128,9 +175,9 @@ class CalendarTool(BaseTool):
         location: str,
     ) -> ToolResult:
         if not title:
-            return ToolResult(output="", success=False, error="Title is required")
+            return ToolResult(output="", success=False, error="Title is required", error_category=ErrorCategory.VALIDATION)
         if not start:
-            return ToolResult(output="", success=False, error="Start time is required (ISO8601)")
+            return ToolResult(output="", success=False, error="Start time is required (ISO8601)", error_category=ErrorCategory.VALIDATION)
 
         # Validate duration
         if duration_minutes < 1:
@@ -139,6 +186,7 @@ class CalendarTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Duration cannot exceed {_MAX_DURATION_MINUTES} minutes (24 hours)",
+                error_category=ErrorCategory.VALIDATION,
             )
 
         # Parse start time
@@ -148,6 +196,7 @@ class CalendarTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Invalid start time '{start}'. Use ISO8601 format (e.g., 2026-03-06T15:00:00)",
+                error_category=ErrorCategory.VALIDATION,
             )
 
         # Date range check
@@ -156,6 +205,7 @@ class CalendarTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Date must be within {_MAX_DATE_RANGE_DAYS} days of today",
+                error_category=ErrorCategory.VALIDATION,
             )
 
         from ics import Event
@@ -232,7 +282,7 @@ class CalendarTool(BaseTool):
 
     def _search(self, query: str) -> ToolResult:
         if not query:
-            return ToolResult(output="", success=False, error="Search query is required")
+            return ToolResult(output="", success=False, error="Search query is required", error_category=ErrorCategory.VALIDATION)
 
         path = _safe_calendar_path()
         cal = _load_calendar(path)
@@ -268,7 +318,7 @@ class CalendarTool(BaseTool):
 
     def _delete(self, uid: str) -> ToolResult:
         if not uid:
-            return ToolResult(output="", success=False, error="Event UID is required for deletion")
+            return ToolResult(output="", success=False, error="Event UID is required for deletion", error_category=ErrorCategory.VALIDATION)
 
         path = _safe_calendar_path()
         cal = _load_calendar(path)
@@ -280,7 +330,7 @@ class CalendarTool(BaseTool):
                 break
 
         if not target:
-            return ToolResult(output="", success=False, error=f"Event with UID '{uid}' not found")
+            return ToolResult(output="", success=False, error=f"Event with UID '{uid}' not found", error_category=ErrorCategory.NOT_FOUND)
 
         cal.events.remove(target)
         _save_calendar(cal, path)

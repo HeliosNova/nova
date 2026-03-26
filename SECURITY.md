@@ -8,7 +8,7 @@
 
 ## Reporting a Vulnerability
 
-If you discover a security vulnerability in Nova_, please report it responsibly:
+If you discover a security vulnerability in Nova, please report it responsibly:
 
 1. **Do NOT open a public GitHub issue** for security vulnerabilities.
 2. Email the maintainer directly with:
@@ -21,7 +21,7 @@ You should receive an acknowledgment within 48 hours. We aim to release patches 
 
 ## Security Architecture
 
-Nova_ implements multiple layers of security:
+Nova implements multiple layers of security:
 
 ### Access Tiers (`SYSTEM_ACCESS_LEVEL`)
 - **sandboxed** (default): Most restrictive. Shell blocks system + interpreter commands. File ops limited to `/data`. Code execution blocks os/subprocess/socket.

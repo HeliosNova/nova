@@ -6,6 +6,7 @@ subprocess sandbox as CodeExecTool, reusing _check_code_safety.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import subprocess
@@ -15,7 +16,9 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from app.config import config
-from app.tools.base import BaseTool, ToolResult
+from app.core.access_tiers import requires_tier
+from app.core.platform import get_safe_env
+from app.tools.base import BaseTool, ErrorCategory, ToolResult
 from app.tools.code_exec import _check_code_safety
 
 logger = logging.getLogger(__name__)
@@ -59,8 +62,13 @@ class CustomToolRecord:
 class CustomToolStore:
     """SQLite-backed store for user-created tools."""
 
-    MAX_CODE_LENGTH = 5000
-    MAX_TOOLS = 50
+    @property
+    def MAX_CODE_LENGTH(self):
+        return config.MAX_CUSTOM_TOOL_CODE_LENGTH
+
+    @property
+    def MAX_TOOLS(self):
+        return config.MAX_CUSTOM_TOOLS
 
     def __init__(self, db):
         self._db = db
@@ -153,23 +161,23 @@ class CustomToolStore:
 
         Returns a warning message if the tool was auto-disabled, None otherwise.
         """
+        # Use EMA (alpha=0.15) for consistency with skills
+        alpha = 0.15
+        success_val = 1.0 if success else 0.0
+        self._db.execute(
+            "UPDATE custom_tools SET times_used = times_used + 1, "
+            "success_rate = ? * ? + (1 - ?) * success_rate WHERE name = ?",
+            (alpha, success_val, alpha, name),
+        )
+        # Re-read for auto-disable check
         row = self._db.fetchone(
             "SELECT times_used, success_rate FROM custom_tools WHERE name = ?", (name,)
         )
         if not row:
             return None
 
-        old_uses = row["times_used"]
-        old_rate = row["success_rate"]
-        new_uses = old_uses + 1
-
-        # Running average
-        new_rate = ((old_rate * old_uses) + (1.0 if success else 0.0)) / new_uses
-
-        self._db.execute(
-            "UPDATE custom_tools SET times_used = ?, success_rate = ? WHERE name = ?",
-            (new_uses, round(new_rate, 3), name),
-        )
+        new_uses = row["times_used"]
+        new_rate = row["success_rate"]
 
         # Auto-disable if consistently failing
         if new_uses >= 5 and new_rate < 0.3:
@@ -208,12 +216,13 @@ class DynamicTool(BaseTool):
         self._code = record.code
         self._store = store
 
+    @requires_tier("standard", "full")
     async def execute(self, **kwargs) -> ToolResult:
         """Build and execute the tool's Python script."""
         # Re-check safety (in case code was tampered with in DB)
         safety_error = _check_code_safety(self._code)
         if safety_error:
-            return ToolResult(output="", success=False, error=safety_error)
+            return ToolResult(output="", success=False, error=safety_error, error_category=ErrorCategory.PERMISSION)
 
         # Validate args against declared schema
         try:
@@ -223,7 +232,8 @@ class DynamicTool(BaseTool):
                 unexpected = set(kwargs.keys()) - declared_names
                 if unexpected:
                     return ToolResult(output="", success=False,
-                        error=f"Unexpected parameters: {unexpected}. Expected: {declared_names}")
+                        error=f"Unexpected parameters: {unexpected}. Expected: {declared_names}",
+                        error_category=ErrorCategory.VALIDATION)
         except (json.JSONDecodeError, KeyError):
             pass  # Skip validation if schema is malformed
 
@@ -237,23 +247,21 @@ class DynamicTool(BaseTool):
             f"print(_result)\n"
         )
 
+        script_path = None
         try:
             with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
                 f.write(script)
                 script_path = f.name
 
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [sys.executable, script_path],
                 capture_output=True,
                 text=True,
                 timeout=config.CODE_EXEC_TIMEOUT,
                 cwd=tempfile.gettempdir(),
+                env=get_safe_env(),
             )
-
-            try:
-                Path(script_path).unlink()
-            except OSError:
-                pass
 
             success = result.returncode == 0
             output = result.stdout
@@ -274,6 +282,7 @@ class DynamicTool(BaseTool):
                     output=output or result.stderr,
                     success=False,
                     error=f"Tool exited with code {result.returncode}",
+                    error_category=ErrorCategory.INTERNAL,
                 )
 
             return ToolResult(output=output, success=True)
@@ -283,10 +292,17 @@ class DynamicTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Tool timed out after {config.CODE_EXEC_TIMEOUT}s",
+                error_category=ErrorCategory.TRANSIENT,
             )
         except Exception as e:
             self._store.record_use(self.name, success=False)
-            return ToolResult(output="", success=False, error=f"Tool failed: {e}")
+            return ToolResult(output="", success=False, error=f"Tool failed: {e}", error_category=ErrorCategory.INTERNAL)
+        finally:
+            if script_path:
+                try:
+                    Path(script_path).unlink()
+                except OSError:
+                    pass
 
 
 # Tool-create prompt addition for the system prompt

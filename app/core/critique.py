@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 
+from app.config import config
 from app.core import llm
 
 logger = logging.getLogger(__name__)
@@ -18,18 +19,7 @@ logger = logging.getLogger(__name__)
 # Should-critique heuristic (no LLM call)
 # ---------------------------------------------------------------------------
 
-_TOOL_FAILURE_MARKERS = ("failed", "timed out", "error", "not available")
-
-
-def _all_tools_succeeded(tool_results: list[dict]) -> bool:
-    """Return True if every tool result is clean (no failure markers)."""
-    for tr in tool_results:
-        output = str(tr.get("output", "")).lower()
-        if any(marker in output for marker in _TOOL_FAILURE_MARKERS):
-            return False
-        if output.startswith("[tool"):
-            return False
-    return True
+from app.core.quality import all_tools_clean as _all_tools_succeeded
 
 
 def should_critique(
@@ -38,10 +28,17 @@ def should_critique(
     intent: str,
     tool_results: list[dict],
     was_planned: bool = False,
+    kg_facts: str = "",
+    user_facts: str = "",
 ) -> bool:
     """Decide if an answer needs critique. Pure heuristic."""
-    if intent in ("greeting", "correction"):
+    if intent == "correction":
         return False
+
+    # Greetings/meta skip only if short AND query is short AND facts are grounding
+    if intent in ("greeting", "meta"):
+        if len(query) < 20 and (kg_facts or user_facts):
+            return False
 
     # Short answers don't need critique
     if len(answer) < 50:
@@ -49,6 +46,10 @@ def should_critique(
 
     # Tool results are ground truth — skip critique when all tools succeeded
     if tool_results and _all_tools_succeeded(tool_results):
+        return False
+
+    # KG/user facts are pre-verified — skip critique when answer is grounded in them
+    if (kg_facts or user_facts) and intent == "general":
         return False
 
     # Triggers: failed tools, long answer, or was planned
@@ -68,12 +69,14 @@ def should_critique(
 
 _CRITIQUE_SYSTEM = """You are a strict answer verifier. For each check, explain your reasoning briefly.
 
+IMPORTANT: Owner facts and knowledge graph facts are PRE-VERIFIED. Claims matching these are NEVER hallucinations. Only flag claims with NO source support.
+
 ## Checks
 
 1. **Query coverage**: Count how many distinct parts/questions are in the query. Verify each is addressed. List any missing parts.
-2. **Source grounding**: For each factual claim in the answer, check if it's supported by the retrieved sources. If the answer states "Python was created in 1989" but the source says "1991", flag it. If the answer makes claims not in the sources, flag them as unsupported.
+2. **Source grounding**: For each factual claim, check if it's supported by the retrieved sources, owner facts, OR knowledge graph facts. A claim grounded in ANY of these is valid. Owner facts and knowledge graph entries are authoritative — referencing them is NOT hallucination.
 3. **Calculation accuracy**: Verify any numbers, math, or logic in the answer.
-4. **Hallucination check**: Flag any specific facts (dates, names, numbers, statistics) that appear fabricated or contradict the sources.
+4. **Hallucination check**: Flag specific facts (dates, names, numbers) that appear fabricated AND are not supported by any provided source category. Do NOT flag claims that match owner facts or knowledge graph entries.
 
 ## Output
 
@@ -86,19 +89,28 @@ If there are issues:
 Be strict but fair. Short correct answers pass. Only flag real, specific issues."""
 
 
-async def critique_answer(query: str, answer: str, sources: str = "") -> dict | None:
+async def critique_answer(
+    query: str, answer: str, sources: str = "",
+    user_facts: str = "", kg_facts: str = "",
+) -> dict | None:
     """Run a critique check on the answer.
 
     Args:
         query: The original question.
         answer: The generated answer.
         sources: Retrieved context/sources the answer should draw from.
+        user_facts: Verified personal info about the user (name, employer, etc.).
+        kg_facts: Verified facts from the knowledge graph.
 
     Returns: {"pass": bool, "issues": [...]} or None on failure.
     """
-    user_content = f"Question: {query}\n\nAnswer: {answer[:1500]}"
+    user_content = f"Question: {query}\n\nAnswer: {answer[:config.CRITIQUE_ANSWER_LIMIT]}"
     if sources:
-        user_content += f"\n\nRetrieved sources:\n{sources[:1500]}"
+        user_content += f"\n\nRetrieved sources:\n{sources[:config.CRITIQUE_SOURCES_LIMIT]}"
+    if user_facts:
+        user_content += f"\n\nOwner facts (verified personal info about the user):\n{user_facts[:config.CRITIQUE_FACTS_LIMIT]}"
+    if kg_facts:
+        user_content += f"\n\nKnowledge graph facts (verified stored facts):\n{kg_facts[:config.CRITIQUE_FACTS_LIMIT]}"
 
     try:
         raw = await llm.invoke_nothink(

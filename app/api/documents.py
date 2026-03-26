@@ -11,13 +11,13 @@ from __future__ import annotations
 
 import logging
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.auth import require_auth
 from app.core.brain import get_services
 from app.schema import IngestRequest
-from app.tools.http_fetch import _is_safe_url
+from app.tools.http_fetch import _is_safe_url, _safe_url_with_pinned_ip
 
 logger = logging.getLogger(__name__)
 
@@ -35,16 +35,30 @@ async def ingest_document(request: IngestRequest):
     text = request.text
     source = "direct_text"
 
-    # If URL provided, fetch it (with SSRF protection)
+    # If URL provided, fetch it (with SSRF protection + DNS pinning)
     if request.url and not text:
-        if not _is_safe_url(request.url):
+        pin_result = _safe_url_with_pinned_ip(request.url)
+        if pin_result is None:
             raise HTTPException(status_code=400, detail="URL blocked: internal/private addresses not allowed")
+        _orig_url, pinned_url, original_host = pin_result
         try:
             import httpx
+            _MAX_FETCH_BYTES = 10 * 1024 * 1024  # 10 MB
+            _fetch_headers = {"Host": original_host} if original_host else {}
             async with httpx.AsyncClient(timeout=15.0) as client:
-                resp = await client.get(request.url)
-                resp.raise_for_status()
-                text = resp.text
+                async with client.stream("GET", pinned_url, headers=_fetch_headers) as resp:
+                    resp.raise_for_status()
+                    chunks = []
+                    total = 0
+                    async for chunk in resp.aiter_bytes(chunk_size=65536):
+                        total += len(chunk)
+                        if total > _MAX_FETCH_BYTES:
+                            raise HTTPException(
+                                status_code=413,
+                                detail=f"Response too large (>{_MAX_FETCH_BYTES // (1024*1024)}MB)",
+                            )
+                        chunks.append(chunk)
+                    text = b"".join(chunks).decode("utf-8", errors="replace")
                 source = request.url
         except HTTPException:
             raise
@@ -108,11 +122,14 @@ async def delete_document(doc_id: str):
     return {"status": "deleted", "document_id": doc_id}
 
 
+class SearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=5_000)
+
+
 @router.post("/search")
-async def search_documents(query: str = ""):
+async def search_documents(body: SearchRequest):
     """Search ingested documents."""
-    if len(query) > 5_000:
-        raise HTTPException(status_code=400, detail="Search query too long (max 5000 chars)")
+    query = body.query
     svc = get_services()
     if not svc.retriever:
         return []

@@ -11,9 +11,11 @@ SQLite-only, keyword retrieval (same pattern as lessons + KG).
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from dataclasses import dataclass
+from datetime import datetime
 
 from app.config import config
 
@@ -93,19 +95,42 @@ def assess_quality(
         reasons.append("Contains uncertainty phrase (honest)")
 
     # Tool exhaustion — used all rounds without a clean answer
+    _failure_markers = ("failed", "timed out", "error", "not available", "not found")
     if tool_results and len(tool_results) >= max_tool_rounds:
-        score -= 0.3
-        reasons.append(f"Exhausted all {max_tool_rounds} tool rounds")
+        # Milder penalty if some tools succeeded
+        tool_successes = sum(
+            1 for tr in tool_results
+            if not any(f in str(tr.get("output", "")).lower()
+                       for f in _failure_markers)
+        )
+        if tool_successes > 0:
+            score -= 0.1
+            reasons.append(f"Exhausted {max_tool_rounds} rounds but {tool_successes} succeeded")
+        else:
+            score -= 0.3
+            reasons.append(f"Exhausted all {max_tool_rounds} tool rounds with zero successes")
 
-    # Tool failures in results
-    tool_failures = sum(
-        1 for tr in tool_results
-        if any(f in str(tr.get("output", "")).lower()
-               for f in ("failed", "timed out", "error", "not available"))
-    )
-    if tool_failures:
-        score -= 0.15 * tool_failures
-        reasons.append(f"{tool_failures} tool(s) failed")
+    # Tool failures in results — separate browser selector misses from hard failures
+    _browser_selector_hints = ("selector", "not found", "timed out waiting")
+    browser_selector_misses = 0
+    hard_tool_failures = 0
+    for tr in tool_results:
+        output_lower = str(tr.get("output", "")).lower()
+        error_lower = str(tr.get("error", "")).lower()
+        combined = output_lower + " " + error_lower
+        is_failure = any(f in combined for f in _failure_markers)
+        if not is_failure:
+            continue
+        if any(m in combined for m in _browser_selector_hints):
+            browser_selector_misses += 1
+        else:
+            hard_tool_failures += 1
+    if browser_selector_misses:
+        score -= 0.05 * browser_selector_misses
+        reasons.append(f"{browser_selector_misses} browser selector miss(es)")
+    if hard_tool_failures:
+        score -= 0.15 * hard_tool_failures
+        reasons.append(f"{hard_tool_failures} tool(s) failed")
 
     score = max(0.0, min(1.0, score))
     reason = "; ".join(reasons) if reasons else ""
@@ -118,31 +143,21 @@ def assess_quality(
 
 _CRITIQUE_PROMPT = """Rate this AI response on a 0.0-1.0 scale. Be strict.
 
+{date_context}
 Question: {query}
 Answer: {answer}
 Tools used: {tools}
-
+{context_section}
 Check:
 1. Does it answer the question directly?
 2. Any missing context or incomplete information?
-3. Any unsupported claims or hallucinated details?
+3. Any unsupported claims or hallucinated details? Claims grounded in owner facts, knowledge graph facts, or the current date/year are NOT hallucinations — they are verified data. References to the current date above are from the real system clock.
 4. Is it well-structured and clear?
 
 Return JSON: {{"score": 0.0-1.0, "critique": "one sentence summary"}}"""
 
 
-_TOOL_FAILURE_MARKERS = ("failed", "timed out", "error", "not available")
-
-
-def _all_tools_clean(tool_results: list[dict]) -> bool:
-    """Return True if every tool result is clean (no failure markers)."""
-    for tr in tool_results:
-        output = str(tr.get("output", "")).lower()
-        if any(marker in output for marker in _TOOL_FAILURE_MARKERS):
-            return False
-        if output.startswith("[tool"):
-            return False
-    return True
+from app.core.quality import all_tools_clean as _all_tools_clean  # noqa: F401
 
 
 def should_use_llm_critique(intent: str, answer: str, tool_results: list[dict]) -> bool:
@@ -155,15 +170,21 @@ def should_use_llm_critique(intent: str, answer: str, tool_results: list[dict]) 
     # Always critique when tools failed, regardless of intent
     if tool_results and not _all_tools_clean(tool_results):
         return True
-    if intent != "general":
+    # Skip when tools all succeeded — heuristic is sufficient
+    if tool_results and _all_tools_clean(tool_results):
         return False
-    return len(answer) > 200 or len(tool_results) > 0
+    if intent == "correction":
+        return False
+    # LLM-critique substantial, tool-less answers for all non-correction intents
+    return len(answer) > 200
 
 
 async def critique_response(
     query: str,
     answer: str,
     tool_results: list[dict],
+    user_facts: str = "",
+    kg_facts: str = "",
 ) -> tuple[float, str]:
     """Use LLM to critique an answer. Falls back to heuristic on failure.
 
@@ -172,19 +193,35 @@ async def critique_response(
     from app.core import llm
 
     tools_desc = ", ".join(tr.get("tool", "?") for tr in tool_results) if tool_results else "none"
+    context_parts = []
+    if user_facts:
+        context_parts.append(f"Owner facts (verified):\n{user_facts[:500]}")
+    if kg_facts:
+        context_parts.append(f"Knowledge graph facts (verified):\n{kg_facts[:500]}")
+    context_section = "\n".join(context_parts) if context_parts else ""
+    now = datetime.now()
+    date_context = (
+        f"Current date: {now.strftime('%B %d, %Y')}. "
+        f"The year {now.year} is the present year — this is the real system clock date, not a future or hypothetical date."
+    )
     prompt = _CRITIQUE_PROMPT.format(
         query=query[:500],
         answer=answer[:1000],
         tools=tools_desc,
+        context_section=context_section,
+        date_context=date_context,
     )
 
     try:
-        raw = await llm.invoke_nothink(
-            [{"role": "user", "content": prompt}],
-            json_mode=True,
-            json_prefix="{",
-            max_tokens=150,
-            temperature=0.1,
+        raw = await asyncio.wait_for(
+            llm.invoke_nothink(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+                json_prefix="{",
+                max_tokens=150,
+                temperature=0.1,
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
         )
 
         obj = llm.extract_json_object(raw)
@@ -239,7 +276,9 @@ class ReflexionStore:
     CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
     """
 
-    MAX_REFLEXIONS = 200  # Auto-prune beyond this
+    @property
+    def MAX_REFLEXIONS(self) -> int:
+        return config.MAX_REFLEXIONS
 
     def __init__(self, db):
         self._db = db
@@ -289,7 +328,7 @@ class ReflexionStore:
             metadatas.append({"outcome": row["outcome"], "quality_score": row["quality_score"]})
 
         if ids:
-            collection.add(ids=ids, documents=documents, metadatas=metadatas)
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
             logger.info("Reindexed %d reflexions into ChromaDB", len(ids))
         return len(ids)
 
@@ -375,14 +414,16 @@ class ReflexionStore:
             outcome_filter = "failure"
 
         # --- Keyword search ---
+        # Successes: sort DESC (best first). Failures: sort ASC (worst first).
+        sort_order = "DESC" if successes_only else "ASC"
         if outcome_filter:
             rows = self._db.fetchall(
-                "SELECT * FROM reflexions WHERE outcome = ? ORDER BY quality_score ASC LIMIT 200",
+                f"SELECT * FROM reflexions WHERE outcome = ? ORDER BY quality_score {sort_order} LIMIT 200",
                 (outcome_filter,),
             )
         else:
             rows = self._db.fetchall(
-                "SELECT * FROM reflexions ORDER BY quality_score ASC LIMIT 200"
+                f"SELECT * FROM reflexions ORDER BY quality_score {sort_order} LIMIT 200"
             )
         rows_by_id = {row["id"]: row for row in rows}
 
@@ -519,17 +560,32 @@ class ReflexionStore:
             "avg_quality": round(avg_quality["avg"], 2) if avg_quality["avg"] else 0.0,
         }
 
-    def decay_stale(self, days: int = 90, decay_amount: float = 0.05) -> int:
+    def decay_stale(self, days: int | None = None, decay_amount: float | None = None) -> int:
         """Lower quality score on old reflexions so they fade out. Returns count affected."""
-        cursor = self._db.execute(
+        if days is None:
+            days = config.REFLEXION_DECAY_DAYS
+        if decay_amount is None:
+            decay_amount = config.REFLEXION_DECAY_AMOUNT
+        # Decay failures at full rate
+        cursor_fail = self._db.execute(
             "UPDATE reflexions SET quality_score = MAX(0.0, quality_score - ?) "
-            "WHERE created_at < datetime('now', ?)",
+            "WHERE created_at < datetime('now', ?) AND outcome = 'failure'",
             (decay_amount, f"-{days} days"),
         )
-        return cursor.rowcount
+        # Decay successes at half rate (they remain useful longer)
+        cursor_success = self._db.execute(
+            "UPDATE reflexions SET quality_score = MAX(0.0, quality_score - ?) "
+            "WHERE created_at < datetime('now', ?) AND outcome = 'success'",
+            (decay_amount / 2, f"-{days} days"),
+        )
+        return cursor_fail.rowcount + cursor_success.rowcount
 
     def _is_duplicate(self, task_summary: str, reflection: str) -> bool:
-        """Check if a near-identical reflexion already exists (Jaccard >= 0.8)."""
+        """Check if a near-identical reflexion already exists (Jaccard >= 0.6).
+
+        Threshold lowered from 0.8 to 0.6 to catch more near-duplicate
+        reflexions that are phrased slightly differently but convey the same lesson.
+        """
         new_words = _normalize_words(task_summary + " " + reflection) - _STOP_WORDS
         if len(new_words) < 3:
             return False
@@ -545,7 +601,7 @@ class ReflexionStore:
                 continue
             overlap = len(new_words & existing_words)
             union = len(new_words | existing_words)
-            if union > 0 and overlap / union >= 0.8:
+            if union > 0 and overlap / union >= 0.6:
                 return True
         return False
 
@@ -635,28 +691,26 @@ async def check_recurring_failures(task_summary: str, learning_engine) -> None:
     )
 
     try:
-        raw = await llm_mod.invoke_nothink(
-            [{"role": "user", "content": prompt}],
-            json_mode=True,
-            json_prefix="{",
-            max_tokens=200,
-            temperature=0.2,
+        raw = await asyncio.wait_for(
+            llm_mod.invoke_nothink(
+                [{"role": "user", "content": prompt}],
+                json_mode=True,
+                json_prefix="{",
+                max_tokens=200,
+                temperature=0.2,
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
         )
         obj = llm_mod.extract_json_object(raw)
         if not obj or "lesson" not in obj:
             return
 
-        from app.core.learning import Correction
-        correction = Correction(
-            user_message=f"Auto-promoted from {len(similar)} recurring failures",
-            previous_answer="",
+        lesson_id = learning_engine.add_knowledge_lesson(
             topic=obj.get("topic", task_summary[:100]),
             correct_answer=obj["lesson"],
-            wrong_answer="",
-            original_query=task_summaries[0] if task_summaries else "",
             lesson_text=f"Auto-lesson: {obj['lesson']}",
+            context=task_summaries[0] if task_summaries else "",
         )
-        lesson_id = learning_engine.save_lesson(correction)
         logger.info(
             "Recurring failure promoted to lesson #%d: '%s' (from %d failures)",
             lesson_id, obj.get("topic", "")[:60], len(similar),

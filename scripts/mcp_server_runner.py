@@ -1,4 +1,4 @@
-"""Nova_ MCP Server runner — entry point for stdio-based MCP transport.
+"""Nova MCP Server runner — entry point for stdio-based MCP transport.
 
 This script is spawned as a subprocess by MCP clients (Claude Code, Cursor, etc.).
 It initializes the database and required services, then runs the MCP server
@@ -76,7 +76,7 @@ async def main() -> None:
         retriever=retriever,
     )
 
-    logger.info("Nova_ MCP server starting (name=%s)...", config.MCP_SERVER_NAME)
+    logger.info("Nova MCP server starting (name=%s)...", config.MCP_SERVER_NAME)
 
     # --- Run over stdio transport ---
     async with stdio_server() as (read_stream, write_stream):
@@ -91,7 +91,7 @@ if __name__ == "__main__":
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
-        logger.info("Nova_ MCP server stopped.")
+        logger.info("Nova MCP server stopped.")
     except Exception:
-        logger.exception("Nova_ MCP server crashed")
+        logger.exception("Nova MCP server crashed")
         sys.exit(1)

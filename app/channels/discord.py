@@ -1,4 +1,4 @@
-"""Discord channel adapter — connects Nova_ to Discord via discord.py."""
+"""Discord channel adapter — connects Nova to Discord via discord.py."""
 
 from __future__ import annotations
 
@@ -25,6 +25,8 @@ class DiscordBot:
         intents.message_content = True
         self._client = discord.Client(intents=intents)
         self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # discord user_id → conv_id
+        self._conv_store = None  # lazy-init DB store
+        self._conv_lock = asyncio.Lock()
         self._allowed_users = self._parse_allowed_users()
         self._setup_events()
 
@@ -65,6 +67,7 @@ class DiscordBot:
             is_mentioned = self._client.user in message.mentions if self._client.user else False
 
             if not is_dm and not is_mentioned:
+                logger.debug("[Discord] Ignoring message — not a DM and bot not mentioned (requires either)")
                 return
 
             # Strip bot mention from content
@@ -91,18 +94,24 @@ class DiscordBot:
         from app.core.brain import think
         from app.core.brain import get_services
 
-        # Get or create conversation for this user
-        conv_id = self._conversations.get(user_id)
-        if conv_id:
-            # Move to end so it's marked as recently used
-            self._conversations.move_to_end(user_id)
-        else:
-            svc = get_services()
-            conv_id = svc.conversations.create_conversation()
-            self._conversations[user_id] = conv_id
-            # LRU eviction: cap at 1000 entries
-            while len(self._conversations) > 1000:
-                self._conversations.popitem(last=False)
+        # Get or create conversation for this user (memory cache + DB fallback)
+        async with self._conv_lock:
+            conv_id = self._conversations.get(user_id)
+            if conv_id:
+                self._conversations.move_to_end(user_id)
+            else:
+                # Try DB recovery
+                if self._conv_store is None:
+                    from app.database import get_db, ChannelConversationStore
+                    self._conv_store = ChannelConversationStore(get_db())
+                conv_id = self._conv_store.get("discord", str(user_id))
+                if not conv_id:
+                    svc = get_services()
+                    conv_id = svc.conversations.create_conversation()
+                    self._conv_store.set("discord", str(user_id), conv_id)
+                self._conversations[user_id] = conv_id
+                while len(self._conversations) > 1000:  # LRU cap for personal bot
+                    self._conversations.popitem(last=False)
 
         try:
             tokens = []
@@ -143,8 +152,18 @@ class DiscordBot:
 
     async def send_alert(self, message: str):
         """Send a message to the default channel."""
-        if not self.default_channel_id or not self._client.is_ready():
+        if not self.default_channel_id:
+            logger.warning("[Discord] Skipping alert — no default channel configured")
             return
+        if not self._client.is_ready():
+            # Wait briefly for the client to become ready (e.g. during startup)
+            for _ in range(10):
+                await asyncio.sleep(1)
+                if self._client.is_ready():
+                    break
+            if not self._client.is_ready():
+                logger.warning("[Discord] Skipping alert — client not ready after 10s wait")
+                return
         try:
             channel = self._client.get_channel(int(self.default_channel_id))
             if channel:
@@ -154,18 +173,32 @@ class DiscordBot:
             logger.error("[Discord] Alert send failed: %s", e)
 
     async def start(self):
-        """Start the Discord bot (blocks until disconnected)."""
+        """Start the Discord bot with reconnection and exponential backoff."""
         if not self.token:
             logger.warning("[Discord] No token configured, skipping")
             return
-        try:
-            await self._client.start(self.token)
-        except discord.LoginFailure as e:
-            logger.error("[Discord] Authentication failed (check DISCORD_TOKEN): %s", e)
-        except discord.ConnectionClosed as e:
-            logger.error("[Discord] Connection closed: code=%s", e.code)
-        except Exception as e:
-            logger.error("[Discord] Bot failed: %s", e, exc_info=True)
+
+        backoff = 5.0
+        max_backoff = 60.0
+
+        while True:
+            try:
+                await self._client.start(self.token)
+                return  # Clean exit
+            except discord.LoginFailure as e:
+                logger.error("[Discord] Authentication failed (check DISCORD_TOKEN): %s", e)
+                return  # Don't retry auth failures
+            except discord.ConnectionClosed as e:
+                logger.warning("[Discord] Connection closed (code=%s), reconnecting in %.0fs...", e.code, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+            except asyncio.CancelledError:
+                logger.info("[Discord] Bot shutting down")
+                return
+            except Exception as e:
+                logger.error("[Discord] Bot failed: %s, reconnecting in %.0fs...", e, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
 
     async def close(self):
         """Gracefully close the Discord connection."""

@@ -6,21 +6,24 @@ export function cn(...classes: (string | false | null | undefined)[]): string {
 }
 
 /**
- * Format an ISO date string to a human-friendly relative time or date.
+ * Format an ISO date string to a human-friendly time.
+ * < 1 min: "just now", < 60 min: "5m ago", today: "4:30 PM",
+ * yesterday: "Yesterday 4:30 PM", older: "Mar 25, 4:30 PM"
  */
 export function formatDate(iso: string): string {
   const date = new Date(iso);
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
   const diffMin = Math.floor(diffMs / 60_000);
-  const diffHr = Math.floor(diffMs / 3_600_000);
-  const diffDay = Math.floor(diffMs / 86_400_000);
 
   if (diffMin < 1) return "just now";
   if (diffMin < 60) return `${diffMin}m ago`;
-  if (diffHr < 24) return `${diffHr}h ago`;
-  if (diffDay < 7) return `${diffDay}d ago`;
-  return date.toLocaleDateString();
+
+  const time = date.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+  if (now.toDateString() === date.toDateString()) return time;
+  const yesterday = new Date(now.getTime() - 86_400_000);
+  if (yesterday.toDateString() === date.toDateString()) return `Yesterday ${time}`;
+  return date.toLocaleDateString([], { month: "short", day: "numeric" }) + `, ${time}`;
 }
 
 /**

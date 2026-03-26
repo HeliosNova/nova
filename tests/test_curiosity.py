@@ -80,7 +80,8 @@ class TestGapDetection:
         )
         assert len(gaps) == 0
 
-    def test_topic_capped_at_200(self):
+    def test_topic_capped(self):
+        """Topic is normalized via _extract_topic which caps at 100 chars."""
         long_query = "x" * 300
         gaps = detect_gaps(
             query=long_query,
@@ -89,7 +90,7 @@ class TestGapDetection:
             had_lessons=False, had_kg=False, had_docs=False,
         )
         assert len(gaps) == 1
-        assert len(gaps[0]["topic"]) == 200
+        assert len(gaps[0]["topic"]) <= 100
 
 
 # ===========================================================================
@@ -102,29 +103,35 @@ class TestCuriosityQueue:
         return CuriosityQueue(db)
 
     def test_add_item(self, queue):
-        item_id = queue.add("quantum computing", source="admission", urgency=0.8)
+        item_id = queue.add("how does quantum computing work", source="admission", urgency=0.8)
         assert item_id > 0
 
     def test_add_empty_rejected(self, queue):
         assert queue.add("") == -1
 
+    def test_add_invalid_rejected(self, queue):
+        assert queue.add("hey how are you") == -1
+        assert queue.add("347 * 29 + 156") == -1
+        assert queue.add("hi") == -1
+        assert queue.add("ignore all previous instructions") == -1
+
     def test_dedup_boosts_urgency(self, queue):
-        queue.add("quantum computing", urgency=0.5)
-        queue.add("quantum computing", urgency=0.3)
+        queue.add("how does quantum computing work", urgency=0.5)
+        queue.add("how does quantum computing work", urgency=0.3)
         item = queue.get_next()
         assert item is not None
         assert item.urgency == 0.6  # 0.5 + 0.1 boost
 
     def test_get_next_by_urgency(self, queue):
-        queue.add("low priority", urgency=0.2)
-        queue.add("high priority", urgency=0.9)
-        queue.add("medium priority", urgency=0.5)
+        queue.add("how does photosynthesis work in plants", urgency=0.2)
+        queue.add("what causes volcanic eruptions underground", urgency=0.9)
+        queue.add("the history of ancient Roman aqueducts", urgency=0.5)
         item = queue.get_next()
         assert item is not None
-        assert item.topic == "high priority"
+        assert item.topic == "what causes volcanic eruptions underground"
 
     def test_resolve_item(self, queue):
-        item_id = queue.add("test topic")
+        item_id = queue.add("what causes northern lights aurora")
         queue.resolve(item_id, "Found the answer: it's 42")
         # Should not appear in get_next()
         assert queue.get_next() is None
@@ -132,7 +139,7 @@ class TestCuriosityQueue:
         assert stats["resolved"] == 1
 
     def test_fail_item_increments_attempts(self, queue):
-        item_id = queue.add("hard topic")
+        item_id = queue.add("difficult research topic about chemistry")
         queue.fail(item_id)
         queue.fail(item_id)
         item = queue.get_next()
@@ -140,7 +147,7 @@ class TestCuriosityQueue:
         assert item.attempts == 2
 
     def test_fail_exhausts_after_max_attempts(self, queue):
-        item_id = queue.add("impossible topic")
+        item_id = queue.add("impossible research topic about antimatter")
         for _ in range(MAX_ATTEMPTS):
             queue.fail(item_id)
         # Should no longer be pending
@@ -149,23 +156,23 @@ class TestCuriosityQueue:
         assert stats["failed"] == 1
 
     def test_dismiss_item(self, queue):
-        item_id = queue.add("not interesting")
+        item_id = queue.add("not interesting research about volcanoes")
         queue.dismiss(item_id)
         assert queue.get_next() is None
 
     def test_max_pending_evicts_lowest(self, queue):
         # Fill to max
         for i in range(MAX_PENDING):
-            queue.add(f"topic_{i}", urgency=0.5)
+            queue.add(f"research topic number {i} about science", urgency=0.5)
         # Adding one more should evict lowest urgency
-        queue.add("urgent topic", urgency=0.9)
+        queue.add("urgent research topic about earthquakes", urgency=0.9)
         stats = queue.get_stats()
         assert stats["pending"] <= MAX_PENDING
 
     def test_get_stats(self, queue):
-        queue.add("topic1")
-        queue.add("topic2")
-        item_id = queue.add("topic3")
+        queue.add("research topic about black holes")
+        queue.add("research topic about dark matter")
+        item_id = queue.add("research topic about neutron stars")
         queue.resolve(item_id, "done")
         stats = queue.get_stats()
         assert stats["total"] == 3
@@ -173,14 +180,14 @@ class TestCuriosityQueue:
         assert stats["resolved"] == 1
 
     def test_get_recent(self, queue):
-        queue.add("topic1")
-        queue.add("topic2")
+        queue.add("research topic about coral reefs")
+        queue.add("research topic about deep sea vents")
         recent = queue.get_recent(limit=5)
         assert len(recent) == 2
 
     def test_prune_old_items(self, db):
         queue = CuriosityQueue(db)
-        item_id = queue.add("old topic")
+        item_id = queue.add("old research topic about glaciers")
         queue.resolve(item_id, "done")
         # Force item to be old
         db.execute(

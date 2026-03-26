@@ -1,13 +1,14 @@
-"""Tests for the Nova_ MCP Server — tool definitions and handler logic.
+"""Tests for the Nova MCP Server and MCP client bridge.
 
 Tests the MCP server's tool listing and the underlying service logic
 that each tool handler wraps, using a real in-memory SQLite database.
+Also tests MCPTool wrapping and MCPManager discovery.
 """
 
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -92,11 +93,12 @@ class TestListTools:
 
 
 class TestNovaKnowledgeGraph:
-    def test_query_entity(self, services):
+    @pytest.mark.asyncio
+    async def test_query_entity(self, services):
         """Add facts via KG, then verify the MCP handler would return them."""
         kg = services["kg"]
-        kg.add_fact("python", "is_a", "programming language")
-        kg.add_fact("python", "created_by", "guido van rossum")
+        await kg.add_fact("python", "is_a", "programming language")
+        await kg.add_fact("python", "created_by", "guido van rossum")
 
         facts = kg.query("python")
         assert len(facts) >= 2
@@ -300,8 +302,8 @@ class TestMCPServerCallTool:
     async def test_knowledge_graph_via_service(self, services):
         """Test the knowledge_graph logic end-to-end using the services directly."""
         kg = services["kg"]
-        kg.add_fact("rust", "is_a", "programming language")
-        kg.add_fact("rust", "developed_by", "mozilla")
+        await kg.add_fact("rust", "is_a", "programming language")
+        await kg.add_fact("rust", "developed_by", "mozilla")
 
         facts = kg.query("rust", hops=1)
         assert len(facts) == 2
@@ -450,3 +452,102 @@ class TestMCPServerCreation:
         assert hasattr(server, "request_handlers")
         # At minimum, tools/list and tools/call should be registered
         assert len(server.request_handlers) >= 2
+
+
+# ===========================================================================
+# MCP Client Bridge (from test_mcp)
+# ===========================================================================
+
+from app.tools.base import ToolResult
+
+
+class TestMCPTool:
+    """Test MCPTool wrapping and execution."""
+
+    def _make_tool(self, client=None, spec=None):
+        from app.tools.mcp import MCPTool
+        spec = spec or {
+            "name": "get_weather",
+            "description": "Get current weather",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "city": {"type": "string"},
+                    "units": {"type": "string"},
+                },
+                "required": ["city"],
+            },
+        }
+        return MCPTool(client or MagicMock(), spec)
+
+    def test_name_prefixed(self):
+        tool = self._make_tool()
+        assert tool.name == "mcp_get_weather"
+
+    def test_description(self):
+        tool = self._make_tool()
+        assert tool.description == "Get current weather"
+
+    def test_parameters_formatted(self):
+        tool = self._make_tool()
+        assert "city" in tool.parameters
+        assert "[required]" in tool.parameters
+
+    @pytest.mark.asyncio
+    async def test_execute_calls_client(self):
+        mock_client = MagicMock()
+        mock_block = MagicMock()
+        mock_block.text = "Sunny, 72F"
+        mock_result = MagicMock()
+        mock_result.content = [mock_block]
+        mock_result.isError = False
+        mock_client.call_tool = AsyncMock(return_value=mock_result)
+
+        tool = self._make_tool(client=mock_client)
+        with patch("app.core.access_tiers._tier", return_value="full"):
+            result = await tool.execute(city="NYC")
+
+        mock_client.call_tool.assert_called_once_with("get_weather", {"city": "NYC"})
+        assert isinstance(result, ToolResult)
+        assert result.success is True
+        assert "Sunny" in result.output
+
+    @pytest.mark.asyncio
+    async def test_execute_handles_error_gracefully(self):
+        mock_client = MagicMock()
+        mock_client.call_tool = AsyncMock(side_effect=RuntimeError("server crashed"))
+
+        tool = self._make_tool(client=mock_client)
+        with patch("app.core.access_tiers._tier", return_value="full"):
+            result = await tool.execute(city="NYC")
+
+        assert result.success is False
+        assert "server crashed" in result.error
+
+
+class TestMCPManager:
+    """Test MCPManager discovery (without real MCP servers)."""
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_dir_returns_zero(self, tmp_path):
+        from app.tools.mcp import MCPManager
+        mgr = MCPManager()
+        registry = MagicMock()
+
+        with patch("app.tools.mcp.config") as mock_config:
+            mock_config.MCP_CONFIG_DIR = str(tmp_path / "does_not_exist")
+            count = await mgr.discover_and_register(registry)
+
+        assert count == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_dir_returns_zero(self, tmp_path):
+        from app.tools.mcp import MCPManager
+        mgr = MCPManager()
+        registry = MagicMock()
+
+        with patch("app.tools.mcp.config") as mock_config:
+            mock_config.MCP_CONFIG_DIR = str(tmp_path)
+            count = await mgr.discover_and_register(registry)
+
+        assert count == 0

@@ -1,7 +1,7 @@
 # Helios Project Ecosystem Audit
 
 **Date**: 2026-03-04
-**Scope**: Full Helios ecosystem review with Nova_ as sole active project
+**Scope**: Full Helios ecosystem review with Nova as sole active project
 
 ---
 
@@ -17,13 +17,13 @@
 | Helios v1 proto | 3.5GB | Old version, kept as-is (historical) |
 | Helios - original 2 | 8.4GB | Old version, kept as-is (historical) |
 | archives | 23GB | Historical archive, kept as-is |
-| Others | ~76KB | Nova_2 docs, config files |
+| Others | ~76KB | Nova2 docs, config files |
 
 **Total ecosystem**: ~39GB. Only nova_ (91MB) is active.
 
 ---
 
-## Nova_ Status: Production-Ready
+## Nova Status: Production-Ready
 
 ### Architecture
 
@@ -118,7 +118,7 @@ If the bots are no longer in use, no action needed — the tokens will remain in
 
 ## Future Directions (Not Planned)
 
-Nova_ is feature-complete. Potential future work if desired:
+Nova is feature-complete. Potential future work if desired:
 
 - Multi-user authentication
 - Auto fine-tuning pipeline (use exported DPO data to auto-retrain)

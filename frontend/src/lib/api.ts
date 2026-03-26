@@ -33,7 +33,7 @@ import type {
   FinetuneTriggerResponse,
 } from "./types";
 
-function getBaseUrl(): string {
+export function getBaseUrl(): string {
   // In dev, Vite proxy handles /api -> backend. In prod, same origin.
   return "";
 }
@@ -107,6 +107,23 @@ export async function importData(file: File): Promise<{ status: string; stats: R
   return res.json();
 }
 
+// ── Voice ──
+
+export async function transcribeVoice(audioBlob: Blob, filename = "recording.webm"): Promise<{ text: string; language?: string; duration?: number }> {
+  const form = new FormData();
+  form.append("file", audioBlob, filename);
+  const headers: Record<string, string> = {};
+  const apiKey = localStorage.getItem("nova_api_key");
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  const res = await fetch(`${getBaseUrl()}/api/voice/transcribe`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Transcription failed: ${res.status}`);
+  return res.json();
+}
+
 // ── Conversations ──
 
 export async function getConversations(limit = 50): Promise<ConversationSummary[]> {
@@ -173,7 +190,10 @@ export async function deleteLesson(id: number): Promise<void> {
 }
 
 export async function bulkDeleteLessons(ids: number[]): Promise<void> {
-  await Promise.all(ids.map((id) => deleteLesson(id)));
+  await request("/api/learning/lessons/bulk-delete", {
+    method: "POST",
+    body: JSON.stringify({ ids }),
+  });
 }
 
 export async function getSkills(limit = 50): Promise<SkillInfo[]> {
@@ -383,4 +403,46 @@ export async function getCuriosityQueue(): Promise<CuriosityItem[]> {
 
 export async function triggerFinetune(): Promise<FinetuneTriggerResponse> {
   return request("/api/learning/finetune/trigger", { method: "POST" });
+}
+
+// ── Heartbeat Instructions (single) ──
+
+export async function getHeartbeatInstruction(id: number): Promise<unknown> {
+  return request(`/api/monitors/${id}/instruction`);
+}
+
+export async function updateHeartbeatInstruction(id: number, data: object): Promise<unknown> {
+  return request(`/api/monitors/${id}/instruction`, {
+    method: "PUT",
+    body: JSON.stringify(data),
+  });
+}
+
+// ── Actions (single) ──
+
+export async function getAction(id: number): Promise<ActionInfo> {
+  return request(`/api/actions/${id}`);
+}
+
+// ── Documents (single) ──
+
+export async function getDocument(id: number): Promise<DocumentInfo> {
+  return request(`/api/documents/${id}`);
+}
+
+// ── Voice Chat ──
+
+export async function voiceChat(blob: Blob, filename = "recording.webm"): Promise<Response> {
+  const form = new FormData();
+  form.append("file", blob, filename);
+  const headers: Record<string, string> = {};
+  const apiKey = localStorage.getItem("nova_api_key");
+  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
+  const res = await fetch(`${getBaseUrl()}/api/voice/chat`, {
+    method: "POST",
+    headers,
+    body: form,
+  });
+  if (!res.ok) throw new Error(`Voice chat failed: ${res.status}`);
+  return res;
 }

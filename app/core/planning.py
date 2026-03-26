@@ -6,11 +6,14 @@ invoke_nothink call that produces a step-by-step plan with tool assignments.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 
+from app.config import config
 from app.core import llm
+from app.core.text_utils import STOP_WORDS
 
 logger = logging.getLogger(__name__)
 
@@ -108,15 +111,18 @@ async def create_plan(
         system += f"\n\nWarnings from past failures:\n{reflexions_text}"
 
     try:
-        raw = await llm.invoke_nothink(
-            [
-                {"role": "system", "content": system},
-                {"role": "user", "content": query},
-            ],
-            json_mode=True,
-            json_prefix='{"',
-            max_tokens=300,
-            temperature=0.1,
+        raw = await asyncio.wait_for(
+            llm.invoke_nothink(
+                [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": query},
+                ],
+                json_mode=True,
+                json_prefix='{"',
+                max_tokens=300,
+                temperature=0.1,
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
         )
         if not raw:
             return None
@@ -184,7 +190,7 @@ def verify_plan_coverage(plan: dict, answer: str) -> list[str]:
             continue
         # Extract keywords (3+ char words) from the step description
         keywords = [w for w in re.findall(r"\b\w{3,}\b", desc.lower())
-                    if w not in {"the", "and", "for", "from", "with", "use", "using", "that", "this", "none"}]
+                    if w not in STOP_WORDS]
         if not keywords:
             continue
         # Step is "covered" if at least 40% of keywords appear in the answer

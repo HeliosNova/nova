@@ -33,6 +33,7 @@ class DailyDigest:
         whatsapp_bot: Any = None,
         signal_bot: Any = None,
         learning_engine: Any = None,
+        db: Any = None,
     ):
         self._store = monitor_store
         self._discord = discord_bot
@@ -40,9 +41,37 @@ class DailyDigest:
         self._whatsapp = whatsapp_bot
         self._signal = signal_bot
         self._learning = learning_engine
+        self._db = db
         self._task: asyncio.Task | None = None
         self._running = False
-        self._last_digest: str | None = None
+        self._last_digest: str | None = self._load_last_digest()
+
+    def _load_last_digest(self) -> str | None:
+        """Load last_digest_date from the system_state table."""
+        if self._db is None:
+            return None
+        try:
+            row = self._db.fetchone(
+                "SELECT value FROM system_state WHERE key = ?",
+                ("last_digest_date",),
+            )
+            return row["value"] if row else None
+        except Exception as e:
+            logger.warning("[Digest] Failed to load last_digest_date: %s", e)
+            return None
+
+    def _save_last_digest(self, date_str: str) -> None:
+        """Save last_digest_date to the system_state table."""
+        if self._db is None:
+            return
+        try:
+            self._db.execute(
+                "INSERT OR REPLACE INTO system_state (key, value, updated_at) "
+                "VALUES (?, ?, CURRENT_TIMESTAMP)",
+                ("last_digest_date", date_str),
+            )
+        except Exception as e:
+            logger.warning("[Digest] Failed to save last_digest_date: %s", e)
 
     def start(self) -> asyncio.Task:
         self._running = True
@@ -57,22 +86,34 @@ class DailyDigest:
 
     async def _loop(self) -> None:
         """Check every 15 minutes if it's digest time."""
-        await asyncio.sleep(30)  # Let things initialize
+        try:
+            await asyncio.sleep(30)  # Let things initialize
 
-        while self._running:
-            try:
-                now = datetime.now(timezone.utc)
-                today = now.strftime("%Y-%m-%d")
+            while self._running:
+                try:
+                    now_utc = datetime.now(timezone.utc)
+                    # Convert to user's timezone for hour comparison
+                    try:
+                        from zoneinfo import ZoneInfo
+                        user_tz = ZoneInfo(config.USER_TIMEZONE) if config.USER_TIMEZONE else timezone.utc
+                        now_local = now_utc.astimezone(user_tz)
+                    except (KeyError, ImportError):
+                        now_local = now_utc
+                    today = now_local.strftime("%Y-%m-%d")
 
-                # Send digest if it's the right hour and we haven't sent today.
-                # Note: DIGEST_HOUR is compared against UTC (datetime.now(timezone.utc)).
-                if now.hour == config.DIGEST_HOUR and self._last_digest != today:
-                    await self.send_digest()
-                    self._last_digest = today
-            except Exception as e:
-                logger.error("[Digest] Loop failed: %s", e)
+                    # Send digest if it's the right hour in user's timezone
+                    if now_local.hour == config.DIGEST_HOUR and self._last_digest != today:
+                        await self.send_digest()
+                        self._last_digest = today
+                        self._save_last_digest(today)
+                except Exception as e:
+                    logger.error("[Digest] Loop failed: %s", e)
 
-            await asyncio.sleep(900)  # Check every 15 min
+                await asyncio.sleep(900)  # Check every 15 min
+        except asyncio.CancelledError:
+            logger.info("[Digest] Loop cancelled")
+        except Exception as e:
+            logger.error("[Digest] Loop terminated unexpectedly: %s", e)
 
     async def send_digest(self) -> str | None:
         """Compile and send the daily digest. Returns the digest text."""
@@ -200,13 +241,13 @@ class DailyDigest:
         full_input = summary_input + learning_input + teaching_input + curiosity_input
 
         system_content = (
-            "You are Nova, composing your evening digest for your owner. "
-            "Summarize the monitor results, learning activity, and teaching progress "
-            "from the last 24 hours in a friendly, concise message. Highlight anything "
-            "notable — new skills or lessons learned are worth mentioning proudly. "
-            "Report quiz and skill test results as a sign of self-improvement. "
-            "Flag any degraded skills that need attention. Keep it to 4-6 sentences. "
-            "Be warm but informative."
+            "You are Nova composing your evening digest. Use this format:\n\n"
+            "**Monitors:** X passed, Y failed, Z changed\n"
+            "**Learning:** (new lessons, skills, training pairs — numbers + highlights)\n"
+            "**Teaching:** (quiz results, skill test results)\n"
+            "**Issues:** (anything degraded or failing — be specific)\n\n"
+            "Keep each section to 1-2 lines. Be specific with numbers. "
+            "Skip sections with no activity. No filler."
         )
 
         try:

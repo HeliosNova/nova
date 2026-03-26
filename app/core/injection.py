@@ -28,7 +28,7 @@ class InjectionResult:
 
 # 1. Role override patterns (weight 0.4)
 _ROLE_OVERRIDE_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(r"you\s+are\s+now\b", re.I), "role override: 'you are now'"),
+    (re.compile(r"you\s+are\s+now\s+(?:a|an|my|the|in)\b", re.I), "role override: 'you are now'"),
     (re.compile(r"ignore\s+(all\s+)?previous\s+instructions", re.I), "role override: 'ignore previous instructions'"),
     (re.compile(r"ignore\s+all\s+prior\b", re.I), "role override: 'ignore all prior'"),
     (re.compile(r"disregard\s+your\s+instructions", re.I), "role override: 'disregard your instructions'"),
@@ -59,6 +59,13 @@ _DELIMITER_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"<<\s*SYS\s*>>", re.I), "delimiter abuse: '<<SYS>>'"),
     (re.compile(r"###\s*Instruction\s*:", re.I), "delimiter abuse: '### Instruction:'"),
     (re.compile(r"```\s*(?:system|assistant|user)\b", re.I), "delimiter abuse: code block with role content"),
+    (re.compile(r"<\|endoftext\|>", re.I), "delimiter abuse: '<|endoftext|>'"),
+    (re.compile(r"<\|assistant\|>", re.I), "delimiter abuse: '<|assistant|>'"),
+    (re.compile(r"\nHuman:", re.I), "delimiter abuse: 'Human:' role marker"),
+    (re.compile(r"\nAssistant:", re.I), "delimiter abuse: 'Assistant:' role marker"),
+    (re.compile(r"<\|im_end\|>", re.I), "delimiter abuse: '<|im_end|>'"),
+    (re.compile(r"<\|user\|>", re.I), "delimiter abuse: '<|user|>'"),
+    (re.compile(r"<\|system\|>", re.I), "delimiter abuse: '<|system|>'"),
 ]
 
 # 4. Encoding tricks — patterns checked differently
@@ -89,7 +96,19 @@ _WEIGHT_INSTRUCTION = 0.3
 _WEIGHT_DELIMITER = 0.2
 _WEIGHT_ENCODING = 0.1
 
-_SUSPICIOUS_THRESHOLD = 0.3
+_SUSPICIOUS_THRESHOLD = None  # Use config.INJECTION_SUSPICIOUS_THRESHOLD
+
+
+def _get_suspicious_threshold() -> float:
+    """Get the injection suspicious threshold from config, with fallback."""
+    try:
+        from app.config import config
+        val = config.INJECTION_SUSPICIOUS_THRESHOLD
+        if isinstance(val, (int, float)):
+            return float(val)
+        return 0.3
+    except Exception:
+        return 0.3
 
 
 # ---------------------------------------------------------------------------
@@ -170,40 +189,60 @@ def detect_injection(text: str) -> InjectionResult:
         if hits > 0:
             score += weights[cat]
 
+    # Combo rule: when both delimiter AND encoding categories hit (both > 0),
+    # flag as suspicious even if individually below threshold. Combined attacks
+    # that stay under individual category thresholds are still dangerous.
+    combo_flag = category_hits["delimiter"] > 0 and category_hits["encoding"] > 0
+
     # Cap at 1.0
     score = min(score, 1.0)
 
     return InjectionResult(
-        is_suspicious=score >= _SUSPICIOUS_THRESHOLD,
+        is_suspicious=combo_flag or score >= _get_suspicious_threshold(),
         score=round(score, 3),
         reasons=reasons,
     )
 
 
 def _has_homoglyphs(text: str) -> bool:
-    """Detect likely homoglyph substitution (mixing Latin with Cyrillic/Greek lookalikes)."""
-    has_latin = False
-    has_cyrillic = False
-    has_greek = False
+    """Detect likely homoglyph substitution (mixing Latin with Cyrillic/Greek lookalikes).
 
-    # Only check first 2000 chars for performance
-    sample = text[:2000]
-    for ch in sample:
-        cat = unicodedata.category(ch)
-        if cat.startswith("L"):  # Letter
-            try:
-                name = unicodedata.name(ch, "")
-            except ValueError:
-                continue
-            if "CYRILLIC" in name:
-                has_cyrillic = True
-            elif "GREEK" in name:
-                has_greek = True
-            elif "LATIN" in name:
-                has_latin = True
+    Uses overlapping sliding windows (stride 1000, window 2000) to prevent
+    attacks that span window boundaries.
+    """
+    # Build overlapping windows (stride 1000, window 2000)
+    window_size = 2000
+    stride = 1000
+    windows = []
+    if len(text) <= window_size:
+        windows.append(text)
+    else:
+        for start in range(0, len(text), stride):
+            end = min(start + window_size, len(text))
+            windows.append(text[start:end])
+            if end >= len(text):
+                break
 
-        if has_latin and (has_cyrillic or has_greek):
-            return True
+    for sample in windows:
+        has_latin = False
+        has_cyrillic = False
+        has_greek = False
+        for ch in sample:
+            cat = unicodedata.category(ch)
+            if cat.startswith("L"):  # Letter
+                try:
+                    name = unicodedata.name(ch, "")
+                except ValueError:
+                    continue
+                if "CYRILLIC" in name:
+                    has_cyrillic = True
+                elif "GREEK" in name:
+                    has_greek = True
+                elif "LATIN" in name:
+                    has_latin = True
+
+            if has_latin and (has_cyrillic or has_greek):
+                return True
 
     return False
 

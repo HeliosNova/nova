@@ -390,7 +390,7 @@ def test_learning():
 # ═══════════════════════════════════════════════════════════════════
 
 async def main():
-    print(f"Nova_ Live E2E Tests")
+    print(f"Nova Live E2E Tests")
     print(f"Temp dir: {_tmpdir}")
 
     # Browser tests (async)

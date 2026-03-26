@@ -191,6 +191,16 @@ class TestMonitorStore:
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
 
+    def test_quiz_and_skill_seeded_on_change(self, store):
+        """Quiz and Skill Validation should seed with notify_condition='on_change'."""
+        store.seed_defaults()
+        quiz = store.get_by_name("Lesson Quiz")
+        skill = store.get_by_name("Skill Validation")
+        assert quiz is not None
+        assert skill is not None
+        assert quiz.notify_condition == "on_change"
+        assert skill.notify_condition == "on_change"
+
     def test_seed_defaults_idempotent(self, store):
         store.seed_defaults()
         count2 = store.seed_defaults()
@@ -302,7 +312,7 @@ class TestMonitorTool:
             action="create",
             name="StringConfig",
             check_type="search",
-            config='{"query": "test"}',
+            check_config='{"query": "test"}',
             schedule_minutes=10,
         )
         assert result.success

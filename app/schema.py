@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from enum import Enum
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 # ---------------------------------------------------------------------------
@@ -13,7 +13,7 @@ from pydantic import BaseModel, Field, field_validator
 # ---------------------------------------------------------------------------
 
 class ChatRequest(BaseModel):
-    query: str = Field(min_length=1, max_length=10_000)
+    query: str = Field(min_length=1, max_length=50_000)
     conversation_id: str | None = Field(None, max_length=100)
     image_base64: str | None = Field(None, max_length=10_000_000)
 
@@ -34,6 +34,8 @@ class ChatResponse(BaseModel):
     sources: list[dict] = Field(default_factory=list)
     tool_results: list[dict] = Field(default_factory=list)
     lessons_used: int = 0
+    kg_facts_used: int = 0
+    reflexions_used: int = 0
     skill_used: str | None = None
 
 
@@ -101,6 +103,12 @@ class IngestRequest(BaseModel):
             raise ValueError("URL must start with http:// or https://")
         return v
 
+    @model_validator(mode="after")
+    def require_text_or_url(self) -> "IngestRequest":
+        if not self.text and not self.url:
+            raise ValueError("Either 'text' or 'url' must be provided")
+        return self
+
 
 
 # ---------------------------------------------------------------------------
@@ -120,6 +128,7 @@ class LessonInfo(BaseModel):
     topic: str
     wrong_answer: str | None
     correct_answer: str
+    lesson_text: str | None = None
     confidence: float
     times_retrieved: int
     times_helpful: int
@@ -131,9 +140,11 @@ class SkillInfo(BaseModel):
     name: str
     trigger_pattern: str
     steps: list[dict]
+    answer_template: str | None = None
     times_used: int
     success_rate: float
     enabled: bool
+    created_at: str | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -142,12 +153,7 @@ class SkillInfo(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str = "ok"
-    version: str = "1.0.0"
-    model: str = ""
-    provider: str = "ollama"
-    llm_connected: bool = False
-    ollama_connected: bool = False  # backward compat
-    db_connected: bool = False
+    timestamp: str = ""
 
 
 class StatusResponse(BaseModel):

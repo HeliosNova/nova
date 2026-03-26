@@ -1,4 +1,4 @@
-"""Real-world end-to-end tests — hits the live Nova_ server.
+"""Real-world end-to-end tests — hits the live Nova server.
 
 Exercises the system as different user personas would actually use it.
 No mocks. Real LLM calls. Real tool execution. Real learning.
@@ -412,9 +412,9 @@ def test_api_consumer():
         report("Health endpoint works",
                data.get("status") == "ok",
                f"Response: {data}")
-        report("LLM connected",
-               data.get("llm_connected", False),
-               f"Provider: {data.get('provider')}, Model: {data.get('model')}")
+        report("Health timestamp present",
+               bool(data.get("timestamp")),
+               f"Timestamp: {data.get('timestamp')}")
     except Exception as e:
         report("Health endpoint", False, str(e))
 
@@ -456,7 +456,7 @@ def test_api_consumer():
     try:
         resp = httpx.post(
             f"{BASE}/api/documents/ingest",
-            json={"text": "Nova_ is a sovereign personal AI assistant built with async Python and httpx. "
+            json={"text": "Nova is a sovereign personal AI assistant built with async Python and httpx. "
                          "It supports 4 LLM providers and learns from user corrections.",
                   "title": "E2E Test Document"},
             timeout=30,
@@ -475,7 +475,7 @@ def test_api_consumer():
     if doc_id:
         time.sleep(1)  # Brief delay for indexing
         try:
-            r = chat("Search your documents: what is Nova_ built with?")
+            r = chat("Search your documents: what is Nova built with?")
             answer = r.get("answer", "")
             tools = r.get("tool_results", [])
             used_knowledge = any(t.get("tool") == "knowledge_search" for t in tools)
@@ -532,7 +532,7 @@ def test_reasoning():
 
 def main():
     print("=" * 60)
-    print("NOVA_ REAL-WORLD E2E TESTS")
+    print("NOVA REAL-WORLD E2E TESTS")
     print("=" * 60)
     print(f"Target: {BASE}")
 
@@ -543,8 +543,7 @@ def main():
         if data.get("status") != "ok":
             print("ERROR: Server not healthy!")
             sys.exit(1)
-        print(f"Server: OK | Model: {data.get('model')} | Provider: {data.get('provider')}")
-        print(f"LLM: {'connected' if data.get('llm_connected') else 'DISCONNECTED'}")
+        print(f"Server: OK | Timestamp: {data.get('timestamp')}")
     except Exception as e:
         print(f"ERROR: Cannot reach server at {BASE}: {e}")
         sys.exit(1)

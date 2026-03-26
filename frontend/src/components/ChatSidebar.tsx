@@ -53,7 +53,7 @@ export default function ChatSidebar({ onSelect }: Props) {
   useEffect(() => {
     refresh();
     let interval: ReturnType<typeof setInterval>;
-    const start = () => { interval = setInterval(refresh, 10_000); };
+    const start = () => { interval = setInterval(refresh, 30_000); };
     const stop = () => clearInterval(interval);
     const onVisibility = () => { document.hidden ? stop() : start(); };
     start();

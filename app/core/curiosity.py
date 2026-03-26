@@ -13,8 +13,15 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
+from app.config import config
+from app.core.text_utils import normalize_words
+
 logger = logging.getLogger(__name__)
 
+_URGENCY_CRITICAL = 0.8
+_URGENCY_HIGH = 0.6
+_URGENCY_MEDIUM = 0.4
+_URGENCY_LOW = 0.3
 
 # ---------------------------------------------------------------------------
 # Gap detection — heuristic, no LLM call
@@ -39,6 +46,11 @@ _ADMISSION_PATTERNS = [
 
 _TOOL_FAILURE_MARKERS = ("failed", "timed out", "error", "not available", "[tool")
 
+# Tool command queries should not become curiosity research topics
+_TOOL_COMMAND_RE = re.compile(
+    r"(?i)(use the browser|fill.*form|httpbin|submit|navigate to|go to https?://)"
+)
+
 
 def detect_gaps(
     query: str,
@@ -54,32 +66,36 @@ def detect_gaps(
     """
     gaps: list[dict] = []
     lower = answer.lower()
-    topic = query[:200]
+    topic = TopicTracker._extract_topic(query[:200])
+
+    # Tool commands should never become research topics
+    if _TOOL_COMMAND_RE.search(query):
+        return []
 
     # Check for admissions of ignorance (highest urgency)
     admission_hits = sum(1 for p in _ADMISSION_PATTERNS if p.search(answer))
     if admission_hits >= 1:
-        gaps.append({"topic": topic, "source": "admission", "urgency": 0.8})
+        gaps.append({"topic": topic, "source": "admission", "urgency": _URGENCY_CRITICAL})
         return gaps  # One gap per query is enough
 
-    # Check for tool failures
+    # Check for tool failures — but not if the query is a tool command itself
     tool_failures = sum(
         1 for tr in tool_results
         if any(m in str(tr.get("output", "")).lower() for m in _TOOL_FAILURE_MARKERS)
     )
     if tool_failures:
-        gaps.append({"topic": topic, "source": "tool_failure", "urgency": 0.6})
+        gaps.append({"topic": topic, "source": "tool_failure", "urgency": _URGENCY_HIGH})
         return gaps
 
     # Check for hedging language
     hedging_hits = sum(1 for p in _HEDGING_PATTERNS if p.search(answer))
     if hedging_hits >= 2:
-        gaps.append({"topic": topic, "source": "hedging", "urgency": 0.4})
+        gaps.append({"topic": topic, "source": "hedging", "urgency": _URGENCY_MEDIUM})
         return gaps
 
     # Check for missing context (no lessons, KG, or docs matched)
     if not had_lessons and not had_kg and not had_docs and len(query) > 30:
-        gaps.append({"topic": topic, "source": "context_gap", "urgency": 0.3})
+        gaps.append({"topic": topic, "source": "context_gap", "urgency": _URGENCY_LOW})
 
     return gaps
 
@@ -88,8 +104,36 @@ def detect_gaps(
 # CuriosityQueue — SQLite-backed research queue
 # ---------------------------------------------------------------------------
 
-MAX_PENDING = 50
-MAX_ATTEMPTS = 3
+class _LazyConfigInt:
+    """Proxy that reads from config at access time, not import time.
+
+    Supports int operations so existing code (comparisons, range()) works.
+    """
+    def __init__(self, attr: str):
+        self._attr = attr
+    def _val(self):
+        return getattr(config, self._attr)
+    def __eq__(self, other):
+        return self._val() == other
+    def __ge__(self, other):
+        return self._val() >= other
+    def __le__(self, other):
+        return self._val() <= other
+    def __lt__(self, other):
+        return self._val() < other
+    def __gt__(self, other):
+        return self._val() > other
+    def __int__(self):
+        return self._val()
+    def __index__(self):
+        return self._val()
+    def __repr__(self):
+        return repr(self._val())
+    def __hash__(self):
+        return hash(self._val())
+
+MAX_PENDING = _LazyConfigInt("MAX_CURIOSITY_PENDING")
+MAX_ATTEMPTS = _LazyConfigInt("MAX_CURIOSITY_ATTEMPTS")
 
 
 @dataclass
@@ -134,16 +178,56 @@ class CuriosityQueue:
     @staticmethod
     def _jaccard_similarity(a: str, b: str) -> float:
         """Compute Jaccard word similarity between two strings."""
-        words_a = set(a.lower().split())
-        words_b = set(b.lower().split())
+        words_a = normalize_words(a)
+        words_b = normalize_words(b)
         if not words_a or not words_b:
             return 0.0
         return len(words_a & words_b) / len(words_a | words_b)
+
+    # Patterns indicating invalid/low-quality curiosity topics
+    _INVALID_TOPIC_RE = [
+        re.compile(r"(?i)^(hey|hi|hello|yo|sup|what'?s up|how are you)"),
+        re.compile(r"^\s*[\d\s\+\-\*\/\.\(\)\^%=]+\s*$"),  # pure math
+        re.compile(r"(?i)(ignore|forget|disregard|override|pretend|act as)"),
+        re.compile(r"(?i)^(yes|no|ok|sure|thanks|thank you|please|sorry)\b"),
+        # Tool/test commands
+        re.compile(r"(?i)(use the browser|httpbin|fill.*(form|out)|submit.*(form|it))"),
+        re.compile(r"(?i)^(search|go to|visit|navigate|open|click|type)\s"),
+        # Conversational/trivial
+        re.compile(r"(?i)(tell me .* joke|tell me a joke|what did (i|you) (just )?(say|said)|repeat that)"),
+        re.compile(r"(?i)^(test|ping|debug|check|try)\b"),
+        # URLs as topics
+        re.compile(r"https?://"),
+        # Declarative assertions — user stating facts, not asking questions
+        # "the capital of france is berlin", "my name is Alex", "actually X is Y"
+        re.compile(r"(?i)^(?:the|my|his|her|its|our|their|this|that|it|i|we|you|actually)\b.+\b(?:is|are|was|were|am)\b"),
+        # Corrections — these create lessons, not curiosity items
+        re.compile(r"(?i)^(?:no|nope|wrong|incorrect|that'?s (?:not|wrong)|actually)"),
+        # Calculator-style queries
+        re.compile(r"(?i)^(?:what is|calculate|compute)\s+\d"),
+        # Very short generic queries
+        re.compile(r"(?i)^(?:use|do|make|run|set|get|put|add|try|fix)\s"),
+    ]
+
+    @classmethod
+    def _is_valid_topic(cls, topic: str) -> bool:
+        """Check if a topic is worth researching."""
+        t = topic.strip()
+        if len(t) < 15 or len(t.split()) < 2:
+            return False
+        for pat in cls._INVALID_TOPIC_RE:
+            if pat.search(t):
+                return False
+        return True
 
     def add(self, topic: str, source: str = "gap_detection", urgency: float = 0.5) -> int:
         """Add a topic to the queue. Deduplicates by boosting urgency if already pending."""
         topic = topic.strip()[:500]
         if not topic:
+            return -1
+
+        if not self._is_valid_topic(topic):
+            logger.debug("Curiosity topic rejected (validation): '%s'", topic[:80])
             return -1
 
         # Dedup: exact match
@@ -202,7 +286,7 @@ class CuriosityQueue:
             "SELECT * FROM curiosity_queue "
             "WHERE status = 'pending' AND attempts < ? "
             "ORDER BY urgency DESC, created_at ASC LIMIT 1",
-            (MAX_ATTEMPTS,),
+            (int(MAX_ATTEMPTS),),
         )
         return self._row_to_item(row) if row else None
 
@@ -332,30 +416,57 @@ class TopicTracker:
                 self._db.execute(stmt)
 
     def record_topic(self, query: str) -> None:
-        """Record a query topic. Extracts key noun phrases as the topic."""
+        """Record a query topic with fuzzy matching.
+
+        Uses Jaccard similarity (≥0.6) on normalized word sets to merge
+        semantically similar topics like "What is Bitcoin" and "Tell me about Bitcoin".
+        """
         topic = self._extract_topic(query)
         if not topic or len(topic) < 3:
             return
 
+        # Exact match first
         existing = self._db.fetchone(
             "SELECT id, query_count FROM topic_frequency WHERE topic = ?",
             (topic,),
         )
         if existing:
-            self._db.execute(
-                "UPDATE topic_frequency SET query_count = query_count + 1, "
-                "last_seen = CURRENT_TIMESTAMP WHERE id = ?",
-                (existing["id"],),
+            self._record_exact(existing["id"])
+            return
+
+        # Fuzzy match against recent topics (last 30 days)
+        topic_words = normalize_words(topic)
+        if topic_words:
+            recent = self._db.fetchall(
+                "SELECT id, topic FROM topic_frequency "
+                "WHERE last_seen > datetime('now', '-30 days')"
             )
-        else:
-            self._db.execute(
-                "INSERT INTO topic_frequency (topic) VALUES (?)",
-                (topic,),
-            )
+            for row in recent:
+                row_words = normalize_words(row["topic"])
+                if not row_words:
+                    continue
+                jaccard = len(topic_words & row_words) / len(topic_words | row_words)
+                if jaccard >= 0.6:
+                    self._record_exact(row["id"])
+                    return
+
+        # No match — insert new
+        self._db.execute(
+            "INSERT INTO topic_frequency (topic) VALUES (?)",
+            (topic,),
+        )
 
         # Auto-cleanup old entries
         self._db.execute(
             "DELETE FROM topic_frequency WHERE last_seen < datetime('now', '-30 days')"
+        )
+
+    def _record_exact(self, topic_id: int) -> None:
+        """Increment count and update last_seen for an existing topic row."""
+        self._db.execute(
+            "UPDATE topic_frequency SET query_count = query_count + 1, "
+            "last_seen = CURRENT_TIMESTAMP WHERE id = ?",
+            (topic_id,),
         )
 
     def get_monitor_candidates(self, min_count: int = 3, days: int = 7) -> list[dict]:

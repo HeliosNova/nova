@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 import threading
 import uuid
 from dataclasses import dataclass
@@ -396,7 +395,10 @@ def _entity_relevance_filter(
 
     # Always return at least min(3, available) results
     min_results = min(3, len(chunks))
-    return filtered if len(filtered) >= min_results else chunks[:min_results]
+    if len(filtered) >= min_results:
+        return filtered
+    # Fallback: return top-scored chunks when filter is too aggressive
+    return sorted(chunks, key=lambda c: -(c.score or 0))[:min_results]
 
 
 def _escape_fts5(query: str) -> str:
@@ -404,7 +406,7 @@ def _escape_fts5(query: str) -> str:
     # Remove FTS5 operators that could cause syntax errors
     safe = query.replace('"', "").replace("'", "")
     # Remove other FTS5 special chars
-    for char in ["*", "(", ")", "{", "}", ":", "^", "~", "+", "-", "?", "!", "@", "#", "$", "%", "&", ".", ",", ";", "/", "=", "|", "\\", "<", ">"]:
+    for char in ["*", "(", ")", "{", "}", ":", "^", "~", "+", "-", "?", "!", "@", "#", "$", "%", "&", ",", ";", "/", "=", "|", "\\", "<", ">", ".", "[", "]"]:
         safe = safe.replace(char, " ")
     # Collapse whitespace
     return " ".join(safe.split())

@@ -17,7 +17,8 @@ router = APIRouter(tags=["monitors"], dependencies=[Depends(require_auth)])
 # Request/Response models
 # ---------------------------------------------------------------------------
 
-_VALID_CHECK_TYPES = {"url", "search", "command", "query"}
+_USER_CHECK_TYPES = {"url", "search", "command", "query"}
+_ALL_CHECK_TYPES = {"url", "search", "command", "query", "system_health", "quiz", "skill_validation", "kg_curate", "curiosity", "finetune_check", "auto_monitor"}
 _VALID_NOTIFY_CONDITIONS = {"on_change", "always", "on_error", "on_threshold"}
 
 
@@ -39,8 +40,8 @@ class MonitorCreate(BaseModel):
     @field_validator("check_type")
     @classmethod
     def validate_check_type(cls, v: str) -> str:
-        if v not in _VALID_CHECK_TYPES:
-            raise ValueError(f"check_type must be one of {_VALID_CHECK_TYPES}")
+        if v not in _USER_CHECK_TYPES:
+            raise ValueError(f"check_type must be one of {_USER_CHECK_TYPES}")
         return v
 
     @field_validator("notify_condition")
@@ -74,8 +75,8 @@ class MonitorUpdate(BaseModel):
     def validate_check_type(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        if v not in _VALID_CHECK_TYPES:
-            raise ValueError(f"check_type must be one of {_VALID_CHECK_TYPES}")
+        if v not in _USER_CHECK_TYPES:
+            raise ValueError(f"check_type must be one of {_USER_CHECK_TYPES}")
         return v
 
     @field_validator("notify_condition")
@@ -91,6 +92,31 @@ class MonitorUpdate(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+# Allowed keys per check_type for check_config validation
+_ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
+    "search": frozenset({"query"}),
+    "url": frozenset({"url", "match"}),
+    "command": frozenset({"command"}),
+    "api": frozenset({"url", "method", "headers"}),
+    "query": frozenset({"query"}),
+}
+
+
+def _validate_check_config(check_type: str, check_config: dict) -> str | None:
+    """Validate check_config keys against whitelist for the given check_type.
+
+    Returns an error message string if invalid, None if valid.
+    """
+    allowed = _ALLOWED_CONFIG_KEYS.get(check_type)
+    if allowed is None:
+        # Internal check types (system_health, quiz, etc.) — no user-facing validation
+        return None
+    unknown = set(check_config.keys()) - allowed
+    if unknown:
+        return f"Unknown check_config keys for '{check_type}': {', '.join(sorted(unknown))}. Allowed: {', '.join(sorted(allowed))}"
+    return None
+
 
 def _get_store():
     """Get the MonitorStore from services."""
@@ -140,6 +166,10 @@ async def list_monitors():
 
 @router.post("/monitors", status_code=201)
 async def create_monitor(body: MonitorCreate):
+    # Validate check_config keys against whitelist
+    config_err = _validate_check_config(body.check_type, body.check_config)
+    if config_err:
+        raise HTTPException(status_code=422, detail=config_err)
     store = _get_store()
     monitor_id = store.create(
         name=body.name,
@@ -153,6 +183,29 @@ async def create_monitor(body: MonitorCreate):
         raise HTTPException(status_code=409, detail=f"Monitor '{body.name}' already exists or creation failed")
     monitor = store.get(monitor_id)
     return _monitor_to_dict(monitor)
+
+
+# IMPORTANT: literal path /monitors/results/recent must be registered BEFORE
+# the parameterized /monitors/{monitor_id} to avoid FastAPI matching "results" as an ID.
+@router.get("/monitors/results/recent")
+async def recent_results(hours: int = Query(default=24, ge=1, le=720), limit: int = Query(default=50, ge=1, le=500)):
+    store = _get_store()
+    results = store.get_recent_results(hours=hours, limit=limit)
+    return {
+        "results": [
+            {
+                "id": r.id,
+                "monitor_id": r.monitor_id,
+                "status": r.status,
+                "value": r.value,
+                "message": r.message,
+                "created_at": r.created_at,
+                "user_rating": r.user_rating,
+            }
+            for r in results
+        ],
+        "count": len(results),
+    }
 
 
 @router.get("/monitors/{monitor_id}")
@@ -188,6 +241,13 @@ async def update_monitor(monitor_id: int, body: MonitorUpdate):
     if not updates:
         raise HTTPException(status_code=400, detail="No fields to update")
 
+    # Validate check_config keys if both check_type and check_config are provided
+    check_type = updates.get("check_type", monitor.check_type)
+    if "check_config" in updates:
+        config_err = _validate_check_config(check_type, updates["check_config"])
+        if config_err:
+            raise HTTPException(status_code=422, detail=config_err)
+
     store.update(monitor_id, **updates)
     return _monitor_to_dict(store.get(monitor_id))
 
@@ -211,27 +271,6 @@ async def trigger_monitor(monitor_id: int):
     heartbeat = _get_heartbeat()
     result = await heartbeat.trigger_monitor(monitor_id)
     return result
-
-
-@router.get("/monitors/results/recent")
-async def recent_results(hours: int = Query(default=24, ge=1, le=720), limit: int = Query(default=50, ge=1, le=500)):
-    store = _get_store()
-    results = store.get_recent_results(hours=hours, limit=limit)
-    return {
-        "results": [
-            {
-                "id": r.id,
-                "monitor_id": r.monitor_id,
-                "status": r.status,
-                "value": r.value,
-                "message": r.message,
-                "created_at": r.created_at,
-                "user_rating": r.user_rating,
-            }
-            for r in results
-        ],
-        "count": len(results),
-    }
 
 
 class InstructionCreate(BaseModel):

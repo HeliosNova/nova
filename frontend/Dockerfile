@@ -3,7 +3,7 @@ WORKDIR /app
 
 # Install dependencies first (cache layer)
 COPY package.json package-lock.json ./
-RUN npm ci
+RUN npm install --prefer-offline 2>/dev/null || npm install
 
 # Copy source
 COPY . .

@@ -12,3 +12,5 @@ export { default as StatCard } from "./StatCard";
 export { default as ErrorBanner } from "./ErrorBanner";
 export { default as Skeleton } from "./Skeleton";
 export { default as StatusBadge } from "./StatusBadge";
+export { default as ResponsiveTable } from "./ResponsiveTable";
+export type { Column } from "./ResponsiveTable";

@@ -29,6 +29,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   nova:
@@ -49,9 +54,11 @@ services:
       SEARXNG_URL: http://searxng:8080
       DB_PATH: /data/nova.db
       CHROMADB_PATH: /data/chromadb
+      ANONYMIZED_TELEMETRY: "false"
       TRAINING_DATA_PATH: /data/training_data.jsonl
       MCP_CONFIG_DIR: /data/mcp
       ENABLE_SHELL_EXEC: "true"
+      XDG_CACHE_HOME: /tmp/.cache
       # DISPLAY: ${DISPLAY:-:0}  # Uncomment for desktop automation
     volumes:
       - nova_data:/data
@@ -61,6 +68,7 @@ services:
     read_only: true
     tmpfs:
       - /tmp
+      - /home/nova/.cache
     security_opt:
       - no-new-privileges:true
     cap_drop:
@@ -72,6 +80,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   frontend:
@@ -86,12 +99,20 @@ services:
       nova:
         condition: service_healthy
     environment:
-      VITE_API_URL: http://nova:8000
+      # Browser-accessible URL (not internal docker network name)
+      VITE_API_URL: http://localhost:8000
+      # Allow internal Docker hostnames for inter-container access
+      __VITE_ADDITIONAL_SERVER_ALLOWED_HOSTS: nova-frontend
     volumes:
       - ./frontend/src:/app/src        # hot-reload source changes
       - ./frontend/index.html:/app/index.html
     mem_limit: 512m
     cpus: 1.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
   searxng:
@@ -108,6 +129,11 @@ services:
       interval: 30s
       timeout: 5s
       retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     restart: unless-stopped
 
 volumes:

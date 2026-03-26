@@ -14,7 +14,7 @@ interface Props {
 
 export default function Tabs({ tabs, active, onChange }: Props) {
   return (
-    <div className="mb-4 flex gap-1 border-b border-nova-border pb-2">
+    <div className="mb-4 flex gap-1 border-b border-nova-border pb-2 overflow-x-auto scrollbar-hide">
       {tabs.map((tab) => (
         <button
           key={tab.id}
@@ -33,7 +33,7 @@ export default function Tabs({ tabs, active, onChange }: Props) {
             )}
           </span>
           {active === tab.id && (
-            <span className="absolute bottom-0 left-1 right-1 h-0.5 rounded-full bg-gradient-to-r from-nova-accent to-blue-400" />
+            <span className="absolute bottom-0 left-1 right-1 h-0.5 rounded-full bg-gradient-to-r from-nova-accent to-nova-glow" />
           )}
         </button>
       ))}

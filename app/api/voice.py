@@ -67,10 +67,11 @@ async def transcribe_audio(
             "model": config.WHISPER_MODEL_SIZE,
         }
     except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        logger.error("[Voice] Transcription runtime error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Transcription failed due to an internal error")
     except Exception as e:
         logger.error("[Voice] Transcription failed: %s", e, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+        raise HTTPException(status_code=500, detail="Transcription failed due to an internal error")
     finally:
         Path(tmp.name).unlink(missing_ok=True)
 
@@ -106,8 +107,8 @@ async def voice_chat(
             language=language if language else None,
         )
     except Exception as e:
-        Path(tmp.name).unlink(missing_ok=True)
-        raise HTTPException(status_code=500, detail=f"Transcription failed: {e}")
+        logger.error("[Voice] Voice chat transcription failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Transcription failed due to an internal error")
     finally:
         Path(tmp.name).unlink(missing_ok=True)
 
@@ -116,18 +117,22 @@ async def voice_chat(
 
     # Stream the chat response
     from app.core.brain import think
-    import json
+    from app.schema import StreamEvent, EventType
 
     async def _stream():
         # First, emit the transcription
-        yield f"data: {json.dumps({'type': 'transcription', 'data': {'text': transcription.text, 'language': transcription.language, 'duration': transcription.duration}})}\n\n"
+        transcription_event = StreamEvent(
+            type=EventType.TOKEN,
+            data={"type": "transcription", "text": transcription.text, "language": transcription.language, "duration": transcription.duration},
+        )
+        yield transcription_event.to_sse()
 
         # Then stream the response
         async for event in think(
             query=transcription.text,
             conversation_id=conversation_id if conversation_id else None,
         ):
-            yield f"data: {json.dumps({'type': event.type.value if hasattr(event.type, 'value') else str(event.type), 'data': event.data})}\n\n"
+            yield event.to_sse()
 
         yield "data: [DONE]\n\n"
 

@@ -5,15 +5,30 @@ from __future__ import annotations
 import logging
 
 from app.core.text_utils import normalize_words, STOP_WORDS
-from app.tools.base import BaseTool, ToolResult
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
 
 class MemorySearchTool(BaseTool):
     name = "memory_search"
-    description = "Search past conversations and archival memory."
+    description = (
+        "Search past conversations and stored user facts from long-term memory. "
+        "Returns matching facts (key-value pairs with categories) and conversation excerpts. "
+        "Use when the user asks about past discussions or their own preferences/facts. "
+        "Do NOT use for ingested documents (use knowledge_search) or current web information (use web_search)."
+    )
     parameters = "query: str"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Search query for memory lookup. Use keywords related to the topic.",
+            },
+        },
+        "required": ["query"],
+    }
 
     def __init__(self, conversations=None, user_facts=None):
         self._conversations = conversations
@@ -21,7 +36,7 @@ class MemorySearchTool(BaseTool):
 
     async def execute(self, *, query: str = "", **kwargs) -> ToolResult:
         if not query:
-            return ToolResult(output="", success=False, error="No query provided")
+            return ToolResult(output="", success=False, error="No query provided", error_category=ErrorCategory.VALIDATION)
 
         results = []
 

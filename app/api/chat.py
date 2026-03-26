@@ -13,10 +13,13 @@ DELETE /api/chat/facts/{key} — Delete a user fact
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
+
+from pydantic import BaseModel, Field
 
 from app.auth import require_auth
 from app.core.brain import get_services, think
@@ -27,6 +30,10 @@ from app.schema import (
     StreamEvent,
     UserFactCreate,
 )
+
+
+class RenameRequest(BaseModel):
+    title: str = Field(min_length=1, max_length=500)
 
 logger = logging.getLogger(__name__)
 
@@ -41,21 +48,53 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_auth)])
 async def chat_stream(request: ChatRequest):
     """Stream a chat response via Server-Sent Events."""
 
+    _KEEPALIVE_INTERVAL = 15.0
+    _SENTINEL = object()
+
     async def event_generator():
+        # Use a queue so keepalive and data events can be interleaved
+        queue: asyncio.Queue = asyncio.Queue()
+
+        async def _producer():
+            """Push think() events into the queue."""
+            try:
+                async for event in think(
+                    query=request.query,
+                    conversation_id=request.conversation_id,
+                    image=request.image_base64,
+                ):
+                    await queue.put(event.to_sse())
+            except Exception:
+                logger.exception("Error in chat stream")
+                error_event = StreamEvent(
+                    type=EventType.ERROR,
+                    data={"message": "An internal error occurred while processing your request"},
+                )
+                await queue.put(error_event.to_sse())
+            finally:
+                await queue.put(_SENTINEL)
+
+        producer_task = asyncio.create_task(_producer())
+
         try:
-            async for event in think(
-                query=request.query,
-                conversation_id=request.conversation_id,
-                image=request.image_base64,
-            ):
-                yield event.to_sse()
-        except Exception:
-            logger.exception("Error in chat stream")
-            error_event = StreamEvent(
-                type=EventType.ERROR,
-                data={"message": "An internal error occurred while processing your request"},
-            )
-            yield error_event.to_sse()
+            while True:
+                try:
+                    item = await asyncio.wait_for(queue.get(), timeout=_KEEPALIVE_INTERVAL)
+                except asyncio.TimeoutError:
+                    # No data for 15s — send keepalive SSE comment
+                    yield ": keepalive\n\n"
+                    continue
+                if item is _SENTINEL:
+                    break
+                yield item
+        finally:
+            producer_task.cancel()
+            try:
+                await producer_task
+            except asyncio.CancelledError:
+                pass
+
+        yield "data: [DONE]\n\n"
 
     return StreamingResponse(
         event_generator(),
@@ -80,6 +119,8 @@ async def chat_sync(request: ChatRequest):
     tool_results: list[dict] = []
     sources: list[dict] = []
     lessons_used = 0
+    kg_facts_used = 0
+    reflexions_used = 0
     skill_used = None
 
     try:
@@ -93,6 +134,8 @@ async def chat_sync(request: ChatRequest):
             elif event.type == EventType.DONE:
                 conversation_id = event.data.get("conversation_id", conversation_id)
                 lessons_used = event.data.get("lessons_used", 0)
+                kg_facts_used = event.data.get("kg_facts_used", 0)
+                reflexions_used = event.data.get("reflexions_used", 0)
                 skill_used = event.data.get("skill_used")
             elif event.type == EventType.TOOL_USE and event.data.get("status") == "complete":
                 tool_results.append({
@@ -115,6 +158,8 @@ async def chat_sync(request: ChatRequest):
         sources=sources,
         tool_results=tool_results,
         lessons_used=lessons_used,
+        kg_facts_used=kg_facts_used,
+        reflexions_used=reflexions_used,
         skill_used=skill_used,
     )
 
@@ -175,17 +220,13 @@ async def get_conversation(conv_id: str):
 
 
 @router.patch("/chat/conversations/{conv_id}")
-async def rename_conversation(conv_id: str, body: dict):
+async def rename_conversation(conv_id: str, body: RenameRequest):
     """Rename a conversation."""
     svc = get_services()
     conv = svc.conversations.get_conversation(conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    title = body.get("title", "").strip()
-    if not title:
-        raise HTTPException(status_code=400, detail="Title is required")
-    if len(title) > 500:
-        raise HTTPException(status_code=400, detail="Title too long (max 500 chars)")
+    title = body.title.strip()
     svc.conversations.update_title(conv_id, title)
     return {"status": "ok", "conversation_id": conv_id, "title": title}
 

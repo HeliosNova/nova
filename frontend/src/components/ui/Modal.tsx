@@ -21,6 +21,24 @@ interface Props {
 export default function Modal({ open, onClose, title, size = "md", footer, children }: Props) {
   const dialogRef = useRef<HTMLDivElement>(null);
 
+  // Scroll lock + auto-focus
+  useEffect(() => {
+    if (!open) return;
+    document.body.style.overflow = "hidden";
+    // Auto-focus first focusable element
+    requestAnimationFrame(() => {
+      if (dialogRef.current) {
+        const focusable = dialogRef.current.querySelector<HTMLElement>(
+          "button, [href], input, select, textarea, [tabindex]:not([tabindex='-1'])"
+        );
+        focusable?.focus();
+      }
+    });
+    return () => {
+      document.body.style.overflow = "";
+    };
+  }, [open]);
+
   useEffect(() => {
     if (!open) return;
     const onKey = (e: KeyboardEvent) => {

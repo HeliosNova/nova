@@ -42,20 +42,18 @@ class TestHealthEndpoint:
         assert resp.status_code == 200
 
     def test_health_response_shape(self, client):
-        """Health response should have required fields."""
+        """Health response should have required fields (minimal: status + timestamp only)."""
         resp = client.get("/api/health")
         data = resp.json()
         assert "status" in data
-        assert "version" in data
-        assert "ollama_connected" in data
-        assert "db_connected" in data
-        assert data["status"] in ("ok", "degraded")
-
-    def test_health_db_connected(self, client):
-        """DB should be connected in test environment."""
-        resp = client.get("/api/health")
-        data = resp.json()
-        assert data["db_connected"] is True
+        assert "timestamp" in data
+        assert data["status"] == "ok"
+        # Verify no sensitive info is leaked
+        assert "model" not in data
+        assert "version" not in data
+        assert "provider" not in data
+        assert "db_connected" not in data
+        assert "llm_connected" not in data
 
 
 class TestStatusEndpoint:

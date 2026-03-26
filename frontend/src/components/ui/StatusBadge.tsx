@@ -13,7 +13,7 @@ export default function StatusBadge({ className }: Props) {
 
   useEffect(() => {
     const check = () => {
-      getHealth().then(setHealth).catch(() => setHealth(null as never));
+      getHealth().then(setHealth).catch(() => setHealth(null));
     };
     check();
     let interval: ReturnType<typeof setInterval>;
@@ -42,7 +42,7 @@ export default function StatusBadge({ className }: Props) {
   return (
     <span
       className={cn("inline-flex items-center gap-1.5", className)}
-      title={health ? `${health.status} — ${health.model || "no model"}` : "Disconnected"}
+      title={health ? `${health.status}` : "Disconnected"}
     >
       <span className={cn("inline-block h-2.5 w-2.5 rounded-full", color)} />
       <span className="text-xs text-nova-text-dim hidden sm:inline">{statusText}</span>

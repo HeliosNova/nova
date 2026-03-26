@@ -1,4 +1,4 @@
-"""Nova_ Live Evaluation — Teacher-style graded test suite.
+"""Nova Live Evaluation — Teacher-style graded test suite.
 
 Runs against the live Docker deployment at localhost:8000.
 Tests unique scenarios across all capabilities, scores each one.

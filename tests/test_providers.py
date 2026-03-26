@@ -133,9 +133,9 @@ class TestOpenAIProvider:
             [{"role": "user", "content": "search for test"}], tools
         )
         assert isinstance(result, GenerationResult)
-        assert result.tool_call is not None
-        assert result.tool_call.tool == "web_search"
-        assert result.tool_call.args == {"query": "test"}
+        assert result.tool_calls
+        assert result.tool_calls[0].tool == "web_search"
+        assert result.tool_calls[0].args == {"query": "test"}
 
     @pytest.mark.asyncio
     @patch("app.core.providers.openai._retry_on_transient", new_callable=AsyncMock)
@@ -218,9 +218,9 @@ class TestAnthropicProvider:
         result = await provider.generate_with_tools(
             [{"role": "user", "content": "search"}], tools
         )
-        assert result.tool_call is not None
-        assert result.tool_call.tool == "web_search"
-        assert result.tool_call.args == {"query": "test"}
+        assert result.tool_calls
+        assert result.tool_calls[0].tool == "web_search"
+        assert result.tool_calls[0].args == {"query": "test"}
 
     @pytest.mark.asyncio
     @patch("app.core.providers.anthropic._retry_on_transient", new_callable=AsyncMock)
@@ -305,8 +305,8 @@ class TestGoogleProvider:
         result = await provider.generate_with_tools(
             [{"role": "user", "content": "search"}], tools
         )
-        assert result.tool_call is not None
-        assert result.tool_call.tool == "web_search"
+        assert result.tool_calls
+        assert result.tool_calls[0].tool == "web_search"
 
     @pytest.mark.asyncio
     @patch("app.core.providers.google._retry_on_transient", new_callable=AsyncMock)
@@ -321,7 +321,7 @@ class TestGoogleProvider:
             [{"name": "t", "description": "d"}],
         )
         assert result.content == ""
-        assert result.tool_call is None
+        assert not result.tool_calls
 
     @pytest.mark.asyncio
     @patch("app.core.providers.google._retry_on_transient", new_callable=AsyncMock)
@@ -343,3 +343,137 @@ class TestGoogleProvider:
         provider._client = mock_client
 
         assert await provider.check_health() is True
+
+
+# ---------------------------------------------------------------------------
+# Retry Backoff (from test_audit_consolidated)
+# ---------------------------------------------------------------------------
+
+
+class TestRetryBackoff:
+    """retry_on_transient uses exponential backoff + jitter."""
+
+    @pytest.mark.asyncio
+    async def test_429_jitter(self):
+        from app.core.providers._retry import retry_on_transient
+
+        call_count = 0
+        sleep_delays = []
+
+        async def mock_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            if call_count <= 2:
+                resp.status_code = 429
+                resp.headers = {"Retry-After": "2"}
+            else:
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+            return resp
+
+        client = MagicMock()
+        client.request = mock_request
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await retry_on_transient(client, "POST", "/test")
+            assert result.status_code == 200
+            for call in mock_sleep.call_args_list:
+                delay = call[0][0]
+                sleep_delays.append(delay)
+                assert delay >= 2.0
+
+    @pytest.mark.asyncio
+    async def test_500_exponential_backoff(self):
+        from app.core.providers._retry import retry_on_transient
+
+        call_count = 0
+        sleep_delays = []
+
+        async def mock_request(method, url, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            resp = MagicMock()
+            if call_count <= 2:
+                resp.status_code = 500
+                resp.text = "Internal Server Error"
+            else:
+                resp.status_code = 200
+                resp.raise_for_status = MagicMock()
+            return resp
+
+        client = MagicMock()
+        client.request = mock_request
+
+        with patch("asyncio.sleep", new_callable=AsyncMock) as mock_sleep:
+            result = await retry_on_transient(client, "POST", "/test")
+            assert result.status_code == 200
+            assert mock_sleep.call_count >= 1
+            for call in mock_sleep.call_args_list:
+                delay = call[0][0]
+                sleep_delays.append(delay)
+            if len(sleep_delays) >= 2:
+                assert sleep_delays[1] > sleep_delays[0]
+
+
+# ---------------------------------------------------------------------------
+# Streaming Idle Timeout (from test_audit_consolidated)
+# ---------------------------------------------------------------------------
+
+
+class TestStreamingIdleTimeout:
+
+    def _assert_has_streaming(self, provider_cls, provider_instance):
+        """Verify the provider has stream_with_thinking method."""
+        assert hasattr(provider_instance, "stream_with_thinking"), (
+            f"{provider_cls.__name__} must have stream_with_thinking method"
+        )
+        assert callable(getattr(provider_instance, "stream_with_thinking"))
+
+    def test_ollama_has_streaming(self):
+        from app.core.providers.ollama import OllamaProvider
+        provider = OllamaProvider()
+        self._assert_has_streaming(OllamaProvider, provider)
+
+    def test_ollama_client_timeout_has_connect(self):
+        """The actual Ollama provider client should have a connect timeout of 10s."""
+        from app.core.providers.ollama import OllamaProvider
+        provider = OllamaProvider()
+        client = provider._get_client()
+        assert client.timeout.connect == 10.0
+
+    def test_anthropic_has_streaming(self):
+        from app.core.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider(api_key="sk-ant-test", model="claude-sonnet-4-20250514")
+        self._assert_has_streaming(AnthropicProvider, provider)
+
+    def test_anthropic_client_timeout_has_connect(self):
+        """The actual Anthropic provider client should have a connect timeout of 10s."""
+        from app.core.providers.anthropic import AnthropicProvider
+        provider = AnthropicProvider(api_key="sk-ant-test", model="claude-sonnet-4-20250514")
+        client = provider._get_client()
+        assert client.timeout.connect == 10.0
+
+    def test_openai_has_streaming(self):
+        from app.core.providers.openai import OpenAIProvider
+        provider = OpenAIProvider(api_key="sk-test", model="gpt-4o")
+        self._assert_has_streaming(OpenAIProvider, provider)
+
+    def test_openai_client_timeout_has_connect(self):
+        """The actual OpenAI provider client should have a connect timeout of 10s."""
+        from app.core.providers.openai import OpenAIProvider
+        provider = OpenAIProvider(api_key="sk-test", model="gpt-4o")
+        client = provider._get_client()
+        assert client.timeout.connect == 10.0
+
+    def test_google_has_streaming(self):
+        from app.core.providers.google import GoogleProvider
+        provider = GoogleProvider(api_key="AIza-test", model="gemini-2.0-flash")
+        self._assert_has_streaming(GoogleProvider, provider)
+
+    def test_google_client_timeout_has_connect(self):
+        """The actual Google provider client should have a connect timeout of 10s."""
+        from app.core.providers.google import GoogleProvider
+        provider = GoogleProvider(api_key="AIza-test", model="gemini-2.0-flash")
+        client = provider._get_client()
+        assert client.timeout.connect == 10.0

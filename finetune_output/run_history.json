@@ -1,0 +1,16 @@
+[
+  {
+    "started_at": "2026-03-22T14:15:52.455274",
+    "data_path": "training_data.jsonl",
+    "output_dir": "finetune_output",
+    "base_model": "qwen3.5:27b",
+    "ft_model": "nova-ft",
+    "status": "failed",
+    "total_pairs": 13,
+    "new_pairs": 13,
+    "training_pairs": 10,
+    "holdout_queries": 3,
+    "reason": "Training failed: cannot import name 'AttrsDescriptor' from 'triton.compiler.compiler' (C:\\Users\\sysadmin\\Desktop\\Helios Project\\nova_\\finetune_env\\Lib\\site-packages\\triton\\compiler\\compiler.py)",
+    "completed_at": "2026-03-22T14:16:23.059643"
+  }
+]

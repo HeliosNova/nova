@@ -58,13 +58,14 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Defaults (overridden by config when running inside Nova)
-DEFAULT_DATA_PATH = "/data/training_data.jsonl"
-DEFAULT_OUTPUT_DIR = "/data/finetune"
+_NOVA_DATA_DIR = os.environ.get("NOVA_DATA_DIR", "/data")
+DEFAULT_DATA_PATH = os.path.join(_NOVA_DATA_DIR, "training_data.jsonl")
+DEFAULT_OUTPUT_DIR = os.path.join(_NOVA_DATA_DIR, "finetune")
 DEFAULT_MIN_NEW_PAIRS = 50
 DEFAULT_EVAL_HOLDOUT = 10
 DEFAULT_BASE_MODEL = "qwen3.5:27b"
 DEFAULT_FT_MODEL_NAME = "nova-ft"
-DEFAULT_OLLAMA_URL = "http://localhost:11434"
+DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 METADATA_FILE = "run_history.json"
 
 
@@ -96,8 +97,46 @@ def _run_cmd(cmd: list[str], *, check: bool = True, timeout: int = 120) -> subpr
         raise
 
 
+def _pause_monitors(nova_url: str = "http://localhost:8000") -> list[int]:
+    """Disable all monitors before fine-tuning to prevent error floods."""
+    import requests
+    paused: list[int] = []
+    try:
+        resp = requests.get(f"{nova_url}/api/monitors", timeout=10)
+        if resp.status_code == 200:
+            monitors = resp.json()
+            for m in monitors:
+                if m.get("enabled"):
+                    mid = m["id"]
+                    requests.put(f"{nova_url}/api/monitors/{mid}",
+                                 json={"enabled": False}, timeout=10)
+                    paused.append(mid)
+            logger.info("Paused %d monitors before fine-tuning", len(paused))
+    except Exception as e:
+        logger.warning("Could not pause monitors (Nova may be down): %s", e)
+    return paused
+
+
+def _resume_monitors(paused_ids: list[int], nova_url: str = "http://localhost:8000") -> None:
+    """Re-enable monitors after fine-tuning."""
+    import requests
+    resumed = 0
+    for mid in paused_ids:
+        try:
+            requests.put(f"{nova_url}/api/monitors/{mid}",
+                         json={"enabled": True}, timeout=10)
+            resumed += 1
+        except Exception:
+            pass
+    logger.info("Resumed %d/%d monitors after fine-tuning", resumed, len(paused_ids))
+
+
 def stop_ollama(compose_dir: str | None = None) -> bool:
-    """Stop Ollama via docker compose to free VRAM."""
+    """Stop Ollama via docker compose to free VRAM. Pauses monitors first."""
+    logger.info("Pausing monitors before Ollama shutdown...")
+    global _paused_monitor_ids
+    _paused_monitor_ids = _pause_monitors()
+
     logger.info("Stopping Ollama to free VRAM...")
     try:
         cmd = ["docker", "compose", "stop", "ollama"]
@@ -111,9 +150,12 @@ def stop_ollama(compose_dir: str | None = None) -> bool:
         logger.error("Failed to stop Ollama: %s", e)
         return False
 
+# Track which monitors were paused so start_ollama can resume them
+_paused_monitor_ids: list[int] = []
+
 
 def start_ollama(compose_dir: str | None = None) -> bool:
-    """Start Ollama via docker compose."""
+    """Start Ollama via docker compose. Resumes monitors after."""
     logger.info("Starting Ollama...")
     try:
         cmd = ["docker", "compose", "start", "ollama"]
@@ -123,6 +165,13 @@ def start_ollama(compose_dir: str | None = None) -> bool:
         # Wait for Ollama to be ready
         logger.info("Waiting for Ollama to initialize...")
         time.sleep(15)
+
+        # Resume monitors
+        global _paused_monitor_ids
+        if _paused_monitor_ids:
+            _resume_monitors(_paused_monitor_ids)
+            _paused_monitor_ids = []
+
         return True
     except Exception as e:
         logger.error("Failed to start Ollama: %s", e)
@@ -131,7 +180,7 @@ def start_ollama(compose_dir: str | None = None) -> bool:
 
 def register_model(model_name: str, modelfile_path: str) -> bool:
     """Register a GGUF model with Ollama via `ollama create`."""
-    container = os.environ.get("OLLAMA_CONTAINER", "helios-ollama")
+    container = os.environ.get("OLLAMA_CONTAINER", "nova-ollama")
     logger.info("Registering model '%s' from %s (container: %s)", model_name, modelfile_path, container)
     try:
         _run_cmd(

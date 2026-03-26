@@ -37,6 +37,8 @@ export interface SSEToolUseData {
   tool: string;
   status: "executing" | "complete";
   result?: string;
+  tool_call_id?: string;
+  args?: Record<string, unknown>;
 }
 
 export interface SSESourcesData {
@@ -162,12 +164,7 @@ export interface SkillInfo {
 
 export interface HealthResponse {
   status: string;
-  version: string;
-  model: string;
-  provider: string;
-  llm_connected: boolean;
-  ollama_connected: boolean;
-  db_connected: boolean;
+  timestamp: string;
 }
 
 export interface StatusResponse {
@@ -190,6 +187,8 @@ export interface ToolCall {
   tool: string;
   status: "executing" | "complete";
   result?: string;
+  tool_call_id?: string;
+  args?: Record<string, unknown>;
 }
 
 // ── Documents ──
@@ -374,7 +373,27 @@ export interface ConfigSummary {
 
 // ── Full Config (all settings) ──
 
-export type FullConfig = Record<string, unknown>;
+export interface FullConfig {
+  LLM_PROVIDER?: string;
+  LLM_MODEL?: string;
+  OLLAMA_URL?: string;
+  SYSTEM_ACCESS_LEVEL?: string;
+  ENABLE_VOICE?: boolean;
+  ENABLE_MCP?: boolean;
+  ENABLE_DELEGATION?: boolean;
+  ENABLE_PLANNING?: boolean;
+  ENABLE_CRITIQUE?: boolean;
+  ENABLE_CURIOSITY?: boolean;
+  ENABLE_HEARTBEAT?: boolean;
+  ENABLE_PROACTIVE?: boolean;
+  ENABLE_CUSTOM_TOOLS?: boolean;
+  ENABLE_EXTENDED_THINKING?: boolean;
+  ENABLE_MODEL_ROUTING?: boolean;
+  MAX_TOOL_ROUNDS?: number;
+  TOOL_TIMEOUT?: number;
+  GENERATION_TIMEOUT?: number;
+  [key: string]: unknown;
+}
 
 // ── Config Update Response ──
 

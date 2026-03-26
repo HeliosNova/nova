@@ -11,7 +11,9 @@ import json
 import logging
 from typing import Any
 
-from app.tools.base import BaseTool, ToolResult
+from app.config import config
+from app.core.access_tiers import _tier
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -19,10 +21,40 @@ logger = logging.getLogger(__name__)
 class MonitorTool(BaseTool):
     name = "monitor"
     description = (
-        "Create, list, or delete background monitors that automatically check things "
-        "and alert the user when changes happen. Actions: create, list, delete."
+        "Create, list, or delete background monitors that automatically check things on a schedule "
+        "and alert when changes happen. Supports check types: url (HTTP health), search (web search), "
+        "command (shell command), query (intelligent reasoning with full tool access). Returns monitor "
+        "ID and config on creation. Do NOT use for one-shot reminders (use the reminder tool)."
     )
     parameters = "action: str, name: str, check_type: str, config: dict, schedule_minutes: int"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["create", "list", "delete"],
+                "description": "Monitor action to perform.",
+            },
+            "name": {
+                "type": "string",
+                "description": "Monitor name (required for create and delete).",
+            },
+            "check_type": {
+                "type": "string",
+                "enum": ["url", "search", "command", "query"],
+                "description": "Type of check. Defaults to 'search'. Use 'query' for intelligent monitoring.",
+            },
+            "check_config": {
+                "type": "object",
+                "description": "Check configuration. E.g., {url: '...'} for url type, {query: '...'} for search/query type.",
+            },
+            "schedule_minutes": {
+                "type": "integer",
+                "description": "Check interval in minutes. Minimum 1. Defaults to 30.",
+            },
+        },
+        "required": ["action"],
+    }
 
     def __init__(self, monitor_store: Any = None):
         self._store = monitor_store
@@ -33,26 +65,30 @@ class MonitorTool(BaseTool):
         action: str = "",
         name: str = "",
         check_type: str = "search",
-        config: dict | str = None,
+        check_config: dict | str = None,
         schedule_minutes: int = 30,
         **kwargs,
     ) -> ToolResult:
+        # Backward compat: LLM may send "config" (old name) instead of "check_config"
+        if check_config is None and "config" in kwargs:
+            check_config = kwargs.pop("config")
+
         if not action:
-            return ToolResult(output="", success=False, error="No action specified. Use: create, list, delete")
+            return ToolResult(output="", success=False, error="No action specified. Use: create, list, delete", error_category=ErrorCategory.VALIDATION)
 
         if not self._store:
-            return ToolResult(output="", success=False, error="Monitor system not initialized")
+            return ToolResult(output="", success=False, error="Monitor system not initialized", error_category=ErrorCategory.INTERNAL)
 
         action = action.lower().strip()
 
         if action == "create":
-            return await self._create(name, check_type, config, schedule_minutes)
+            return await self._create(name, check_type, check_config, schedule_minutes)
         elif action == "list":
             return await self._list()
         elif action == "delete":
             return await self._delete(name)
         else:
-            return ToolResult(output="", success=False, error=f"Unknown action '{action}'. Use: create, list, delete")
+            return ToolResult(output="", success=False, error=f"Unknown action '{action}'. Use: create, list, delete", error_category=ErrorCategory.VALIDATION)
 
     async def _create(
         self,
@@ -62,7 +98,7 @@ class MonitorTool(BaseTool):
         schedule_minutes: int,
     ) -> ToolResult:
         if not name:
-            return ToolResult(output="", success=False, error="Monitor name is required")
+            return ToolResult(output="", success=False, error="Monitor name is required", error_category=ErrorCategory.VALIDATION)
 
         # Parse config if it's a string
         if isinstance(check_config, str):
@@ -74,12 +110,27 @@ class MonitorTool(BaseTool):
         if not check_config:
             check_config = {}
 
+        # Gate command-type monitors to standard/full/none tiers
+        if check_type == "command":
+            current_tier = _tier()
+            if current_tier not in ("standard", "full", "none"):
+                return ToolResult(
+                    output="", success=False,
+                    error=f"Command-type monitors require tier standard/full, current: {current_tier}",
+                    error_category=ErrorCategory.PERMISSION,
+                )
+
         # Validate check_type
         valid_types = {"url", "search", "command", "query"}
         if check_type not in valid_types:
             return ToolResult(
                 output="", success=False,
-                error=f"Invalid check_type '{check_type}'. Use: {', '.join(valid_types)}",
+                error=(
+                    f"Invalid check_type '{check_type}'. "
+                    f"Use: {', '.join(sorted(valid_types))}. "
+                    f"Recommended: 'query' for intelligent monitoring with full reasoning."
+                ),
+                error_category=ErrorCategory.VALIDATION,
             )
 
         # Auto-populate config based on type
@@ -92,7 +143,7 @@ class MonitorTool(BaseTool):
         if check_type == "search" and "query" not in check_config:
             check_config["query"] = name
 
-        schedule_seconds = max(60, schedule_minutes * 60)  # Minimum 1 minute
+        schedule_seconds = max(config.MIN_MONITOR_SCHEDULE_SECONDS, schedule_minutes * 60)
 
         monitor_id = self._store.create(
             name=name,
@@ -106,6 +157,7 @@ class MonitorTool(BaseTool):
             return ToolResult(
                 output="", success=False,
                 error=f"Failed to create monitor '{name}' (name may already exist)",
+                error_category=ErrorCategory.INTERNAL,
             )
 
         return ToolResult(
@@ -138,7 +190,7 @@ class MonitorTool(BaseTool):
 
     async def _delete(self, name: str) -> ToolResult:
         if not name:
-            return ToolResult(output="", success=False, error="Monitor name is required for deletion")
+            return ToolResult(output="", success=False, error="Monitor name is required for deletion", error_category=ErrorCategory.VALIDATION)
 
         # Try by name first, then by ID
         monitor = self._store.get_by_name(name)
@@ -149,7 +201,7 @@ class MonitorTool(BaseTool):
                 pass
 
         if not monitor:
-            return ToolResult(output="", success=False, error=f"Monitor '{name}' not found")
+            return ToolResult(output="", success=False, error=f"Monitor '{name}' not found", error_category=ErrorCategory.NOT_FOUND)
 
         self._store.delete(monitor.id)
         return ToolResult(output=f"Monitor '{monitor.name}' (id={monitor.id}) deleted.", success=True)

@@ -44,16 +44,31 @@ class StreamChunk:
     thinking: str = ""    # Incremental thinking text
     content: str = ""     # Incremental content text
     done: bool = False
+    tool_call: ToolCall | None = None  # Structured tool call (cloud providers)
 
 
 @dataclass
 class GenerationResult:
     """Result of a single LLM generation."""
     content: str
-    tool_call: ToolCall | None
+    tool_calls: list[ToolCall]
     raw: dict
     thinking: str = ""
     usage: dict | None = None
+    stop_reason: str = ""
+
+
+# ---------------------------------------------------------------------------
+# Provider capabilities
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ProviderCapabilities:
+    """Declares provider-specific behavior flags."""
+    needs_emphatic_prompts: bool = False
+    supports_native_tools: bool = True
+    supports_thinking: bool = True
+    json_prefix_behavior: str = "prepend"  # "prepend" or "ignore"
 
 
 # ---------------------------------------------------------------------------
@@ -63,6 +78,11 @@ class GenerationResult:
 @runtime_checkable
 class LLMProvider(Protocol):
     """Interface that all LLM providers must implement."""
+
+    @property
+    def capabilities(self) -> ProviderCapabilities:
+        """Return provider capabilities."""
+        ...
 
     async def invoke_nothink(
         self,
@@ -85,6 +105,8 @@ class LLMProvider(Protocol):
         model: str | None = None,
         temperature: float = 0.5,
         max_tokens: int = 2000,
+        images: list[str] | None = None,
+        tool_choice: str | None = None,
     ) -> GenerationResult:
         """Generate a response that may contain a tool call."""
         ...
@@ -97,6 +119,7 @@ class LLMProvider(Protocol):
         model: str | None = None,
         temperature: float = 0.6,
         max_tokens: int = 4000,
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream a response with thinking enabled. Yields incremental chunks."""
         ...
@@ -147,12 +170,16 @@ def set_provider(provider: LLMProvider) -> None:
 
 
 def get_provider() -> LLMProvider:
-    """Get the current LLM provider. Auto-creates OllamaProvider if none set."""
+    """Get the current LLM provider. Auto-creates from config if none set."""
     global _provider
     if _provider is None:
-        from app.core.providers.ollama import OllamaProvider
-        _provider = OllamaProvider()
+        _provider = create_provider()
     return _provider
+
+
+def get_capabilities() -> ProviderCapabilities:
+    """Get the current provider's capabilities."""
+    return get_provider().capabilities
 
 
 # ---------------------------------------------------------------------------
@@ -190,6 +217,7 @@ async def generate_with_tools(
     temperature: float = 0.5,
     max_tokens: int = 2000,
     images: list[str] | None = None,
+    tool_choice: str | None = None,
 ) -> GenerationResult:
     """Generate a response that may contain a tool call."""
     return await get_provider().generate_with_tools(
@@ -199,6 +227,7 @@ async def generate_with_tools(
         temperature=temperature,
         max_tokens=max_tokens,
         images=images,
+        tool_choice=tool_choice,
     )
 
 
@@ -209,6 +238,7 @@ async def stream_with_thinking(
     model: str | None = None,
     temperature: float = 0.6,
     max_tokens: int = 4000,
+    tool_choice: str | None = None,
 ) -> AsyncGenerator[StreamChunk, None]:
     """Stream a response with thinking enabled. Yields incremental chunks."""
     async for chunk in get_provider().stream_with_thinking(
@@ -217,6 +247,7 @@ async def stream_with_thinking(
         model=model,
         temperature=temperature,
         max_tokens=max_tokens,
+        tool_choice=tool_choice,
     ):
         yield chunk
 
@@ -242,13 +273,24 @@ async def close_client() -> None:
 # ---------------------------------------------------------------------------
 
 def _strip_think_tags(text: str) -> str:
-    """Remove <think>...</think> blocks and unmatched thinking from model output."""
-    # Strip matched <think>...</think> pairs
+    """Remove <think>...</think> blocks and unmatched thinking from model output.
+
+    Only strips matched <think>...</think> pairs. Unmatched tags are logged
+    as warnings rather than silently dropping content.
+    """
+    # Non-greedy: strip each matched <think>...</think> block individually
     text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text)
     # Strip content before an unmatched </think> tag (model continuing reasoning after prefix)
     last_close = text.rfind("</think>")
     if last_close != -1:
         text = text[last_close + len("</think>"):]
+    # Warn about unclosed <think> tag instead of stripping everything after it
+    open_idx = text.find("<think>")
+    if open_idx != -1:
+        logger.warning(
+            "Unclosed <think> tag at position %d — leaving content intact (len=%d)",
+            open_idx, len(text),
+        )
     return text
 
 
@@ -267,20 +309,31 @@ def _find_balanced_json(text: str, prefix: str) -> str:
     depth = 0
     in_string = False
     num_backslashes = 0
+    i = start
 
-    for i in range(start, len(text)):
+    while i < len(text):
         c = text[i]
         if c == "\\" and in_string:
             num_backslashes += 1
+            # Skip \uXXXX unicode escapes entirely so hex digits
+            # can't accidentally interfere with brace/quote detection
+            if i + 1 < len(text) and text[i + 1] == "u":
+                # Consume \uXXXX (backslash + u + 4 hex digits)
+                i += 6  # skip past all 6 chars
+                num_backslashes = 0
+                continue
+            i += 1
             continue
         if c == '"':
             # Only toggle string if preceded by even number of backslashes
             if num_backslashes % 2 == 0:
                 in_string = not in_string
             num_backslashes = 0
+            i += 1
             continue
         num_backslashes = 0
         if in_string:
+            i += 1
             continue
         if c == open_char:
             depth += 1
@@ -288,6 +341,7 @@ def _find_balanced_json(text: str, prefix: str) -> str:
             depth -= 1
             if depth == 0:
                 return text[start:i + 1]
+        i += 1
 
     return text
 
@@ -304,14 +358,7 @@ def extract_json_object(text: str) -> dict:
     try:
         return json.loads(balanced)
     except json.JSONDecodeError:
-        logger.debug("extract_json_object: balanced parse failed, trying regex fallback")
-        match = re.search(r"\{[\s\S]*\}", text)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                logger.debug("extract_json_object: regex fallback also failed")
-                pass
+        logger.debug("extract_json_object: balanced parse failed — returning empty dict")
         return {}
 
 
@@ -368,7 +415,7 @@ def _extract_tool_calls(content: str, tools: list[dict]) -> list[ToolCall]:
                             calls.append(tc)
                 if calls:
                     return calls
-    except (json.JSONDecodeError, Exception):
+    except Exception:
         pass
 
     # Fall back to finding all JSON objects in the content

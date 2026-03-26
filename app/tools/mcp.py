@@ -6,20 +6,36 @@ connects to each server, and wraps discovered tools as BaseTool instances.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import os
 from pathlib import Path
 
 from app.config import config
-from app.tools.base import BaseTool, ToolRegistry, ToolResult
+from app.tools.base import BaseTool, ToolRegistry, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
 
-class MCPTool(BaseTool):
-    """Wraps a single MCP tool as a Nova_ BaseTool."""
+def _classify_mcp_error(error_msg: str) -> ErrorCategory:
+    """Classify an MCP error message into an ErrorCategory."""
+    msg = error_msg.lower()
+    if "timeout" in msg or "timed out" in msg:
+        return ErrorCategory.TRANSIENT
+    if "validation" in msg or "invalid" in msg:
+        return ErrorCategory.VALIDATION
+    if "permission" in msg or "denied" in msg or "forbidden" in msg:
+        return ErrorCategory.PERMISSION
+    if "not found" in msg or "unknown tool" in msg:
+        return ErrorCategory.NOT_FOUND
+    return ErrorCategory.INTERNAL
 
-    def __init__(self, client, tool_spec: dict):
+
+class MCPTool(BaseTool):
+    """Wraps a single MCP tool as a Nova BaseTool."""
+
+    def __init__(self, client, tool_spec: dict, manager: "MCPManager | None" = None, server_name: str = ""):
         self.name = f"mcp_{tool_spec.get('name', 'unknown')}"
         self.description = tool_spec.get("description", "MCP tool")
         # Format parameters from JSON schema for the system prompt
@@ -34,6 +50,9 @@ class MCPTool(BaseTool):
         self.parameters = ", ".join(param_parts) if param_parts else "none"
         self._client = client
         self._raw_name = tool_spec.get("name", "unknown")
+        self.input_schema = tool_spec.get("inputSchema")
+        self._manager = manager
+        self._server_name = server_name
 
     async def execute(self, **kwargs) -> ToolResult:
         from app.core.access_tiers import _tier
@@ -43,11 +62,32 @@ class MCPTool(BaseTool):
                 output="",
                 success=False,
                 error="MCP tools are blocked at 'sandboxed' access tier. Set SYSTEM_ACCESS_LEVEL to 'standard' or higher.",
+                error_category=ErrorCategory.PERMISSION,
             )
         if tier == "standard":
             logger.warning("MCP tool '%s' executing at 'standard' tier — external tool access", self.name)
         try:
-            result = await self._client.call_tool(self._raw_name, kwargs)
+            result = await asyncio.wait_for(
+                self._client.call_tool(self._raw_name, kwargs),
+                timeout=config.TOOL_TIMEOUT,
+            )
+            # Check MCP isError flag
+            if hasattr(result, "isError") and result.isError:
+                error_text = ""
+                if hasattr(result, "content"):
+                    parts = []
+                    for block in result.content:
+                        if hasattr(block, "text"):
+                            parts.append(block.text)
+                    error_text = "\n".join(parts)
+                category = _classify_mcp_error(error_text) if error_text else ErrorCategory.INTERNAL
+                return ToolResult(
+                    output="",
+                    success=False,
+                    error=error_text or "MCP tool returned an error",
+                    retriable=category == ErrorCategory.TRANSIENT,
+                    error_category=category,
+                )
             # MCP results can be text or structured — normalize to string
             if hasattr(result, "content"):
                 # mcp SDK returns CallToolResult with content list
@@ -65,8 +105,53 @@ class MCPTool(BaseTool):
                 output = sanitize_content(output, context="MCP tool output")
             return ToolResult(output=output, success=True)
         except Exception as e:
-            logger.error("MCP tool '%s' failed: %s", self.name, e)
-            return ToolResult(output="", success=False, error=str(e))
+            logger.warning("MCP tool '%s' failed: %s — attempting reconnect", self.name, e)
+            # Attempt one reconnect and retry
+            try:
+                await self._client.initialize()
+                result = await asyncio.wait_for(
+                    self._client.call_tool(self._raw_name, kwargs),
+                    timeout=config.TOOL_TIMEOUT,
+                )
+                # Check isError on retry path (matching primary path)
+                if hasattr(result, "isError") and result.isError:
+                    error_text = ""
+                    if hasattr(result, "content"):
+                        parts = []
+                        for block in result.content:
+                            if hasattr(block, "text"):
+                                parts.append(block.text)
+                        error_text = "\n".join(parts)
+                    category = _classify_mcp_error(error_text) if error_text else ErrorCategory.INTERNAL
+                    return ToolResult(
+                        output="", success=False,
+                        error=error_text or "MCP tool returned an error after reconnect",
+                        retriable=category == ErrorCategory.TRANSIENT,
+                        error_category=category,
+                    )
+                if hasattr(result, "content"):
+                    parts = []
+                    for block in result.content:
+                        if hasattr(block, "text"):
+                            parts.append(block.text)
+                        else:
+                            parts.append(str(block))
+                    output = "\n".join(parts)
+                else:
+                    output = str(result)
+                if config.ENABLE_INJECTION_DETECTION:
+                    from app.core.injection import sanitize_content
+                    output = sanitize_content(output, context="MCP tool output")
+                logger.info("MCP tool '%s' succeeded after reconnect", self.name)
+                return ToolResult(output=output, success=True)
+            except Exception as retry_err:
+                logger.error("MCP tool '%s' failed after reconnect: %s", self.name, retry_err)
+                category = _classify_mcp_error(str(e))
+                return ToolResult(
+                    output="", success=False, error=str(e),
+                    retriable=category == ErrorCategory.TRANSIENT,
+                    error_category=category,
+                )
 
 
 class MCPManager:
@@ -109,6 +194,17 @@ class MCPManager:
 
         server_config = json.loads(config_file.read_text())
         server_name = config_file.stem
+
+        # Expand environment variables (${VAR}) in string config values
+        def _expand_vars(obj):
+            if isinstance(obj, str):
+                return os.path.expandvars(obj)
+            elif isinstance(obj, dict):
+                return {k: _expand_vars(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [_expand_vars(item) for item in obj]
+            return obj
+        server_config = _expand_vars(server_config)
 
         # Support both flat format and nested "mcpServers" format
         if "mcpServers" in server_config:
@@ -168,7 +264,21 @@ class MCPManager:
                     "description": getattr(tool_spec, "description", ""),
                     "inputSchema": getattr(tool_spec, "inputSchema", {}),
                 }
-                mcp_tool = MCPTool(session, spec_dict)
+                mcp_tool = MCPTool(session, spec_dict, manager=self, server_name=name)
+                # Check for name collision and suffix to avoid overwriting
+                if registry.get(mcp_tool.name) is not None:
+                    original_name = mcp_tool.name
+                    suffix = "_mcp"
+                    candidate = f"{original_name}{suffix}"
+                    counter = 2
+                    while registry.get(candidate) is not None:
+                        candidate = f"{original_name}_{counter}"
+                        counter += 1
+                    logger.warning(
+                        "MCP tool name collision: '%s' already registered — renaming to '%s'",
+                        original_name, candidate,
+                    )
+                    mcp_tool.name = candidate
                 registry.register(mcp_tool)
                 registered += 1
 
@@ -209,7 +319,7 @@ class MCPManager:
                             "description": getattr(tool_spec, "description", ""),
                             "inputSchema": getattr(tool_spec, "inputSchema", {}),
                         }
-                        registry.register(MCPTool(session, spec_dict))
+                        registry.register(MCPTool(session, spec_dict, manager=self))
                         total += 1
             except Exception as e:
                 logger.warning("MCP refresh failed for session: %s", e)

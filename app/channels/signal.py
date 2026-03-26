@@ -1,9 +1,10 @@
-"""Signal channel adapter — connects Nova_ to Signal via signal-cli REST API."""
+"""Signal channel adapter — connects Nova to Signal via signal-cli REST API."""
 
 from __future__ import annotations
 
 import asyncio
 import collections
+import hashlib
 import logging
 
 import httpx
@@ -23,7 +24,9 @@ class SignalBot:
         self.default_recipient = config.SIGNAL_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
         self._conversations: collections.OrderedDict[str, str] = collections.OrderedDict()  # sender phone → conv_id
-        self._processed_ids: collections.OrderedDict[str, None] = collections.OrderedDict()
+        self._conv_store = None  # lazy-init DB store
+        self._conv_lock = asyncio.Lock()
+        self._dedup_db = None  # lazy-init SQLite dedup
         self._running = False
         self._client: httpx.AsyncClient | None = None
 
@@ -47,7 +50,11 @@ class SignalBot:
 
     async def _poll_messages(self) -> None:
         """Poll signal-cli REST API for incoming messages."""
+        backoff = 2.0
+        max_backoff = 60.0
         while self._running:
+            if self._client is None or not self._running:
+                break
             try:
                 resp = await self._client.get(
                     f"{self.api_url}/v1/receive/{self.phone_number}",
@@ -59,8 +66,13 @@ class SignalBot:
                         await self._process_envelope(msg)
                 elif resp.status_code != 204:
                     logger.warning("[Signal] Poll returned status %d", resp.status_code)
+                # Reset backoff on successful poll
+                backoff = 2.0
             except httpx.ConnectError:
-                logger.warning("[Signal] Cannot reach signal-cli at %s (retrying)", self.api_url)
+                logger.warning("[Signal] Cannot reach signal-cli at %s (retrying in %.0fs)", self.api_url, backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, max_backoff)
+                continue
             except httpx.TimeoutException:
                 pass  # Normal on long poll with no messages
             except Exception as e:
@@ -82,14 +94,13 @@ class SignalBot:
             if not text or not text.strip():
                 return
 
-            # Dedup using timestamp + source
+            # Dedup using timestamp + source + content hash (persistent via SQLite)
             timestamp = str(data_message.get("timestamp", ""))
-            dedup_key = f"{timestamp}:{source}"
-            if dedup_key in self._processed_ids:
+            content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
+            dedup_key = f"{timestamp}:{source}:{content_hash}"
+            if self._check_dedup(dedup_key):
                 return
-            self._processed_ids[dedup_key] = None
-            while len(self._processed_ids) > 10000:
-                self._processed_ids.popitem(last=False)
+            self._record_dedup(dedup_key)
 
             if not self._is_allowed(source):
                 await self._send_message(source, "Sorry, you're not authorized to use this bot.")
@@ -104,22 +115,54 @@ class SignalBot:
         except Exception as e:
             logger.error("[Signal] Error processing message: %s", e, exc_info=True)
 
+    def _get_dedup_db(self):
+        """Lazy-init SQLite dedup table."""
+        if self._dedup_db is None:
+            from app.database import get_db
+            self._dedup_db = get_db()
+            self._dedup_db.execute(
+                "CREATE TABLE IF NOT EXISTS channel_dedup "
+                "(msg_id TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+        return self._dedup_db
+
+    def _check_dedup(self, msg_id: str) -> bool:
+        """Return True if msg_id was already processed."""
+        db = self._get_dedup_db()
+        row = db.fetchone("SELECT 1 FROM channel_dedup WHERE msg_id = ?", (msg_id,))
+        return row is not None
+
+    def _record_dedup(self, msg_id: str) -> None:
+        """Record a processed msg_id and clean up old entries."""
+        db = self._get_dedup_db()
+        db.execute("INSERT OR IGNORE INTO channel_dedup (msg_id) VALUES (?)", (msg_id,))
+        # Periodic cleanup of entries older than 24 hours
+        db.execute(
+            "DELETE FROM channel_dedup WHERE created_at < datetime('now', '-24 hours')"
+        )
+
     async def _handle_query(self, query: str, sender: str) -> str:
         """Run query through think() and collect the response."""
         from app.core.brain import think, get_services
 
         # Get or create conversation for this sender
-        conv_id = self._conversations.get(sender)
-        if conv_id:
-            # Move to end so it's marked as recently used
-            self._conversations.move_to_end(sender)
-        else:
-            svc = get_services()
-            conv_id = svc.conversations.create_conversation()
-            self._conversations[sender] = conv_id
-            # LRU eviction: cap at 1000 entries
-            while len(self._conversations) > 1000:
-                self._conversations.popitem(last=False)
+        async with self._conv_lock:
+            conv_id = self._conversations.get(sender)
+            if conv_id:
+                self._conversations.move_to_end(sender)
+            else:
+                # Try DB recovery
+                if self._conv_store is None:
+                    from app.database import get_db, ChannelConversationStore
+                    self._conv_store = ChannelConversationStore(get_db())
+                conv_id = self._conv_store.get("signal", str(sender))
+                if not conv_id:
+                    svc = get_services()
+                    conv_id = svc.conversations.create_conversation()
+                    self._conv_store.set("signal", str(sender), conv_id)
+                self._conversations[sender] = conv_id
+                while len(self._conversations) > 1000:  # LRU cap for personal bot
+                    self._conversations.popitem(last=False)
 
         try:
             tokens = []
@@ -217,4 +260,4 @@ class SignalBot:
                 await self._client.aclose()
             except Exception:
                 pass
-            self._client = None
+        self._client = None

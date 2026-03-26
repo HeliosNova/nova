@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 
-from app.tools.base import BaseTool, ToolResult
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -23,12 +24,27 @@ _UNSAFE_RE = re.compile(
 
 class CalculatorTool(BaseTool):
     name = "calculator"
-    description = "Evaluate math expressions with SymPy. Use for ANY calculation, even simple ones."
+    description = (
+        "Evaluate mathematical expressions using SymPy. Supports arithmetic, algebra, calculus, and symbolic math. "
+        "Returns the expression and its evaluated result. "
+        "Use for ANY calculation, even simple ones — never do mental math. "
+        "Do NOT use for string manipulation or non-math operations."
+    )
     parameters = "expression: str"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "expression": {
+                "type": "string",
+                "description": "Mathematical expression to evaluate (e.g., '2**10', 'sqrt(144)', 'integrate(x**2, x)').",
+            },
+        },
+        "required": ["expression"],
+    }
 
     async def execute(self, *, expression: str = "", **kwargs) -> ToolResult:
         if not expression:
-            return ToolResult(output="", success=False, error="No expression provided")
+            return ToolResult(output="", success=False, error="No expression provided", error_category=ErrorCategory.VALIDATION)
 
         # Input sanitization — reject anything that looks like code injection
         if _UNSAFE_RE.search(expression):
@@ -36,6 +52,7 @@ class CalculatorTool(BaseTool):
                 output="",
                 success=False,
                 error="Expression contains disallowed patterns. Use pure math only.",
+                error_category=ErrorCategory.VALIDATION,
             )
 
         try:
@@ -46,15 +63,17 @@ class CalculatorTool(BaseTool):
             )
 
             transformations = standard_transformations + (implicit_multiplication_application,)
-            result = parse_expr(expression, local_dict={}, transformations=transformations)
-            evaluated = result.evalf()
+            result = await asyncio.wait_for(
+                asyncio.to_thread(lambda: parse_expr(expression, local_dict={}, transformations=transformations).evalf()),
+                timeout=10.0,
+            )
 
             # Format nicely
-            output = f"{expression} = {evaluated}"
+            output = f"{expression} = {result}"
 
             # If it's a real integer result, show without decimals
-            if evaluated.is_real and evaluated == int(evaluated):
-                output = f"{expression} = {int(evaluated)}"
+            if result.is_real and result == int(result):
+                output = f"{expression} = {int(result)}"
 
             return ToolResult(output=output, success=True)
 
@@ -63,4 +82,5 @@ class CalculatorTool(BaseTool):
                 output="",
                 success=False,
                 error=f"Math error: {e}. Check expression syntax.",
+                error_category=ErrorCategory.VALIDATION,
             )

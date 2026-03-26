@@ -7,14 +7,16 @@ Temporal tracking: facts have valid_from/valid_to for historical queries.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
 import re
-import threading
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 
 logger = logging.getLogger(__name__)
+
+_PRUNE_BATCH_SIZE = 50
 
 # ---------------------------------------------------------------------------
 # Data types
@@ -45,6 +47,9 @@ CANONICAL_PREDICATES = frozenset({
     "born_in", "founded_in", "capital_of", "currency_of",
     "spoken_in", "developed_by", "written_by", "caused_by",
     "contains", "produces", "leads",
+    "works_at", "employed_by", "lives_in", "studied_at",
+    "married_to", "member_of", "invented_by", "successor_of",
+    "succeeded_by", "price_of", "version_of",
 })
 
 _PREDICATE_ALIASES: dict[str, str] = {
@@ -55,7 +60,7 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "used for": "used_for", "used in": "used_for",
     "known for": "known_for", "famous for": "known_for",
     "related to": "related_to",
-    "belongs to": "belongs_to", "member of": "belongs_to",
+    "belongs to": "belongs_to",
     "has property": "has_property", "has": "has_property",
     "born in": "born_in",
     "founded in": "founded_in", "established in": "founded_in",
@@ -68,6 +73,16 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "contains": "contains", "includes": "contains",
     "produces": "produces",
     "leads": "leads",
+    "works at": "works_at", "works for": "works_at", "employed at": "works_at",
+    "employed by": "employed_by", "hired by": "employed_by",
+    "lives in": "lives_in", "resides in": "lives_in",
+    "studied at": "studied_at", "graduated from": "studied_at", "attended": "studied_at",
+    "married to": "married_to", "spouse of": "married_to",
+    "member of": "member_of",
+    "invented by": "invented_by", "discovered by": "invented_by",
+    "successor of": "successor_of", "succeeded by": "succeeded_by", "replaced by": "succeeded_by",
+    "price of": "price_of", "cost of": "price_of", "costs": "price_of",
+    "version of": "version_of", "variant of": "version_of",
 }
 
 
@@ -97,6 +112,10 @@ def normalize_predicate(pred: str) -> str:
                 if short == alias_key.replace(" ", "_"):
                     return canon
 
+    # Allow well-formed custom predicates (lowercase, underscores, 3-31 chars, max 3 underscores)
+    if re.match(r"^[a-z][a-z_]{2,30}$", p) and p.count("_") <= 3:
+        return p
+
     return "related_to"
 
 
@@ -123,8 +142,14 @@ _GARBAGE_PATTERNS = [
 ]
 
 _GARBAGE_VALUES = frozenset({
-    "testuser", "test", "pizza", "foo", "bar", "baz", "example",
+    "testuser", "test", "foo", "bar", "baz", "example",
     "null", "none", "undefined", "n/a", "na",
+})
+
+
+_SHORT_ENTITY_ALLOWLIST = frozenset({
+    "c", "r", "go", "us", "uk", "eu", "ai", "ml",
+    "os", "js", "ts", "py", "c#", "c++", "f#", "qt", "vi",
 })
 
 
@@ -132,8 +157,10 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     """Return True if a triple is obvious garbage that should not be stored."""
     s, o = subject.strip().lower(), object_.strip().lower()
 
-    # Too short
-    if len(s) < 2 or len(o) < 2:
+    # Too short (unless in the allowlist of legitimate short entities)
+    if len(s) < 2 and s not in _SHORT_ENTITY_ALLOWLIST:
+        return True
+    if len(o) < 2 and o not in _SHORT_ENTITY_ALLOWLIST:
         return True
 
     # Self-referential
@@ -180,7 +207,7 @@ def _is_recent(ts: str | None, days: int = 7) -> bool:
 # KnowledgeGraph
 # ---------------------------------------------------------------------------
 
-MAX_KG_FACTS = 1000
+from app.config import config as _config
 
 
 class KnowledgeGraph:
@@ -242,11 +269,11 @@ class KnowledgeGraph:
         # Insert counter for batched pruning (only prune every 50 inserts)
         self._inserts_since_prune = 0
         # Lock for concurrent supersession safety
-        self._write_lock = threading.Lock()
+        self._write_lock = asyncio.Lock()
 
     # --- Core operations ---
 
-    def add_fact(
+    async def add_fact(
         self,
         subject: str,
         predicate: str,
@@ -263,9 +290,9 @@ class KnowledgeGraph:
         different object), the old fact is superseded rather than deleted,
         creating a temporal trail.
         """
-        subject = subject.strip().lower()
+        subject = subject.strip()
         predicate = normalize_predicate(predicate)
-        object_ = object_.strip().lower()
+        object_ = object_.strip()
 
         if not subject or not object_ or len(subject) > 200 or len(object_) > 200:
             return False
@@ -280,11 +307,12 @@ class KnowledgeGraph:
 
         # All DB operations under the write lock to prevent TOCTOU races
         # (duplicate check, conflict resolution, insert, prune counter)
-        with self._write_lock:
+        async with self._write_lock:
             # Check for exact duplicate (same subject+predicate+object) — current
+            # Use LOWER() for case-insensitive matching to preserve original casing
             existing = self._db.fetchone(
                 "SELECT id, confidence FROM kg_facts "
-                "WHERE subject = ? AND predicate = ? AND object = ? "
+                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
                 "AND valid_to IS NULL",
                 (subject, predicate, object_),
             )
@@ -301,82 +329,124 @@ class KnowledgeGraph:
                 return False
 
             # Check for contradicting facts (same subject+predicate, different object, still current)
+            # Also check reversed direction: same object+predicate, different subject
+            # (e.g. "Arsenal leads Premier League" contradicts "Man Utd leads Premier League")
             conflicts = self._db.fetchall(
                 "SELECT id, object, confidence FROM kg_facts "
-                "WHERE subject = ? AND predicate = ? AND object != ? "
+                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
                 "AND valid_to IS NULL",
                 (subject, predicate, object_),
             )
-
-            # Supersede conflicting facts
-            for conflict in conflicts:
-                self._db.execute(
-                    "UPDATE kg_facts SET valid_to = ? WHERE id = ?",
-                    (now, conflict["id"]),
-                )
-
-            # Check for a previously-superseded row with the same triple
-            # (the UNIQUE constraint means we can't INSERT a duplicate).
-            # If found, reactivate it instead of inserting.
-            old_superseded = self._db.fetchone(
-                "SELECT id FROM kg_facts "
-                "WHERE subject = ? AND predicate = ? AND object = ? "
-                "AND valid_to IS NOT NULL",
-                (subject, predicate, object_),
-            )
-
-            if old_superseded:
-                # Reactivate: clear valid_to/superseded_by, update metadata
-                self._db.execute(
-                    "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
-                    "superseded_by = NULL, confidence = ?, source = ?, "
-                    "provenance = ? WHERE id = ?",
-                    (fact_valid_from, confidence, source, provenance, old_superseded["id"]),
-                )
-                new_id = old_superseded["id"]
-            else:
-                # Insert the new fact
-                self._db.execute(
-                    "INSERT INTO kg_facts "
-                    "(subject, predicate, object, confidence, source, valid_from, valid_to, provenance) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (subject, predicate, object_, confidence, source, fact_valid_from, valid_to, provenance),
-                )
-                # Get the new fact's ID
-                new_row = self._db.fetchone(
-                    "SELECT id FROM kg_facts "
-                    "WHERE subject = ? AND predicate = ? AND object = ? "
-                    "AND valid_to IS NULL ORDER BY id DESC LIMIT 1",
+            # Also find inverse contradictions: same object being "led" by a different subject
+            # Only for predicates that imply uniqueness (leads, is_leader_of, etc.)
+            _UNIQUE_PREDICATES = {"leads", "is_leader_of", "is_president_of", "is_ceo_of",
+                                  "is_capital_of", "is_champion_of"}
+            if predicate in _UNIQUE_PREDICATES:
+                inverse_conflicts = self._db.fetchall(
+                    "SELECT id, object, confidence FROM kg_facts "
+                    "WHERE LOWER(subject) != LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                    "AND valid_to IS NULL",
                     (subject, predicate, object_),
                 )
-                new_id = new_row["id"] if new_row else None
+                conflicts = list(conflicts) + list(inverse_conflicts)
 
-            # Set superseded_by on old conflicting facts
-            if conflicts and new_id is not None:
+            # Supersede conflicting facts + insert new fact atomically
+            with self._db.transaction() as tx:
                 for conflict in conflicts:
-                    self._db.execute(
-                        "UPDATE kg_facts SET superseded_by = ? WHERE id = ?",
-                        (new_id, conflict["id"]),
+                    tx.execute(
+                        "UPDATE kg_facts SET valid_to = ? WHERE id = ?",
+                        (now, conflict["id"]),
                     )
+
+                # Check for a previously-superseded row with the same triple
+                # (the UNIQUE constraint means we can't INSERT a duplicate).
+                # If found, reactivate it instead of inserting.
+                old_superseded = tx.fetchone(
+                    "SELECT id FROM kg_facts "
+                    "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                    "AND valid_to IS NOT NULL",
+                    (subject, predicate, object_),
+                )
+
+                if old_superseded:
+                    # Reactivate: clear valid_to/superseded_by, update metadata
+                    tx.execute(
+                        "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
+                        "superseded_by = NULL, confidence = ?, source = ?, "
+                        "provenance = ? WHERE id = ?",
+                        (fact_valid_from, confidence, source, provenance, old_superseded["id"]),
+                    )
+                    new_id = old_superseded["id"]
+                else:
+                    # Insert the new fact
+                    tx.execute(
+                        "INSERT INTO kg_facts "
+                        "(subject, predicate, object, confidence, source, valid_from, valid_to, provenance) "
+                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        (subject, predicate, object_, confidence, source, fact_valid_from, valid_to, provenance),
+                    )
+                    # Get the new fact's ID
+                    new_row = tx.fetchone(
+                        "SELECT id FROM kg_facts "
+                        "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                        "AND valid_to IS NULL ORDER BY id DESC LIMIT 1",
+                        (subject, predicate, object_),
+                    )
+                    new_id = new_row["id"] if new_row else None
+
+                # Set superseded_by on old conflicting facts
+                if conflicts and new_id is not None:
+                    for conflict in conflicts:
+                        tx.execute(
+                            "UPDATE kg_facts SET superseded_by = ? WHERE id = ?",
+                            (new_id, conflict["id"]),
+                        )
                 logger.info(
                     "KG: superseded %d fact(s) for %s/%s -> %s",
                     len(conflicts), subject, predicate, object_,
                 )
 
             self._inserts_since_prune += 1
-            if self._inserts_since_prune >= 50:
+            if self._inserts_since_prune >= _PRUNE_BATCH_SIZE:
                 self._prune()
                 self._inserts_since_prune = 0
 
         return True
 
-    def delete_fact(self, subject: str, predicate: str, object_: str) -> bool:
-        """Delete a specific fact triple."""
+    def _retire_fact(self, fact_id: int) -> bool:
+        """Retire a fact by setting valid_to instead of deleting.
+
+        This preserves temporal history. Works for single fact retirement.
+        Returns True if a row was updated.
+        """
         cursor = self._db.execute(
-            "DELETE FROM kg_facts WHERE subject = ? AND predicate = ? AND object = ?",
-            (subject.strip().lower(), normalize_predicate(predicate), object_.strip().lower()),
+            "UPDATE kg_facts SET valid_to = CURRENT_TIMESTAMP WHERE id = ? AND valid_to IS NULL",
+            (fact_id,),
         )
         return cursor.rowcount > 0
+
+    def _retire_facts_batch(self, fact_ids: list[int]) -> int:
+        """Retire multiple facts by setting valid_to. Returns count retired."""
+        if not fact_ids:
+            return 0
+        placeholders = ",".join("?" for _ in fact_ids)
+        cursor = self._db.execute(
+            f"UPDATE kg_facts SET valid_to = CURRENT_TIMESTAMP "
+            f"WHERE id IN ({placeholders}) AND valid_to IS NULL",
+            tuple(fact_ids),
+        )
+        return cursor.rowcount
+
+    async def delete_fact(self, subject: str, predicate: str, object_: str) -> bool:
+        """Retire a specific fact triple (temporal retirement, not hard delete)."""
+        async with self._write_lock:
+            row = self._db.fetchone(
+                "SELECT id FROM kg_facts WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) AND valid_to IS NULL",
+                (subject.strip(), normalize_predicate(predicate), object_.strip()),
+            )
+            if row:
+                return self._retire_fact(row["id"])
+            return False
 
     async def check_and_resolve_contradictions(
         self,
@@ -385,26 +455,33 @@ class KnowledgeGraph:
         new_object: str,
         new_confidence: float = 0.8,
     ) -> bool:
-        """Check for contradicting facts and resolve via LLM. Returns True if safe to add."""
-        subject = subject.strip().lower()
-        predicate = normalize_predicate(predicate)
-        new_object = new_object.strip().lower()
+        """Check for contradicting facts and resolve via LLM. Returns True if safe to add.
 
-        # Find existing current facts with same subject+predicate but different object
-        conflicts = self._db.fetchall(
-            "SELECT id, object, confidence FROM kg_facts "
-            "WHERE subject = ? AND predicate = ? AND object != ? "
-            "AND valid_to IS NULL",
-            (subject, predicate, new_object),
-        )
+        Uses read-under-lock -> LLM call (no lock) -> re-read-and-write-under-lock
+        pattern to avoid holding the lock during slow LLM calls while still
+        preventing stale-data races.
+        """
+        subject = subject.strip()
+        predicate = normalize_predicate(predicate)
+        new_object = new_object.strip()
+
+        # Phase 1: Read under lock — snapshot the conflicts
+        async with self._write_lock:
+            conflicts = self._db.fetchall(
+                "SELECT id, object, confidence FROM kg_facts "
+                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
+                "AND valid_to IS NULL",
+                (subject, predicate, new_object),
+            )
         if not conflicts:
             return True  # no contradiction
 
+        # Phase 2: LLM calls outside the lock (slow I/O, no DB mutation)
         from app.core import llm
 
+        decisions: list[tuple[dict, str]] = []  # (conflict_row, keep_verdict)
         for conflict in conflicts:
             old_object = conflict["object"]
-            old_confidence = conflict["confidence"]
 
             prompt = (
                 f"Two facts conflict. Which is correct?\n"
@@ -424,23 +501,34 @@ class KnowledgeGraph:
                 obj = llm.extract_json_object(raw)
                 if not obj:
                     continue
-
                 keep = str(obj.get("keep", "both")).upper()
+                decisions.append((conflict, keep))
+            except Exception as e:
+                logger.debug("KG contradiction check failed (allowing both): %s", e)
+
+        # Phase 3: Re-read and write under lock — verify data hasn't gone stale
+        async with self._write_lock:
+            for conflict, keep in decisions:
                 if keep == "B":
-                    # New fact wins — supersede old fact now
+                    # Re-check that the conflict row is still current (not retired by another task)
+                    still_current = self._db.fetchone(
+                        "SELECT id FROM kg_facts WHERE id = ? AND valid_to IS NULL",
+                        (conflict["id"],),
+                    )
+                    if not still_current:
+                        logger.debug("KG contradiction: conflict id=%d already retired, skipping", conflict["id"])
+                        continue
                     now = _now_iso()
                     self._db.execute(
                         "UPDATE kg_facts SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
                         (now, conflict["id"]),
                     )
-                    logger.info("KG contradiction resolved: superseded old '%s' for new '%s'", old_object, new_object)
+                    logger.info("KG contradiction resolved: superseded old '%s' for new '%s'", conflict["object"], new_object)
                 elif keep == "A":
                     # Old fact wins — don't add new
-                    logger.info("KG contradiction resolved: kept old '%s', rejected new '%s'", old_object, new_object)
+                    logger.info("KG contradiction resolved: kept old '%s', rejected new '%s'", conflict["object"], new_object)
                     return False
                 # "both" — not a real contradiction, allow both
-            except Exception as e:
-                logger.debug("KG contradiction check failed (allowing both): %s", e)
 
         return True
 
@@ -471,13 +559,9 @@ class KnowledgeGraph:
                     ids_to_delete.append(row["id"])
 
             if ids_to_delete:
-                placeholders = ",".join("?" for _ in ids_to_delete)
-                self._db.execute(
-                    f"DELETE FROM kg_facts WHERE id IN ({placeholders})",
-                    tuple(ids_to_delete),
-                )
-                deleted_heuristic = len(ids_to_delete)
-                logger.info("KG curation: deleted %d garbage facts (heuristic)", deleted_heuristic)
+                async with self._write_lock:
+                    deleted_heuristic = self._retire_facts_batch(ids_to_delete)
+                logger.info("KG curation: retired %d garbage facts (heuristic)", deleted_heuristic)
 
         if sample_size <= 0:
             return {"heuristic": deleted_heuristic, "llm": 0}
@@ -521,13 +605,9 @@ class KnowledgeGraph:
                     if 1 <= idx <= len(low_facts) and r.get("verdict") == "garbage":
                         garbage_ids.append(low_facts[idx - 1]["id"])
                 if garbage_ids:
-                    placeholders = ",".join("?" for _ in garbage_ids)
-                    self._db.execute(
-                        f"DELETE FROM kg_facts WHERE id IN ({placeholders})",
-                        tuple(garbage_ids),
-                    )
-                    deleted_llm = len(garbage_ids)
-                    logger.info("KG curation: deleted %d garbage facts (LLM)", deleted_llm)
+                    async with self._write_lock:
+                        deleted_llm = self._retire_facts_batch(garbage_ids)
+                    logger.info("KG curation: retired %d garbage facts (LLM)", deleted_llm)
         except Exception as e:
             logger.warning("KG LLM curation failed (heuristic pass still ran): %s", e)
 
@@ -573,7 +653,7 @@ class KnowledgeGraph:
             rows = self._db.fetchall(
                 f"SELECT id, subject, predicate, object, confidence, source "
                 f"FROM kg_facts "
-                f"WHERE (subject IN ({placeholders}) OR object IN ({placeholders})) "
+                f"WHERE (LOWER(subject) IN ({placeholders}) OR LOWER(object) IN ({placeholders})) "
                 f"{validity_filter}",
                 params,
             )
@@ -584,6 +664,7 @@ class KnowledgeGraph:
                     continue
                 seen_ids.add(r["id"])
                 results.append({
+                    "id": r["id"],
                     "subject": r["subject"],
                     "predicate": r["predicate"],
                     "object": r["object"],
@@ -591,14 +672,33 @@ class KnowledgeGraph:
                     "source": r["source"],
                     "depth": depth,
                 })
-                next_entities.add(r["subject"])
-                next_entities.add(r["object"])
+                next_entities.add(r["subject"].lower())
+                next_entities.add(r["object"].lower())
 
             visited.update(frontier)
             frontier = next_entities - visited  # only truly new entities
+            # Cap frontier size to prevent query explosion on highly-connected graphs
+            if len(frontier) > _config.KG_GRAPH_MAX_FRONTIER:
+                frontier = set(list(frontier)[:_config.KG_GRAPH_MAX_FRONTIER])
 
         results.sort(key=lambda x: (x["depth"], -(x["confidence"] or 0)))
-        return results[:max_results]
+        final = results[:max_results]
+
+        # Batch-update times_retrieved for all returned facts
+        if final:
+            ret_ids = [r["id"] for r in final if r.get("id") is not None]
+            if ret_ids:
+                placeholders = ",".join("?" for _ in ret_ids)
+                try:
+                    self._db.execute(
+                        f"UPDATE kg_facts SET times_retrieved = times_retrieved + 1 "
+                        f"WHERE id IN ({placeholders})",
+                        tuple(ret_ids),
+                    )
+                except Exception:
+                    pass  # backward compat if column missing
+
+        return final
 
     def search(
         self,
@@ -623,14 +723,30 @@ class KnowledgeGraph:
         validity_filter = "" if include_history else "AND valid_to IS NULL"
 
         rows = self._db.fetchall(
-            f"SELECT subject, predicate, object, confidence, source "
+            f"SELECT id, subject, predicate, object, confidence, source "
             f"FROM kg_facts "
             f"WHERE (subject LIKE ? ESCAPE '\\' OR object LIKE ? ESCAPE '\\') "
             f"{validity_filter} "
             f"ORDER BY confidence DESC LIMIT ?",
             (f"%{escaped}%", f"%{escaped}%", limit),
         )
-        return [dict(r) for r in rows]
+        results = [dict(r) for r in rows]
+
+        # Batch-update times_retrieved for all returned facts
+        if results:
+            ret_ids = [r["id"] for r in results if r.get("id") is not None]
+            if ret_ids:
+                placeholders = ",".join("?" for _ in ret_ids)
+                try:
+                    self._db.execute(
+                        f"UPDATE kg_facts SET times_retrieved = times_retrieved + 1 "
+                        f"WHERE id IN ({placeholders})",
+                        tuple(ret_ids),
+                    )
+                except Exception:
+                    pass  # backward compat if column missing
+
+        return results
 
     def get_relevant_facts(self, query: str, limit: int = 8) -> list[Fact]:
         """Get facts relevant to a query by keyword overlap.
@@ -665,13 +781,14 @@ class KnowledgeGraph:
 
         top = scored[:limit]
 
-        # Batch increment retrieval counts
+        # Batch increment retrieval counts and update last_retrieved_at
         if top:
             retrieved_ids = [row["id"] for _, row in top]
             placeholders = ",".join("?" for _ in retrieved_ids)
             try:
                 self._db.execute(
-                    f"UPDATE kg_facts SET times_retrieved = times_retrieved + 1 WHERE id IN ({placeholders})",
+                    f"UPDATE kg_facts SET times_retrieved = times_retrieved + 1, "
+                    f"last_retrieved_at = datetime('now') WHERE id IN ({placeholders})",
                     tuple(retrieved_ids),
                 )
             except Exception:
@@ -727,7 +844,7 @@ class KnowledgeGraph:
                 "created_at, valid_from, valid_to, provenance "
                 "FROM kg_facts "
                 "WHERE (subject = ? OR object = ?) "
-                "AND valid_from <= ? "
+                "AND COALESCE(valid_from, created_at) <= ? "
                 "AND (valid_to IS NULL OR valid_to > ?) "
                 "ORDER BY confidence DESC",
                 (entity, entity, at_time, at_time),
@@ -835,6 +952,18 @@ class KnowledgeGraph:
             for r in rows
         ]
 
+    def get_top_entities(self, limit: int = 10) -> list[dict]:
+        """Return the top entities by fact count (current facts only).
+
+        Returns list of dicts with 'subject' and 'cnt' keys, ordered by count descending.
+        """
+        rows = self._db.fetchall(
+            "SELECT subject, COUNT(*) as cnt FROM kg_facts "
+            "WHERE valid_to IS NULL GROUP BY subject ORDER BY cnt DESC LIMIT ?",
+            (limit,),
+        )
+        return [dict(r) for r in rows]
+
     def get_stats(self) -> dict:
         """Return KG statistics."""
         total = self._db.fetchone("SELECT COUNT(*) AS c FROM kg_facts")["c"]
@@ -859,7 +988,7 @@ class KnowledgeGraph:
         }
 
     def _prune(self) -> None:
-        """If current kg_facts exceed MAX_KG_FACTS, delete oldest low-confidence ones.
+        """If current kg_facts exceed _config.MAX_KG_FACTS, delete oldest low-confidence ones.
 
         Only prunes current facts. Superseded facts are historical and not counted.
         """
@@ -867,25 +996,29 @@ class KnowledgeGraph:
             "SELECT COUNT(*) AS c FROM kg_facts WHERE valid_to IS NULL"
         )
         count = count_row["c"] if count_row else 0
-        if count <= MAX_KG_FACTS:
+        if count <= _config.MAX_KG_FACTS:
             return
-        excess = count - MAX_KG_FACTS
-        self._db.execute(
-            """DELETE FROM kg_facts WHERE id IN (
-                SELECT id FROM kg_facts
-                WHERE valid_to IS NULL
-                ORDER BY times_retrieved ASC, confidence ASC, created_at ASC
-                LIMIT ?
-            )""",
+        excess = count - _config.MAX_KG_FACTS
+        # Retire (set valid_to) instead of hard-deleting to preserve temporal history
+        prune_rows = self._db.fetchall(
+            "SELECT id FROM kg_facts "
+            "WHERE valid_to IS NULL "
+            "ORDER BY times_retrieved ASC, confidence ASC, created_at ASC "
+            "LIMIT ?",
             (excess,),
         )
-        logger.info("Pruned %d KG facts (over %d limit)", excess, MAX_KG_FACTS)
+        prune_ids = [r["id"] for r in prune_rows]
+        retired = self._retire_facts_batch(prune_ids)
+        logger.info("Pruned (retired) %d KG facts (over %d limit)", retired, _config.MAX_KG_FACTS)
 
-    def decay_stale(self, days: int = 60, decay_amount: float = 0.05) -> int:
+    async def decay_stale(self, days: int = 60, decay_amount: float = 0.05) -> int:
         """Lower confidence on old current facts. Returns count affected."""
-        cursor = self._db.execute(
-            "UPDATE kg_facts SET confidence = MAX(0.1, confidence - ?) "
-            "WHERE created_at < datetime('now', ?) AND valid_to IS NULL",
-            (decay_amount, f"-{days} days"),
-        )
-        return cursor.rowcount
+        cutoff = f"-{days} days"
+        async with self._write_lock:
+            cursor = self._db.execute(
+                "UPDATE kg_facts SET confidence = MAX(0.1, confidence - ?) "
+                "WHERE created_at < datetime('now', ?) AND valid_to IS NULL "
+                "AND (last_retrieved_at IS NULL OR last_retrieved_at < datetime('now', ?))",
+                (decay_amount, cutoff, cutoff),
+            )
+            return cursor.rowcount

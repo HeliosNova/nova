@@ -1,6 +1,6 @@
 ---
 name: Feature Request
-about: Suggest a feature for Nova_
+about: Suggest a feature for Nova
 title: "[Feature] "
 labels: enhancement
 assignees: ''

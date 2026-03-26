@@ -1,5 +1,73 @@
 # Changelog
 
+## [1.3.0] - 2026-03-26
+
+### Added
+- **Blacklist fact extraction** — replaced regex whitelist gate (`has_fact_signals`) with blacklist approach (`_is_pure_question_or_command`). Nova now extracts facts from ANY message that isn't a pure question, command, or greeting. Implicit statements like "my portfolio is 60/40" and "I drive a Tesla" are now captured. The LLM extraction prompt handles false positives by returning `{}`
+- **Action audit trail** — all tool executions and monitor alerts now logged to `action_log` table via `AuditLogHook.post_execute()`. Actions page is no longer empty
+- **All config toggles working** — added 11 missing `ENABLE_*` fields to both `ConfigUpdateRequest` (Pydantic) and `_MUTABLE_FIELDS` set. Toggles that returned 422 now work
+- **API key authentication** — `REQUIRE_AUTH=true` with generated API key. Endpoints reject unauthenticated requests
+- **DPO from messaging channels** — `TRAINING_DATA_CHANNELS=api,discord,telegram` enables training pair generation from corrections via Discord and Telegram
+- **Frontend UX overhaul** — timestamps show actual times ("4:30 PM", "Yesterday 4:30 PM") instead of vague "3d ago"; tool calls display arguments inline; chat empty state has clickable example prompts; monitors grouped by category with collapsible sections and schedule presets; reflexions have All/Successes/Failures filter; curiosity shows priority badges; lessons column renamed "Times Used"; all empty states have guidance text; StatusBadge shows "Connected" (proxy fix)
+- **Sports monitor browser fallback** — query instructs Nova to use Playwright browser for ESPN scoreboards when web_search returns only portal links
+
+### Fixed
+- **Frontend proxy "Disconnected"** — Vite dev server proxied to `localhost:8000` (unreachable inside container). Changed to `nova-app:8000` via `API_PROXY_TARGET`
+- **Test suite auth failures** — conftest now resets `NOVA_API_KEY=""`, `REQUIRE_AUTH=false`, `SYSTEM_ACCESS_LEVEL=sandboxed` so tests don't inherit production env
+- **Script smoke tests** — added `pytestmark = pytest.mark.skipif` when `scripts/` directory unavailable in container
+- **Duplicate lessons** — deleted pre-dedup duplicate "Premier League Standings" from database
+
+### Changed
+- `FINETUNE_MIN_NEW_PAIRS` default lowered from 50 to 15 for bootstrapping first fine-tune cycle
+- Frontend Dockerfile uses `npm install` fallback for cross-platform lock file compatibility
+- Vite config adds `allowedHosts` for Docker inter-container access
+
+## [1.2.0] - 2026-03-26
+
+### Added
+- **51 autonomous monitors** — expanded from 14 to 51 across 29 domains: financial intelligence (whale watch, top trades, commodities, DeFi), international perspectives (China, Russia, Middle East, India, EU, Latin America, Africa), science/tech deep dives (AI/ML, semiconductors, quantum, robotics, biotech), policy/security (cybersecurity, defense, US regulation), culture (sports, entertainment, social media), developer ecosystem (GitHub trending, framework releases), and local news (Los Angeles)
+- **Temporal freshness enforcement** — `_think_query()` now injects today's date into every monitor query context; all monitor prompts anchored to "past 24-48 hours" instead of vague "recently"
+- **Ollama thinking fallback** — provider catches "does not support thinking" 400 errors and retries with `think=false` instead of crashing
+- **Fact extraction for life changes** — added patterns for "I moved to", "I switched to", "I joined", "I left", "I no longer", "I used to" so corrections about personal info are captured
+- **Monitor migration v3** — existing monitors auto-update to freshness-anchored prompts on restart
+
+### Fixed
+- **P0: Chat completely broken** — fine-tuned model (`nova-ft`) was missing `RENDERER qwen3.5` and `PARSER qwen3.5` in Modelfile config, causing Ollama to reject all `think:true` requests with 400. Fixed model config blob and all finetune scripts
+- **User facts silently dropped on correction** — `UserFactStore.set()` used `<=` for same-source confidence check, blocking same-authority overwrites. User correcting their own facts (e.g., "I moved to Seattle") was silently ignored
+- **Monitor retry storm** — outer exception handler in heartbeat loop used flat 5-minute retry regardless of error count. Now uses exponential backoff (5→15→45→135→405 min) matching the inner handler
+- **ChromaDB telemetry errors** — PostHog `capture()` API mismatch producing "takes 1 positional argument but 3 were given". Fixed by disabling telemetry via `ANONYMIZED_TELEMETRY=false`
+- **ChromaDB duplicate embedding warnings** — `collection.add()` on startup re-added existing embeddings. Changed to `collection.upsert()` in both `learning.py` and `reflexion.py`
+- **Finetune model missing thinking support** — `finetune.py`, `finetune_weekly.sh`, and `finetune_auto.py` now include `RENDERER qwen3.5` and `PARSER qwen3.5` in generated Modelfiles
+
+### Changed
+- Monitor error backoff now consistent between inner (LLM failure detection) and outer (exception handler) paths
+- All monitor query prompts updated from vague temporal language to explicit "from TODAY" / "past 24-48 hours" with date requirements
+
+## [1.1.0] - 2026-03-25
+
+### Fixed
+- **Quiz DPO generation blocked** — quiz monitor wasn't generating DPO pairs from failed quizzes
+- **Tool error exposure** — raw internal errors leaked to user in tool failure responses
+- **Discord alerts** — alert delivery to Discord was silently failing
+- **Fact extraction** — missed extraction on some explicit user statements
+- **Lesson quality gate** — low-confidence lessons were being retrieved in prompts
+- **Self-reflection context** — reflexion monitor lacked conversation context for meaningful self-assessment
+- **KG contradictions** — contradicting facts weren't being superseded properly
+- **LLM failure detection** — silent failures in generation not being caught by reflexion system
+
+### Added
+- Exponential backoff for monitor retries
+- Background task tools (submit, status, list, cancel)
+- Desktop automation tool (screenshot, click, type, hotkey)
+- Voice interface (Whisper STT)
+- WhatsApp and Signal channel adapters
+- Access tier system (sandboxed/standard/full/none)
+- Skill import/export with HMAC-SHA256 signing
+- Prompt injection detection (4 categories)
+- MCP server exposing 5 Nova tools
+- Provider-aware prompt building (emphatic for Ollama, condensed for cloud)
+- Configurable cloud provider base URLs
+
 ## [1.0.0] - 2026-03-13
 
 ### Security

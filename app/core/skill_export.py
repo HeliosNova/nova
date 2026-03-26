@@ -68,9 +68,17 @@ def export_skill(skill, private_key_path: str | None = None) -> dict:
         Dict with name, description (trigger), trigger, steps, template,
         version, author, created_at. Optionally includes signature.
     """
+    # Derive description from trigger + template rather than repeating the name
+    desc_parts = []
+    if skill.trigger_pattern:
+        desc_parts.append(f"Triggered by: {skill.trigger_pattern}")
+    if skill.answer_template:
+        desc_parts.append(f"Template: {skill.answer_template[:100]}")
+    description = "; ".join(desc_parts) if desc_parts else skill.name
+
     data = {
         "name": skill.name,
-        "description": skill.trigger_pattern,
+        "description": description,
         "trigger": skill.trigger_pattern,
         "steps": skill.steps,
         "template": skill.answer_template,
@@ -140,6 +148,10 @@ def import_skill(data: dict, db, verify_key_path: str | None = None) -> int:
                 f"Invalid signature for skill '{data['name']}'"
             )
         logger.info("Signature verified for skill '%s'", data["name"])
+    elif signature and not verify_key_path and require_signed:
+        raise SkillSignatureError(
+            f"Skill '{data['name']}' has signature but no verification key path provided"
+        )
     elif not signature and require_signed:
         raise SkillSignatureError(
             f"Skill '{data['name']}' is unsigned but REQUIRE_SIGNED_SKILLS is enabled"

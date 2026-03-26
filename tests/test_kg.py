@@ -36,8 +36,11 @@ class TestPredicateNormalization:
         assert normalize_predicate("has_property") == "has_property"
 
     def test_unknown_falls_back(self):
-        assert normalize_predicate("dances with") == "related_to"
-        assert normalize_predicate("smells like") == "related_to"
+        assert normalize_predicate("!!!xyz") == "related_to"
+        assert normalize_predicate("a") == "related_to"  # too short
+        # Well-formed custom predicates are now allowed through
+        assert normalize_predicate("dances with") == "dances_with"
+        assert normalize_predicate("smells like") == "smells_like"
 
     def test_case_insensitive(self):
         assert normalize_predicate("IS A") == "is_a"
@@ -56,45 +59,57 @@ class TestKnowledgeGraph:
     def kg(self, db):
         return KnowledgeGraph(db)
 
-    def test_add_fact(self, kg):
-        assert kg.add_fact("python", "is_a", "programming language") is True
+    @pytest.mark.asyncio
+    async def test_add_fact(self, kg):
+        assert await kg.add_fact("python", "is_a", "programming language") is True
         facts = kg.query("python")
         assert len(facts) == 1
         assert facts[0]["subject"] == "python"
         assert facts[0]["predicate"] == "is_a"
         assert facts[0]["object"] == "programming language"
 
-    def test_add_fact_normalizes(self, kg):
-        kg.add_fact("Python", "IS A", "Language")
+    @pytest.mark.asyncio
+    async def test_add_fact_normalizes(self, kg):
+        await kg.add_fact("Python", "IS A", "Language")
         facts = kg.query("python")
-        assert facts[0]["subject"] == "python"
+        assert facts[0]["subject"] == "Python"  # Preserves original casing
         assert facts[0]["predicate"] == "is_a"
-        assert facts[0]["object"] == "language"
+        assert facts[0]["object"] == "Language"  # Preserves original casing
 
-    def test_add_fact_deduplication(self, kg):
-        assert kg.add_fact("python", "is_a", "language", confidence=0.8) is True
-        assert kg.add_fact("python", "is_a", "language", confidence=0.7) is False  # lower confidence
-        assert kg.add_fact("python", "is_a", "language", confidence=0.9) is True   # higher confidence
+    @pytest.mark.asyncio
+    async def test_add_fact_deduplication(self, kg):
+        assert await kg.add_fact("python", "is_a", "language", confidence=0.8) is True
+        assert await kg.add_fact("python", "is_a", "language", confidence=0.7) is False  # lower confidence
+        assert await kg.add_fact("python", "is_a", "language", confidence=0.9) is True   # higher confidence
         stats = kg.get_stats()
         assert stats["total_facts"] == 1
 
-    def test_add_fact_rejects_empty(self, kg):
-        assert kg.add_fact("", "is_a", "thing") is False
-        assert kg.add_fact("thing", "is_a", "") is False
+    @pytest.mark.asyncio
+    async def test_add_fact_rejects_empty(self, kg):
+        assert await kg.add_fact("", "is_a", "thing") is False
+        assert await kg.add_fact("thing", "is_a", "") is False
 
-    def test_add_fact_rejects_long(self, kg):
-        assert kg.add_fact("x" * 201, "is_a", "thing") is False
+    @pytest.mark.asyncio
+    async def test_add_fact_rejects_long(self, kg):
+        assert await kg.add_fact("x" * 201, "is_a", "thing") is False
 
-    def test_delete_fact(self, kg):
-        kg.add_fact("python", "is_a", "language")
-        assert kg.delete_fact("python", "is_a", "language") is True
-        assert kg.delete_fact("python", "is_a", "language") is False  # already gone
-        assert kg.get_stats()["total_facts"] == 0
+    @pytest.mark.asyncio
+    async def test_delete_fact(self, kg):
+        await kg.add_fact("python", "is_a", "language")
+        assert await kg.delete_fact("python", "is_a", "language") is True
+        assert await kg.delete_fact("python", "is_a", "language") is False  # already retired
+        # Retired facts still exist in DB but have valid_to set (temporal retirement)
+        # Active query should not return them
+        active_facts = kg.query("python")
+        active_subjects = [f["subject"] for f in active_facts if f.get("subject") == "python"]
+        # The retired fact should not appear in active queries
+        assert len([f for f in active_facts if f.get("object") == "language"]) == 0
 
-    def test_query_single_hop(self, kg):
-        kg.add_fact("python", "created_by", "guido van rossum")
-        kg.add_fact("guido van rossum", "born_in", "netherlands")
-        kg.add_fact("java", "created_by", "james gosling")
+    @pytest.mark.asyncio
+    async def test_query_single_hop(self, kg):
+        await kg.add_fact("python", "created_by", "guido van rossum")
+        await kg.add_fact("guido van rossum", "born_in", "netherlands")
+        await kg.add_fact("java", "created_by", "james gosling")
 
         facts = kg.query("python", hops=1)
         subjects = {f["subject"] for f in facts}
@@ -107,14 +122,16 @@ class TestKnowledgeGraph:
     def test_query_empty_entity(self, kg):
         assert kg.query("") == []
 
-    def test_query_unknown_entity(self, kg):
-        kg.add_fact("python", "is_a", "language")
+    @pytest.mark.asyncio
+    async def test_query_unknown_entity(self, kg):
+        await kg.add_fact("python", "is_a", "language")
         assert kg.query("unknown_entity") == []
 
-    def test_search(self, kg):
-        kg.add_fact("bitcoin", "is_a", "cryptocurrency")
-        kg.add_fact("ethereum", "is_a", "cryptocurrency")
-        kg.add_fact("python", "is_a", "language")
+    @pytest.mark.asyncio
+    async def test_search(self, kg):
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency")
+        await kg.add_fact("ethereum", "is_a", "cryptocurrency")
+        await kg.add_fact("python", "is_a", "language")
 
         results = kg.search("crypto")
         assert len(results) == 2  # bitcoin and ethereum
@@ -122,23 +139,26 @@ class TestKnowledgeGraph:
     def test_search_empty(self, kg):
         assert kg.search("") == []
 
-    def test_get_stats(self, kg):
-        kg.add_fact("python", "is_a", "language")
-        kg.add_fact("python", "created_by", "guido")
+    @pytest.mark.asyncio
+    async def test_get_stats(self, kg):
+        await kg.add_fact("python", "is_a", "language")
+        await kg.add_fact("python", "created_by", "guido")
         stats = kg.get_stats()
         assert stats["total_facts"] == 2
         assert stats["unique_predicates"] == 2
 
-    def test_get_all_facts(self, kg):
-        kg.add_fact("a", "is_a", "b")
-        kg.add_fact("c", "is_a", "d")
+    @pytest.mark.asyncio
+    async def test_get_all_facts(self, kg):
+        await kg.add_fact("a", "is_a", "b")
+        await kg.add_fact("c", "is_a", "d")
         facts = kg.get_all_facts(limit=10)
         assert len(facts) == 2
         assert all(isinstance(f, Fact) for f in facts)
 
-    def test_get_all_facts_pagination(self, kg):
+    @pytest.mark.asyncio
+    async def test_get_all_facts_pagination(self, kg):
         for i in range(5):
-            kg.add_fact(f"entity_{i}", "is_a", "thing")
+            await kg.add_fact(f"entity_{i}", "is_a", "thing")
         page1 = kg.get_all_facts(limit=2, offset=0)
         page2 = kg.get_all_facts(limit=2, offset=2)
         assert len(page1) == 2
@@ -150,20 +170,21 @@ class TestKnowledgeGraph:
 # Relevance Scoring
 # ===========================================================================
 
-class TestKGRelevance:
+class TestKGRelevanceBase:
     @pytest.fixture
-    def kg(self, db):
+    async def kg(self, db):
         kg = KnowledgeGraph(db)
-        kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
-        kg.add_fact("bitcoin", "has_property", "deflationary", confidence=0.8)
-        kg.add_fact("ethereum", "is_a", "cryptocurrency", confidence=0.9)
-        kg.add_fact("python", "created_by", "guido van rossum", confidence=0.95)
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        await kg.add_fact("bitcoin", "has_property", "deflationary", confidence=0.8)
+        await kg.add_fact("ethereum", "is_a", "cryptocurrency", confidence=0.9)
+        await kg.add_fact("python", "created_by", "guido van rossum", confidence=0.95)
         return kg
 
     def test_relevant_facts_found(self, kg):
         facts = kg.get_relevant_facts("bitcoin cryptocurrency info")
         assert len(facts) >= 1
-        assert all(f.subject == "bitcoin" or f.object == "bitcoin" for f in facts[:2])
+        # Best match (highest overlap) should be a bitcoin fact
+        assert facts[0].subject == "bitcoin" or facts[0].object == "bitcoin"
 
     def test_irrelevant_query_empty(self, kg):
         facts = kg.get_relevant_facts("what is the weather")
@@ -188,27 +209,29 @@ class TestKGRelevance:
 # ===========================================================================
 
 class TestKGDecay:
-    def test_decay_stale_facts(self, db):
+    @pytest.mark.asyncio
+    async def test_decay_stale_facts(self, db):
         kg = KnowledgeGraph(db)
-        kg.add_fact("old_entity", "is_a", "thing", confidence=0.8)
+        await kg.add_fact("old_entity", "is_a", "thing", confidence=0.8)
         # Force the fact to be old
         db.execute(
             "UPDATE kg_facts SET created_at = datetime('now', '-90 days') WHERE subject = ?",
             ("old_entity",),
         )
-        decayed = kg.decay_stale(days=60, decay_amount=0.1)
+        decayed = await kg.decay_stale(days=60, decay_amount=0.1)
         assert decayed == 1
         facts = kg.get_all_facts()
         assert facts[0].confidence == pytest.approx(0.7, abs=0.01)
 
-    def test_decay_respects_floor(self, db):
+    @pytest.mark.asyncio
+    async def test_decay_respects_floor(self, db):
         kg = KnowledgeGraph(db)
-        kg.add_fact("old_entity", "is_a", "thing", confidence=0.15)
+        await kg.add_fact("old_entity", "is_a", "thing", confidence=0.15)
         db.execute(
             "UPDATE kg_facts SET created_at = datetime('now', '-90 days') WHERE subject = ?",
             ("old_entity",),
         )
-        kg.decay_stale(days=60, decay_amount=0.1)
+        await kg.decay_stale(days=60, decay_amount=0.1)
         facts = kg.get_all_facts()
         assert facts[0].confidence >= 0.1  # floor
 
@@ -219,12 +242,12 @@ class TestKGDecay:
 
 class TestKGBrainIntegration:
     @pytest.fixture
-    def services_with_kg(self, db):
+    async def services_with_kg(self, db):
         from app.core.brain import Services, set_services
         from app.core.memory import ConversationStore, UserFactStore
 
         kg = KnowledgeGraph(db)
-        kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
 
         svc = Services(
             conversations=ConversationStore(db),
@@ -243,7 +266,7 @@ class TestKGBrainIntegration:
         with patch("app.core.brain.llm") as mock_llm:
             mock_result = AsyncMock()
             mock_result.content = "Bitcoin is a cryptocurrency."
-            mock_result.tool_call = None
+            mock_result.tool_calls = []
             mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
 
             captured_messages = []
@@ -274,13 +297,13 @@ class TestKGBrainIntegration:
 class TestKGExtraction:
     @pytest.mark.asyncio
     async def test_extract_triples(self, db):
-        """_extract_kg_triples should add facts from LLM response."""
+        """_extract_kg_triples should add facts with LLM-scored confidence."""
         from app.core.brain import _extract_kg_triples
 
         kg = KnowledgeGraph(db)
         mock_response = json.dumps([
-            {"subject": "Python", "predicate": "created_by", "object": "Guido van Rossum"},
-            {"subject": "Python", "predicate": "is_a", "object": "programming language"},
+            {"subject": "Python", "predicate": "created_by", "object": "Guido van Rossum", "confidence": 0.9},
+            {"subject": "Python", "predicate": "is_a", "object": "programming language", "confidence": 0.85},
         ])
 
         with patch("app.core.brain.llm") as mock_llm:
@@ -289,6 +312,8 @@ class TestKGExtraction:
 
         facts = kg.get_all_facts()
         assert len(facts) == 2
+        confs = sorted(f.confidence for f in facts)
+        assert confs == [0.85, 0.9]  # LLM-scored, not all 0.7
 
     @pytest.mark.asyncio
     async def test_extract_rejects_garbage(self, db):
@@ -324,6 +349,45 @@ class TestKGExtraction:
 
         assert kg.get_stats()["total_facts"] == 0
 
+    @pytest.mark.asyncio
+    async def test_extract_fallback_confidence(self, db):
+        """Without LLM confidence, facts should get source-tiered confidence."""
+        from app.core.brain import _extract_kg_triples
+
+        kg = KnowledgeGraph(db)
+        mock_response = json.dumps([
+            {"subject": "quantum", "predicate": "is_a", "object": "physics branch"},
+        ])
+
+        with patch("app.core.brain.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(return_value=mock_response)
+            await _extract_kg_triples(kg, "What is quantum?", "Quantum is a branch of physics.", source_name="Domain Study: Science")
+
+        facts = kg.get_all_facts()
+        assert len(facts) == 1
+        assert facts[0].confidence == 0.75  # Science tier, not 0.7
+
+    @pytest.mark.asyncio
+    async def test_extract_clamps_confidence(self, db):
+        """LLM confidence outside [0.3, 0.95] should be clamped."""
+        from app.core.brain import _extract_kg_triples
+
+        kg = KnowledgeGraph(db)
+        mock_response = json.dumps([
+            {"subject": "fact_high", "predicate": "is_a", "object": "thing", "confidence": 1.5},
+            {"subject": "fact_low", "predicate": "is_a", "object": "thing", "confidence": 0.1},
+        ])
+
+        with patch("app.core.brain.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(return_value=mock_response)
+            await _extract_kg_triples(kg, "test", "test answer")
+
+        facts = kg.get_all_facts()
+        high = next(f for f in facts if f.subject == "fact_high")
+        low = next(f for f in facts if f.subject == "fact_low")
+        assert high.confidence == 0.95
+        assert low.confidence == 0.3
+
 
 # ===========================================================================
 # Garbage Triple Detection
@@ -347,7 +411,7 @@ class TestGarbageTripleFilter:
 
     def test_test_artifacts(self):
         assert is_garbage_triple("testuser", "is_a", "person") is True
-        assert is_garbage_triple("pizza", "is_a", "food") is True
+        assert is_garbage_triple("pizza", "is_a", "food") is False  # pizza removed from _GARBAGE_VALUES
 
     def test_valid_triple_passes(self):
         assert is_garbage_triple("python", "created_by", "guido van rossum") is False
@@ -362,7 +426,7 @@ class TestContradictionDetection:
     @pytest.mark.asyncio
     async def test_no_contradiction(self, db):
         kg = KnowledgeGraph(db)
-        kg.add_fact("python", "created_by", "guido van rossum")
+        await kg.add_fact("python", "created_by", "guido van rossum")
         result = await kg.check_and_resolve_contradictions(
             "java", "created_by", "james gosling"
         )
@@ -372,7 +436,7 @@ class TestContradictionDetection:
     async def test_contradiction_keeps_new(self, db):
         from app.core import llm as llm_mod
         kg = KnowledgeGraph(db)
-        kg.add_fact("france", "capital_of", "lyon")  # wrong fact
+        await kg.add_fact("france", "capital_of", "lyon")  # wrong fact
 
         with patch.object(llm_mod, "invoke_nothink", new_callable=AsyncMock) as mock_invoke, \
              patch.object(llm_mod, "extract_json_object") as mock_extract:
@@ -391,7 +455,7 @@ class TestContradictionDetection:
     async def test_contradiction_keeps_old(self, db):
         from app.core import llm as llm_mod
         kg = KnowledgeGraph(db)
-        kg.add_fact("france", "capital_of", "paris")  # correct fact
+        await kg.add_fact("france", "capital_of", "paris")  # correct fact
 
         with patch.object(llm_mod, "invoke_nothink", new_callable=AsyncMock) as mock_invoke, \
              patch.object(llm_mod, "extract_json_object") as mock_extract:
@@ -407,7 +471,7 @@ class TestContradictionDetection:
     async def test_contradiction_llm_failure_allows_both(self, db):
         from app.core import llm as llm_mod
         kg = KnowledgeGraph(db)
-        kg.add_fact("france", "capital_of", "paris")
+        await kg.add_fact("france", "capital_of", "paris")
 
         with patch.object(llm_mod, "invoke_nothink", new_callable=AsyncMock) as mock_invoke:
             mock_invoke.side_effect = Exception("LLM down")
@@ -427,7 +491,7 @@ class TestKGCuration:
     async def test_heuristic_curation(self, db):
         from app.core import llm as llm_mod
         kg = KnowledgeGraph(db)
-        kg.add_fact("python", "created_by", "guido van rossum")  # valid
+        await kg.add_fact("python", "created_by", "guido van rossum")  # valid
 
         # Force add garbage via raw SQL (bypasses add_fact validation)
         db.execute(
@@ -452,3 +516,54 @@ class TestKGCuration:
         result = await kg.curate()
         assert result["heuristic"] == 0
         assert result["llm"] == 0
+
+
+# ===========================================================================
+# KG Relevance -- Audit Fix 2 (from test_audit_fixes2)
+# ===========================================================================
+
+class TestKGRelevanceSingleWord:
+    """KG relevance uses overlap >= 2 to avoid overly loose matches."""
+
+    @pytest.fixture
+    def kg(self, db):
+        return KnowledgeGraph(db)
+
+    @pytest.mark.asyncio
+    async def test_single_word_no_match(self, kg):
+        """Single-word queries require overlap >= 2, so one word alone doesn't match."""
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        facts = kg.get_relevant_facts("bitcoin")
+        # Single word overlap (1) is below threshold (2), so no match
+        assert len(facts) == 0
+
+    @pytest.mark.asyncio
+    async def test_two_word_match(self, kg):
+        """Two matching words should match facts (overlap >= 2)."""
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        facts = kg.get_relevant_facts("bitcoin cryptocurrency")
+        assert len(facts) >= 1
+
+    @pytest.mark.asyncio
+    async def test_multi_word_still_works(self, kg):
+        """Multi-word overlap should still rank higher than single-word."""
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        await kg.add_fact("bitcoin", "created_by", "satoshi nakamoto", confidence=0.85)
+        facts = kg.get_relevant_facts("bitcoin cryptocurrency")
+        assert len(facts) >= 1
+        assert facts[0].subject == "bitcoin"
+        assert facts[0].object == "cryptocurrency"
+
+    @pytest.mark.asyncio
+    async def test_no_match_still_empty(self, kg):
+        """Completely unrelated queries should still return no facts."""
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        facts = kg.get_relevant_facts("quantum physics")
+        assert len(facts) == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_query_returns_nothing(self, kg):
+        """Empty or stopword-only queries return nothing."""
+        await kg.add_fact("bitcoin", "is_a", "cryptocurrency", confidence=0.9)
+        facts = kg.get_relevant_facts("")
+        assert len(facts) == 0

@@ -1,4 +1,9 @@
-# Nova_
+# Nova
+
+[![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-1%2C453%20passing-brightgreen)](tests/)
+[![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
+[![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
 **The personal AI that actually learns from its mistakes.**
 
@@ -18,13 +23,19 @@ Nova: "Canberra"  ← learned permanently
 
 No other AI assistant does this.
 
+### See it in action
+
+<p align="center">
+  <img src="docs/demo.svg" alt="Nova learning loop demo" width="700">
+</p>
+
 ---
 
-## Why Nova_
+## Why Nova
 
-Nova_ is a sovereign personal AI that runs entirely on your hardware with zero cloud dependencies. It doesn't just answer questions — it gets permanently smarter through a self-improvement pipeline that no other open-source project has:
+Nova is a sovereign personal AI that runs entirely on your hardware with zero cloud dependencies. It doesn't just answer questions — it gets permanently smarter through a self-improvement pipeline that no other open-source project has:
 
-| | Nova_ | OpenClaw (216K stars) | Khoj (32K stars) | Open WebUI (124K stars) |
+| | Nova | OpenClaw (216K stars) | Khoj (32K stars) | Open WebUI (124K stars) |
 |---|---|---|---|---|
 | Learns from corrections | **Full pipeline** | No | No | No |
 | Fine-tunes itself | **DPO + A/B eval** | No | No | No |
@@ -33,7 +44,7 @@ Nova_ is a sovereign personal AI that runs entirely on your hardware with zero c
 | Zero cloud dependency | **Yes (bundled Ollama)** | No (needs API keys) | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No (CVE'd) | No | No |
 | Messaging channels | **4 (all with allowlisting)** | 22+ | 3 | 0 |
-| Proactive monitors | **14 scheduled** | Heartbeat | Automations | No |
+| Proactive monitors | **51 across 29 domains** | Heartbeat | Automations | No |
 | MCP (client + server) | **Both** | No | No | Client only |
 
 ## Quick Start
@@ -42,7 +53,7 @@ Nova_ is a sovereign personal AI that runs entirely on your hardware with zero c
 
 ```bash
 # Clone and start
-git clone https://github.com/your-org/nova_.git
+git clone https://github.com/HeliosNova/nova.git
 cd nova_
 cp .env.example .env
 docker compose up -d
@@ -73,13 +84,19 @@ User query -> brain.think()
   -> tool loop if needed (max 5 rounds, 21 tools available)
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
+
+Meanwhile, 51 monitors run autonomously:
+  -> web search across 29 domains every 1-24h
+  -> extract knowledge graph triples from every result
+  -> send alerts via Discord/Telegram when something changes
+  -> quiz itself on learned lessons, validate skills, research gaps
 ```
 
-No LangChain. No LangGraph. No agent frameworks. ~74 files of async Python + httpx + FastAPI.
+No LangChain. No LangGraph. No agent frameworks. ~79 files of async Python + httpx + FastAPI.
 
 ## The Learning Loop
 
-This is what makes Nova_ unique. Every conversation makes it smarter:
+This is what makes Nova unique. Every conversation makes it smarter:
 
 1. **Correction Detection** (2-stage) — regex pre-filter + LLM confirmation extracts what was wrong and what's correct
 2. **Lesson Storage** — topic, wrong answer, correct answer, lesson text — retrieved on future similar queries
@@ -123,7 +140,7 @@ Plus dynamically created custom tools and MCP-discovered external tools.
 
 ## Channels
 
-Talk to Nova_ where you already are:
+Talk to Nova where you already are:
 
 | Channel | Type | Config |
 |---------|------|--------|
@@ -136,38 +153,39 @@ All channels support phone-number allowlisting, message splitting, and graceful 
 
 ## Heartbeat Monitors
 
-14 proactive monitors run on schedule — Nova_ works even when you're not talking to it:
+51 autonomous monitors run on schedule across 29 domains — Nova works even when you're not talking to it:
 
-| Monitor | Schedule | What it does |
-|---------|----------|-------------|
-| Morning Check-in | Daily | Greeting + agenda |
-| System Health | 2h | Memory, disk, Ollama status |
-| Self-Reflection | Daily | Quality self-assessment |
-| Science / Tech / Events / Finance | 8-12h | Domain research → KG triples |
-| World Awareness | 4h | Global news monitoring |
-| Lesson Quiz | 6h | Self-tests on learned lessons |
-| Skill Validation | 12h | Tests skill effectiveness |
-| Curiosity Research | 1h | Researches queued knowledge gaps |
-| Auto-Monitor Detector | Daily | Detects new monitoring needs |
-| System Maintenance | Daily | Decays stale data, prunes |
-| Fine-Tune Check | Weekly | Reports when ready for retraining |
+| Category | Monitors | Schedule | What they do |
+|----------|----------|----------|-------------|
+| **Operational** | Morning Check-in, System Health, Self-Reflection, System Maintenance, Fine-Tune Check | 2h-weekly | Health checks, self-assessment, data hygiene |
+| **Self-Improvement** | Lesson Quiz, Skill Validation, Curiosity Research, Auto-Monitor Detector | 1-12h | Self-tests on learned lessons, validates skills, researches knowledge gaps |
+| **Financial Intelligence** | Finance, Crypto & Web3, DeFi & Protocols, Whale Watch, Top Trades & Positioning, Commodities & Forex, Earnings & Corporate Events, Economics & Markets | 6-12h | Whale movements, trader positioning, commodity prices, earnings, macro data |
+| **International** | China Tech & Economy, Russia & Eastern Europe, Middle East, India, Europe & EU, Latin America, Africa & Emerging Markets | 8-24h | Regional perspectives from every major economic zone |
+| **Science & Tech** | Science, Technology, AI & ML, Space & Astronomy, Quantum Computing, Robotics & Autonomy, Physics & Mathematics, Biotech & Genetics, Semiconductors | 8-24h | Research breakthroughs, model releases, chip industry, gene therapy |
+| **Policy & Security** | US Policy & Regulation, Cybersecurity, Energy & Climate, Defense & Military Tech | 12h | Regulation, CVEs, climate policy, defense contracts |
+| **Culture & Local** | Sports, Entertainment & Gaming, Social Media Platforms, Local: Los Angeles | 6-12h | Scores, releases, platform changes, local news |
+| **Developer** | Open Source & GitHub, Developer Ecosystem, Startups & VC | 12h | Trending repos, framework releases, funding rounds |
+| **Global** | World Awareness, Current Events, Geopolitics, Supply Chain & Trade, Climate & Weather, Research Frontiers | 4-24h | Breaking news, trade disruptions, trending papers |
+
+Every query-type monitor auto-extracts knowledge graph triples. All results include today's date — no stale content.
 
 ## Knowledge Graph
 
-Temporal knowledge graph with structured facts:
+Temporal knowledge graph that grows autonomously — 200+ new facts per day from 37 domain monitors:
 
-- 20 canonical predicates (`is_a`, `located_in`, `created_by`, etc.)
+- 20 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, etc.)
 - `valid_from` / `valid_to` — when a fact was true
-- `superseded_by` — tracks how facts change over time
+- `superseded_by` — tracks how facts change over time (old facts aren't deleted, they're versioned)
 - `provenance` — which source/conversation created it
 - `query_at(entity, timestamp)` — what was true at a specific time
 - Auto-curation: heuristic + LLM pass removes garbage triples
+- Facts are used in chat: relevant KG triples are injected into the system prompt for contextual answers
 
 ## MCP Integration
 
-Nova_ is both an MCP **client** and **server** — unique in the landscape:
+Nova is both an MCP **client** and **server** — unique in the landscape:
 
-**As client:** Drop MCP tool configs in `/data/mcp/` and Nova_ discovers and uses them.
+**As client:** Drop MCP tool configs in `/data/mcp/` and Nova discovers and uses them.
 
 **As server:** Exposes 5 tools for Claude Code, Cursor, or any MCP client:
 - `nova_memory_query` — search user facts and conversations
@@ -218,7 +236,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-1,443 tests across 57 files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
+1,453 tests across 60+ files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
 
 ## Hardware Requirements
 
@@ -229,9 +247,37 @@ docker exec nova-app sh -c "python -m pytest tests/ -v"
 | Disk | 50GB | 100GB |
 | GPU | RTX 3090 | RTX 4090 / A5000 |
 
+### Low VRAM / No GPU Options
+
+Nova's LLM layer is provider-agnostic — you don't need a 3090.
+
+| Setup | VRAM | How |
+|-------|------|-----|
+| **Full local (default)** | 20GB+ | `qwen3.5:27b` via Ollama |
+| **Quantized local** | 16GB | `qwen3.5:27b-q4_K_M` — set `LLM_MODEL=qwen3.5:27b-q4_K_M` in `.env` |
+| **Smaller model** | 8GB | `qwen3.5:9b` — set `LLM_MODEL=qwen3.5:9b` in `.env` |
+| **Tiny model** | 4GB | `qwen3.5:4b` — set `LLM_MODEL=qwen3.5:4b` in `.env` |
+| **Cloud inference** | 0GB | Set `LLM_PROVIDER=openai` (or `anthropic`/`google`) + API key |
+| **Mixed** | 0GB | Cloud for inference, local for everything else |
+
+All options keep your data fully local — memory, knowledge graph, lessons, training pairs, and conversations never leave your machine. Cloud mode only sends the current query + context to the LLM provider.
+
+```bash
+# Cloud mode — no GPU needed
+docker compose -f docker-compose.cloud.yml up -d
+
+# Quantized — fits in 16GB VRAM
+# Just change LLM_MODEL in .env, then:
+docker compose up -d
+```
+
 ## Configuration
 
 All settings via `.env`. See [CLAUDE.md](CLAUDE.md) for the full list of 75+ config fields.
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs welcome.
 
 ## License
 

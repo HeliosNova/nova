@@ -1,6 +1,7 @@
 import { useState, useRef, useEffect, useCallback } from "react";
 import { ImagePlus, Send, Square, X, ArrowUp, Mic, MicOff } from "lucide-react";
 import { toast } from "sonner";
+import { transcribeVoice, getConfigSummary } from "@/lib/api";
 
 interface Props {
   onSend: (text: string, imageBase64?: string) => void;
@@ -26,13 +27,12 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef = useRef<Blob[]>([]);
 
-  // Check if voice is enabled on mount
+  // Check if voice is enabled on mount (via config-summary with auth headers)
   useEffect(() => {
     const checkVoice = async () => {
       try {
-        const resp = await fetch("/api/voice/transcribe", { method: "POST" });
-        // If it's not a 404, voice endpoints exist (might be 400/422 due to no file, that's OK)
-        setVoiceEnabled(resp.status !== 404);
+        const data = await getConfigSummary();
+        setVoiceEnabled(!!data.ENABLE_VOICE);
       } catch {
         setVoiceEnabled(false);
       }
@@ -130,28 +130,7 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
 
         setTranscribing(true);
         try {
-          const form = new FormData();
-          form.append("file", blob, "recording.webm");
-
-          const controller = new AbortController();
-          const timeout = setTimeout(() => controller.abort(), 30000);
-
-          const resp = await fetch("/api/voice/transcribe", {
-            method: "POST",
-            body: form,
-            signal: controller.signal,
-          });
-          clearTimeout(timeout);
-
-          if (!resp.ok) {
-            const statusMsg =
-              resp.status === 413 ? "Recording too large — try a shorter clip"
-              : resp.status === 422 ? "Audio format not supported"
-              : resp.status === 503 ? "Transcription service unavailable — is Whisper loaded?"
-              : `Transcription failed (HTTP ${resp.status})`;
-            throw new Error(statusMsg);
-          }
-          const data = await resp.json();
+          const data = await transcribeVoice(blob, "recording.webm");
           if (data.text) {
             setText((prev) => (prev ? prev + " " + data.text : data.text));
             textareaRef.current?.focus();
@@ -232,8 +211,8 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
           onClick={() => fileInputRef.current?.click()}
           disabled={streaming || disabled}
           className="rounded-lg p-2 text-nova-text-dim hover:bg-nova-surface-elevated hover:text-nova-text disabled:opacity-40 transition-all"
-          title="Attach image"
-          aria-label="Attach image"
+          title="Attach image (max 10MB)"
+          aria-label="Attach image (max 10MB)"
         >
           <ImagePlus size={18} />
         </button>
@@ -256,7 +235,7 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
           onPaste={handlePaste}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
-          placeholder={transcribing ? "Transcribing..." : imageBase64 ? "Describe what you want to know..." : "Message Nova_..."}
+          placeholder={transcribing ? "Transcribing..." : imageBase64 ? "Describe what you want to know..." : "Message Nova..."}
           rows={1}
           className="flex-1 resize-none bg-transparent px-1 py-2 text-sm text-nova-text placeholder:text-nova-text-dim/60 outline-none"
           style={{ maxHeight: 150 }}

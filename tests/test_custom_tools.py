@@ -85,11 +85,12 @@ class TestCustomToolStore:
         assert tool is not None
 
     def test_max_tools_limit(self, store):
-        store.MAX_TOOLS = 3
-        for i in range(3):
-            store.create_tool(f"tool_{i}", "desc", "[]", f'def run(): return "{i}"')
-        tid = store.create_tool("tool_overflow", "desc", "[]", 'def run(): return "x"')
-        assert tid == -1
+        from unittest.mock import patch
+        with patch.object(type(store), "MAX_TOOLS", new=property(lambda self: 3)):
+            for i in range(3):
+                store.create_tool(f"tool_{i}", "desc", "[]", f'def run(): return "{i}"')
+            tid = store.create_tool("tool_overflow", "desc", "[]", 'def run(): return "x"')
+            assert tid == -1
 
     def test_invalid_parameters_defaults_to_empty(self, store):
         tid = store.create_tool("bad_params", "desc", "not json", 'def run(): return "ok"')
@@ -124,11 +125,12 @@ class TestUsageTracking:
         store.record_use("counter", success=False)
         tool = store.get_tool("counter")
         assert tool.times_used == 1
-        assert tool.success_rate == 0.0
+        # EMA (alpha=0.15): 0.15*0.0 + 0.85*1.0 = 0.85
+        assert tool.success_rate == pytest.approx(0.85, abs=0.01)
 
     def test_auto_disable_on_low_success_rate(self, store):
-        # 5 failures in a row → should auto-disable
-        for _ in range(5):
+        # EMA needs more failures to drop below 0.3 threshold
+        for _ in range(8):
             store.record_use("counter", success=False)
         tool = store.get_tool("counter")
         assert tool is None  # disabled
@@ -146,6 +148,13 @@ class TestUsageTracking:
 # ===========================================================================
 
 class TestDynamicTool:
+    @pytest.fixture(autouse=True)
+    def _set_tier(self):
+        """DynamicTool requires standard/full tier."""
+        with patch("app.core.access_tiers.config") as mock_cfg:
+            mock_cfg.SYSTEM_ACCESS_LEVEL = "standard"
+            yield
+
     @pytest.fixture
     def tool(self, db):
         store = CustomToolStore(db)
@@ -174,9 +183,10 @@ class TestDynamicTool:
     async def test_unsafe_code_blocked(self, db):
         store = CustomToolStore(db)
         # Manually insert unsafe code bypassing safety check
+        # Use ctypes which is blocked at ALL tiers (including standard)
         db.execute(
             "INSERT INTO custom_tools (name, description, parameters, code) VALUES (?, ?, ?, ?)",
-            ("evil", "bad tool", "[]", "import os\ndef run(): return os.getcwd()"),
+            ("evil", "bad tool", "[]", "import ctypes\ndef run(): return str(ctypes)"),
         )
         record = store.get_tool("evil")
         tool = DynamicTool(record, store)

@@ -1,6 +1,6 @@
-# Contributing to Nova_
+# Contributing to Nova
 
-Thanks for your interest in contributing to Nova_!
+Thanks for your interest in contributing to Nova!
 
 ## Development Setup
 

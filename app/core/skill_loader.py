@@ -28,11 +28,11 @@ class ExternalSkill:
     body: str                          # Full markdown body (instructions)
     metadata: dict = field(default_factory=dict)
     requirements_met: bool = True
-    tool_mapping: dict = field(default_factory=dict)  # OpenClaw tool -> Nova_ tool
+    tool_mapping: dict = field(default_factory=dict)  # OpenClaw tool -> Nova tool
     _description_words: set = field(default_factory=set, repr=False)
 
 
-# Maps OpenClaw/AgentSkills tool names to Nova_ tool names
+# Maps OpenClaw/AgentSkills tool names to Nova tool names
 _TOOL_MAP = {
     "bash": "shell_exec",
     "read": "file_ops",
@@ -162,7 +162,7 @@ def _check_requirements(metadata: dict) -> tuple[bool, list[str]]:
 
 
 def _map_tools(metadata: dict) -> dict[str, str]:
-    """Map OpenClaw allowed-tools to Nova_ tool names."""
+    """Map OpenClaw allowed-tools to Nova tool names."""
     allowed = metadata.get("allowed-tools", [])
     if isinstance(allowed, str):
         allowed = [allowed]
@@ -239,7 +239,7 @@ def load_skills(skills_dir: str | None = None) -> list[ExternalSkill]:
     return skills
 
 
-def match_skill(query: str, skills: list[ExternalSkill], threshold: float = 0.2) -> ExternalSkill | None:
+def match_skill(query: str, skills: list[ExternalSkill], threshold: float = 0.3) -> ExternalSkill | None:
     """Find the best matching external skill for a query using Jaccard overlap.
 
     Returns the top match if similarity >= threshold, else None.

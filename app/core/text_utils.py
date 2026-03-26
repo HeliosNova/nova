@@ -57,9 +57,9 @@ _SUFFIX_RULES: list[tuple[str, str]] = [
     ("ational", "ate"), ("tional", "tion"), ("ization", "ize"),
     ("fulness", "ful"), ("iveness", "ive"), ("ousness", "ous"),
     ("ement", ""), ("ment", ""), ("ness", ""),
-    ("ities", "ity"), ("ying", "y"), ("ling", "l"),
+    ("ities", "ity"), ("ying", "y"),
     ("ating", "ate"), ("izing", "ize"),
-    ("tion", "te"), ("sion", "se"),
+    ("ation", "ate"), ("ssion", "ss"),
     ("ious", ""), ("eous", ""), ("ous", ""),
     ("ible", ""), ("able", ""),
     ("ive", ""), ("ize", "ize"),  # keep -ize so "optimize" stays "optimize"
@@ -119,3 +119,53 @@ def normalize_words(text: str, *, min_length: int = 1, stem: bool = True) -> set
 def content_words(text: str) -> set[str]:
     """Lowercase words, strip punctuation, remove stop words, stem. Shorthand for normalize_words."""
     return normalize_words(text)
+
+
+def detect_image_mime(base64_data: str) -> str:
+    """Detect image MIME type from base64 data URI prefix or magic bytes.
+
+    Returns a MIME type string like 'image/png', 'image/jpeg', etc.
+    Falls back to 'image/png' if detection fails.
+    """
+    # Check data URI prefix first (e.g., "data:image/jpeg;base64,...")
+    if base64_data.startswith("data:"):
+        try:
+            mime = base64_data.split(";")[0].split(":")[1]
+            if mime.startswith("image/"):
+                return mime
+        except (IndexError, ValueError):
+            pass
+        # Strip the data URI prefix for magic byte detection
+        if ",," in base64_data:
+            base64_data = base64_data.split(",", 1)[1]
+        elif "," in base64_data:
+            base64_data = base64_data.split(",", 1)[1]
+
+    # Detect from decoded magic bytes
+    import base64
+    try:
+        header = base64.b64decode(base64_data[:32])
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            return "image/png"
+        if header[:3] == b'\xff\xd8\xff':
+            return "image/jpeg"
+        if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+            return "image/webp"
+        if header[:6] in (b'GIF87a', b'GIF89a'):
+            return "image/gif"
+    except Exception:
+        pass
+
+    return "image/png"  # safe default
+
+
+def estimate_tokens(text: str) -> int:
+    """Rough token estimate: ~4 chars/token for English, ~1.5 chars/token for CJK."""
+    if not text:
+        return 0
+    cjk_count = sum(
+        1 for c in text
+        if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af'
+    )
+    non_cjk = len(text) - cjk_count
+    return non_cjk // 4 + int(cjk_count / 1.5)

@@ -38,6 +38,16 @@ class OllamaProvider:
         self._embed_model = embed_model or config.EMBEDDING_MODEL
         self._client: httpx.AsyncClient | None = None
 
+    @property
+    def capabilities(self) -> "ProviderCapabilities":
+        from app.core.llm import ProviderCapabilities
+        return ProviderCapabilities(
+            needs_emphatic_prompts=True,
+            supports_native_tools=False,
+            supports_thinking=True,
+            json_prefix_behavior="prepend",
+        )
+
     def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
             try:
@@ -128,8 +138,8 @@ class OllamaProvider:
         except LLMUnavailableError:
             raise
         except Exception as e:
-            logger.warning("[invoke_nothink] Unexpected error: %s", e)
-            return ""
+            logger.error("[invoke_nothink] Unexpected error: %s", e)
+            raise LLMUnavailableError(f"Ollama unexpected error: {e}")
 
     async def generate_with_tools(
         self,
@@ -137,9 +147,10 @@ class OllamaProvider:
         tools: list[dict],
         *,
         model: str | None = None,
-        temperature: float = 0.4,
+        temperature: float = 0.5,
         max_tokens: int = 2000,
         images: list[str] | None = None,
+        tool_choice: str | None = None,  # ignored — Ollama has no native tool calling
     ) -> GenerationResult:
         model = model or self._llm_model
         client = self._get_client()
@@ -180,9 +191,26 @@ class OllamaProvider:
         content = data.get("message", {}).get("content", "")
         content = _strip_think_tags(content).strip()
 
+        # Populate usage from Ollama response
+        usage = None
+        if "eval_count" in data or "prompt_eval_count" in data:
+            usage = {"completion_tokens": data.get("eval_count", 0), "prompt_tokens": data.get("prompt_eval_count", 0)}
+
+        # Detect truncation due to token limit
+        done_reason = data.get("done_reason", "")
+        if done_reason == "length":
+            logger.warning("Ollama response truncated (done_reason=length)")
+            content += "\n\n[Warning: Response was truncated due to token limit]"
+
         tool_call = _extract_tool_call(content, tools)
 
-        return GenerationResult(content=content, tool_call=tool_call, raw=data)
+        return GenerationResult(
+            content=content,
+            tool_calls=[tool_call] if tool_call else [],
+            raw=data,
+            usage=usage,
+            stop_reason=data.get("done_reason", ""),
+        )
 
     async def stream_with_thinking(
         self,
@@ -190,58 +218,85 @@ class OllamaProvider:
         tools: list[dict],
         *,
         model: str | None = None,
-        temperature: float = 0.4,
+        temperature: float = 0.6,
         max_tokens: int = 4000,
+        tool_choice: str | None = None,  # ignored — Ollama has no native tool calling
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Stream a response with thinking enabled. Yields incremental chunks."""
+        """Stream a response with thinking enabled. Yields incremental chunks.
+
+        Note: tools are not passed to Ollama streaming — Qwen3.5 native tool
+        calling via Ollama is broken (GitHub ollama/ollama#14493). Tool calls
+        are extracted from text output by the brain's _extract_tool_calls().
+        """
         model = model or self._llm_model
         client = self._get_client()
+        use_think = True  # Fallback to False if model doesn't support thinking
 
+        _yielded_done = False
         max_stream_retries = 2
-        for _stream_attempt in range(max_stream_retries + 1):
-            try:
-                async with client.stream(
-                    "POST",
-                    "/api/chat",
-                    json={
-                        "model": model,
-                        "stream": True,
-                        "think": True,
-                        "messages": messages,
-                        "options": {
-                            "num_predict": max_tokens,
-                            "temperature": temperature,
+        try:
+            for _stream_attempt in range(max_stream_retries + 1):
+                try:
+                    async with client.stream(
+                        "POST",
+                        "/api/chat",
+                        json={
+                            "model": model,
+                            "stream": True,
+                            **({"think": True} if use_think else {}),
+                            "messages": messages,
+                            "options": {
+                                "num_predict": max_tokens,
+                                "temperature": temperature,
+                            },
                         },
-                    },
-                    timeout=httpx.Timeout(float(config.GENERATION_TIMEOUT), connect=10.0, read=60.0),
-                ) as resp:
-                    resp.raise_for_status()
-                    async for line in resp.aiter_lines():
-                        if not line.strip():
-                            continue
-                        try:
-                            chunk_data = json.loads(line)
-                        except json.JSONDecodeError:
-                            continue
+                        timeout=httpx.Timeout(float(config.GENERATION_TIMEOUT), connect=10.0, read=300.0),
+                    ) as resp:
+                        # Catch models that don't support thinking (missing RENDERER/PARSER)
+                        if resp.status_code == 400 and use_think:
+                            body = await resp.aread()
+                            if b"does not support thinking" in body:
+                                logger.warning(
+                                    "Model '%s' does not support thinking API — "
+                                    "falling back to think=false. Fix: add RENDERER/PARSER to Modelfile.",
+                                    model,
+                                )
+                                use_think = False
+                                continue  # Retry without think=true
+                        resp.raise_for_status()
+                        async for line in resp.aiter_lines():
+                            if not line.strip():
+                                continue
+                            try:
+                                chunk_data = json.loads(line)
+                            except json.JSONDecodeError:
+                                continue
 
-                        msg = chunk_data.get("message", {})
-                        thinking_delta = msg.get("thinking", "")
-                        content_delta = msg.get("content", "")
-                        done = chunk_data.get("done", False)
+                            msg = chunk_data.get("message", {})
+                            thinking_delta = msg.get("thinking", "")
+                            content_delta = msg.get("content", "")
+                            done = chunk_data.get("done", False)
 
-                        if thinking_delta or content_delta or done:
-                            yield StreamChunk(
-                                thinking=thinking_delta,
-                                content=content_delta,
-                                done=done,
-                            )
-                return  # Success — exit retry loop
-            except httpx.ConnectError:
-                if _stream_attempt < max_stream_retries:
-                    import asyncio
-                    logger.warning("Ollama stream connect error, retrying (%d/%d)", _stream_attempt + 1, max_stream_retries)
-                    await asyncio.sleep(2.0)
-                    continue
-                raise LLMUnavailableError("Cannot connect to Ollama. Is it running?")
-            except httpx.TimeoutException:
-                raise LLMUnavailableError("Ollama request timed out.")
+                            if thinking_delta or content_delta or done:
+                                if done:
+                                    _yielded_done = True
+                                yield StreamChunk(
+                                    thinking=thinking_delta,
+                                    content=content_delta,
+                                    done=done,
+                                )
+                    return  # Success — exit retry loop
+                except httpx.ReadError:
+                    raise LLMUnavailableError("Connection lost during Ollama streaming")
+                except httpx.ConnectError:
+                    if _stream_attempt < max_stream_retries:
+                        import asyncio
+                        logger.warning("Ollama stream connect error, retrying (%d/%d)", _stream_attempt + 1, max_stream_retries)
+                        await asyncio.sleep(2.0)
+                        continue
+                    raise LLMUnavailableError("Cannot connect to Ollama. Is it running?")
+                except httpx.TimeoutException:
+                    raise LLMUnavailableError("Ollama request timed out.")
+        finally:
+            if not _yielded_done:
+                yield StreamChunk(done=True)

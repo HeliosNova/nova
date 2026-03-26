@@ -1,6 +1,6 @@
 ---
 name: Bug Report
-about: Report a bug in Nova_
+about: Report a bug in Nova
 title: "[Bug] "
 labels: bug
 assignees: ''

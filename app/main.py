@@ -1,4 +1,4 @@
-"""Nova_ — Sovereign Personal AI.
+"""Nova — Sovereign Personal AI.
 
 FastAPI application entry point.
 """
@@ -19,6 +19,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from app import __version__
+from app.auth import _get_client_ip
 from app.config import config
 
 # Correlation ID for request tracing
@@ -73,7 +75,13 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI):
     """Startup and shutdown lifecycle."""
     # --- Startup ---
-    logger.info("Nova_ starting up...")
+    logger.info("Nova starting up...")
+
+    # Auth check — warn prominently if API_KEY is not set
+    if not config.API_KEY:
+        logger.critical(
+            "*** SECURITY WARNING: NOVA_API_KEY is not set — all endpoints are publicly accessible! ***"
+        )
 
     # Validate configuration
     config_warnings = config.validate()
@@ -93,6 +101,10 @@ async def lifespan(app: FastAPI):
     db.init_schema()
     logger.info("Database initialized at %s", config.DB_PATH)
 
+    # Restore auth lockout state from DB
+    from app.auth import load_lockouts_from_db
+    load_lockouts_from_db()
+
     # Core services
     conversations = ConversationStore(db)
     user_facts = UserFactStore(db)
@@ -111,6 +123,7 @@ async def lifespan(app: FastAPI):
 
     # KG auto-curation (heuristic pass runs inline, LLM pass runs in background)
     # Note: KG/reflexion decay is handled by the daily maintenance monitor
+    kg_curation_task = None
     try:
         curation = await kg.curate(sample_size=0)  # heuristic only — fast
         heuristic_cleaned = curation.get("heuristic", 0)
@@ -126,7 +139,7 @@ async def lifespan(app: FastAPI):
             except Exception as e:
                 logger.warning("KG LLM curation failed (non-blocking): %s", e)
 
-        asyncio.create_task(_bg_kg_curate())
+        kg_curation_task = asyncio.create_task(_bg_kg_curate())
     except Exception as e:
         logger.warning("KG curation failed: %s", e)
 
@@ -227,14 +240,18 @@ async def lifespan(app: FastAPI):
     # Monitor store + monitor tool
     monitor_store = None
     if config.ENABLE_HEARTBEAT:
-        from app.monitors.heartbeat import MonitorStore
-        monitor_store = MonitorStore(db)
-        registry.register(MonitorTool(monitor_store=monitor_store))
-        registry.register(ReminderTool(monitor_store=monitor_store))
-        seeded = monitor_store.seed_defaults()
-        if seeded:
-            logger.info("Seeded %d default monitor(s)", seeded)
-        logger.info("Monitor store initialized (%d monitors)", len(monitor_store.list_all()))
+        try:
+            from app.monitors.heartbeat import MonitorStore
+            monitor_store = MonitorStore(db)
+            registry.register(MonitorTool(monitor_store=monitor_store))
+            registry.register(ReminderTool(monitor_store=monitor_store))
+            seeded = monitor_store.seed_defaults()
+            if seeded:
+                logger.info("Seeded %d default monitor(s)", seeded)
+            logger.info("Monitor store initialized (%d monitors)", len(monitor_store.list_all()))
+        except Exception as e:
+            logger.warning("Monitor store init failed (heartbeat disabled): %s", e)
+            monitor_store = None
 
     # Curiosity engine + topic tracker
     curiosity_queue = None
@@ -347,40 +364,60 @@ async def lifespan(app: FastAPI):
         logger.info("Signal bot starting (polling mode)...")
 
     # Start heartbeat + proactive engines
+    def _on_bg_task_done(task: asyncio.Task) -> None:
+        """Log unhandled exceptions from monitor background tasks."""
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            logger.error("Background task %s died: %s", task.get_name(), exc, exc_info=exc)
+
     heartbeat_loop = None
     daily_digest = None
     if config.ENABLE_HEARTBEAT and monitor_store:
-        from app.monitors.heartbeat import HeartbeatLoop
-        from app.monitors.proactive import DailyDigest
-        heartbeat_loop = HeartbeatLoop(
-            monitor_store,
-            discord_bot=discord_bot,
-            telegram_bot=telegram_bot,
-            whatsapp_bot=whatsapp_bot,
-            signal_bot=signal_bot,
-        )
-        heartbeat_loop.start()
-        svc.heartbeat = heartbeat_loop
-        logger.info("Heartbeat loop started")
-
-        if config.ENABLE_PROACTIVE:
-            daily_digest = DailyDigest(
+        try:
+            from app.monitors.heartbeat import HeartbeatLoop
+            from app.monitors.proactive import DailyDigest
+            heartbeat_loop = HeartbeatLoop(
                 monitor_store,
                 discord_bot=discord_bot,
                 telegram_bot=telegram_bot,
                 whatsapp_bot=whatsapp_bot,
                 signal_bot=signal_bot,
-                learning_engine=learning,
             )
-            daily_digest.start()
-            logger.info("Daily digest started (hour=%d)", config.DIGEST_HOUR)
+            task = heartbeat_loop.start()
+            task.add_done_callback(_on_bg_task_done)
+            svc.heartbeat = heartbeat_loop
+            logger.info("Heartbeat loop started")
 
-    logger.info("Nova_ ready.")
+            if config.ENABLE_PROACTIVE:
+                daily_digest = DailyDigest(
+                    monitor_store,
+                    discord_bot=discord_bot,
+                    telegram_bot=telegram_bot,
+                    whatsapp_bot=whatsapp_bot,
+                    signal_bot=signal_bot,
+                    learning_engine=learning,
+                )
+                dtask = daily_digest.start()
+                dtask.add_done_callback(_on_bg_task_done)
+                logger.info("Daily digest started (hour=%d)", config.DIGEST_HOUR)
+        except Exception as e:
+            logger.warning("Heartbeat/proactive startup failed: %s", e)
+
+    logger.info("Nova ready.")
 
     yield
 
     # --- Shutdown ---
-    logger.info("Nova_ shutting down...")
+    logger.info("Nova shutting down...")
+
+    # Cancel KG curation task if still running
+    try:
+        if kg_curation_task is not None and not kg_curation_task.done():
+            kg_curation_task.cancel()
+    except NameError:
+        pass  # kg_curation_task was never assigned (curation failed at startup)
 
     # Stop heartbeat + proactive
     if heartbeat_loop:
@@ -399,6 +436,8 @@ async def lifespan(app: FastAPI):
         await signal_bot.close()
     for task in channel_tasks:
         task.cancel()
+    if channel_tasks:
+        await asyncio.gather(*channel_tasks, return_exceptions=True)
 
     # Unload Whisper model
     if config.ENABLE_VOICE:
@@ -425,11 +464,16 @@ async def lifespan(app: FastAPI):
     close_all()
 
 
+_docs_url = None if config.API_KEY else "/docs"
+_redoc_url = None if config.API_KEY else "/redoc"
+
 app = FastAPI(
-    title="Nova_",
-    version="1.0.0",
+    title="Nova",
+    version=__version__,
     description="Sovereign Personal AI",
     lifespan=lifespan,
+    docs_url=_docs_url,
+    redoc_url=_redoc_url,
 )
 
 # Rate limiting — simple in-memory per-IP limiter
@@ -453,9 +497,11 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path == "/api/health":
             return await call_next(request)
 
-        client_ip = request.client.host if request.client else "unknown"
+        client_ip = _get_client_ip(request)
         now = time.time()
         cutoff = now - self.window
+
+        _HARD_CAP = 10_000  # Absolute max tracked IPs to prevent memory exhaustion
 
         async with self._lock:
             # Prune old entries for this IP
@@ -468,33 +514,48 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
                 for ip in stale:
                     del self._requests[ip]
 
+            # Hard cap: if still too many IPs after stale eviction, drop oldest entries
+            if len(self._requests) > _HARD_CAP:
+                # Sort by most recent request timestamp, keep newest _HARD_CAP // 2
+                sorted_ips = sorted(
+                    self._requests.items(),
+                    key=lambda kv: kv[1][-1] if kv[1] else 0,
+                    reverse=True,
+                )
+                keep = _HARD_CAP // 2
+                self._requests.clear()
+                for ip, ts in sorted_ips[:keep]:
+                    self._requests[ip] = ts
+
             current_count = len(self._requests[client_ip])
 
-            if current_count >= self.max_requests:
+            # Read limit dynamically so runtime config changes take effect
+            effective_limit = config.RATE_LIMIT_RPM
+            if current_count >= effective_limit:
                 # Find earliest expiry for reset time
                 reset_time = int(self._requests[client_ip][0] + self.window)
                 return JSONResponse(
                     status_code=429,
                     content={"detail": "Too many requests. Try again later."},
                     headers={
-                        "X-RateLimit-Limit": str(self.max_requests),
+                        "X-RateLimit-Limit": str(effective_limit),
                         "X-RateLimit-Remaining": "0",
                         "X-RateLimit-Reset": str(reset_time),
                     },
                 )
 
             self._requests[client_ip].append(now)
-            remaining = self.max_requests - current_count - 1
+            remaining = effective_limit - current_count - 1
             reset_time = int(now + self.window)
 
         response = await call_next(request)
-        response.headers["X-RateLimit-Limit"] = str(self.max_requests)
+        response.headers["X-RateLimit-Limit"] = str(effective_limit)
         response.headers["X-RateLimit-Remaining"] = str(remaining)
         response.headers["X-RateLimit-Reset"] = str(reset_time)
         return response
 
 
-app.add_middleware(RateLimitMiddleware, max_requests=60, window_seconds=60)
+app.add_middleware(RateLimitMiddleware, max_requests=config.RATE_LIMIT_RPM, window_seconds=60)
 
 
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
@@ -505,7 +566,7 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; connect-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:"
         response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
         return response
 

@@ -96,6 +96,9 @@ export default function ActionsPage() {
     <div className="flex-1 overflow-y-auto">
       <div className="mx-auto max-w-4xl w-full px-4 md:px-6 py-6">
         <PageHeader icon={<Zap size={22} />} title="Action Audit Log" />
+        <p className="mb-4 -mt-2 text-xs text-nova-text-dim">
+          System actions logged when Nova uses tools, sends alerts, runs monitors, or processes background tasks.
+        </p>
 
         {/* Filters */}
         <div className="mb-4 flex items-center gap-3">
@@ -126,6 +129,7 @@ export default function ActionsPage() {
           <EmptyState
             icon={<Zap size={40} strokeWidth={1.5} />}
             title="No actions in this time range."
+            description="Actions are logged when Nova uses tools, runs monitors, or processes background tasks. Try a longer time range."
           />
         ) : (
           <div className="overflow-x-auto rounded-lg border border-nova-border">

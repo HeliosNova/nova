@@ -1,4 +1,4 @@
-"""Telegram channel adapter — connects Nova_ to Telegram via python-telegram-bot."""
+"""Telegram channel adapter — connects Nova to Telegram via python-telegram-bot."""
 
 from __future__ import annotations
 
@@ -6,7 +6,6 @@ import asyncio
 import collections
 import logging
 
-import httpx
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -30,7 +29,10 @@ class TelegramBot:
         self.default_chat_id = config.TELEGRAM_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
         self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # telegram user_id → conv_id
+        self._conv_store = None  # lazy-init DB store
+        self._conv_lock = asyncio.Lock()
         self._app: Application | None = None
+        self._stop_event = asyncio.Event()
 
     @staticmethod
     def _parse_allowed_users() -> set[int]:
@@ -52,22 +54,30 @@ class TelegramBot:
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /start command."""
+        if not self._is_allowed(update.effective_user.id):
+            await update.message.reply_text("Sorry, you're not authorized to use this bot.")
+            return
+        logger.info(
+            "[Telegram] /start from user_id=%s chat_id=%s username=%s",
+            update.effective_user.id, update.effective_chat.id, update.effective_user.username,
+        )
         await update.message.reply_text(
-            "Hello! I'm Nova_, your personal AI assistant. Send me a message to get started."
+            "Hello! I'm Nova, your personal AI assistant. Send me a message to get started."
         )
 
     async def _handle_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle /status command."""
+        if not self._is_allowed(update.effective_user.id):
+            await update.message.reply_text("Unauthorized")
+            return
         try:
             import httpx
             async with httpx.AsyncClient() as client:
-                resp = await client.get(f"http://nova:{config.PORT}/api/health", timeout=5)
+                resp = await client.get(f"http://127.0.0.1:{config.PORT}/api/health", timeout=5)
                 data = resp.json()
                 status = (
                     f"Status: {data.get('status', 'unknown')}\n"
-                    f"Model: {data.get('model', 'unknown')}\n"
-                    f"Ollama: {'connected' if data.get('ollama_connected') else 'disconnected'}\n"
-                    f"DB: {'connected' if data.get('db_connected') else 'disconnected'}"
+                    f"Timestamp: {data.get('timestamp', 'unknown')}"
                 )
         except httpx.ConnectError:
             status = "Could not reach health endpoint (connection refused)"
@@ -113,17 +123,23 @@ class TelegramBot:
         from app.core.brain import think, get_services
 
         # Get or create conversation for this user
-        conv_id = self._conversations.get(user_id)
-        if conv_id:
-            # Move to end so it's marked as recently used
-            self._conversations.move_to_end(user_id)
-        else:
-            svc = get_services()
-            conv_id = svc.conversations.create_conversation()
-            self._conversations[user_id] = conv_id
-            # LRU eviction: cap at 1000 entries
-            while len(self._conversations) > 1000:
-                self._conversations.popitem(last=False)
+        async with self._conv_lock:
+            conv_id = self._conversations.get(user_id)
+            if conv_id:
+                self._conversations.move_to_end(user_id)
+            else:
+                # Try DB recovery
+                if self._conv_store is None:
+                    from app.database import get_db, ChannelConversationStore
+                    self._conv_store = ChannelConversationStore(get_db())
+                conv_id = self._conv_store.get("telegram", str(user_id))
+                if not conv_id:
+                    svc = get_services()
+                    conv_id = svc.conversations.create_conversation()
+                    self._conv_store.set("telegram", str(user_id), conv_id)
+                self._conversations[user_id] = conv_id
+                while len(self._conversations) > 1000:  # LRU cap for personal bot
+                    self._conversations.popitem(last=False)
 
         try:
             tokens = []
@@ -191,9 +207,21 @@ class TelegramBot:
             await self._app.updater.start_polling(drop_pending_updates=True)
             logger.info("[Telegram] Bot started, polling for messages")
 
-            # Keep running until cancelled
-            while True:
-                await asyncio.sleep(3600)
+            # Validate default chat_id at startup so bad config surfaces immediately
+            if self.default_chat_id:
+                try:
+                    chat = await self._app.bot.get_chat(chat_id=int(self.default_chat_id))
+                    logger.info("[Telegram] Alert chat validated: %s (type=%s)", chat.title or chat.first_name or chat.id, chat.type)
+                except Exception as e:
+                    logger.error(
+                        "[Telegram] TELEGRAM_CHAT_ID=%s is invalid (%s). "
+                        "Send /start to the bot, then check logs or use: "
+                        "curl https://api.telegram.org/bot<TOKEN>/getUpdates",
+                        self.default_chat_id, e,
+                    )
+
+            # Keep running until stop event is set or task is cancelled
+            await self._stop_event.wait()
 
         except asyncio.CancelledError:
             logger.info("[Telegram] Bot shutting down")
@@ -210,10 +238,4 @@ class TelegramBot:
 
     async def close(self):
         """Gracefully close the Telegram bot."""
-        if self._app:
-            try:
-                await self._app.updater.stop()
-                await self._app.stop()
-                await self._app.shutdown()
-            except Exception:
-                pass
+        self._stop_event.set()

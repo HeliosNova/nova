@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { Activity, Plus, Pencil, ThumbsUp, ThumbsDown, ChevronDown, ChevronUp, Trash2, MessageSquare } from "lucide-react";
+import { Activity, Plus, Pencil, ThumbsUp, ThumbsDown, ChevronDown, ChevronUp, Trash2, MessageSquare, Loader2 } from "lucide-react";
 import { toast } from "sonner";
 import {
   getMonitors,
@@ -15,7 +15,7 @@ import {
   deleteHeartbeatInstruction,
 } from "../lib/api";
 import { formatDate, formatSeconds } from "../lib/utils";
-import type { MonitorInfo, MonitorResult, MonitorDetail } from "../lib/types";
+import type { MonitorInfo, MonitorCreate, MonitorResult, MonitorDetail } from "../lib/types";
 import {
   PageHeader,
   Card,
@@ -38,6 +38,7 @@ export default function MonitorsPage() {
   const [loading, setLoading] = useState(true);
   const [confirmId, setConfirmId] = useState<number | null>(null);
   const [triggering, setTriggering] = useState<number | null>(null);
+  const [togglingId, setTogglingId] = useState<number | null>(null);
 
   // Create/Edit form
   const [showForm, setShowForm] = useState(false);
@@ -135,6 +136,19 @@ export default function MonitorsPage() {
       toast.success(rating === 1 ? "Rated as good" : "Rated as bad");
     } catch {
       toast.error("Failed to rate result");
+    }
+  };
+
+  const handleToggleEnabled = async (m: MonitorInfo) => {
+    setTogglingId(m.id);
+    try {
+      await updateMonitor(m.id, { enabled: !m.enabled } as Partial<MonitorCreate>);
+      toast.success(m.enabled ? "Monitor disabled" : "Monitor enabled");
+      refresh();
+    } catch {
+      toast.error("Failed to toggle monitor");
+    } finally {
+      setTogglingId(null);
     }
   };
 
@@ -240,10 +254,10 @@ export default function MonitorsPage() {
                 value={formType}
                 onChange={(e) => setFormType(e.target.value)}
                 options={[
-                  { value: "url", label: "URL" },
-                  { value: "search", label: "Search" },
-                  { value: "command", label: "Command" },
-                  { value: "query", label: "Query" },
+                  { value: "query", label: "Query (AI reasoning + tools)" },
+                  { value: "url", label: "URL (health check)" },
+                  { value: "search", label: "Search (web search)" },
+                  { value: "command", label: "Command (shell)" },
                 ]}
               />
               <FormInput
@@ -253,17 +267,33 @@ export default function MonitorsPage() {
                 placeholder="Target URL, query, or command"
               />
               <div className="space-y-1">
-                <FormInput
-                  label="Schedule (seconds)"
-                  type="number"
-                  value={String(formSchedule)}
-                  onChange={(e) => setFormSchedule(Number(e.target.value))}
-                  onBlur={() => setFormTouched((t) => ({ ...t, schedule: true }))}
-                  min={1}
-                  error={scheduleError}
+                <FormSelect
+                  label="Schedule"
+                  value={[3600, 21600, 28800, 43200, 86400, 604800].includes(formSchedule) ? String(formSchedule) : "custom"}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v !== "custom") setFormSchedule(Number(v));
+                  }}
+                  options={[
+                    { value: "3600", label: "Every hour" },
+                    { value: "21600", label: "Every 6 hours" },
+                    { value: "28800", label: "Every 8 hours" },
+                    { value: "43200", label: "Every 12 hours" },
+                    { value: "86400", label: "Daily" },
+                    { value: "604800", label: "Weekly" },
+                    { value: "custom", label: "Custom..." },
+                  ]}
                 />
-                {!scheduleError && scheduleHint && (
-                  <p className="text-xs text-nova-text-dim">{scheduleHint}</p>
+                {![3600, 21600, 28800, 43200, 86400, 604800].includes(formSchedule) && (
+                  <FormInput
+                    type="number"
+                    value={String(formSchedule)}
+                    onChange={(e) => setFormSchedule(Number(e.target.value))}
+                    onBlur={() => setFormTouched((t) => ({ ...t, schedule: true }))}
+                    min={60}
+                    placeholder="seconds"
+                    error={scheduleError}
+                  />
                 )}
               </div>
             </div>
@@ -284,10 +314,10 @@ export default function MonitorsPage() {
           </Card>
         )}
 
-        {/* Monitor list */}
+        {/* Monitor list — grouped by category */}
         <section className="mb-8">
           <h2 className="mb-3 text-sm font-medium text-nova-text-dim">
-            Active Monitors ({monitors.length})
+            Monitors ({monitors.length})
           </h2>
           {loading ? (
             <Skeleton lines={3} />
@@ -295,10 +325,32 @@ export default function MonitorsPage() {
             <EmptyState
               icon={<Activity size={40} strokeWidth={1.5} />}
               title="No monitors configured."
+              description="Create a monitor to start tracking web data, APIs, or scheduled queries."
             />
           ) : (
-            <div className="space-y-2">
-              {monitors.map((m) => {
+            <div className="space-y-4">
+              {(() => {
+                // Group monitors by category
+                const groups: Record<string, MonitorInfo[]> = {};
+                for (const m of monitors) {
+                  let cat = "Other";
+                  if (["system_health", "maintenance", "finetune"].includes(m.check_type)) cat = "Operational";
+                  else if (["quiz", "skill_test", "curiosity", "auto_monitor"].includes(m.check_type)) cat = "Self-Improvement";
+                  else if (m.name.startsWith("Domain Study:")) cat = "Domain Study";
+                  else if (m.name.startsWith("Local:")) cat = "Local";
+                  else if (m.name.startsWith("Auto:")) cat = "Auto-Created";
+                  else if (["Morning Check-in", "Self-Reflection", "World Awareness"].includes(m.name)) cat = "Operational";
+                  (groups[cat] ??= []).push(m);
+                }
+                const order = ["Operational", "Self-Improvement", "Domain Study", "Local", "Auto-Created", "Other"];
+                return order.filter(c => groups[c]?.length).map((cat) => (
+                  <details key={cat} open={cat !== "Other"} className="group">
+                    <summary className="flex cursor-pointer items-center gap-2 rounded-lg px-2 py-1.5 text-xs font-semibold uppercase tracking-wider text-nova-text-dim hover:text-nova-text transition-colors select-none">
+                      <ChevronDown size={12} className="transition-transform group-open:rotate-180" />
+                      {cat} ({groups[cat].length})
+                    </summary>
+                    <div className="mt-1 space-y-1.5 pl-1">
+              {groups[cat].map((m) => {
                 const target = configTarget(m.check_config);
                 const lastStatus = m.last_result;
                 return (
@@ -323,11 +375,20 @@ export default function MonitorsPage() {
                         >
                           {m.name}
                         </button>
-                        <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                          m.enabled ? "bg-nova-success/20 text-nova-success" : "bg-nova-error/20 text-nova-error"
-                        }`}>
-                          {m.enabled ? "ON" : "OFF"}
-                        </span>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleToggleEnabled(m); }}
+                          disabled={togglingId === m.id}
+                          className={`rounded px-1.5 py-0.5 text-[10px] font-medium cursor-pointer transition-opacity hover:opacity-80 ${
+                            togglingId === m.id ? "opacity-40" : ""
+                          } ${
+                            m.enabled ? "bg-nova-success/20 text-nova-success" : "bg-nova-error/20 text-nova-error"
+                          }`}
+                          title={m.enabled ? "Click to disable" : "Click to enable"}
+                        >
+                          {togglingId === m.id ? (
+                            <Loader2 size={10} className="inline animate-spin" />
+                          ) : m.enabled ? "ON" : "OFF"}
+                        </button>
                       </div>
                       <div className="mt-0.5 text-xs text-nova-text-dim">
                         {m.check_type} &middot; {target.slice(0, 60)} &middot; every {Math.round(m.schedule_seconds / 60)}m
@@ -362,6 +423,10 @@ export default function MonitorsPage() {
                   </div>
                 );
               })}
+                    </div>
+                  </details>
+                ));
+              })()}
             </div>
           )}
         </section>
@@ -404,7 +469,12 @@ export default function MonitorsPage() {
                             {r.status}
                           </span>
                         </td>
-                        <td className="max-w-[250px] truncate px-3 py-2 text-nova-text-dim">{r.message || r.value || "—"}</td>
+                        <td className="max-w-[250px] px-3 py-2 text-nova-text-dim">
+                          <details className="cursor-pointer">
+                            <summary className="truncate">{(r.message || r.value || "—").slice(0, 80)}</summary>
+                            <pre className="mt-1 max-h-40 overflow-auto whitespace-pre-wrap text-[11px] leading-relaxed">{r.value || r.message}</pre>
+                          </details>
+                        </td>
                         <td className="px-3 py-2 text-nova-text-dim">{formatDate(r.created_at)}</td>
                         <td className="px-3 py-2">
                           <div className="flex gap-1">

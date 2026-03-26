@@ -6,7 +6,7 @@ const variants = {
   primary: "bg-nova-accent text-white hover:bg-nova-accent-hover",
   secondary: "border border-nova-border text-nova-text hover:bg-nova-surface",
   ghost: "text-nova-text-dim hover:text-nova-text hover:bg-nova-border",
-  danger: "bg-nova-error text-white hover:bg-red-600",
+  danger: "bg-nova-error text-white hover:bg-nova-error/80",
 } as const;
 
 const sizes = {

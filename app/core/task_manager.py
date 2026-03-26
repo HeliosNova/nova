@@ -21,6 +21,7 @@ class BackgroundTask:
     status: str  # pending, running, complete, failed, cancelled
     result: str | None = None
     error: str | None = None
+    partial_result: str | None = None
     created_at: str = ""
     completed_at: str | None = None
     _task: asyncio.Task | None = field(default=None, repr=False)
@@ -33,10 +34,21 @@ class TaskManager:
         self.max_concurrent = max_concurrent
         self.task_timeout = task_timeout
         self._tasks: dict[str, BackgroundTask] = {}
+        self._semaphore = asyncio.Semaphore(max_concurrent)
 
-    def submit(self, coro: Coroutine, description: str) -> str:
-        """Submit a coroutine as a background task. Returns task ID."""
-        # Check concurrency limit
+    def submit(
+        self,
+        coro: Coroutine,
+        description: str,
+        partial_collector: list[str] | None = None,
+    ) -> str:
+        """Submit a coroutine as a background task. Returns task ID.
+
+        If *partial_collector* is provided (a mutable list of strings), its
+        contents are joined and saved as ``partial_result`` when the task
+        fails, giving callers whatever was collected before the error.
+        """
+        # Check concurrency limit (non-blocking check for fast rejection)
         active = sum(1 for t in self._tasks.values() if t.status in ("pending", "running"))
         if active >= self.max_concurrent:
             raise RuntimeError(f"Max background tasks ({self.max_concurrent}) reached")
@@ -50,22 +62,30 @@ class TaskManager:
         )
 
         async def _run():
-            bg.status = "running"
-            try:
-                result = await asyncio.wait_for(coro, timeout=self.task_timeout)
-                bg.result = str(result) if result else "Completed"
-                bg.status = "complete"
-            except asyncio.TimeoutError:
-                bg.error = f"Task timed out after {self.task_timeout}s"
-                bg.status = "failed"
-            except asyncio.CancelledError:
-                bg.status = "cancelled"
-            except Exception as e:
-                bg.error = str(e)
-                bg.status = "failed"
-                logger.error("[TaskManager] Task %s failed: %s", task_id, e)
-            finally:
-                bg.completed_at = datetime.now(timezone.utc).isoformat()
+            async with self._semaphore:
+                bg.status = "running"
+                try:
+                    result = await asyncio.wait_for(coro, timeout=self.task_timeout)
+                    bg.result = str(result) if result else "Completed"
+                    bg.status = "complete"
+                except asyncio.TimeoutError:
+                    bg.error = f"Task timed out after {self.task_timeout}s"
+                    bg.status = "failed"
+                except asyncio.CancelledError:
+                    bg.status = "cancelled"
+                except Exception as e:
+                    bg.error = str(e)
+                    bg.status = "failed"
+                    logger.error("[TaskManager] Task %s failed: %s", task_id, e)
+                finally:
+                    # Capture partial results on non-success
+                    if partial_collector and bg.status in ("failed", "cancelled"):
+                        partial = "".join(partial_collector)
+                        if partial.strip():
+                            bg.partial_result = partial[:3000]
+                    bg.completed_at = datetime.now(timezone.utc).isoformat()
+                    # Release coroutine frame to free memory (Phase 5.9)
+                    bg._task = None
 
         bg._task = asyncio.create_task(_run())
         self._tasks[task_id] = bg
@@ -97,6 +117,10 @@ class TaskManager:
         return True
 
     async def cancel_all(self):
+        tasks_to_cancel = []
         for bg in self._tasks.values():
             if bg._task and not bg._task.done():
                 bg._task.cancel()
+                tasks_to_cancel.append(bg._task)
+        if tasks_to_cancel:
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)

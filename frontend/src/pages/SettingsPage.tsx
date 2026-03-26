@@ -201,7 +201,7 @@ export default function SettingsPage() {
       // Populate LLM provider form
       setProvider(String(config.LLM_PROVIDER || "ollama"));
       setModel(String(config.LLM_MODEL || ""));
-      setOllamaUrl(String(config.OLLAMA_BASE_URL || "http://localhost:11434"));
+      setOllamaUrl(String(config.OLLAMA_URL || "http://localhost:11434"));
       setOpenaiKey(String(config.OPENAI_API_KEY || ""));
       setAnthropicKey(String(config.ANTHROPIC_API_KEY || ""));
       setGoogleKey(String(config.GOOGLE_API_KEY || ""));
@@ -244,7 +244,7 @@ export default function SettingsPage() {
         LLM_MODEL: model,
       };
       if (provider === "ollama") {
-        updates.OLLAMA_BASE_URL = ollamaUrl;
+        updates.OLLAMA_URL = ollamaUrl;
       }
       if (provider === "openai" && openaiKey) {
         updates.OPENAI_API_KEY = openaiKey;
@@ -688,12 +688,7 @@ export default function SettingsPage() {
                 value={health.status}
                 className={health.status === "ok" ? "" : "border-nova-warning"}
               />
-              <StatCard label="Version" value={health.version} />
-              <StatCard label="Model" value={health.model || "\u2014"} />
-              <StatCard
-                label="LLM"
-                value={health.llm_connected ? "connected" : "disconnected"}
-              />
+              <StatCard label="Timestamp" value={health.timestamp || "\u2014"} />
             </div>
           ) : (
             <Skeleton lines={2} />

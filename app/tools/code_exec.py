@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import asyncio
 import logging
 import subprocess
 import sys
@@ -11,7 +12,8 @@ from pathlib import Path
 
 from app.config import config
 from app.core.access_tiers import get_blocked_builtins, get_blocked_imports
-from app.tools.base import BaseTool, ToolResult
+from app.core.platform import get_safe_env
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,13 @@ def _check_code_safety(code: str) -> str | None:
         # If it doesn't parse, fall back to text checks (the code will fail to run anyway)
         return _check_code_safety_text(code, blocked_imports, blocked_builtins)
 
+    # Expanded dunder attribute blocklist for sandbox escape prevention
+    _blocked_dunder_attrs = frozenset({
+        "__loader__", "__spec__", "__builtins__",
+        "__class__", "__bases__", "__mro__", "__subclasses__",
+        "__globals__", "__code__",
+    })
+
     for node in ast.walk(tree):
         # Check import statements
         if isinstance(node, ast.Import):
@@ -61,15 +70,25 @@ def _check_code_safety(code: str) -> str | None:
             # Attribute access: builtins.__import__(...)
             if isinstance(func, ast.Attribute) and func.attr in blocked_builtin_names:
                 return f"'{func.attr}' is blocked for security."
+            # getattr() bypass: getattr(obj, "blocked_builtin") or getattr(obj, "__dunder__")
+            if isinstance(func, ast.Name) and func.id == "getattr" and len(node.args) >= 2:
+                second_arg = node.args[1]
+                if isinstance(second_arg, ast.Constant) and isinstance(second_arg.value, str):
+                    if second_arg.value in blocked_builtin_names:
+                        return f"getattr() with '{second_arg.value}' is blocked for security."
+                    if second_arg.value in _blocked_dunder_attrs:
+                        return f"getattr() with '{second_arg.value}' is blocked for security."
 
-        # Check bare Name references to __builtins__, __import__
+        # Check bare Name references to __builtins__, __import__, builtins
         elif isinstance(node, ast.Name):
             if node.id in blocked_builtin_names and node.id.startswith("__"):
                 return f"'{node.id}' is blocked for security."
+            if node.id == "builtins":
+                return "Access to 'builtins' is blocked for security."
 
         # Block access to module internals for sandbox escape
         elif isinstance(node, ast.Attribute):
-            if node.attr in ("__loader__", "__spec__", "__builtins__", "__subclasses__"):
+            if node.attr in _blocked_dunder_attrs:
                 return f"Access to '{node.attr}' is blocked for security."
 
     return None
@@ -92,17 +111,39 @@ def _check_code_safety_text(
 
 class CodeExecTool(BaseTool):
     name = "code_exec"
-    description = "Execute Python code in a sandbox. Use for data processing, complex logic, formatting."
+    description = (
+        "Execute Python code in a sandboxed subprocess. Returns stdout and stderr. "
+        "Use for data processing, complex calculations, formatting, or any task requiring code execution. "
+        "Code runs in an isolated environment with minimal PATH and no access to environment variables. "
+        "Imports are restricted based on the SYSTEM_ACCESS_LEVEL tier. "
+        "Do NOT use for shell commands (use shell_exec instead)."
+    )
     parameters = "code: str"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "code": {
+                "type": "string",
+                "description": "Python code to execute. Must be valid Python 3 syntax.",
+            },
+        },
+        "required": ["code"],
+    }
+
+    def trim_output(self, output: str) -> str:
+        """Keep tail of output — most relevant for code results."""
+        if len(output) <= 2000:
+            return output
+        return '[...truncated]\n' + output[-1500:]
 
     async def execute(self, *, code: str = "", **kwargs) -> ToolResult:
         if not code:
-            return ToolResult(output="", success=False, error="No code provided")
+            return ToolResult(output="", success=False, error="No code provided", error_category=ErrorCategory.VALIDATION)
 
         # Safety check
         safety_error = _check_code_safety(code)
         if safety_error:
-            return ToolResult(output="", success=False, error=safety_error)
+            return ToolResult(output="", success=False, error=safety_error, error_category=ErrorCategory.PERMISSION)
 
         script_path = None
         try:
@@ -114,13 +155,14 @@ class CodeExecTool(BaseTool):
                 script_path = f.name
 
             # Execute in subprocess with timeout and minimal env (no token leakage)
-            result = subprocess.run(
+            result = await asyncio.to_thread(
+                subprocess.run,
                 [sys.executable, script_path],
                 capture_output=True,
                 text=True,
                 timeout=config.CODE_EXEC_TIMEOUT,
                 cwd=tempfile.gettempdir(),
-                env={"PATH": "/usr/local/bin:/usr/bin:/bin", "HOME": "/tmp", "LANG": "C.UTF-8"},
+                env=get_safe_env(),
             )
 
             if result.stdout and result.stderr:
@@ -137,15 +179,17 @@ class CodeExecTool(BaseTool):
                     output=output or result.stderr,
                     success=False,
                     error=f"Script exited with code {result.returncode}",
+                    error_category=ErrorCategory.INTERNAL,
                 )
 
             if not output.strip():
                 output = "[Code executed successfully with no output]"
 
             # Truncate long output
-            if len(output) > 5000:
+            max_chars = config.TOOL_OUTPUT_MAX_CHARS
+            if len(output) > max_chars:
                 total_len = len(output)
-                output = output[:5000] + f"\n[... truncated: showing 5000 of {total_len} chars]"
+                output = output[:max_chars] + f"\n[... truncated: showing {max_chars} of {total_len} chars]"
 
             return ToolResult(output=output, success=True)
 
@@ -154,9 +198,10 @@ class CodeExecTool(BaseTool):
                 output="",
                 success=False,
                 error=f"Code execution timed out after {config.CODE_EXEC_TIMEOUT}s",
+                error_category=ErrorCategory.TRANSIENT,
             )
         except Exception as e:
-            return ToolResult(output="", success=False, error=f"Execution failed: {e}")
+            return ToolResult(output="", success=False, error=f"Execution failed: {e}", error_category=ErrorCategory.INTERNAL)
         finally:
             if script_path:
                 try:

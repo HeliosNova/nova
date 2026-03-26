@@ -24,11 +24,11 @@ from app.core.memory import ConversationStore, UserFactStore
 class TestToolExceptionHandler:
     @pytest.mark.asyncio
     async def test_tool_exception_returns_error_string(self, db):
-        """When a tool raises, _execute_tool should return error string."""
+        """When a tool raises, _execute_tool should return (error_str, ToolResult)."""
         from app.core.brain import _execute_tool
 
         mock_registry = MagicMock()
-        mock_registry.execute = AsyncMock(side_effect=RuntimeError("tool broke"))
+        mock_registry.execute_full = AsyncMock(side_effect=RuntimeError("tool broke"))
         svc = Services(
             conversations=ConversationStore(db),
             user_facts=UserFactStore(db),
@@ -36,9 +36,11 @@ class TestToolExceptionHandler:
         )
         set_services(svc)
 
-        result = await _execute_tool("bad_tool", {"arg": "val"})
-        assert "failed" in result.lower()
-        assert "tool broke" in result
+        output, tool_result = await _execute_tool("bad_tool", {"arg": "val"})
+        assert "failed" in output.lower()
+        assert "tool broke" in output
+        assert tool_result is not None
+        assert not tool_result.success
 
 
 # ---------------------------------------------------------------------------
@@ -89,7 +91,7 @@ class TestCorrectionBoundsCheck:
         with patch("app.core.brain.llm") as mock_llm:
             mock_llm.generate_with_tools = AsyncMock(return_value=MagicMock(
                 content="I understand the correction.",
-                tool_call=None,
+                tool_calls=[],
                 raw={},
             ))
             mock_llm.invoke_nothink = AsyncMock(return_value="Correction Note")
@@ -155,15 +157,38 @@ class TestSkillRecovery:
 
 class TestLessonDedupThreshold:
     def test_threshold_is_085(self, db):
-        """Jaccard threshold should be 0.85 in source."""
+        """Lessons with ~85% Jaccard overlap should be deduplicated."""
         from app.core.learning import LearningEngine
 
         db.init_schema()
         engine = LearningEngine(db)
 
-        import inspect
-        source = inspect.getsource(engine._find_similar_lesson)
-        assert "0.85" in source
+        # Insert an initial lesson
+        engine.add_knowledge_lesson(
+            topic="python data structures",
+            correct_answer="python lists are mutable ordered collections that support indexing",
+            lesson_text="Lists are mutable in Python",
+        )
+
+        # Insert a near-duplicate (~85%+ overlap) — should be deduplicated
+        engine.add_knowledge_lesson(
+            topic="python data structures",
+            correct_answer="python lists are mutable ordered collections that support indexing and slicing",
+            lesson_text="Lists are mutable in Python",
+        )
+
+        # Should have only 1 lesson (second was deduped)
+        all_lessons = engine.get_all_lessons(limit=10)
+        assert len(all_lessons) == 1, f"Expected dedup to merge similar lessons, got {len(all_lessons)}"
+
+        # Insert a clearly different lesson — should NOT be deduped
+        engine.add_knowledge_lesson(
+            topic="python data structures",
+            correct_answer="dictionaries preserve insertion order since python 3.7",
+            lesson_text="Dict ordering in Python",
+        )
+        all_lessons = engine.get_all_lessons(limit=10)
+        assert len(all_lessons) == 2, f"Expected distinct lesson to be kept, got {len(all_lessons)}"
 
 
 # ---------------------------------------------------------------------------
@@ -271,6 +296,7 @@ class TestSummarizationFallback:
         with patch("app.core.brain.config") as mock_config:
             mock_config.MAX_CONTEXT_TOKENS = 100
             mock_config.RECENT_MESSAGES_KEEP = 4
+            mock_config.RESPONSE_TOKEN_BUDGET = 600
 
             with patch("app.core.brain.llm") as mock_llm:
                 mock_llm.invoke_nothink = AsyncMock(side_effect=Exception("LLM down"))

@@ -33,7 +33,7 @@ async def retry_on_transient(
 
             if resp.status_code == 429:
                 retry_after = float(resp.headers.get("Retry-After", "2"))
-                retry_after = min(retry_after, 30.0)
+                retry_after = min(retry_after, 300.0)  # safety cap at 5 minutes
                 retry_after += random.uniform(0, retry_after * 0.25)  # jitter to avoid thundering herd
                 if attempt < max_retries:
                     logger.warning("Rate limited (429), retrying after %.1fs (attempt %d/%d)", retry_after, attempt + 1, max_retries)
@@ -57,16 +57,32 @@ async def retry_on_transient(
             return resp
 
         except httpx.HTTPStatusError as e:
+            if e.response.status_code in (429, 500, 502, 503):
+                if attempt < max_retries:
+                    delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
+                    logger.warning("HTTP %d error, retrying after %.1fs (attempt %d/%d): %s",
+                                  e.response.status_code, delay, attempt + 1, max_retries, e)
+                    await asyncio.sleep(delay)
+                    continue
+                raise LLMUnavailableError(f"HTTP {e.response.status_code} after {max_retries} retries")
             raise LLMUnavailableError(f"HTTP error: {e}")
-        except (httpx.ConnectError, httpx.TimeoutException):
-            raise
-        except LLMUnavailableError:
-            raise
-        except Exception:
+        except httpx.ConnectError as e:
             if attempt < max_retries:
                 delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
+                logger.warning("Connect error, retrying after %.1fs (attempt %d/%d): %s",
+                              delay, attempt + 1, max_retries, e)
                 await asyncio.sleep(delay)
                 continue
+            raise LLMUnavailableError(f"Connection failed after {max_retries} retries: {e}")
+        except httpx.TimeoutException as e:
+            if attempt < max_retries:
+                delay = min(2 ** (attempt + 1), 16) + random.uniform(0, 1)
+                logger.warning("Timeout error, retrying after %.1fs (attempt %d/%d): %s",
+                              delay, attempt + 1, max_retries, e)
+                await asyncio.sleep(delay)
+                continue
+            raise LLMUnavailableError(f"Request timed out after {max_retries} retries: {e}")
+        except LLMUnavailableError:
             raise
 
     raise LLMUnavailableError("Max retries exceeded")

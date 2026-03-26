@@ -1,7 +1,7 @@
-# Helios Nova_ — Competitive Landscape & Comparison (March 2026)
+# Helios Nova — Competitive Landscape & Comparison (March 2026)
 
 ## Context
-Research into the latest Claude-based tools, AI agents, and similar projects to understand where Helios Nova_ stands in the current landscape.
+Research into the latest Claude-based tools, AI agents, and similar projects to understand where Helios Nova stands in the current landscape.
 
 ---
 
@@ -24,7 +24,7 @@ Research into the latest Claude-based tools, AI agents, and similar projects to 
 | **Weaknesses** | Cloud-only, coding-focused (not a general personal assistant), no self-learning |
 
 ### B. OpenClaw (formerly Clawdbot / Moltbot)
-**What it is:** Open-source autonomous personal AI agent. 145K+ GitHub stars. Created by Peter Steinberger.
+**What it is:** Open-source autonomous personal AI agent. 216K+ GitHub stars. Created by Peter Steinberger.
 **Category:** Personal AI assistant (local-first)
 
 | Aspect | Details |
@@ -64,24 +64,24 @@ Research into the latest Claude-based tools, AI agents, and similar projects to 
 
 ---
 
-## 2. Nova_'s Unique Position
+## 2. Nova's Unique Position
 
-### What Nova_ does that NO other tool does (combined):
+### What Nova does that NO other tool does (combined):
 1. **Full learning loop** — correction detection -> lesson extraction -> skill creation -> DPO training data export -> automated fine-tuning with A/B eval
 2. **Experiential learning (Reflexion)** — captures silent failures, not just explicit corrections
 3. **Curiosity engine** — auto-detects hedging, ignorance, and tool failures, then queues autonomous background research
 4. **Knowledge graph + hybrid retrieval + learning** in a single system with temporal tracking
 5. **Zero cloud dependency** — truly sovereign with bundled Ollama
-6. **Proactive heartbeat system** — 14 monitors doing scheduled research, health checks, skill validation, fine-tune readiness, and domain studies
-7. **MCP server** — exposes Nova_ intelligence to external agents (Claude Code, Cursor)
+6. **Proactive heartbeat system** — 51 monitors doing scheduled research, health checks, skill validation, fine-tune readiness, and domain studies
+7. **MCP server** — exposes Nova intelligence to external agents (Claude Code, Cursor)
 
-### Where Nova_ is weaker than competitors:
+### Where Nova is weaker than competitors:
 1. **Codebase-scale coding** — Claude Code and Cursor handle 500K+ line codebases
-2. **Community/ecosystem** — OpenClaw has 145K+ stars, Nova_ is private
+2. **Community/ecosystem** — OpenClaw has 216K+ stars, Nova is private
 3. **Multi-agent orchestration** — Devin and Cursor run parallel sub-agents
 
 ### Previously weak — now resolved:
-- ~~Channel breadth~~ — Nova_ now has 4 channels (Discord, Telegram, WhatsApp, Signal) with full allowlisting on all
+- ~~Channel breadth~~ — Nova now has 4 channels (Discord, Telegram, WhatsApp, Signal) with full allowlisting on all
 - ~~GUI/desktop interaction~~ — Desktop automation tool shipped (PyAutoGUI: screenshot, click, type, hotkey, scroll)
 - ~~Security~~ — Was flagged B+ in audit; now hardened against OWASP Agentic Top 10
 
@@ -89,7 +89,7 @@ Research into the latest Claude-based tools, AI agents, and similar projects to 
 
 ## 3. Strategic Positioning
 
-Nova_ occupies a unique niche: the only agent that is simultaneously:
+Nova occupies a unique niche: the only agent that is simultaneously:
 - A **personal assistant** (not just a coding tool)
 - **Fully sovereign** (zero cloud dependencies)
 - **Self-improving** (learns from corrections, failures, and curiosity)
@@ -102,7 +102,7 @@ Nova_ occupies a unique niche: the only agent that is simultaneously:
 ### Delivered:
 1. **Automated fine-tuning pipeline** (`scripts/finetune_auto.py`) — 8-step pipeline with A/B eval
 2. **A/B evaluation harness** (`scripts/eval_harness.py`) — LLM-as-judge with position bias prevention
-3. **MCP server** (`app/mcp_server.py`) — 5 tools exposing Nova_ intelligence
+3. **MCP server** (`app/mcp_server.py`) — 5 tools exposing Nova intelligence
 4. **Temporal knowledge graph** — valid_from/valid_to, supersession, provenance tracking
 5. **Fine-Tune Check heartbeat monitor** — weekly readiness reporting
 6. **Fine-tune API endpoints** — trigger + history
@@ -129,11 +129,11 @@ Nova_ occupies a unique niche: the only agent that is simultaneously:
 
 A deep audit (5 parallel agents, every file read, live endpoint testing) found 38 bugs and 6 OWASP Agentic Top 10 risks. All fixed. Grade moved from **B+** to **A-**.
 
-### Nova_ vs. OpenClaw — Security Comparison
+### Nova vs. OpenClaw — Security Comparison
 
-OpenClaw was flagged by Cisco and Palo Alto for a "lethal trifecta" of security risks: unrestricted tool access, no injection detection, and credential exposure. Nova_'s audit directly addressed every one of these:
+OpenClaw was flagged by Cisco and Palo Alto for a "lethal trifecta" of security risks: unrestricted tool access, no injection detection, and credential exposure. Nova's audit directly addressed every one of these:
 
-| Risk | OpenClaw | Nova_ (post-audit) |
+| Risk | OpenClaw | Nova (post-audit) |
 |------|----------|---------------------|
 | Unrestricted tool access | No tier system — all tools always available | 4-tier access system (sandboxed/standard/full/none), MCP tools blocked at sandboxed |
 | Prompt injection | No detection | Heuristic detection on all 8 external-content tools (web search, HTTP fetch, browser, MCP, knowledge, skill loader) |
@@ -143,11 +143,11 @@ OpenClaw was flagged by Cisco and Palo Alto for a "lethal trifecta" of security 
 | Credential management | Flagged for exposure | No hardcoded secrets in code, `.env` in `.gitignore`, skill signing enforced by default |
 | Container security | Basic Docker | Read-only root, no-new-privileges, all capabilities dropped, non-root user |
 
-**Nova_ is now more secure than any open-source personal AI agent in the landscape.**
+**Nova is now more secure than any open-source personal AI agent in the landscape.**
 
 ### Revised Competitive Matrix
 
-| Capability | Claude Code | OpenClaw | Devin | Cursor | Nova_ |
+| Capability | Claude Code | OpenClaw | Devin | Cursor | Nova |
 |-----------|-------------|----------|-------|--------|-------|
 | Personal assistant | No (coding only) | Yes | No | No | **Yes** |
 | Sovereign / local-first | No (cloud API) | Partial (needs external LLM) | No (SaaS) | No (cloud) | **Yes (bundled Ollama)** |
@@ -163,23 +163,23 @@ OpenClaw was flagged by Cisco and Palo Alto for a "lethal trifecta" of security 
 | Background task delegation | Sub-agents | No | Yes | Sub-agents | **Yes** |
 | Fine-tuning pipeline | No | No | Internal | No | **Yes (automated + A/B eval)** |
 | Codebase-scale coding | **500K+ lines** | No | **Yes** | **Yes** | No (not the focus) |
-| Community size | Anthropic-backed | **145K+ stars** | VC-backed | VC-backed | Private |
+| Community size | Anthropic-backed | **216K+ stars** | VC-backed | VC-backed | Private |
 
 ### Remaining Gaps (Honest Assessment)
 
-1. **Community** — Nova_ is private. OpenClaw has 145K+ stars, massive contributor base, plugin ecosystem. This matters for adoption and bug-finding. Open-sourcing under AGPL-3.0 is the next step.
+1. **Community** — Nova is private. OpenClaw has 216K+ stars, massive contributor base, plugin ecosystem. This matters for adoption and bug-finding. Open-sourcing under AGPL-3.0 is the next step.
 
-2. **Multi-agent orchestration** — Claude Code and Devin can spawn parallel sub-agents with deep coordination. Nova_ has background tasks but not true multi-agent planning.
+2. **Multi-agent orchestration** — Claude Code and Devin can spawn parallel sub-agents with deep coordination. Nova has background tasks but not true multi-agent planning.
 
-3. **Large codebase navigation** — Claude Code handles 500K+ line repos with deep AST understanding. Nova_ isn't a coding agent and doesn't compete here.
+3. **Large codebase navigation** — Claude Code handles 500K+ line repos with deep AST understanding. Nova isn't a coding agent and doesn't compete here.
 
-4. **Hardware requirement** — Nova_ needs an RTX 3090 (or equivalent) for local inference. OpenClaw runs on a Mac Mini with external LLM API calls. Trade-off: sovereignty vs. accessibility.
+4. **Hardware requirement** — Nova needs an RTX 3090 (or equivalent) for local inference. OpenClaw runs on a Mac Mini with external LLM API calls. Trade-off: sovereignty vs. accessibility.
 
-5. **Plugin/skill ecosystem** — OpenClaw has a directory of community skills. Nova_ has skill import/export with signing but no marketplace yet.
+5. **Plugin/skill ecosystem** — OpenClaw has a directory of community skills. Nova has skill import/export with signing but no marketplace yet.
 
 ### Strategic Assessment
 
-Nova_ has no direct competitor. The closest is OpenClaw, but OpenClaw:
+Nova has no direct competitor. The closest is OpenClaw, but OpenClaw:
 - Has no learning loop (doesn't get smarter)
 - Has no knowledge graph (no structured memory)
 - Has no retrieval system (no document search)
@@ -188,9 +188,9 @@ Nova_ has no direct competitor. The closest is OpenClaw, but OpenClaw:
 
 The agents that are technically sophisticated (Claude Code, Devin, Cursor) are coding-specific, cloud-dependent, and don't do personal assistance.
 
-**Nova_ is the only sovereign, self-improving, security-hardened personal AI agent that exists.**
+**Nova is the only sovereign, self-improving, security-hardened personal AI agent that exists.**
 
-The path forward is open-source release → community → skill marketplace → federated learning between Nova_ instances.
+The path forward is open-source release → community → skill marketplace → federated learning between Nova instances.
 
 ---
 
@@ -198,7 +198,7 @@ The path forward is open-source release → community → skill marketplace → 
 
 ### All Personal AI / Self-Hosted AI Competitors
 
-Eight major open-source projects compete in the self-hosted personal AI space. This section compares them head-to-head against Nova_ across every dimension that matters.
+Eight major open-source projects compete in the self-hosted personal AI space. This section compares them head-to-head against Nova across every dimension that matters.
 
 #### A. OpenClaw (216K+ stars)
 
@@ -278,13 +278,13 @@ Eight major open-source projects compete in the self-hosted personal AI space. T
 
 **Self-improvement:** None. Infrastructure layer, not a personal assistant.
 
-**Focus:** Inference server, not an assistant. Complementary to (not competitive with) Nova_.
+**Focus:** Inference server, not an assistant. Complementary to (not competitive with) Nova.
 
 ---
 
 ### Side-by-Side Feature Matrix (March 15, 2026)
 
-| Feature | Nova_ | OpenClaw | Khoj | Open WebUI | AnythingLLM | LibreChat | Dify | Letta |
+| Feature | Nova | OpenClaw | Khoj | Open WebUI | AnythingLLM | LibreChat | Dify | Letta |
 |---------|-------|----------|------|------------|-------------|-----------|------|-------|
 | **GitHub Stars** | Private | 216K | 32.5K | 124K | 54K | 20K | 90K | 28K |
 | **License** | AGPL-3.0 | MIT | AGPL-3.0 | MIT | MIT | MIT | Apache-2.0 | Apache-2.0 |
@@ -353,13 +353,13 @@ Eight major open-source projects compete in the self-hosted personal AI space. T
 | Offline capable | **Yes** | No | No | Yes (w/ Ollama) | Yes (w/ Ollama) | No | No | Partial |
 | | | | | | | | | |
 | **MATURITY** | | | | | | | | |
-| Test suite | **1,430+ tests** | Unknown | Moderate | Moderate | Limited | Moderate | Good | Moderate |
+| Test suite | **1,700+ tests** | Unknown | Moderate | Moderate | Limited | Moderate | Good | Moderate |
 | Documentation | **Excellent** | Good | Good | Good | Good | Good | Excellent | Good |
 | Production readiness | **High** | Moderate (security) | High | High | High | High | High | Moderate |
 
 ---
 
-### Analysis: Who Actually Competes with Nova_?
+### Analysis: Who Actually Competes with Nova?
 
 **Direct competitors (personal AI assistants):** OpenClaw, Khoj
 
@@ -367,31 +367,31 @@ Eight major open-source projects compete in the self-hosted personal AI space. T
 
 **Different category entirely:** LibreChat (enterprise chat), Dify (app builder), Letta (memory framework), LocalAI (inference server)
 
-### Nova_'s Unique Moats
+### Nova's Unique Moats
 
 1. **The learning loop is unmatched.** No other project has the full pipeline: corrections → lessons → skills → DPO pairs → automated fine-tuning with A/B evaluation. OpenClaw's Foundry does pattern crystallization (5+ uses → new skill) but doesn't learn from *mistakes*, doesn't extract lessons, and doesn't improve the underlying model.
 
-2. **Hybrid retrieval (ChromaDB + FTS5 + RRF) is unique.** Most competitors use vector-only search. Nova_ fuses vector + keyword + reciprocal rank fusion, with entity relevance guard to prevent the embedding collapse bug. Only AnythingLLM approaches this with multiple vector DB options, but without the fusion layer.
+2. **Hybrid retrieval (ChromaDB + FTS5 + RRF) is unique.** Most competitors use vector-only search. Nova fuses vector + keyword + reciprocal rank fusion, with entity relevance guard to prevent the embedding collapse bug. Only AnythingLLM approaches this with multiple vector DB options, but without the fusion layer.
 
 3. **Temporal knowledge graph is unique.** Khoj has experimental GraphRAG. No other competitor tracks fact validity windows, provenance, or supersession chains.
 
 4. **Security posture is best-in-class.** 4-tier access control, prompt injection detection (4 categories with Unicode normalization), SSRF with DNS rebinding defense, HMAC skill signing, training data poisoning prevention, Docker hardening. OpenClaw has been flagged by security researchers as dangerous.
 
-5. **Proactive intelligence is unique.** 14 scheduled monitors doing domain research, self-reflection, skill validation, maintenance, and curiosity research. No other personal AI assistant has this.
+5. **Proactive intelligence is unique.** 51 scheduled monitors across 29 domains doing domain research, self-reflection, skill validation, maintenance, and curiosity research. No other personal AI assistant has this.
 
-6. **MCP dual-mode is unique.** Nova_ is both an MCP client (consumes external tools) and MCP server (exposes its intelligence). No other personal AI assistant does both.
+6. **MCP dual-mode is unique.** Nova is both an MCP client (consumes external tools) and MCP server (exposes its intelligence). No other personal AI assistant does both.
 
-### Where Nova_ Trails
+### Where Nova Trails
 
-1. **Community/ecosystem:** OpenClaw 216K stars, Open WebUI 124K, Dify 90K. Nova_ is private. This is the single biggest gap.
+1. **Community/ecosystem:** OpenClaw 216K stars, Open WebUI 124K, Dify 90K. Nova is private. This is the single biggest gap.
 
-2. **Channel breadth:** OpenClaw supports 22+ messaging platforms vs. Nova_'s 4. However, Nova_'s 4 channels (Discord, Telegram, WhatsApp, Signal) cover the vast majority of personal use cases with proper security (allowlisting on all).
+2. **Channel breadth:** OpenClaw supports 22+ messaging platforms vs. Nova's 4. However, Nova's 4 channels (Discord, Telegram, WhatsApp, Signal) cover the vast majority of personal use cases with proper security (allowlisting on all).
 
-3. **Hardware accessibility:** Nova_ needs an RTX 3090 for local Qwen3.5:27b inference. OpenClaw and Khoj work with cloud LLM APIs on any hardware. Trade-off: sovereignty vs. accessibility.
+3. **Hardware accessibility:** Nova needs an RTX 3090 for local Qwen3.5:27b inference. OpenClaw and Khoj work with cloud LLM APIs on any hardware. Trade-off: sovereignty vs. accessibility.
 
-4. **Plugin/skill marketplace:** OpenClaw has 5,400+ community skills. Nova_ has skill import/export with signing but no public registry.
+4. **Plugin/skill marketplace:** OpenClaw has 5,400+ community skills. Nova has skill import/export with signing but no public registry.
 
-5. **Multi-provider model routing in UI:** Open WebUI and AnythingLLM let users switch models per-conversation in a polished UI. Nova_'s model routing is automatic (fast/default/heavy) but not user-selectable per-message.
+5. **Multi-provider model routing in UI:** Open WebUI and AnythingLLM let users switch models per-conversation in a polished UI. Nova's model routing is automatic (fast/default/heavy) but not user-selectable per-message.
 
 ---
 
@@ -399,17 +399,17 @@ Eight major open-source projects compete in the self-hosted personal AI space. T
 
 The competitive landscape has expanded significantly since the initial analysis. OpenClaw has grown from 145K to 216K stars. Khoj has emerged as a credible personal AI with 32.5K stars. Open WebUI and AnythingLLM dominate the "AI interface" layer.
 
-**But the core thesis holds: Nova_ has no direct equivalent.**
+**But the core thesis holds: Nova has no direct equivalent.**
 
 No other project combines:
 - Sovereign local-first deployment (no cloud dependency)
 - Full self-improvement pipeline (corrections → DPO → fine-tuning)
 - Temporal knowledge graph
 - Hybrid retrieval with RRF fusion
-- 14 proactive monitors with domain research
+- 51 autonomous monitors across 29 domains with domain research
 - Defense-in-depth security (OWASP agentic compliance)
 - MCP dual-mode (client + server)
 
-The biggest risk is not technical — it's adoption. OpenClaw proved that personal AI assistants have massive demand (216K stars in 6 weeks). Nova_ needs to capture that demand with a superior, more secure product.
+The biggest risk is not technical — it's adoption. OpenClaw proved that personal AI assistants have massive demand (216K stars in 6 weeks). Nova needs to capture that demand with a superior, more secure product.
 
 **Priority:** Open-source release → community building → skill marketplace → federated learning.

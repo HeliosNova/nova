@@ -7,6 +7,7 @@ Next time a matching query arrives, Nova follows the learned procedure.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -31,6 +32,19 @@ class Skill:
     success_rate: float
     enabled: bool
     created_at: str | None
+
+
+def _pattern_specificity(pattern: str) -> tuple[int, int, int]:
+    """Return a specificity score for a regex pattern.
+
+    Returns (length, -wildcard_count, -alternation_count) so that longer
+    patterns with fewer wildcards/quantifiers and fewer alternations sort
+    higher (more specific = higher priority). More `|` alternations = less
+    specific trigger, so they receive a negative penalty.
+    """
+    wildcard_count = len(re.findall(r'[.*+?]|\{[\d,]+\}', pattern))
+    alternation_count = pattern.count("|")
+    return (len(pattern), -wildcard_count, -alternation_count)
 
 
 class SkillStore:
@@ -70,8 +84,11 @@ class SkillStore:
         if not matches:
             return None
 
-        # Sort by regex pattern length descending (longer = more specific = higher priority)
-        matches.sort(key=lambda r: len(r["trigger_pattern"]), reverse=True)
+        # Sort by specificity: longer pattern first, then fewer wildcards (more specific)
+        matches.sort(
+            key=lambda r: _pattern_specificity(r["trigger_pattern"]),
+            reverse=True,
+        )
         return self._row_to_skill(matches[0])
 
     def create_skill(
@@ -113,17 +130,18 @@ class SkillStore:
 
         # Name-based dedup — if same name (case-insensitive) exists, update it
         existing_by_name = self._db.fetchone(
-            "SELECT id FROM skills WHERE LOWER(name) = LOWER(?)",
+            "SELECT id, trigger_pattern FROM skills WHERE LOWER(name) = LOWER(?)",
             (name,),
         )
         if existing_by_name:
+            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>")
             self._db.execute(
                 "UPDATE skills SET trigger_pattern = ?, steps = ?, answer_template = ?, enabled = 1 WHERE id = ?",
                 (trigger_pattern, json.dumps(steps), answer_template, existing_by_name["id"]),
             )
             logger.info(
-                "Skill name-dedup: updated #%d '%s' with new trigger/steps",
-                existing_by_name["id"], name,
+                "Skill updated: #%d '%s' trigger changed from '%s' to '%s'",
+                existing_by_name["id"], name, old_trigger[:60], trigger_pattern[:60],
             )
             return existing_by_name["id"]
 
@@ -150,7 +168,7 @@ class SkillStore:
         Uses atomic UPDATE to avoid read-then-write race.
         """
         success_val = 1.0 if success else 0.0
-        alpha = 0.15
+        alpha = config.SKILL_EMA_ALPHA
         self._db.execute(
             "UPDATE skills SET times_used = times_used + 1, "
             "success_rate = ? * ? + (1 - ?) * success_rate "
@@ -221,12 +239,11 @@ class SkillStore:
         if not skill or not skill.enabled:
             return False
 
-        import json as _json
         prompt = (
             f"A learned skill is failing. Analyze and suggest a fix.\n\n"
             f"Skill name: {skill.name}\n"
             f"Trigger pattern: {skill.trigger_pattern}\n"
-            f"Steps: {_json.dumps(skill.steps)}\n"
+            f"Steps: {json.dumps(skill.steps)}\n"
             f"Failure context: {failure_context[:500]}\n\n"
             "Options:\n"
             "1. Narrow the trigger regex to be more specific\n"
@@ -238,12 +255,15 @@ class SkillStore:
         )
 
         try:
-            raw = await llm.invoke_nothink(
-                [{"role": "user", "content": prompt}],
-                json_mode=True,
-                json_prefix="{",
-                max_tokens=400,
-                temperature=0.2,
+            raw = await asyncio.wait_for(
+                llm.invoke_nothink(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    json_prefix="{",
+                    max_tokens=400,
+                    temperature=0.2,
+                ),
+                timeout=config.INTERNAL_LLM_TIMEOUT,
             )
             obj = llm.extract_json_object(raw)
             if not obj or obj.get("action") == "skip":
@@ -262,6 +282,7 @@ class SkillStore:
                     logger.warning("Skill #%d refinement rejected: ReDoS risk (%s)", skill_id, new_trigger)
                     return False
                 if _is_too_broad(new_trigger):
+                    logger.warning("Skill #%d refinement rejected: trigger too broad (%s)", skill_id, new_trigger)
                     return False
                 self._db.execute(
                     "UPDATE skills SET trigger_pattern = ? WHERE id = ?",
@@ -281,7 +302,7 @@ class SkillStore:
                         return False
                 self._db.execute(
                     "UPDATE skills SET steps = ? WHERE id = ?",
-                    (_json.dumps(new_steps), skill_id),
+                    (json.dumps(new_steps), skill_id),
                 )
                 logger.info("Skill #%d refined: adjusted steps", skill_id)
                 return True
@@ -323,6 +344,9 @@ def _is_redos_risk(pattern: str) -> bool:
         return True
     # Overlapping quantifiers without anchors: \w+\w+, .+.+
     if re.search(r'(?:\\w|\.)[+*].*(?:\\w|\.)[+*].*[+*$]', pattern):
+        return True
+    # Alternation in quantified groups: (a|b)+, (x|y)*
+    if re.search(r'\([^)]*\|[^)]*\)[+*{]', pattern):
         return True
     return False
 
@@ -397,7 +421,7 @@ _FALLBACK_TOOL_NAMES = frozenset({
     "web_search", "calculator", "http_fetch", "knowledge_search",
     "code_exec", "memory_search", "file_ops", "shell_exec", "browser",
     "integration", "screenshot", "monitor", "email_send", "calendar",
-    "reminder", "webhook", "delegate",
+    "reminder", "webhook", "delegate", "desktop", "background_task",
 })
 
 
@@ -451,23 +475,23 @@ async def extract_skill_from_correction(
         tool_info = f"\n\nTool calls that happened: {json.dumps(tool_history)}"
 
     try:
-        result = await llm.invoke_nothink(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You extract reusable skills from corrections. A skill is a "
-                        "trigger pattern (regex) and a sequence of tool calls.\n\n"
-                        "Given a correction, create a skill if the user describes a "
-                        "reusable procedure involving tool calls.\n\n"
-                        "Respond with JSON:\n"
-                        '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
-                        '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
-                        '"answer_template": "Use the result to answer: {result}"}\n\n'
+        result = await asyncio.wait_for(
+            llm.invoke_nothink(
+                [
+                    {
+                        "role": "system",
+                        "content": (
+                            "You extract reusable skills from corrections. A skill is a "
+                            "trigger pattern (regex) and a sequence of tool calls.\n\n"
+                            "Given a correction, create a skill if the user describes a "
+                            "reusable procedure involving tool calls.\n\n"
+                            "Respond with JSON:\n"
+                            '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
+                            '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
+                            '"answer_template": "Use the result to answer: {result}"}\n\n'
                         "IMPORTANT:\n"
                         "- trigger_pattern must be a valid regex that matches similar future queries\n"
-                        "- steps must reference actual tools: web_search, calculator, http_fetch, "
-                        "knowledge_search, code_exec, memory_search, file_ops\n"
+                        f"- steps must reference actual tools: {', '.join(_get_tool_names())}\n"
                         "- Use {query} as placeholder for the user's query in args_template\n\n"
                         'If this is NOT a reusable tool procedure, respond: {"skip": true}'
                     ),
@@ -476,13 +500,15 @@ async def extract_skill_from_correction(
                     "role": "user",
                     "content": f"Correction: {correction_context}{tool_info}",
                 },
-            ],
-            json_mode=True,
-            json_prefix="{",
+                ],
+                json_mode=True,
+                json_prefix="{",
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
         )
 
         obj = llm.extract_json_object(result)
-        if obj.get("skip") or not obj.get("name"):
+        if not obj or obj.get("skip") or not obj.get("name"):
             return None
 
         # Validate trigger pattern is a valid regex
@@ -494,12 +520,19 @@ async def extract_skill_from_correction(
                 logger.warning("Skill extraction produced invalid regex: %s", pattern)
                 return None
 
-        # Validate steps reference real tools
+        # Validate steps reference real tools and have required structure
         steps = obj.get("steps", [])
         valid_tools = _get_tool_names()
         if steps:
             for step in steps:
+                if not isinstance(step, dict):
+                    return None
                 if step.get("tool") not in valid_tools:
+                    return None
+                if "args_template" not in step:
+                    return None
+                output_key = step.get("output_key", "")
+                if output_key and not re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", output_key):
                     return None
 
         answer_template = obj.get("answer_template")

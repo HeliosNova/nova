@@ -1,4 +1,4 @@
-"""Nova_ configuration — loaded from environment variables."""
+"""Nova configuration — loaded from environment variables."""
 
 from __future__ import annotations
 
@@ -34,6 +34,45 @@ def _env_float(key: str, default: float = 0.0) -> float:
 
 _OVERRIDES_PATH = Path(os.getenv("CONFIG_OVERRIDES_PATH", "/data/config_overrides.json"))
 
+# Fields that may be persisted/loaded via config overrides (security: prevents persisted bypasses)
+_MUTABLE_FIELDS = {
+    "LLM_PROVIDER", "LLM_MODEL", "OLLAMA_URL",
+    "OPENAI_MODEL", "ANTHROPIC_MODEL",
+    "GOOGLE_MODEL", "VISION_MODEL", "FAST_MODEL", "HEAVY_MODEL",
+    "EMBEDDING_MODEL", "RETRIEVAL_TOP_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
+    "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT", "MAX_SKILLS_CHECK",
+    "MAX_CONTEXT_TOKENS", "RECENT_MESSAGES_KEEP",
+    "CODE_EXEC_TIMEOUT", "MAX_TOOL_ROUNDS", "SHELL_EXEC_TIMEOUT",
+    "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
+    "ENABLE_PLANNING", "ENABLE_CRITIQUE", "ENABLE_CUSTOM_TOOLS",
+    "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
+    "ENABLE_VOICE", "ENABLE_MODEL_ROUTING",
+    "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
+    "ENABLE_SHELL_EXEC", "ENABLE_MCP", "ENABLE_MCP_SERVER",
+    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_INJECTION_DETECTION",
+    "ENABLE_DESKTOP_AUTOMATION", "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
+    "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
+    "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
+    "WEB_SEARCH_TIMEOUT", "WEB_SEARCH_ENGINES", "WEB_SEARCH_MAX_RESULTS",
+    "ALLOWED_ORIGINS",
+    "MAX_SYSTEM_TOKENS", "MAX_USER_FACTS", "MAX_KG_FACTS",
+    "MAX_CURIOSITY_PENDING", "MAX_CURIOSITY_ATTEMPTS",
+    "MAX_CUSTOM_TOOL_CODE_LENGTH", "MAX_CUSTOM_TOOLS", "RATE_LIMIT_RPM",
+    "MAX_KG_FACTS_IN_PROMPT", "MAX_REFLEXIONS_IN_PROMPT", "MAX_SUCCESS_PATTERNS_IN_PROMPT",
+    "MAX_REFLEXIONS",
+    "CRITIQUE_ANSWER_LIMIT", "CRITIQUE_SOURCES_LIMIT", "CRITIQUE_FACTS_LIMIT",
+    "MAX_CRITIQUE_ROUNDS", "DIGEST_HOUR", "USER_TIMEZONE",
+    # Tuning parameters
+    "RESPONSE_TOKEN_BUDGET", "RETRIEVAL_RELEVANCE_THRESHOLD",
+    "TEMPERATURE_DEFAULT", "TEMPERATURE_INTERNAL", "TEMPERATURE_REFLEXION",
+    "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
+    "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
+    "SKILL_EMA_ALPHA", "INJECTION_SUSPICIOUS_THRESHOLD",
+    "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
+    "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
+    "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
+}
+
 
 @dataclass
 class Config:
@@ -54,7 +93,7 @@ class Config:
     ENABLE_MCP: bool = field(default_factory=lambda: _env("ENABLE_MCP", "true").lower() == "true")
     MCP_CONFIG_DIR: str = field(default_factory=lambda: _env("MCP_CONFIG_DIR", "/data/mcp"))
 
-    # MCP Server (expose Nova_ as MCP server)
+    # MCP Server (expose Nova as MCP server)
     ENABLE_MCP_SERVER: bool = field(default_factory=lambda: _env("ENABLE_MCP_SERVER", "true").lower() == "true")
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
@@ -79,23 +118,32 @@ class Config:
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))
+    WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 10.0))
+    WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "google,duckduckgo,brave"))
+    WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
     CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 10))
     MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 5))
     SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 30))
     BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 30))
+    BROWSER_CDP_URL: str = field(default_factory=lambda: _env("BROWSER_CDP_URL", ""))  # http:// CDP URL to connect to host browser
     TOOL_TIMEOUT: int = field(default_factory=lambda: _env_int("TOOL_TIMEOUT", 120))
+    TOOL_OUTPUT_MAX_CHARS: int = field(default_factory=lambda: _env_int("TOOL_OUTPUT_MAX_CHARS", 10000))
     GENERATION_TIMEOUT: int = field(default_factory=lambda: _env_int("GENERATION_TIMEOUT", 480))
+    INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 30))
     ENABLE_SHELL_EXEC: bool = field(default_factory=lambda: _env("ENABLE_SHELL_EXEC", "false").lower() == "true")
 
     # Desktop automation (requires display server + PyAutoGUI)
     ENABLE_DESKTOP_AUTOMATION: bool = field(default_factory=lambda: _env("ENABLE_DESKTOP_AUTOMATION", "false").lower() == "true")
     DESKTOP_CLICK_DELAY: float = field(default_factory=lambda: _env_float("DESKTOP_CLICK_DELAY", 0.5))
+    SCREENSHOT_DIR: str = field(default_factory=lambda: _env("SCREENSHOT_DIR", "/tmp/nova_screenshots"))
 
     # Heartbeat / Proactive
     ENABLE_HEARTBEAT: bool = field(default_factory=lambda: _env("ENABLE_HEARTBEAT", "true").lower() == "true")
     HEARTBEAT_INTERVAL: int = field(default_factory=lambda: _env_int("HEARTBEAT_INTERVAL", 60))
     ENABLE_PROACTIVE: bool = field(default_factory=lambda: _env("ENABLE_PROACTIVE", "true").lower() == "true")
+    MIN_MONITOR_SCHEDULE_SECONDS: int = field(default_factory=lambda: _env_int("MIN_MONITOR_SCHEDULE_SECONDS", 60))
     DIGEST_HOUR: int = field(default_factory=lambda: _env_int("DIGEST_HOUR", 21))
+    USER_TIMEZONE: str = field(default_factory=lambda: _env("USER_TIMEZONE", "UTC"))
 
     # Learning
     TRAINING_DATA_PATH: str = field(default_factory=lambda: _env("TRAINING_DATA_PATH", "/data/training_data.jsonl"))
@@ -104,9 +152,8 @@ class Config:
     TRAINING_DATA_CHANNELS: str = field(default_factory=lambda: _env("TRAINING_DATA_CHANNELS", "api"))  # comma-separated: api,discord,telegram,whatsapp,signal
 
     # Fine-tuning automation
-    FINETUNE_MIN_NEW_PAIRS: int = field(default_factory=lambda: _env_int("FINETUNE_MIN_NEW_PAIRS", 50))
+    FINETUNE_MIN_NEW_PAIRS: int = field(default_factory=lambda: _env_int("FINETUNE_MIN_NEW_PAIRS", 15))
     FINETUNE_OUTPUT_DIR: str = field(default_factory=lambda: _env("FINETUNE_OUTPUT_DIR", "/data/finetune"))
-    FINETUNE_EVAL_HOLDOUT: int = field(default_factory=lambda: _env_int("FINETUNE_EVAL_HOLDOUT", 10))
 
     # Reasoning
     ENABLE_PLANNING: bool = field(default_factory=lambda: _env("ENABLE_PLANNING", "true").lower() == "true")
@@ -122,6 +169,9 @@ class Config:
 
     # Critique
     MAX_CRITIQUE_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_CRITIQUE_ROUNDS", 3))
+    CRITIQUE_ANSWER_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_ANSWER_LIMIT", 1500))
+    CRITIQUE_SOURCES_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_SOURCES_LIMIT", 1500))
+    CRITIQUE_FACTS_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_FACTS_LIMIT", 2000))
 
     # Delegation (multi-agent)
     ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
@@ -145,8 +195,62 @@ class Config:
     WHISPER_MODEL_SIZE: str = field(default_factory=lambda: _env("WHISPER_MODEL_SIZE", "base"))
     VOICE_MAX_DURATION: int = field(default_factory=lambda: _env_int("VOICE_MAX_DURATION", 300))
 
+    # Limits
+    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 6000))
+    MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
+    MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 1000))
+    MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
+    MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
+    MAX_CUSTOM_TOOL_CODE_LENGTH: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOL_CODE_LENGTH", 5000))
+    MAX_CUSTOM_TOOLS: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOLS", 50))
+    RATE_LIMIT_RPM: int = field(default_factory=lambda: _env_int("RATE_LIMIT_RPM", 60))
+
+    # Prompt context limits (how many items of each type in system prompt)
+    MAX_KG_FACTS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS_IN_PROMPT", 8))
+    MAX_REFLEXIONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS_IN_PROMPT", 3))
+    MAX_SUCCESS_PATTERNS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_SUCCESS_PATTERNS_IN_PROMPT", 2))
+    MAX_REFLEXIONS: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS", 200))
+
     # Security
     ENABLE_INJECTION_DETECTION: bool = field(default_factory=lambda: _env("ENABLE_INJECTION_DETECTION", "true").lower() == "true")
+    REQUIRE_AUTH: bool = field(default_factory=lambda: _env("REQUIRE_AUTH", "true").lower() == "true")
+    TRUSTED_PROXY: str = field(default_factory=lambda: _env("TRUSTED_PROXY", ""))
+    AUTH_MAX_FAILURES: int = field(default_factory=lambda: _env_int("AUTH_MAX_FAILURES", 10))
+    AUTH_LOCKOUT_SECONDS: int = field(default_factory=lambda: _env_int("AUTH_LOCKOUT_SECONDS", 300))
+
+    # Query limits
+    MAX_QUERY_LENGTH: int = field(default_factory=lambda: _env_int("MAX_QUERY_LENGTH", 50000))
+
+    # --- Tuning parameters ---
+    RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 600))
+    RETRIEVAL_RELEVANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("RETRIEVAL_RELEVANCE_THRESHOLD", 0.15))
+    TEMPERATURE_DEFAULT: float = field(default_factory=lambda: _env_float("TEMPERATURE_DEFAULT", 0.7))
+    TEMPERATURE_INTERNAL: float = field(default_factory=lambda: _env_float("TEMPERATURE_INTERNAL", 0.3))
+    TEMPERATURE_REFLEXION: float = field(default_factory=lambda: _env_float("TEMPERATURE_REFLEXION", 0.4))
+    MIN_RRF_SCORE: float = field(default_factory=lambda: _env_float("MIN_RRF_SCORE", 0.015))
+    DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
+    REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
+    REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
+    REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
+    SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
+    INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
+    FACT_INJECTION_SKIP_THRESHOLD: float = field(default_factory=lambda: _env_float("FACT_INJECTION_SKIP_THRESHOLD", 0.3))
+    FACT_CONFIDENCE_EXTRACTED: float = field(default_factory=lambda: _env_float("FACT_CONFIDENCE_EXTRACTED", 0.65))
+    FACT_CONFIDENCE_USER: float = field(default_factory=lambda: _env_float("FACT_CONFIDENCE_USER", 0.9))
+    REFLEXION_FAILURE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_FAILURE_THRESHOLD", 0.6))
+    REFLEXION_SUCCESS_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_SUCCESS_THRESHOLD", 0.8))
+    KG_GRAPH_MAX_FRONTIER: int = field(default_factory=lambda: _env_int("KG_GRAPH_MAX_FRONTIER", 1000))
+    AUTH_MAX_TRACKED_IPS: int = field(default_factory=lambda: _env_int("AUTH_MAX_TRACKED_IPS", 10000))
+
+    # OpenAI token counting: use completion_tokens instead of total_tokens
+    OPENAI_USE_COMPLETION_TOKENS: bool = field(default_factory=lambda: _env("OPENAI_USE_COMPLETION_TOKENS", "false").lower() == "true")
+
+    # Provider base URLs (for self-hosted / proxy setups)
+    OPENAI_BASE_URL: str = field(default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com"))
+    ANTHROPIC_BASE_URL: str = field(default_factory=lambda: _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
+    GOOGLE_BASE_URL: str = field(default_factory=lambda: _env("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com"))
+    ANTHROPIC_API_VERSION: str = field(default_factory=lambda: _env("ANTHROPIC_API_VERSION", "2024-10-22"))
+    ANTHROPIC_BETA_HEADER: str = field(default_factory=lambda: _env("ANTHROPIC_BETA_HEADER", "interleaved-thinking-2025-05-14"))
 
     # System access tiers (sandboxed | standard | full | none)
     SYSTEM_ACCESS_LEVEL: str = field(default_factory=lambda: _env("SYSTEM_ACCESS_LEVEL", "sandboxed"))
@@ -163,6 +267,7 @@ class Config:
     EMAIL_FROM: str = field(default_factory=lambda: _env("EMAIL_FROM"))
     EMAIL_SMTP_TLS: bool = field(default_factory=lambda: _env("EMAIL_SMTP_TLS", "true").lower() == "true")
     EMAIL_ALLOWED_RECIPIENTS: str = field(default_factory=lambda: _env("EMAIL_ALLOWED_RECIPIENTS"))
+    EMAIL_RATE_LIMIT: int = field(default_factory=lambda: _env_int("EMAIL_RATE_LIMIT", 20))
 
     # Action: Calendar
     ENABLE_CALENDAR: bool = field(default_factory=lambda: _env("ENABLE_CALENDAR", "true").lower() == "true")
@@ -187,6 +292,7 @@ class Config:
     WHATSAPP_PHONE_ID: str = field(default_factory=lambda: _env("WHATSAPP_PHONE_ID"))
     WHATSAPP_CHAT_ID: str = field(default_factory=lambda: _env("WHATSAPP_CHAT_ID"))
     WHATSAPP_ALLOWED_USERS: str = field(default_factory=lambda: _env("WHATSAPP_ALLOWED_USERS"))
+    WHATSAPP_APP_SECRET: str = field(default_factory=lambda: _env("WHATSAPP_APP_SECRET"))
 
     # Channel: Signal (via signal-cli REST API)
     SIGNAL_API_URL: str = field(default_factory=lambda: _env("SIGNAL_API_URL"))
@@ -211,7 +317,8 @@ class Config:
     _SENSITIVE_FIELDS = frozenset({
         "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
         "EMAIL_SMTP_PASS", "DISCORD_TOKEN", "TELEGRAM_TOKEN",
-        "WHATSAPP_API_TOKEN", "WHATSAPP_VERIFY_TOKEN", "API_KEY",
+        "WHATSAPP_API_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET",
+        "API_KEY",
     })
 
     def __post_init__(self) -> None:
@@ -244,6 +351,8 @@ class Config:
         for key, value in kwargs.items():
             if not hasattr(self, key) or key.startswith('_'):
                 continue
+            if key not in _MUTABLE_FIELDS:
+                continue
             # Type coerce based on current field type
             current = getattr(self, key)
             if isinstance(current, bool):
@@ -253,6 +362,9 @@ class Config:
                 value = int(value)
             elif isinstance(current, float):
                 value = float(value)
+            # Bounds validation for security-sensitive thresholds
+            if key == "INJECTION_SUSPICIOUS_THRESHOLD":
+                value = max(0.1, min(0.9, float(value)))
             object.__setattr__(self, key, value)
         return self.validate()
 
@@ -292,7 +404,9 @@ class Config:
             return
         try:
             overrides = json.loads(_OVERRIDES_PATH.read_text())
-            self.update(**overrides)
+            # Only load overrides for mutable fields (security: prevent persisted security bypasses)
+            filtered = {k: v for k, v in overrides.items() if k in _MUTABLE_FIELDS}
+            self.update(**filtered)
         except (json.JSONDecodeError, OSError):
             pass
 
@@ -332,6 +446,19 @@ class Config:
             warnings.append(
                 f"SYSTEM_ACCESS_LEVEL must be sandboxed/standard/full/none, got '{self.SYSTEM_ACCESS_LEVEL}'"
             )
+
+        if not (0 <= self.DIGEST_HOUR <= 23):
+            warnings.append(f"DIGEST_HOUR must be 0-23, got: {self.DIGEST_HOUR}")
+
+        if self.USER_TIMEZONE and self.USER_TIMEZONE != "UTC":
+            try:
+                from zoneinfo import ZoneInfo
+                ZoneInfo(self.USER_TIMEZONE)
+            except (KeyError, ImportError):
+                warnings.append(f"USER_TIMEZONE '{self.USER_TIMEZONE}' is not a valid IANA timezone")
+
+        if self.HEARTBEAT_INTERVAL < 1:
+            warnings.append(f"HEARTBEAT_INTERVAL must be >= 1, got: {self.HEARTBEAT_INTERVAL}")
 
         return warnings
 

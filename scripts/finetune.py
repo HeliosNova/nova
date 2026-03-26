@@ -41,9 +41,10 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Defaults
-DEFAULT_DATA_PATH = "/data/training_data.jsonl"
-DEFAULT_OUTPUT_DIR = "/data/finetune"
+# Defaults (configurable via env vars or CLI args)
+_NOVA_DATA_DIR = os.environ.get("NOVA_DATA_DIR", "/data")
+DEFAULT_DATA_PATH = os.getenv("TRAINING_DATA_PATH", os.path.join(_NOVA_DATA_DIR, "training_data.jsonl"))
+DEFAULT_OUTPUT_DIR = os.getenv("FINETUNE_OUTPUT_DIR", os.path.join(_NOVA_DATA_DIR, "finetune"))
 DEFAULT_MODEL = "Qwen/Qwen3.5-27B"
 DEFAULT_MAX_SEQ_LENGTH = 2048
 DEFAULT_LORA_RANK = 16
@@ -135,26 +136,15 @@ def train(
     grad_accum: int = DEFAULT_GRAD_ACCUM,
     learning_rate: float = DEFAULT_LR,
 ) -> str:
-    """Run DPO fine-tuning with Unsloth + QLoRA.
+    """Run DPO fine-tuning with QLoRA (vanilla HuggingFace stack).
 
+    Uses transformers + PEFT + TRL directly (no Unsloth).
     Returns path to the saved adapter.
     """
-    try:
-        from unsloth import FastLanguageModel
-    except ImportError:
-        raise RuntimeError(
-            "Unsloth not installed. Run:\n"
-            "  pip install -r scripts/requirements-finetune.txt"
-        )
-
-    try:
-        from trl import DPOTrainer, DPOConfig
-    except ImportError:
-        raise RuntimeError(
-            "TRL not installed. Run:\n"
-            "  pip install trl>=0.12.0"
-        )
-
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+    from trl import DPOTrainer, DPOConfig
     from datasets import Dataset
 
     adapter_dir = os.path.join(output_dir, "adapter")
@@ -162,29 +152,37 @@ def train(
 
     # --- Step 1: Load model with 4-bit quantization ---
     logger.info("Loading %s with 4-bit quantization...", model_name)
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=model_name,
-        max_seq_length=max_seq_length,
+    bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
-        dtype=None,  # Auto-detect
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
     )
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     # --- Step 2: Apply LoRA ---
     logger.info("Applying LoRA (rank=%d)...", lora_rank)
-    model = FastLanguageModel.get_peft_model(
-        model,
+    model = prepare_model_for_kbit_training(model)
+    lora_config = LoraConfig(
         r=lora_rank,
-        target_modules=[
-            "q_proj", "k_proj", "v_proj", "o_proj",
-            "gate_proj", "up_proj", "down_proj",
-        ],
         lora_alpha=lora_rank,
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                        "gate_proj", "up_proj", "down_proj"],
         lora_dropout=0,
         bias="none",
-        use_gradient_checkpointing="unsloth",
-        random_state=42,
-        max_seq_length=max_seq_length,
+        task_type="CAUSAL_LM",
     )
+    model = get_peft_model(model, lora_config)
+    model.print_trainable_parameters()
 
     # --- Step 3: Prepare dataset ---
     logger.info("Preparing DPO dataset (%d pairs)...", len(data))
@@ -204,21 +202,22 @@ def train(
         gradient_accumulation_steps=grad_accum,
         learning_rate=learning_rate,
         optim="adamw_8bit",
-        warmup_ratio=0.1,
+        warmup_steps=2,
         logging_steps=1,
         save_strategy="epoch",
         max_length=max_seq_length,
-        max_prompt_length=max_seq_length // 2,
-        beta=0.1,  # DPO temperature
-        fp16=True,
+        # max_prompt_length removed in TRL 0.16+ (auto-calculated)
+        beta=0.1,
+        bf16=True,
         report_to="none",
+        gradient_checkpointing=True,
     )
 
     trainer = DPOTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
-        tokenizer=tokenizer,
+        processing_class=tokenizer,
     )
 
     train_result = trainer.train()
@@ -282,6 +281,9 @@ def export_gguf(adapter_dir: str, output_dir: str, model_name: str = DEFAULT_MOD
         modelfile_path = os.path.join(output_dir, "Modelfile")
         with open(modelfile_path, "w") as f:
             f.write(f'FROM {actual_path}\n')
+            f.write('TEMPLATE {{ .Prompt }}\n')
+            f.write('RENDERER qwen3.5\n')
+            f.write('PARSER qwen3.5\n')
             f.write('PARAMETER temperature 0.7\n')
             f.write('PARAMETER num_predict 2000\n')
             f.write('PARAMETER num_ctx 4096\n')
@@ -356,7 +358,7 @@ def main():
     try:
         import torch
         if torch.cuda.is_available():
-            vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+            vram = torch.cuda.get_device_properties(0).total_memory / 1e9
             free = torch.cuda.mem_get_info()[0] / 1e9
             logger.info("GPU: %s (%.1f GB total, %.1f GB free)", torch.cuda.get_device_name(0), vram, free)
             if free < 18:
@@ -366,7 +368,7 @@ def main():
                 )
         else:
             raise RuntimeError("No CUDA GPU found! Fine-tuning requires an NVIDIA GPU.")
-    except ImportError:
+    except (ImportError, AttributeError):
         logger.warning("PyTorch not installed — can't check VRAM")
 
     # Train

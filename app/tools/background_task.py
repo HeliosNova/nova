@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 
 from app.schema import EventType
-from app.tools.base import BaseTool, ToolResult
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
 
@@ -13,12 +13,32 @@ logger = logging.getLogger(__name__)
 class BackgroundTaskTool(BaseTool):
     name = "background_task"
     description = (
-        "Run a task in the background without blocking the conversation. "
-        "Use for long-running research, analysis, or any task that doesn't "
-        "need an immediate answer. Actions: submit (start a task), status "
-        "(check a task), list (show all tasks), cancel (stop a task)."
+        "Run tasks in the background without blocking the conversation. "
+        "Spawns an ephemeral reasoning loop with full tool access for long-running research or analysis. "
+        "Actions: submit (start a new background task), status (check task progress by ID), "
+        "list (show all tasks with status icons), cancel (stop a running task). "
+        "Do NOT use for quick questions — only for tasks that would take too long to wait for."
     )
     parameters = "action: str (submit|status|list|cancel), task: str = '', task_id: str = ''"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["submit", "status", "list", "cancel"],
+                "description": "Background task action to perform.",
+            },
+            "task": {
+                "type": "string",
+                "description": "Task description to submit (required for submit action).",
+            },
+            "task_id": {
+                "type": "string",
+                "description": "Task ID (required for status and cancel actions).",
+            },
+        },
+        "required": ["action"],
+    }
 
     async def execute(
         self,
@@ -29,18 +49,18 @@ class BackgroundTaskTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         if not action:
-            return ToolResult(output="", success=False, error="No action provided. Use: submit, status, list, cancel")
+            return ToolResult(output="", success=False, error="No action provided. Use: submit, status, list, cancel", error_category=ErrorCategory.VALIDATION)
 
         # Get TaskManager from Services
         from app.core.brain import get_services
         try:
             svc = get_services()
         except RuntimeError:
-            return ToolResult(output="", success=False, error="Services not initialized")
+            return ToolResult(output="", success=False, error="Services not initialized", error_category=ErrorCategory.INTERNAL)
 
         tm = svc.task_manager
         if tm is None:
-            return ToolResult(output="", success=False, error="TaskManager not available")
+            return ToolResult(output="", success=False, error="TaskManager not available", error_category=ErrorCategory.INTERNAL)
 
         action = action.lower().strip()
 
@@ -53,18 +73,20 @@ class BackgroundTaskTool(BaseTool):
         elif action == "cancel":
             return self._cancel(tm, task_id)
         else:
-            return ToolResult(output="", success=False, error=f"Unknown action '{action}'. Use: submit, status, list, cancel")
+            return ToolResult(output="", success=False, error=f"Unknown action '{action}'. Use: submit, status, list, cancel", error_category=ErrorCategory.VALIDATION)
 
     async def _submit(self, tm, task: str) -> ToolResult:
         if not task:
-            return ToolResult(output="", success=False, error="No task provided for submit")
+            return ToolResult(output="", success=False, error="No task provided for submit", error_category=ErrorCategory.VALIDATION)
 
         # Import here to avoid circular imports
         from app.core.brain import think
 
+        # Shared list for partial result capture on failure
+        partial_collector: list[str] = []
+
         async def _run_think() -> str:
             """Run an ephemeral think() call and collect the output."""
-            collected = []
             async for event in think(
                 query=task,
                 conversation_id=None,
@@ -72,11 +94,11 @@ class BackgroundTaskTool(BaseTool):
             ):
                 if event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
-                    collected.append(text)
+                    partial_collector.append(text)
                 elif event.type == EventType.ERROR:
                     raise RuntimeError(event.data.get("message", "unknown error"))
 
-            result = "".join(collected)
+            result = "".join(partial_collector)
             if not result.strip():
                 return "[Background task produced no output]"
 
@@ -86,9 +108,9 @@ class BackgroundTaskTool(BaseTool):
             return result
 
         try:
-            task_id = tm.submit(_run_think(), description=task[:200])
+            task_id = tm.submit(_run_think(), description=task[:200], partial_collector=partial_collector)
         except RuntimeError as e:
-            return ToolResult(output="", success=False, error=str(e))
+            return ToolResult(output="", success=False, error=str(e), error_category=ErrorCategory.INTERNAL)
 
         return ToolResult(
             output=f"Background task submitted. ID: {task_id}\nUse background_task(action='status', task_id='{task_id}') to check progress.",
@@ -97,11 +119,11 @@ class BackgroundTaskTool(BaseTool):
 
     def _status(self, tm, task_id: str) -> ToolResult:
         if not task_id:
-            return ToolResult(output="", success=False, error="No task_id provided for status")
+            return ToolResult(output="", success=False, error="No task_id provided for status", error_category=ErrorCategory.VALIDATION)
 
         bg = tm.get_status(task_id)
         if not bg:
-            return ToolResult(output="", success=False, error=f"Task '{task_id}' not found")
+            return ToolResult(output="", success=False, error=f"Task '{task_id}' not found", error_category=ErrorCategory.NOT_FOUND)
 
         lines = [
             f"Task: {bg.id}",
@@ -115,6 +137,8 @@ class BackgroundTaskTool(BaseTool):
             lines.append(f"Result: {bg.result}")
         if bg.error:
             lines.append(f"Error: {bg.error}")
+        if bg.partial_result:
+            lines.append(f"Partial result: {bg.partial_result}")
 
         return ToolResult(output="\n".join(lines), success=True)
 
@@ -132,9 +156,9 @@ class BackgroundTaskTool(BaseTool):
 
     def _cancel(self, tm, task_id: str) -> ToolResult:
         if not task_id:
-            return ToolResult(output="", success=False, error="No task_id provided for cancel")
+            return ToolResult(output="", success=False, error="No task_id provided for cancel", error_category=ErrorCategory.VALIDATION)
 
         if tm.cancel(task_id):
             return ToolResult(output=f"Task '{task_id}' cancelled.", success=True)
         else:
-            return ToolResult(output="", success=False, error=f"Task '{task_id}' not found or already finished")
+            return ToolResult(output="", success=False, error=f"Task '{task_id}' not found or already finished", error_category=ErrorCategory.NOT_FOUND)

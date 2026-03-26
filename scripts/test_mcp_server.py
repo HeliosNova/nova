@@ -1,4 +1,4 @@
-"""Manual integration test for the Nova_ MCP server.
+"""Manual integration test for the Nova MCP server.
 
 Starts the MCP server as a subprocess via stdio transport, connects
 as an MCP client, lists tools, calls each tool with sample data,
@@ -49,7 +49,7 @@ async def main() -> int:
         print(f"ERROR: MCP server runner not found at {runner_path}")
         return 1
 
-    _banner("Nova_ MCP Server Integration Test")
+    _banner("Nova MCP Server Integration Test")
 
     # Use a temporary database if DB_PATH is not set
     if not os.environ.get("DB_PATH"):

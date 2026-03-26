@@ -59,7 +59,7 @@ export const useChatStore = create<ChatState>((set) => ({
   pendingLessonLearned: null,
   pendingSources: [],
   error: null,
-  sidebarOpen: true,
+  sidebarOpen: typeof window !== 'undefined' && window.innerWidth > 768,
 
   setConversations: (conversations) => set({ conversations }),
 
@@ -217,7 +217,7 @@ interface SettingsState {
   apiKey: string;
   theme: ThemeSetting;
 
-  setHealth: (h: HealthResponse) => void;
+  setHealth: (h: HealthResponse | null) => void;
   setApiKey: (key: string) => void;
   setTheme: (t: ThemeSetting) => void;
 }

@@ -42,7 +42,12 @@ export default function ToolCallCard({ toolCall }: Props) {
           <CheckCircle size={14} className="text-nova-success flex-shrink-0" />
         )}
         <span className="font-semibold text-nova-text">{toolCall.tool}</span>
-        <span className="text-nova-text-dim">
+        {toolCall.args && Object.keys(toolCall.args).length > 0 && (
+          <span className="text-nova-text-dim truncate max-w-[300px]" title={JSON.stringify(toolCall.args)}>
+            {Object.values(toolCall.args).map(v => typeof v === "string" ? v : JSON.stringify(v)).join(", ").slice(0, 80)}
+          </span>
+        )}
+        <span className="ml-auto text-nova-text-dim">
           {isDelegation && isExecuting
             ? "delegating..."
             : isExecuting

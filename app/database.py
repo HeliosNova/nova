@@ -27,7 +27,7 @@ CREATE TABLE IF NOT EXISTS conversations (
 
 CREATE TABLE IF NOT EXISTS messages (
     id TEXT PRIMARY KEY,
-    conversation_id TEXT REFERENCES conversations(id),
+    conversation_id TEXT REFERENCES conversations(id) ON DELETE CASCADE,
     role TEXT NOT NULL,
     content TEXT NOT NULL,
     tool_calls TEXT,
@@ -100,6 +100,11 @@ CREATE TABLE IF NOT EXISTS kg_facts (
     confidence REAL DEFAULT 0.8,
     source TEXT DEFAULT 'extracted',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    valid_from TIMESTAMP,
+    valid_to TIMESTAMP,
+    provenance TEXT DEFAULT '',
+    superseded_by INTEGER,
+    times_retrieved INTEGER DEFAULT 0,
     UNIQUE(subject, predicate, object)
 );
 
@@ -163,6 +168,32 @@ CREATE TABLE IF NOT EXISTS action_log (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Heartbeat instructions
+CREATE TABLE IF NOT EXISTS heartbeat_instructions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    instruction TEXT NOT NULL,
+    schedule_seconds INTEGER DEFAULT 3600,
+    enabled INTEGER DEFAULT 1,
+    last_run_at TEXT,
+    notify_channels TEXT DEFAULT 'discord,telegram',
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+-- System state (key-value persistence for runtime state)
+CREATE TABLE IF NOT EXISTS system_state (
+    key TEXT PRIMARY KEY,
+    value TEXT,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Auth lockout persistence (survive restarts)
+CREATE TABLE IF NOT EXISTS auth_lockouts (
+    ip TEXT PRIMARY KEY,
+    failures TEXT DEFAULT '[]',
+    locked_until REAL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
 CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
@@ -171,6 +202,7 @@ CREATE INDEX IF NOT EXISTS idx_lessons_topic ON lessons(topic);
 CREATE INDEX IF NOT EXISTS idx_skills_trigger ON skills(trigger_pattern);
 CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_facts(subject);
 CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_facts(object);
+CREATE INDEX IF NOT EXISTS idx_kg_valid_from ON kg_facts(valid_from);
 CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 CREATE INDEX IF NOT EXISTS idx_monitor_results_monitor ON monitor_results(monitor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_log_type ON action_log(action_type, created_at);
@@ -223,62 +255,155 @@ class SafeDB:
             self._run_migrations(conn)
 
     def _run_migrations(self, conn: sqlite3.Connection) -> None:
-        """Run schema migrations for existing databases."""
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()}
-        if "lesson_text" not in cols:
-            conn.execute("ALTER TABLE lessons ADD COLUMN lesson_text TEXT DEFAULT ''")
-            conn.commit()
-        if "last_retrieved_at" not in cols:
-            conn.execute("ALTER TABLE lessons ADD COLUMN last_retrieved_at TIMESTAMP")
-            conn.commit()
+        """Run schema migrations for existing databases.
 
-        kg_cols = {row[1] for row in conn.execute("PRAGMA table_info(kg_facts)").fetchall()}
-        if "times_retrieved" not in kg_cols:
-            conn.execute("ALTER TABLE kg_facts ADD COLUMN times_retrieved INTEGER DEFAULT 0")
-            conn.commit()
+        Each migration is versioned and wrapped in a transaction.
+        Already-applied migrations are skipped via the schema_version table.
+        """
+        # Create schema_version tracking table
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS schema_version "
+            "(version INTEGER PRIMARY KEY, applied_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+        )
+        conn.commit()
 
-        uf_cols = {row[1] for row in conn.execute("PRAGMA table_info(user_facts)").fetchall()}
-        if "category" not in uf_cols:
-            conn.execute("ALTER TABLE user_facts ADD COLUMN category TEXT DEFAULT 'fact'")
-            conn.commit()
-        if "last_accessed_at" not in uf_cols:
-            conn.execute("ALTER TABLE user_facts ADD COLUMN last_accessed_at TIMESTAMP")
-            conn.commit()
-        if "access_count" not in uf_cols:
-            conn.execute("ALTER TABLE user_facts ADD COLUMN access_count INTEGER DEFAULT 0")
-            conn.commit()
+        # Get already-applied versions
+        applied = {row[0] for row in conn.execute("SELECT version FROM schema_version").fetchall()}
 
-        # Monitor results: user_rating for feedback loop
-        mr_cols = {row[1] for row in conn.execute("PRAGMA table_info(monitor_results)").fetchall()}
-        if "user_rating" not in mr_cols:
-            conn.execute("ALTER TABLE monitor_results ADD COLUMN user_rating INTEGER DEFAULT 0")
-            conn.commit()
+        # --- Migration 1: lesson columns ---
+        if 1 not in applied:
+            conn.execute("BEGIN")
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+                if "lesson_text" not in cols:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN lesson_text TEXT DEFAULT ''")
+                if "last_retrieved_at" not in cols:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN last_retrieved_at TIMESTAMP")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (1,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-        # Lessons: quiz spaced repetition columns
-        if "last_quizzed_at" not in cols:
-            conn.execute("ALTER TABLE lessons ADD COLUMN last_quizzed_at TIMESTAMP")
-            conn.commit()
-        if "quiz_failures" not in cols:
-            conn.execute("ALTER TABLE lessons ADD COLUMN quiz_failures INTEGER DEFAULT 0")
-            conn.commit()
+        # --- Migration 2: kg_facts columns ---
+        if 2 not in applied:
+            conn.execute("BEGIN")
+            try:
+                kg_cols = {row[1] for row in conn.execute("PRAGMA table_info(kg_facts)").fetchall()}
+                if "times_retrieved" not in kg_cols:
+                    conn.execute("ALTER TABLE kg_facts ADD COLUMN times_retrieved INTEGER DEFAULT 0")
+                if "last_retrieved_at" not in kg_cols:
+                    conn.execute("ALTER TABLE kg_facts ADD COLUMN last_retrieved_at TEXT")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (2,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
-        # Heartbeat instructions table
-        hi_tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table'"
-        ).fetchall()}
-        if "heartbeat_instructions" not in hi_tables:
-            conn.execute("""
-                CREATE TABLE heartbeat_instructions (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    instruction TEXT NOT NULL,
-                    schedule_seconds INTEGER DEFAULT 3600,
-                    enabled INTEGER DEFAULT 1,
-                    last_run_at TEXT,
-                    notify_channels TEXT DEFAULT 'discord,telegram',
-                    created_at TEXT DEFAULT (datetime('now'))
-                )
-            """)
-            conn.commit()
+        # --- Migration 3: user_facts columns ---
+        if 3 not in applied:
+            conn.execute("BEGIN")
+            try:
+                uf_cols = {row[1] for row in conn.execute("PRAGMA table_info(user_facts)").fetchall()}
+                if "category" not in uf_cols:
+                    conn.execute("ALTER TABLE user_facts ADD COLUMN category TEXT DEFAULT 'fact'")
+                if "last_accessed_at" not in uf_cols:
+                    conn.execute("ALTER TABLE user_facts ADD COLUMN last_accessed_at TIMESTAMP")
+                if "access_count" not in uf_cols:
+                    conn.execute("ALTER TABLE user_facts ADD COLUMN access_count INTEGER DEFAULT 0")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (3,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 4: monitor_results user_rating ---
+        if 4 not in applied:
+            conn.execute("BEGIN")
+            try:
+                mr_cols = {row[1] for row in conn.execute("PRAGMA table_info(monitor_results)").fetchall()}
+                if "user_rating" not in mr_cols:
+                    conn.execute("ALTER TABLE monitor_results ADD COLUMN user_rating INTEGER DEFAULT 0")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (4,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 5: lessons quiz columns ---
+        if 5 not in applied:
+            conn.execute("BEGIN")
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+                if "last_quizzed_at" not in cols:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN last_quizzed_at TIMESTAMP")
+                if "quiz_failures" not in cols:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN quiz_failures INTEGER DEFAULT 0")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (5,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 6: indexes ---
+        if 6 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_kg_predicate ON kg_facts(predicate)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_user_facts_last_accessed ON user_facts(last_accessed_at)")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_lessons_last_retrieved ON lessons(last_retrieved_at)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (6,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 7: heartbeat_instructions table ---
+        if 7 not in applied:
+            conn.execute("BEGIN")
+            try:
+                hi_tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "heartbeat_instructions" not in hi_tables:
+                    conn.execute("""
+                        CREATE TABLE heartbeat_instructions (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            instruction TEXT NOT NULL,
+                            schedule_seconds INTEGER DEFAULT 3600,
+                            enabled INTEGER DEFAULT 1,
+                            last_run_at TEXT,
+                            notify_channels TEXT DEFAULT 'discord,telegram',
+                            created_at TEXT DEFAULT (datetime('now'))
+                        )
+                    """)
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (7,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 8: auth_lockouts table ---
+        if 8 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "auth_lockouts" not in tables:
+                    conn.execute("""
+                        CREATE TABLE auth_lockouts (
+                            ip TEXT PRIMARY KEY,
+                            failures TEXT DEFAULT '[]',
+                            locked_until REAL,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (8,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
 
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
         with self._lock:
@@ -405,7 +530,56 @@ def get_async_db(db_path: str | None = None) -> AsyncSafeDB:
 
 def close_all() -> None:
     """Close all SafeDB instances. Call during shutdown."""
+    import logging as _logging
+    _logger = _logging.getLogger(__name__)
     with _instance_lock:
-        for db in _instances.values():
-            db.close()
+        for path, db in _instances.items():
+            try:
+                db.close()
+            except Exception as e:
+                _logger.error("Failed to close database %s: %s", path, e)
         _instances.clear()
+
+
+# ---------------------------------------------------------------------------
+# Channel conversation persistence
+# ---------------------------------------------------------------------------
+
+_CHANNEL_CONV_SCHEMA = """
+CREATE TABLE IF NOT EXISTS channel_conversations (
+    channel TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel, user_id)
+);
+"""
+
+
+class ChannelConversationStore:
+    """Persist channel user → conversation_id mappings in SQLite."""
+
+    def __init__(self, db: SafeDB):
+        self._db = db
+        self._db.execute(_CHANNEL_CONV_SCHEMA.strip())
+
+    def get(self, channel: str, user_id: str) -> str | None:
+        row = self._db.fetchone(
+            "SELECT conversation_id FROM channel_conversations WHERE channel = ? AND user_id = ?",
+            (channel, user_id),
+        )
+        return row["conversation_id"] if row else None
+
+    def set(self, channel: str, user_id: str, conversation_id: str) -> None:
+        self._db.execute(
+            "INSERT OR REPLACE INTO channel_conversations (channel, user_id, conversation_id, updated_at) "
+            "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+            (channel, user_id, conversation_id),
+        )
+
+    def get_all(self, channel: str) -> dict[str, str]:
+        rows = self._db.fetchall(
+            "SELECT user_id, conversation_id FROM channel_conversations WHERE channel = ?",
+            (channel,),
+        )
+        return {r["user_id"]: r["conversation_id"] for r in rows}

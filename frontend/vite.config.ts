@@ -13,12 +13,14 @@ export default defineConfig({
   server: {
     port: 5173,
     host: "0.0.0.0",
+    allowedHosts: ["nova-frontend", "localhost", ".localhost"],
     watch: {
       usePolling: true,
     },
     proxy: {
       "/api": {
-        target: process.env.VITE_API_URL || "http://localhost:8000",
+        // Server-side proxy: use internal Docker hostname, not localhost
+        target: process.env.API_PROXY_TARGET || "http://nova-app:8000",
         changeOrigin: true,
       },
     },

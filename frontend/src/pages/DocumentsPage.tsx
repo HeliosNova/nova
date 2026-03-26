@@ -299,7 +299,7 @@ export default function DocumentsPage() {
                     <p className="text-sm text-nova-text-dim">
                       {uploadStatus === "reading"
                         ? `Reading file${uploadFile ? ` (${formatFileSize(uploadFile.size)})` : ""}...`
-                        : "Uploading to Nova_..."}
+                        : "Uploading to Nova..."}
                     </p>
                     {uploadFile && (
                       <p className="mt-1 flex items-center gap-1.5 text-xs text-nova-text-dim/60">
@@ -432,6 +432,7 @@ export default function DocumentsPage() {
             <EmptyState
               icon={<FileText size={40} strokeWidth={1.5} />}
               title="No documents ingested yet."
+              description="Upload text files, paste content, or provide a URL above. Documents are chunked, embedded, and searchable."
             />
           ) : (
             <div className="overflow-x-auto rounded-lg border border-nova-border">

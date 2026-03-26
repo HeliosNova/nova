@@ -27,7 +27,7 @@ if TYPE_CHECKING:
     from app.tools.base import ToolRegistry
     from app.monitors.heartbeat import MonitorStore, HeartbeatLoop
 from app.core import llm
-from app.core.learning import is_likely_correction
+from app.core.learning import is_likely_correction, response_pushes_back
 from app.core.llm import LLMUnavailableError, _extract_tool_calls
 from app.core.memory import ConversationStore, UserFactStore, has_fact_signals, extract_facts_from_message
 from app.core.prompt import (
@@ -41,6 +41,47 @@ logger = logging.getLogger(__name__)
 
 # Background task references to prevent GC (PEP 540 / asyncio docs warning)
 _background_tasks: set[asyncio.Task] = set()
+
+# Per-conversation locks to serialize concurrent think() calls for the same conversation.
+# Plain dict (insertion-ordered in Python 3.7+) with max-size eviction.
+_conversation_locks: dict[str, asyncio.Lock] = {}
+_conversation_locks_meta_lock = asyncio.Lock()
+_MAX_CONVERSATION_LOCKS = 500
+
+
+async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
+    """Get or create a per-conversation lock with LRU eviction.
+
+    Uses a plain dict (insertion-ordered) as an LRU cache.
+    On hit: re-insert to move to end (most recent).
+    On capacity: evict oldest unlocked entries in one pass.
+    """
+    async with _conversation_locks_meta_lock:
+        if conv_id in _conversation_locks:
+            # Move to end (most recently used) by re-inserting
+            lock = _conversation_locks.pop(conv_id)
+            _conversation_locks[conv_id] = lock
+            return lock
+        # Evict oldest unlocked entries if at capacity
+        if len(_conversation_locks) >= _MAX_CONVERSATION_LOCKS:
+            to_evict = [
+                k for k, v in _conversation_locks.items() if not v.locked()
+            ]
+            # Evict enough to get below capacity (oldest first — dict is ordered)
+            needed = len(_conversation_locks) - _MAX_CONVERSATION_LOCKS + 1
+            for k in to_evict[:needed]:
+                del _conversation_locks[k]
+        lock = asyncio.Lock()
+        _conversation_locks[conv_id] = lock
+        return lock
+
+
+# Tools with side effects — skip caching for these (used in think() tool cache)
+_SIDE_EFFECT_TOOLS = frozenset({
+    "file_ops", "email_send", "webhook", "calendar", "reminder",
+    "shell_exec", "code_exec", "integration", "delegate", "browser",
+    "desktop", "background_task", "tool_create", "monitor",
+})
 
 
 # ---------------------------------------------------------------------------
@@ -73,6 +114,8 @@ _services: Services | None = None
 
 def set_services(svc: Services) -> None:
     global _services
+    if _services is not None:
+        logger.warning("set_services() called more than once — replacing existing Services instance")
     _services = svc
 
 
@@ -112,24 +155,32 @@ async def _handle_tool_create(svc: Services, args: dict) -> str:
         logger.warning("Tool creation failed: %s", e)
         return f"[Tool creation failed: {e}]"
 
-async def _execute_tool(tool_name: str, args: dict) -> str:
-    """Execute a tool via the registry. Falls back to placeholder if no registry."""
-    from app.tools.base import format_tool_error
+async def _execute_tool(tool_name: str, args: dict) -> tuple[str, "ToolResult | None"]:
+    """Execute a tool via the registry. Returns (output_str, ToolResult|None).
+
+    The ToolResult is used for structured failure detection (success field)
+    instead of substring matching on error markers.
+    """
+    from app.tools.base import format_tool_error, ToolResult, ErrorCategory
     svc = get_services()
     if svc.tool_registry:
         timeout = float(config.TOOL_TIMEOUT)
         try:
-            return await asyncio.wait_for(
-                svc.tool_registry.execute(tool_name, args),
+            output, result = await asyncio.wait_for(
+                svc.tool_registry.execute_full(tool_name, args),
                 timeout=timeout,
             )
+            return output, result
         except asyncio.TimeoutError:
             logger.warning("Tool '%s' timed out after %ds", tool_name, config.TOOL_TIMEOUT)
-            return format_tool_error(tool_name, f"Timed out after {config.TOOL_TIMEOUT} seconds", retriable=True)
+            msg = format_tool_error(tool_name, f"Timed out after {config.TOOL_TIMEOUT} seconds", retriable=True, category=ErrorCategory.TRANSIENT)
+            return msg, ToolResult(output="", success=False, error="Timeout", retriable=True, error_category=ErrorCategory.TRANSIENT)
         except Exception as e:
             logger.exception("Tool '%s' failed with exception", tool_name)
-            return format_tool_error(tool_name, f"Failed: {e}", retriable=True)
-    return format_tool_error(tool_name, "Not yet available")
+            msg = format_tool_error(tool_name, f"Failed: {e}", retriable=True, category=ErrorCategory.INTERNAL)
+            return msg, ToolResult(output="", success=False, error=str(e), retriable=True, error_category=ErrorCategory.INTERNAL)
+    msg = format_tool_error(tool_name, "Not yet available")
+    return msg, ToolResult(output="", success=False, error="Not yet available")
 
 
 def _get_tool_descriptions() -> str:
@@ -172,13 +223,7 @@ def _get_available_tools() -> list[dict]:
 # Context window management
 # ---------------------------------------------------------------------------
 
-def _estimate_tokens(text: str) -> int:
-    """Rough token estimate: ~4 chars/token for English, ~1.5 chars/token for CJK."""
-    if not text:
-        return 0
-    cjk_count = sum(1 for c in text if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af')
-    non_cjk = len(text) - cjk_count
-    return non_cjk // 4 + int(cjk_count / 1.5)
+from app.core.text_utils import estimate_tokens as _estimate_tokens
 
 
 async def _manage_context(
@@ -198,7 +243,7 @@ async def _manage_context(
     system_tokens = _estimate_tokens(system_prompt)
     query_tokens = _estimate_tokens(query)
     history_tokens = sum(_estimate_tokens(m.get("content", "")) for m in history)
-    response_budget = 600  # Reserve tokens for the response
+    response_budget = config.RESPONSE_TOKEN_BUDGET  # Reserve tokens for the response
 
     # 20% safety buffer on estimates (heuristic ~4 chars/token can be 30-50% off)
     total = int((system_tokens + history_tokens + query_tokens) * 1.2) + response_budget
@@ -230,7 +275,9 @@ async def _manage_context(
                         "content": (
                             "Summarize this conversation in 2-3 SHORT sentences. "
                             "Only key facts and decisions. No detail, no examples. "
-                            "Example: 'Discussed X. User prefers Y. Corrected Z.'"
+                            "IMPORTANT: Preserve ALL dates, numbers, proper nouns, "
+                            "monetary amounts, and technical values exactly as stated. "
+                            "Example: 'Discussed deployment on March 15. User prefers Y. Budget is $50,000.'"
                         ),
                     },
                     {"role": "user", "content": summary_input},
@@ -238,15 +285,43 @@ async def _manage_context(
                 max_tokens=150,
                 temperature=0.1,
             ),
-            timeout=30,
+            timeout=config.INTERNAL_LLM_TIMEOUT,
         )
+        summary = summary.strip()
         logger.info(
             "Context managed: %d→%d messages, summary=%d chars (budget: %d/%d tokens)",
             len(history), keep, len(summary),
             system_tokens + sum(_estimate_tokens(m.get("content", "")) for m in recent_messages) + query_tokens,
             config.MAX_CONTEXT_TOKENS,
         )
-        return recent_messages, summary.strip()
+
+        # Re-check: if total tokens still exceed budget after summarization,
+        # truncate the summary further (keep only the last half)
+        post_summary_tokens = (
+            system_tokens
+            + sum(_estimate_tokens(m.get("content", "")) for m in recent_messages)
+            + query_tokens
+            + _estimate_tokens(summary)
+            + response_budget
+        )
+        if post_summary_tokens > config.MAX_CONTEXT_TOKENS and summary:
+            half = len(summary) // 2
+            # Find nearest sentence boundary after the half position
+            boundary = -1
+            for sep in (". ", "\n"):
+                pos = summary.find(sep, half)
+                if pos != -1 and (boundary == -1 or pos < boundary):
+                    boundary = pos + len(sep)
+            if boundary != -1 and boundary < len(summary):
+                summary = summary[boundary:].lstrip()
+            else:
+                summary = summary[half:].lstrip()
+            logger.info(
+                "Post-summarization budget still exceeded — truncated summary to %d chars",
+                len(summary),
+            )
+
+        return recent_messages, summary
     except (Exception, asyncio.TimeoutError) as e:
         logger.warning("Summarization failed: %s — truncating instead", e)
         truncation_note = f"[{len(old_messages)} older messages truncated due to context limits]"
@@ -300,8 +375,10 @@ async def _classify_intent(query: str) -> str:
                         max_tokens=10,
                         temperature=0,
                     ),
-                    timeout=30,
+                    timeout=config.INTERNAL_LLM_TIMEOUT,
                 )
+                if result is None:
+                    return "general"
                 classification = result.strip().lower().strip('"\'.')
                 if classification in ("greeting", "general"):
                     return classification
@@ -319,18 +396,27 @@ async def _classify_intent(query: str) -> str:
 
 async def _generate_title(query: str) -> str:
     """Generate a short conversation title from the first query."""
-    result = await llm.invoke_nothink(
-        [
-            {"role": "system", "content": (
-                "Generate a 3-5 word title summarizing this conversation topic. "
-                "Rules: NO emojis, NO quotes, NO punctuation, plain English only. "
-                "Return ONLY the title words, nothing else."
-            )},
-            {"role": "user", "content": query},
-        ],
-        max_tokens=15,
-        temperature=0.2,
-    )
+    try:
+        result = await asyncio.wait_for(
+            llm.invoke_nothink(
+                [
+                    {"role": "system", "content": (
+                        "Generate a 3-5 word title summarizing this conversation topic. "
+                        "Rules: NO emojis, NO quotes, NO punctuation, plain English only. "
+                        "Return ONLY the title words, nothing else."
+                    )},
+                    {"role": "user", "content": query},
+                ],
+                max_tokens=15,
+                temperature=0.2,
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        logger.warning("Title generation timed out")
+        return query[:40].strip()
+    if result is None:
+        return query[:40].strip()
     # Clean up: strip quotes, emojis, limit length
     title = result.strip().strip('"\'').strip()
     # Remove any emojis or non-ASCII
@@ -352,7 +438,11 @@ _META_PATTERNS = [
     re.compile(r"\*+Note:.*?(?:I'(?:ve|ll)|updated|saved|remembered|stored|recorded).*?\*+", re.IGNORECASE),
     re.compile(r"^I've (?:noted|recorded|saved|updated|stored) (?:your|that|this) correction.*$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^Thank you for (?:the )?correction.*$", re.IGNORECASE | re.MULTILINE),
-    re.compile(r"<think>.*?</think>", re.DOTALL),
+    re.compile(r"<think>.*</think>", re.DOTALL),
+    # Date confusion disclaimers (Qwen calls 2026 a "simulated future date")
+    re.compile(r"\b(?:simulated|hypothetical)\s+(?:future\s+)?date\b[^.]*\.?", re.IGNORECASE),
+    re.compile(r"\b(?:since|as)\s+(?:my\s+)?training\s+(?:data\s+)?cut-?off\b[^.]*\.?", re.IGNORECASE),
+    re.compile(r"\bthis\s+(?:appears?\s+to\s+be\s+)?a\s+future\s+date\b[^.]*\.?", re.IGNORECASE),
 ]
 
 
@@ -411,6 +501,36 @@ def _select_model(query: str, intent: str, needs_plan: bool) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Fact extraction gate — blacklist (skip obvious non-facts)
+# ---------------------------------------------------------------------------
+
+_SKIP_FACT_EXTRACTION_RE = re.compile(
+    r"^(?:search|find|look up|calculate|show|tell me about|explain|summarize|compare|check|list|describe)\b"
+    r"|^(?:hey|hi|hello|thanks|thank you|ok|sure|yes|no|yeah|nah|bye|goodbye)\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _is_pure_question_or_command(text: str) -> bool:
+    """Return True if the message is unlikely to contain personal facts.
+
+    Used as a blacklist gate: fact extraction runs by default UNLESS
+    this returns True.  The LLM extraction prompt handles remaining
+    edge cases by returning {} when no facts are present.
+    """
+    stripped = text.strip()
+    if len(stripped) < 8:
+        return True
+    # Pure questions (starts with question word)
+    if _QUESTION_WORDS.match(stripped):
+        return True
+    # Pure commands / greetings
+    if _SKIP_FACT_EXTRACTION_RE.match(stripped):
+        return True
+    return False
+
+
+# ---------------------------------------------------------------------------
 # Internal dataclasses for stage communication
 # ---------------------------------------------------------------------------
 
@@ -423,7 +543,9 @@ class _ThinkContext:
     user_facts_text: str = ""
     lessons_text: str = ""
     kg_facts_text: str = ""
+    kg_facts_count: int = 0
     reflexions_text: str = ""
+    reflexions_count: int = 0
     retrieved_context: str = ""
     retrieved_sources: list[dict] = field(default_factory=list)
     integrations_text: str = ""
@@ -483,6 +605,11 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
     if svc.learning:
         lessons = await asyncio.to_thread(svc.learning.get_relevant_lessons, query)
         if lessons:
+            logger.info(
+                "Retrieved %d lessons: %s",
+                len(lessons),
+                [(l.id, l.topic, (l.lesson_text or "")[:60]) for l in lessons],
+            )
             ctx.lessons = lessons
             ctx.used_lesson_ids = [l.id for l in lessons]
             ctx.lessons_text = format_lessons_for_prompt([
@@ -499,18 +626,20 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
     # --- Knowledge graph facts ---
     if svc.kg:
         try:
-            kg_facts = await asyncio.to_thread(svc.kg.get_relevant_facts, query, 8)
+            kg_facts = await asyncio.to_thread(svc.kg.get_relevant_facts, query, config.MAX_KG_FACTS_IN_PROMPT)
             if kg_facts:
                 ctx.kg_facts_text = svc.kg.format_for_prompt(kg_facts)
+                ctx.kg_facts_count = len(kg_facts)
         except Exception as e:
             logger.warning("KG retrieval failed: %s", e)
 
     # --- Reflexions (past failure warnings) ---
     if svc.reflexions:
         try:
-            reflexions = await asyncio.to_thread(svc.reflexions.get_relevant, query, 3)
+            reflexions = await asyncio.to_thread(svc.reflexions.get_relevant, query, config.MAX_REFLEXIONS_IN_PROMPT)
             if reflexions:
                 ctx.reflexions_text = svc.reflexions.format_for_prompt(reflexions)
+                ctx.reflexions_count = len(reflexions)
         except Exception as e:
             logger.warning("Reflexion retrieval failed: %s", e)
 
@@ -518,7 +647,7 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
     if svc.reflexions:
         try:
             from app.core.reflexion import ReflexionStore
-            successes = await asyncio.to_thread(svc.reflexions.get_success_patterns, query, 2)
+            successes = await asyncio.to_thread(svc.reflexions.get_success_patterns, query, config.MAX_SUCCESS_PATTERNS_IN_PROMPT)
             if successes:
                 ctx.success_patterns_text = ReflexionStore.format_success_patterns(successes)
         except Exception as e:
@@ -531,8 +660,11 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
             if chunks:
                 lines = []
                 for i, chunk in enumerate(chunks, 1):
-                    source = chunk.title or chunk.source or "document"
                     score = chunk.score if hasattr(chunk, "score") and chunk.score is not None else 0.0
+                    # Skip very low relevance chunks — they add noise
+                    if score < config.RETRIEVAL_RELEVANCE_THRESHOLD:
+                        continue
+                    source = chunk.title or chunk.source or "document"
                     relevance = "high relevance" if score >= 0.7 else ("moderate" if score >= 0.4 else "low relevance")
                     lines.append(f"[{i}] ({relevance} | Source: {source})\n{chunk.content}")
                     ctx.retrieved_sources.append({
@@ -540,7 +672,8 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
                         "source": chunk.source or "",
                         "score": round(score, 4),
                     })
-                ctx.retrieved_context = "\n\n".join(lines)
+                if lines:
+                    ctx.retrieved_context = "\n\n".join(lines)
         except Exception as e:
             logger.warning("Retrieval failed: %s", e)
 
@@ -579,7 +712,11 @@ async def _build_messages(
     This is Steps 8–8c of the original think() pipeline.
     Returns: (messages, was_planned, plan)
     """
-    system_prompt = build_system_prompt(
+    # Gather registered tool names for example filtering
+    _tool_names = {t["name"] for t in _get_available_tools()} if svc.tool_registry else None
+
+    # Common kwargs for build_system_prompt (avoids repeating all params)
+    _prompt_kwargs = dict(
         user_facts_text=ctx.user_facts_text,
         lessons_text=ctx.lessons_text,
         tool_descriptions=_get_tool_descriptions(),
@@ -591,29 +728,26 @@ async def _build_messages(
         success_patterns=ctx.success_patterns_text,
         external_skills_text=ctx.external_skills_text,
         matched_external_skill_text=ctx.matched_external_skill_text,
+        registered_tool_names=_tool_names,
+        provider=config.LLM_PROVIDER,
     )
+
+    # Build a preliminary prompt just for token estimation in context management.
+    # This avoids building the full prompt twice when summarization triggers a rebuild.
+    preliminary_prompt = build_system_prompt(**_prompt_kwargs)
 
     # Context window management
     managed_history, conversation_summary = await _manage_context(
-        system_prompt, history, query
+        preliminary_prompt, history, query
     )
 
     if conversation_summary:
-        system_prompt = build_system_prompt(
-            user_facts_text=ctx.user_facts_text,
-            lessons_text=ctx.lessons_text,
-            tool_descriptions=_get_tool_descriptions(),
-            retrieved_context=ctx.retrieved_context,
-            skills_text=ctx.skills_text,
-            conversation_summary=conversation_summary,
-            kg_facts=ctx.kg_facts_text,
-            reflexions=ctx.reflexions_text,
-            integrations_text=ctx.integrations_text,
-            success_patterns=ctx.success_patterns_text,
-            external_skills_text=ctx.external_skills_text,
-            matched_external_skill_text=ctx.matched_external_skill_text,
-        )
+        # Rebuild with summary — this is the only full build
+        system_prompt = build_system_prompt(conversation_summary=conversation_summary, **_prompt_kwargs)
         history = managed_history
+    else:
+        # No summarization needed — reuse the preliminary prompt directly
+        system_prompt = preliminary_prompt
 
     # Assemble messages
     messages = [{"role": "system", "content": system_prompt}]
@@ -641,6 +775,34 @@ async def _build_messages(
                 logger.warning("Planning failed: %s", e)
 
     return messages, was_planned, plan
+
+
+from app.tools.base import TOOL_FAILURE_MARKERS as _TOOL_FAILURE_MARKERS
+from app.tools.base import ErrorCategory
+
+
+def _round_all_succeeded(results: list[tuple]) -> bool:
+    """Check if all tool results in this round indicate success.
+
+    Uses structured ToolResult.success when available; falls back to
+    substring matching for tool_create and legacy paths.
+    """
+    for item in results:
+        # New format: (tc, output, tool_result)
+        if len(item) == 3:
+            _, output, tool_result = item
+            if tool_result is not None:
+                if not tool_result.success:
+                    return False
+                continue
+        else:
+            # Legacy format: (tc, output)
+            _, output = item
+        # Fallback substring matching for tool_create and legacy paths
+        lower = str(output).lower()[:500]
+        if any(m in lower for m in _TOOL_FAILURE_MARKERS):
+            return False
+    return True
 
 
 async def _run_generation_loop(
@@ -680,19 +842,17 @@ async def _run_generation_loop(
         _temperature = 0.4
 
     # Per-conversation tool result cache (C10)
-    # Skip caching for tools with side effects
-    _SIDE_EFFECT_TOOLS = frozenset({
-        "file_ops", "email_send", "webhook", "calendar", "reminder",
-        "shell_exec", "code_exec", "integration", "delegate", "browser",
-        "desktop", "background_task", "tool_create", "monitor",
-    })
+    # Skip caching for tools with side effects (uses module-level _SIDE_EFFECT_TOOLS)
     _tool_cache: dict[tuple, str] = {}
+
+    _any_round_succeeded = False  # Track cumulative success across tool rounds
 
     try:
         for tool_round in range(config.MAX_TOOL_ROUNDS):
             if use_thinking:
                 thinking_buf = ""
                 content_buf = ""
+                _stream_tool_calls: list[llm.ToolCall] = []
                 try:
                     async with asyncio.timeout(_GENERATION_TIMEOUT):
                         async for chunk in llm.stream_with_thinking(
@@ -706,8 +866,11 @@ async def _run_generation_loop(
                                 )
                             if chunk.content:
                                 content_buf += chunk.content
+                            if chunk.tool_call is not None:
+                                _stream_tool_calls.append(chunk.tool_call)
                 except TimeoutError:
                     logger.warning("Streaming generation timed out after %.0fs", _GENERATION_TIMEOUT)
+                    gen.is_error = True
                     if content_buf:
                         content_buf += "\n\n[Response truncated due to timeout]"
                     else:
@@ -715,7 +878,7 @@ async def _run_generation_loop(
                 content_buf = llm._strip_think_tags(content_buf).strip()
                 result = llm.GenerationResult(
                     content=content_buf,
-                    tool_call=None,
+                    tool_calls=_stream_tool_calls,
                     raw={},
                     thinking=thinking_buf,
                 )
@@ -727,9 +890,10 @@ async def _run_generation_loop(
                     )
                 except asyncio.TimeoutError:
                     logger.warning("Generation timed out after %.0fs", _GENERATION_TIMEOUT)
+                    gen.is_error = True
                     result = llm.GenerationResult(
                         content="The response timed out. Please try a simpler query or try again.",
-                        tool_call=None,
+                        tool_calls=[],
                         raw={},
                     )
 
@@ -746,8 +910,8 @@ async def _run_generation_loop(
                 )
 
             # Extract tool calls
-            if result.tool_call is not None:
-                tool_calls = [result.tool_call]
+            if result.tool_calls:
+                tool_calls = result.tool_calls
             else:
                 tool_calls = _extract_tool_calls(result.content, tools)
 
@@ -761,74 +925,172 @@ async def _run_generation_loop(
                 [(tc.tool, tc.args) for tc in tool_calls],
             )
 
-            for tc in tool_calls:
+            for i, tc in enumerate(tool_calls, 1):
                 yield StreamEvent(
                     type=EventType.TOOL_USE,
-                    data={"tool": tc.tool, "args": tc.args, "status": "executing"},
+                    data={"tool": tc.tool, "args": tc.args, "status": "executing",
+                           "tool_call_id": f"{tc.tool}_{tool_round}_{i}"},
                 )
 
             # Execute ALL tool calls concurrently (with per-conversation cache)
             async def _run_tool(tc):
                 if tc.tool == "tool_create" and svc.custom_tools:
-                    return tc, await _handle_tool_create(svc, tc.args)
+                    return tc, await _handle_tool_create(svc, tc.args), None
                 # Cache lookup for idempotent tools
                 if tc.tool not in _SIDE_EFFECT_TOOLS:
                     try:
-                        cache_key = (tc.tool, frozenset(tc.args.items()))
-                    except TypeError:
-                        cache_key = None  # unhashable args
+                        cache_key = (tc.tool, json.dumps(tc.args, sort_keys=True, default=str))
+                    except (TypeError, ValueError):
+                        cache_key = None  # unserializable args
                     if cache_key and cache_key in _tool_cache:
                         logger.debug("Tool cache hit: %s", tc.tool)
-                        return tc, _tool_cache[cache_key]
+                        cached_output, cached_result = _tool_cache[cache_key]
+                        return tc, cached_output, cached_result
                 else:
                     cache_key = None
-                output = await _execute_tool(tc.tool, tc.args)
-                # Sanitize tool outputs not already handled by the tool itself
-                _SELF_SANITIZING_TOOLS = {"web_search", "http_fetch", "browser", "knowledge_search"}
-                if (config.ENABLE_INJECTION_DETECTION
-                        and tc.tool not in _SELF_SANITIZING_TOOLS
-                        and not tc.tool.startswith("mcp_")):
+                output, tool_result = await _execute_tool(tc.tool, tc.args)
+                # One-time retry for transient failures (network timeouts, 429/5xx)
+                if (tool_result and not tool_result.success
+                        and tool_result.retriable
+                        and tool_result.error_category == ErrorCategory.TRANSIENT):
+                    logger.info("Retrying transient failure for tool '%s'", tc.tool)
+                    retry_output, retry_result = await _execute_tool(tc.tool, tc.args)
+                    if retry_result and retry_result.success:
+                        output = retry_output
+                        tool_result = retry_result
+                # Sanitize ALL tool outputs (sanitize_content is idempotent)
+                if config.ENABLE_INJECTION_DETECTION:
                     from app.core.injection import sanitize_content
                     output = sanitize_content(output, context=f"tool:{tc.tool}")
                 if cache_key is not None:
-                    _tool_cache[cache_key] = output
-                return tc, output
+                    _tool_cache[cache_key] = (output, tool_result)
+                return tc, output, tool_result
 
             results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
 
             assistant_content = result.content or f'[Calling tool: {tool_calls[0].tool}]'
-            messages.append({"role": "assistant", "content": assistant_content})
 
-            for tc, tool_output in results:
+            tool_result_parts = []
+            for i, (tc, tool_output, tool_result_obj) in enumerate(results, 1):
+                # Trim output via per-tool trim_output() for context storage
+                tool_obj = svc.tool_registry.get(tc.tool) if svc.tool_registry else None
+                if tool_obj:
+                    trimmed = tool_obj.trim_output(tool_output)
+                else:
+                    trimmed = tool_output[:config.TOOL_OUTPUT_MAX_CHARS]
+                    if len(tool_output) > config.TOOL_OUTPUT_MAX_CHARS:
+                        trimmed += "\n[...truncated]"
                 gen.tool_results.append({
                     "tool": tc.tool,
                     "args": tc.args,
-                    "output": tool_output[:2000],
+                    "output": trimmed,
                 })
                 yield StreamEvent(
                     type=EventType.TOOL_USE,
-                    data={"tool": tc.tool, "result": tool_output[:500], "status": "complete"},
+                    data={"tool": tc.tool, "result": tool_output[:500], "status": "complete",
+                           "tool_call_id": f"{tc.tool}_{tool_round}_{i}"},
                 )
-                # Use "user" role with structured prefix instead of "system" for cleaner role tracking
-                # Truncate to prevent context window blow-up from large tool outputs
-                messages.append({
-                    "role": "user",
-                    "content": f"[Tool Result for '{tc.tool}']:\n{tool_output[:4000]}\n\nUse this result to answer the original question.",
-                })
+                tool_result_parts.append(
+                    f"[Source {i}: {tc.tool}]\n{tool_output[:config.TOOL_OUTPUT_MAX_CHARS]}"
+                )
 
                 if not ephemeral:
                     await asyncio.to_thread(
-                        lambda _tc=tc, _out=tool_output: svc.conversations.add_message(
-                            conversation_id, "tool", _out[:2000], tool_name=_tc.tool
+                        lambda _tc=tc, _out=trimmed: svc.conversations.add_message(
+                            conversation_id, "tool", _out[:config.TOOL_OUTPUT_MAX_CHARS], tool_name=_tc.tool
                         )
                     )
 
+            # Assistant role = self-attribution. Model won't contradict its own prior statements.
+            tool_results_text = "\n\n".join(tool_result_parts)
+            round_succeeded = _round_all_succeeded(results)
+            if round_succeeded:
+                _any_round_succeeded = True
+
+            # Build self-attribution with success-aware framing (provider-aware)
+            from datetime import datetime as _dt
+            _today = _dt.now().strftime("%B %d, %Y")
+            _caps = llm.get_provider().capabilities
+            _is_ollama = _caps.needs_emphatic_prompts
+
+            if round_succeeded:
+                if _is_ollama:
+                    attr_prefix = (
+                        "I used my tools and they returned real, live results "
+                        f"(not simulated, not hypothetical — actual execution on the network). "
+                        f"Today is {_today} — this is the real current date:"
+                    )
+                else:
+                    attr_prefix = f"Tool results (executed {_today}):"
+            else:
+                attr_prefix = f"I executed the tool(s) and received these results. Today is {_today}:"
+
+            messages.append({
+                "role": "assistant",
+                "content": f"{assistant_content}\n\n{attr_prefix}\n\n{tool_results_text}",
+            })
+
+            # User-role synthesis trigger (provider-aware)
+            if round_succeeded:
+                if _is_ollama:
+                    messages.append({
+                        "role": "user",
+                        "content": (
+                            "Based on the real tool results above, provide your answer. "
+                            "The tools ran successfully on real websites with live data. "
+                            "Do NOT say you cannot use tools, that results are simulated, "
+                            "or add disclaimers — just report what happened."
+                        ),
+                    })
+                else:
+                    messages.append({
+                        "role": "user",
+                        "content": "Based on the tool results above, provide your answer.",
+                    })
+            elif _any_round_succeeded:
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Based on the tool results above, provide your answer. "
+                        "Some tools succeeded with real data — focus on those results. "
+                        "If any tools failed, briefly note the limitation in natural language "
+                        "without exposing error messages, tier names, or internal details."
+                    ),
+                })
+            else:
+                messages.append({
+                    "role": "user",
+                    "content": "Based on the tool results above, provide your answer.",
+                })
+
         else:
-            # Exhausted tool rounds
+            # Exhausted tool rounds — synthesize findings via LLM instead of dumping raw output
             if not gen.final_content:
-                gen.final_content = "I attempted to use tools but couldn't complete the task within the allowed steps. Here's what I found so far:\n\n"
+                tool_summary_parts = []
                 for tr in gen.tool_results:
-                    gen.final_content += f"- {tr['tool']}: {tr['output'][:200]}\n"
+                    tool_summary_parts.append(f"- {tr['tool']}: {tr['output'][:500]}")
+                tool_summary_text = "\n".join(tool_summary_parts)
+                synthesis_messages = [
+                    messages[0],  # system prompt
+                    {"role": "user", "content": query},
+                    {"role": "assistant", "content": f"I used several tools. Here are the results:\n{tool_summary_text}"},
+                    {"role": "user", "content": (
+                        "The tool loop has ended. Please synthesize the tool results above "
+                        "into a clear, helpful answer for the user. Summarize what was found "
+                        "and note any incomplete steps."
+                    )},
+                ]
+                try:
+                    synthesis = await llm.invoke_nothink(synthesis_messages, max_tokens=1500)
+                    if synthesis and synthesis.strip():
+                        gen.final_content = synthesis.strip()
+                    else:
+                        raise ValueError("Empty synthesis")
+                except Exception as synth_err:
+                    logger.warning("Synthesis LLM call failed after exhausted tool rounds: %s", synth_err)
+                    gen.final_content = "I attempted to use tools but couldn't complete the task within the allowed steps. Here's what I found so far:\n\n"
+                    for tr in gen.tool_results:
+                        gen.final_content += f"- {tr['tool']}: {tr['output'][:200]}\n"
 
         # Log complex tool loops (3+ rounds) as tool creation candidates
         if len(gen.tool_results) >= 3 and config.ENABLE_CUSTOM_TOOLS:
@@ -855,55 +1117,104 @@ async def _refine_response(
     was_planned: bool,
     plan: dict | None,
     retrieved_context: str = "",
+    user_facts_text: str = "",
+    kg_facts_text: str = "",
 ) -> tuple[str, float | None, str]:
     """Multi-round critique, plan coverage check, reflexion LLM critique.
 
     This is Steps 10b–10d of the original think() pipeline.
     Returns: (refined_content, reflexion_quality, reflexion_reason)
     """
-    # --- Self-Critique (multi-round) ---
+    # --- Self-Critique (addendum-based) ---
+    # Instead of regenerating the full response on critique failure,
+    # generate a short correction addendum that gets appended.
+    # This preserves the already-streamed content and avoids UX jank.
+    critique_passed = False
     if config.ENABLE_CRITIQUE and final_content and intent == "general":
         from app.core.critique import should_critique, critique_answer, format_critique_for_regeneration
-        if should_critique(query, final_content, intent, tool_results, was_planned):
+        if should_critique(query, final_content, intent, tool_results, was_planned, kg_facts=kg_facts_text, user_facts=user_facts_text):
+            last_critique_issues: list[str] = []
             for critique_round in range(config.MAX_CRITIQUE_ROUNDS):
                 try:
-                    critique = await critique_answer(query, final_content, sources=retrieved_context)
+                    critique = await critique_answer(
+                        query, final_content,
+                        sources=retrieved_context,
+                        user_facts=user_facts_text,
+                        kg_facts=kg_facts_text,
+                    )
                     if not critique or critique.get("pass", True):
+                        critique_passed = True
                         break
                     logger.info("Critique round %d failed: %s", critique_round + 1, critique.get("issues", []))
-                    # Log critique failures as reflexions for future learning
-                    _svc = get_services()
-                    if _svc.reflexions and critique.get("issues"):
-                        try:
-                            issues_text = "; ".join(critique["issues"])
-                            await asyncio.to_thread(
-                                lambda: _svc.reflexions.store(
-                                    task_summary=query[:500],
-                                    outcome="failure",
-                                    reflection=f"Critique failed: {issues_text}",
-                                    quality_score=0.3,
-                                )
-                            )
-                        except Exception:
-                            pass
+                    # Track last critique issues for post-loop reflexion storage
+                    last_critique_issues = critique.get("issues", [])
                     critique_msg = format_critique_for_regeneration(critique)
                     if not critique_msg:
                         break
+
+                    # Generate a correction addendum instead of full re-generation.
+                    # The original response is already streamed; appending a correction
+                    # is cheaper and avoids replacing content the user has already read.
+                    issues_list = critique.get("issues", [])
+                    addendum_prompt = (
+                        "The previous response had these issues:\n"
+                        + "\n".join(f"- {issue}" for issue in issues_list)
+                        + "\n\nGenerate ONLY a brief correction addressing these specific issues. "
+                        "Do NOT repeat the full answer. Start with the corrected information directly."
+                    )
+                    # Cap messages to prevent unbounded token growth during critique loops.
+                    # Smart truncation: keep system msg + tool results + recent turns.
+                    if len(messages) > 10:
+                        # Keep system/context messages (index 0..2)
+                        head = messages[:3]
+                        tail = messages[-7:]
+                        # Preserve any tool-result messages from the middle
+                        middle_tool_msgs = [
+                            m for m in messages[3:-7]
+                            if m.get("role") == "tool" or (
+                                m.get("role") == "system" and "tool" in m.get("content", "").lower()[:100]
+                            )
+                        ]
+                        messages = head + middle_tool_msgs + tail
                     messages.append({"role": "assistant", "content": final_content})
-                    messages.append({"role": "system", "content": critique_msg})
+                    messages.append({"role": "user", "content": addendum_prompt})
                     try:
                         retry_result = await llm.generate_with_tools(messages, tools)
-                        if retry_result.content and retry_result.tool_call is None:
-                            final_content = retry_result.content
-                            logger.info("Regenerated after critique round %d (%d chars)", critique_round + 1, len(final_content))
+                        if retry_result.content and not retry_result.tool_calls:
+                            addendum = retry_result.content.strip()
+                            if addendum:
+                                final_content = final_content + "\n\n---\n[Correction: " + addendum + "]"
+                                logger.info(
+                                    "Appended correction addendum after critique round %d (%d chars)",
+                                    critique_round + 1, len(addendum),
+                                )
+                            # Re-run critique on the combined content
+                            continue
                         else:
                             break
                     except Exception as e:
-                        logger.warning("Critique regeneration failed (round %d): %s", critique_round + 1, e)
+                        logger.warning("Critique addendum generation failed (round %d): %s", critique_round + 1, e)
                         break
                 except Exception as e:
                     logger.warning("Critique failed (round %d): %s", critique_round + 1, e)
                     break
+
+            # Store ONE reflexion after the critique loop ends (not per-iteration)
+            if not critique_passed and last_critique_issues:
+                _svc = get_services()
+                if _svc.reflexions:
+                    try:
+                        issues_text = "; ".join(last_critique_issues)
+                        await asyncio.to_thread(
+                            lambda: _svc.reflexions.store(
+                                task_summary=query[:500],
+                                outcome="failure",
+                                reflection=f"Critique failed: {issues_text}",
+                                quality_score=0.3,
+                            )
+                        )
+                    except Exception:
+                        pass
 
     # --- Plan coverage check ---
     if was_planned and final_content and config.ENABLE_PLANNING:
@@ -924,7 +1235,10 @@ async def _refine_response(
                 })
                 try:
                     retry_result = await llm.generate_with_tools(messages, tools)
-                    if retry_result.content and retry_result.tool_call is None:
+                    if retry_result.content:
+                        if retry_result.tool_calls:
+                            logger.info("Plan coverage retry returned %d tool call(s) — ignored, using text content",
+                                        len(retry_result.tool_calls))
                         final_content = retry_result.content
                         logger.info("Regenerated after plan coverage check (%d chars)", len(final_content))
                 except Exception as e:
@@ -939,30 +1253,37 @@ async def _refine_response(
         from app.core.reflexion import should_use_llm_critique, critique_response, assess_quality
         try:
             if should_use_llm_critique(intent, final_content, tool_results):
-                reflexion_quality, reflexion_reason = await critique_response(query, final_content, tool_results)
+                reflexion_quality, reflexion_reason = await critique_response(
+                    query, final_content, tool_results,
+                    user_facts=user_facts_text,
+                    kg_facts=kg_facts_text,
+                )
             else:
                 reflexion_quality, reflexion_reason = assess_quality(final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query)
 
-            if reflexion_quality is not None and reflexion_quality < 0.3 and reflexion_reason:
+            if reflexion_quality is not None and reflexion_quality < 0.3 and reflexion_reason and not critique_passed:
                 logger.info("Reflexion critique flagged (%.2f): %s", reflexion_quality, reflexion_reason)
-                regen_msg = (
-                    f"[Minor quality note (score: {reflexion_quality})]\n"
-                    f"Note: {reflexion_reason}\n"
-                    "Adjust your answer if needed. Keep all correct information intact."
+                # Generate a correction addendum instead of full re-generation
+                addendum_msg = (
+                    f"The previous response had a quality issue: {reflexion_reason}\n\n"
+                    "Generate ONLY a brief correction addressing this specific issue. "
+                    "Do NOT repeat the full answer. Start with the corrected information directly."
                 )
                 messages.append({"role": "assistant", "content": final_content})
-                messages.append({"role": "system", "content": regen_msg})
+                messages.append({"role": "system", "content": addendum_msg})
                 try:
                     retry_result = await llm.generate_with_tools(messages, tools)
-                    if retry_result.content and retry_result.tool_call is None:
-                        final_content = retry_result.content
+                    if retry_result.content and not retry_result.tool_calls:
+                        addendum = retry_result.content.strip()
+                        if addendum:
+                            final_content = final_content + "\n\n---\n[Correction: " + addendum + "]"
                         reflexion_quality, reflexion_reason = assess_quality(
                             final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query
                         )
-                        logger.info("Regenerated after reflexion critique (%d chars, new score: %.2f)",
-                                    len(final_content), reflexion_quality)
+                        logger.info("Appended reflexion correction addendum (%d chars, new score: %.2f)",
+                                    len(addendum), reflexion_quality)
                 except Exception as e:
-                    logger.warning("Reflexion critique regeneration failed: %s", e)
+                    logger.warning("Reflexion critique addendum failed: %s", e)
         except Exception as e:
             logger.debug("Reflexion pre-stream critique failed: %s", e)
 
@@ -984,6 +1305,7 @@ async def _run_post_processing(
     had_kg: bool = False,
     had_docs: bool = False,
     channel: str = "api",
+    saved_msg_id: str | None = None,
 ) -> AsyncGenerator[StreamEvent, None]:
     """Post-response processing: corrections, facts, KG, reflexion storage, auto skills.
 
@@ -996,7 +1318,16 @@ async def _run_post_processing(
         prev_messages = await asyncio.to_thread(svc.conversations.get_history, conversation_id, 10)
         prev_answer = ""
         original_query = ""
-        assistant_skip = 1
+        # Skip the last assistant message only if it is the response we just
+        # saved (step 11).  Use message ID comparison when available for
+        # reliability; fall back to content comparison otherwise.
+        last_assistant = next(
+            (m for m in reversed(prev_messages) if m.role == "assistant"), None,
+        )
+        if saved_msg_id and last_assistant:
+            assistant_skip = 1 if last_assistant.id == saved_msg_id else 0
+        else:
+            assistant_skip = 1 if (last_assistant and last_assistant.content == final_content) else 0
         found_wrong_answer = False
         for msg in reversed(prev_messages):
             if msg.role == "assistant":
@@ -1007,7 +1338,9 @@ async def _run_post_processing(
                     prev_answer = msg.content
                     found_wrong_answer = True
             elif msg.role == "user" and found_wrong_answer:
-                if msg.content != query:
+                # Skip the current correction AND any prior corrections —
+                # we want the original question, not another correction.
+                if msg.content != query and not is_likely_correction(msg.content):
                     original_query = msg.content
                     break
 
@@ -1025,69 +1358,100 @@ async def _run_post_processing(
                 )
                 logger.info("Correction detection result: %s", correction is not None)
                 if correction:
-                    lesson_id = await asyncio.to_thread(svc.learning.save_lesson, correction)
-
-                    dpo_query = original_query or query
-                    dpo_rejected = prev_answer[:1000]
-                    dpo_chosen = correction.correct_answer or correction.lesson_text
-
-                    await svc.learning.save_training_pair(
-                        query=dpo_query,
-                        bad_answer=dpo_rejected,
-                        good_answer=dpo_chosen,
-                        channel=channel,
-                    )
-
-                    degraded_skill = matched_skill
-                    if not degraded_skill and original_query and svc.skills:
-                        degraded_skill = await asyncio.to_thread(svc.skills.get_matching_skill, original_query)
-                    if degraded_skill and svc.skills:
-                        await asyncio.to_thread(svc.skills.record_use, degraded_skill.id, False)
-                        logger.info("Skill '%s' marked as failed due to correction", degraded_skill.name)
-
-                        # Attempt refinement in background instead of just degrading
-                        async def _safe_refine(skills, sid, ctx):
-                            try:
-                                refined = await skills.refine_skill(sid, ctx)
-                                if refined:
-                                    logger.info("Skill #%d refined after correction", sid)
-                            except Exception as e:
-                                logger.debug("Skill refinement failed: %s", e)
-                        _task = asyncio.create_task(
-                            _safe_refine(svc.skills, degraded_skill.id, query[:300])
+                    # Guard: if Nova's response pushed back against the correction,
+                    # Nova was right to disagree — don't save the user's wrong
+                    # correction as a lesson or DPO pair (would corrupt training data).
+                    if response_pushes_back(final_content):
+                        logger.info(
+                            "Skipping correction save: Nova's response pushed back "
+                            "against user correction (topic='%s'). Response likely correct.",
+                            correction.topic,
                         )
-                        _background_tasks.add(_task)
-                        _task.add_done_callback(_background_tasks.discard)
+                    else:
+                        lesson_id = await asyncio.to_thread(svc.learning.save_lesson, correction)
 
-                    if svc.skills:
-                        from app.core.skills import extract_skill_from_correction
-                        skill_data = await extract_skill_from_correction(
-                            correction.user_message,
-                            tool_results,
-                            lesson_id,
+                        dpo_query = original_query or query
+                        dpo_rejected = (prev_answer or "")[:1000]
+                        dpo_chosen = (correction.correct_answer or correction.lesson_text or "")[:1000]
+
+                        if not dpo_chosen or not dpo_rejected:
+                            logger.warning(
+                                "Skipping save_training_pair: empty DPO value (chosen=%d chars, rejected=%d chars)",
+                                len(dpo_chosen), len(dpo_rejected),
+                            )
+                        else:
+                            await svc.learning.save_training_pair(
+                                query=dpo_query,
+                                bad_answer=dpo_rejected,
+                                good_answer=dpo_chosen,
+                                channel=channel,
+                            )
+
+                        degraded_skill = matched_skill
+                        if not degraded_skill and original_query and svc.skills:
+                            degraded_skill = await asyncio.to_thread(svc.skills.get_matching_skill, original_query)
+                        if degraded_skill and svc.skills:
+                            await asyncio.to_thread(svc.skills.record_use, degraded_skill.id, False)
+                            logger.info("Skill '%s' marked as failed due to correction", degraded_skill.name)
+
+                            # Attempt refinement in background instead of just degrading
+                            async def _safe_refine(skills, sid, ctx):
+                                try:
+                                    refined = await skills.refine_skill(sid, ctx)
+                                    if refined:
+                                        logger.info("Skill #%d refined after correction", sid)
+                                except Exception as e:
+                                    logger.debug("Skill refinement failed: %s", e)
+                            _task = asyncio.create_task(
+                                _safe_refine(svc.skills, degraded_skill.id, query[:300])
+                            )
+                            _background_tasks.add(_task)
+                            _task.add_done_callback(_background_tasks.discard)
+
+                        if svc.skills:
+                            from app.core.skills import extract_skill_from_correction
+                            skill_data = await extract_skill_from_correction(
+                                correction.user_message,
+                                tool_results,
+                                lesson_id,
+                            )
+                            if skill_data:
+                                skill_id = await asyncio.to_thread(lambda: svc.skills.create_skill(**skill_data))
+                                if skill_id:
+                                    logger.info("Skill extracted: '%s' (id=%d)", skill_data["name"], skill_id)
+                                else:
+                                    logger.info("Skill rejected (too broad): '%s'", skill_data["name"])
+
+                        logger.info("Correction processed → lesson #%d saved", lesson_id)
+                        yield StreamEvent(
+                            type=EventType.LESSON_LEARNED,
+                            data={
+                                "topic": correction.topic,
+                                "lesson_id": lesson_id,
+                            },
                         )
-                        if skill_data:
-                            skill_id = await asyncio.to_thread(lambda: svc.skills.create_skill(**skill_data))
-                            if skill_id:
-                                logger.info("Skill extracted: '%s' (id=%d)", skill_data["name"], skill_id)
-                            else:
-                                logger.info("Skill rejected (too broad): '%s'", skill_data["name"])
-
-                    logger.info("Correction processed → lesson #%d saved", lesson_id)
-                    yield StreamEvent(
-                        type=EventType.LESSON_LEARNED,
-                        data={
-                            "topic": correction.topic,
-                            "lesson_id": lesson_id,
-                        },
-                    )
             except Exception as e:
                 logger.warning("Correction processing failed: %s", e)
 
     # --- Automatic fact extraction ---
-    # Run on signal match (high confidence) OR any message >50 chars (background, LLM returns {} if nothing)
-    _should_extract = svc.user_facts and not is_error and (has_fact_signals(query) or len(query) > 50)
+    # Only run when regex signals detect fact-bearing language
+    # Blacklist gate: extract facts by default, skip only for pure questions/commands.
+    # The LLM extraction prompt returns {} for non-fact messages (false-positive safe).
+    _should_extract = svc.user_facts and not is_error and not _is_pure_question_or_command(query)
+    # Skip extraction for likely injection attempts
+    if _should_extract and config.ENABLE_INJECTION_DETECTION:
+        try:
+            from app.core.injection import detect_injection
+            _inj = detect_injection(query)
+            if _inj.score > 0.3:
+                logger.info("Skipping fact extraction: injection score %.2f for '%s'", _inj.score, query[:80])
+                _should_extract = False
+        except Exception:
+            pass
     if _should_extract:
+        from app.core.memory import _is_explicit_user_statement
+        _is_explicit = _is_explicit_user_statement(query)
+
         async def _safe_fact_extract():
             try:
                 facts = await extract_facts_from_message(query, final_content, fact_store=svc.user_facts)
@@ -1099,27 +1463,18 @@ async def _run_post_processing(
                         else:
                             value = str(fact_data)
                             category = "fact"
-                        # Tiered confidence: signal match = 0.8, background extraction = 0.5
-                        confidence = 0.8 if has_fact_signals(query) else 0.5
+                        confidence = config.FACT_CONFIDENCE_USER if _is_explicit else config.FACT_CONFIDENCE_EXTRACTED
                         await asyncio.to_thread(
                             lambda _k=key, _v=value, _c=confidence, _cat=category: svc.user_facts.set(
-                                _k, _v, source="extracted", confidence=_c, category=_cat
+                                _k, _v, source="user" if _is_explicit else "extracted", confidence=_c, category=_cat
                             )
                         )
                     logger.info("Extracted %d user fact(s): %s", len(facts), list(facts.keys()))
             except Exception as e:
                 logger.warning("Fact extraction failed: %s", e)
-        if has_fact_signals(query):
-            await _safe_fact_extract()
-        else:
-            _task = asyncio.create_task(_safe_fact_extract())
-            _background_tasks.add(_task)
-            _task.add_done_callback(_background_tasks.discard)
-
-    # --- KG triple extraction (background, with contradiction check) ---
-    # Only extract from monitor queries (is_monitor=True) to prevent untrusted user input
-    # from poisoning the KG (OWASP ASI06)
-    pass  # KG extraction gated — see heartbeat monitors for extraction
+        _task = asyncio.create_task(_safe_fact_extract())
+        _background_tasks.add(_task)
+        _task.add_done_callback(_background_tasks.discard)
 
     # --- Reflexion — store failures AND high-quality successes ---
     if svc.reflexions and intent == "general" and final_content:
@@ -1130,7 +1485,7 @@ async def _run_post_processing(
                 from app.core.reflexion import assess_quality
                 quality, reason = assess_quality(final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query)
             tools_used = [tr["tool"] for tr in tool_results]
-            if quality < 0.6 and reason:
+            if quality < config.REFLEXION_FAILURE_THRESHOLD and reason:
                 await asyncio.to_thread(
                     lambda: svc.reflexions.store(
                         task_summary=query[:500],
@@ -1141,25 +1496,25 @@ async def _run_post_processing(
                         revision_count=len(tool_results),
                     )
                 )
-            elif quality >= 0.8 and tool_results:
+            elif quality >= config.REFLEXION_SUCCESS_THRESHOLD and tool_results:
                 await asyncio.to_thread(
                     lambda: svc.reflexions.store(
                         task_summary=query[:500],
                         outcome="success",
-                        reflection=f"Good result (quality={quality:.2f})",
+                        reflection=f"Successful approach for '{query[:100]}': {' -> '.join(tools_used)} (quality={quality:.2f})",
                         quality_score=quality,
                         tools_used=tools_used,
                         revision_count=len(tool_results),
                     )
                 )
         except Exception as e:
-            logger.debug("Reflexion storage failed: %s", e)
+            logger.warning("Reflexion storage failed: %s", e)
 
     # --- Auto skill creation (background) ---
     if (
         config.ENABLE_AUTO_SKILL_CREATION
         and svc.skills
-        and len(tool_results) >= 3
+        and len(tool_results) >= 2
         and intent == "general"
     ):
         from app.core.auto_skills import maybe_extract_skill
@@ -1198,9 +1553,12 @@ async def _run_post_processing(
     if config.ENABLE_CURIOSITY and svc.curiosity and intent == "general":
         try:
             if reflexion_quality is not None and reflexion_quality < 0.5:
-                await asyncio.to_thread(
-                    lambda: svc.curiosity.add(query[:200], source="reflexion_failure", urgency=0.7)
-                )
+                from app.core.curiosity import TopicTracker
+                topic = TopicTracker._extract_topic(query[:200])
+                if topic:
+                    await asyncio.to_thread(
+                        lambda _t=topic: svc.curiosity.add(_t, source="reflexion_failure", urgency=0.7)
+                    )
         except Exception as e:
             logger.debug("Curiosity failure queueing failed: %s", e)
 
@@ -1208,14 +1566,14 @@ async def _run_post_processing(
     if svc.reflexions and svc.learning and intent == "general" and final_content:
         try:
             if reflexion_quality is not None and reflexion_quality < 0.6:
-                async def _safe_check_recurring(reflexions, task_summary, learning):
+                async def _safe_check_recurring(task_summary, learning):
                     try:
                         from app.core.reflexion import check_recurring_failures
                         await check_recurring_failures(task_summary, learning)
                     except Exception as e:
                         logger.debug("Recurring failure check failed: %s", e)
                 _task = asyncio.create_task(
-                    _safe_check_recurring(svc.reflexions, query[:500], svc.learning)
+                    _safe_check_recurring(query[:500], svc.learning)
                 )
                 _background_tasks.add(_task)
                 _task.add_done_callback(_background_tasks.discard)
@@ -1249,6 +1607,14 @@ async def think(
     """
     svc = get_services()
 
+    # --- Step 0: Query length validation ---
+    if len(query) > config.MAX_QUERY_LENGTH:
+        yield StreamEvent(
+            type=EventType.ERROR,
+            data={"message": f"Query too long ({len(query)} chars). Maximum is {config.MAX_QUERY_LENGTH}."},
+        )
+        return
+
     # --- Step 1: Conversation setup ---
     yield StreamEvent(type=EventType.THINKING, data={"stage": "loading_context"})
 
@@ -1267,154 +1633,199 @@ async def think(
             is_new_conversation = True
             logger.warning("Conversation '%s' not found, created new '%s'", old_id, conversation_id)
 
-    # --- Step 2: History ---
-    if not ephemeral:
-        history = await asyncio.to_thread(
-            svc.conversations.get_history_as_dicts,
-            conversation_id, config.MAX_HISTORY_MESSAGES,
-        )
+    # Acquire per-conversation lock to serialize concurrent think() calls
+    _conv_lock = None
+    _conv_lock_acquired = False
+    if not ephemeral and conversation_id:
+        _conv_lock = await _get_conversation_lock(conversation_id)
+        await _conv_lock.acquire()
+        _conv_lock_acquired = True
 
-    # --- Step 3: Intent ---
-    intent = await _classify_intent(query)
+    try:
 
-    # --- Step 4: Gather all context ---
-    ctx = await _gather_context(svc, query, intent)
-
-    # --- Step 5: Emit LESSON_USED events ---
-    if ctx.used_lesson_ids and ctx.lessons:
-        for lesson in ctx.lessons:
-            yield StreamEvent(
-                type=EventType.LESSON_USED,
-                data={
-                    "topic": lesson.topic,
-                    "confidence": lesson.confidence,
-                    "lesson_id": lesson.id,
-                },
+        # --- Step 2: History ---
+        if not ephemeral:
+            history = await asyncio.to_thread(
+                svc.conversations.get_history_as_dicts,
+                conversation_id, config.MAX_HISTORY_MESSAGES,
             )
 
-    # --- Step 6: Build messages + planning ---
-    messages, was_planned, plan = await _build_messages(
-        svc, ctx, query, history, image, intent
-    )
+        # --- Step 3: Intent ---
+        intent = await _classify_intent(query)
 
-    # Save user message
-    if not ephemeral:
-        await asyncio.to_thread(svc.conversations.add_message, conversation_id, "user", query)
+        # --- Step 4: Gather all context ---
+        ctx = await _gather_context(svc, query, intent)
 
-    # --- Step 7: Generate + Tool Loop ---
-    yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})
+        # --- Step 5: Emit LESSON_USED events ---
+        if ctx.used_lesson_ids and ctx.lessons:
+            for lesson in ctx.lessons:
+                yield StreamEvent(
+                    type=EventType.LESSON_USED,
+                    data={
+                        "topic": lesson.topic,
+                        "confidence": lesson.confidence,
+                        "lesson_id": lesson.id,
+                    },
+                )
 
-    tools = _get_available_tools()
-    if config.ENABLE_CUSTOM_TOOLS and svc.custom_tools:
-        tools.append({"name": "tool_create"})
-    if ephemeral:
-        tools = [t for t in tools if t["name"] != "delegate"]
+        # --- Step 6: Build messages + planning ---
+        messages, was_planned, plan = await _build_messages(
+            svc, ctx, query, history, image, intent
+        )
 
-    gen = _GenerationResult()
-    async for event in _run_generation_loop(
-        messages, tools, svc, conversation_id, image, intent,
-        was_planned, ephemeral, gen, query=query,
-    ):
-        yield event
+        # Save user message
+        if not ephemeral:
+            await asyncio.to_thread(svc.conversations.add_message, conversation_id, "user", query)
 
-    # --- Step 8: Ephemeral early return ---
-    if ephemeral:
-        if gen.final_content:
-            final_content = _sanitize_answer(gen.final_content)
+        # --- Step 7: Generate + Tool Loop ---
+        yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})
+
+        tools = _get_available_tools()
+        if config.ENABLE_CUSTOM_TOOLS and svc.custom_tools:
+            tools.append({
+                "name": "tool_create",
+                "description": "Create a new reusable tool. Write a Python function named 'run' that takes declared parameters and returns a string.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "description": "Tool name (lowercase, underscores)"},
+                        "description": {"type": "string", "description": "What the tool does"},
+                        "parameters": {"type": "string", "description": "JSON array of parameter defs"},
+                        "code": {"type": "string", "description": "Python code with a run() function"},
+                    },
+                    "required": ["name", "description", "parameters", "code"],
+                },
+            })
+        if ephemeral:
+            tools = [t for t in tools if t["name"] != "delegate"]
+
+        gen = _GenerationResult()
+        async for event in _run_generation_loop(
+            messages, tools, svc, conversation_id, image, intent,
+            was_planned, ephemeral, gen, query=query,
+        ):
+            yield event
+
+        # --- Step 8: Ephemeral early return ---
+        if ephemeral:
+            if gen.final_content:
+                final_content = _sanitize_answer(gen.final_content)
+                chunk_size = 20
+                for i in range(0, len(final_content), chunk_size):
+                    yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
+            yield StreamEvent(type=EventType.DONE, data={"conversation_id": conversation_id, "ephemeral": True})
+            return
+
+        # --- Step 9: Refine (critique + reflexion) ---
+        final_content, reflexion_quality, reflexion_reason = await _refine_response(
+            messages, tools, gen.final_content, query, intent,
+            gen.tool_results, was_planned, plan,
+            retrieved_context=ctx.retrieved_context,
+            user_facts_text=ctx.user_facts_text,
+            kg_facts_text=ctx.kg_facts_text,
+        )
+
+        # --- Step 10: Emit sources + stream tokens ---
+        # Guard against None content from LLM (would cause IntegrityError on NOT NULL column)
+        if final_content is None:
+            logger.warning("final_content is None after LLM generation — defaulting to empty string (conv=%s)", conversation_id)
+            final_content = ""
+
+        if ctx.retrieved_sources:
+            yield StreamEvent(type=EventType.SOURCES, data={"sources": ctx.retrieved_sources})
+
+        if final_content:
+            final_content = _sanitize_answer(final_content)
             chunk_size = 20
             for i in range(0, len(final_content), chunk_size):
                 yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
-        yield StreamEvent(type=EventType.DONE, data={"conversation_id": conversation_id, "ephemeral": True})
-        return
-
-    # --- Step 9: Refine (critique + reflexion) ---
-    final_content, reflexion_quality, reflexion_reason = await _refine_response(
-        messages, tools, gen.final_content, query, intent,
-        gen.tool_results, was_planned, plan,
-        retrieved_context=ctx.retrieved_context,
-    )
-
-    # --- Step 10: Emit sources + stream tokens ---
-    if ctx.retrieved_sources:
-        yield StreamEvent(type=EventType.SOURCES, data={"sources": ctx.retrieved_sources})
-
-    if final_content:
-        final_content = _sanitize_answer(final_content)
-        chunk_size = 20
-        for i in range(0, len(final_content), chunk_size):
-            yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
-
-    # --- Step 11: Save assistant message + skill usage + title ---
-    # Guard against None content from LLM (would cause IntegrityError on NOT NULL column)
-    if final_content is None:
-        final_content = ""
-    await asyncio.to_thread(
-        lambda: svc.conversations.add_message(
-            conversation_id,
-            "assistant",
-            final_content,
-            tool_calls=[{"tool": tr["tool"], "args": tr["args"]} for tr in gen.tool_results] if gen.tool_results else None,
-            sources=ctx.retrieved_sources or None,
-        )
-    )
-
-    if ctx.matched_skill and svc.skills:
-        if ctx.matched_skill.steps:
-            skill_success = (
-                len(gen.tool_results) > 0
-                and not gen.is_error
-                and not any(
-                    tr.get("output", "").startswith("[Tool") and "failed" in tr.get("output", "")
-                    for tr in gen.tool_results
-                )
+        saved_msg_id = await asyncio.to_thread(
+            lambda: svc.conversations.add_message(
+                conversation_id,
+                "assistant",
+                final_content,
+                tool_calls=[{"tool": tr["tool"], "args": tr["args"]} for tr in gen.tool_results] if gen.tool_results else None,
+                sources=ctx.retrieved_sources or None,
             )
-        else:
-            skill_success = True
-        await asyncio.to_thread(svc.skills.record_use, ctx.matched_skill.id, skill_success)
+        )
 
-    if is_new_conversation and final_content:
-        try:
-            title = await _generate_title(query)
-            await asyncio.to_thread(svc.conversations.update_title, conversation_id, title)
-        except Exception as e:
-            logger.warning("Failed to generate title: %s", e)
+        if ctx.matched_skill and svc.skills:
+            if ctx.matched_skill.steps:
+                skill_success = (
+                    len(gen.tool_results) > 0
+                    and not gen.is_error
+                    and not any(
+                        isinstance(tr.get("output", ""), str)
+                        and tr["output"].startswith("[Tool") and "failed" in tr["output"]
+                        for tr in gen.tool_results
+                    )
+                )
+            else:
+                skill_success = not gen.is_error
+            await asyncio.to_thread(svc.skills.record_use, ctx.matched_skill.id, skill_success)
 
-    # --- Step 12: Done event ---
-    yield StreamEvent(
-        type=EventType.DONE,
-        data={
-            "conversation_id": conversation_id,
-            "intent": intent,
-            "tool_results_count": len(gen.tool_results),
-            "lessons_used": len(ctx.used_lesson_ids),
-            "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
-        },
-    )
-
-    # --- Step 13: Post-processing ---
-    async for event in _run_post_processing(
-        svc, query, final_content, intent, conversation_id,
-        gen.tool_results, ctx.matched_skill, ctx.used_lesson_ids,
-        gen.is_error, reflexion_quality, reflexion_reason,
-        had_kg=bool(ctx.kg_facts_text),
-        had_docs=bool(ctx.retrieved_context),
-        channel=channel,
-    ):
-        yield event
-
-    # --- Step 14: Mark lessons helpful/unhelpful based on quality ---
-    if ctx.used_lesson_ids and intent != "correction" and svc.learning:
-        for lid in ctx.used_lesson_ids:
+        if is_new_conversation and final_content:
             try:
-                if reflexion_quality is not None and reflexion_quality >= 0.6:
-                    await asyncio.to_thread(svc.learning.mark_lesson_helpful, lid)
-                elif reflexion_quality is not None and reflexion_quality < 0.4:
-                    await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, lid)
-            except Exception:
-                pass
+                title = await _generate_title(query)
+                await asyncio.to_thread(svc.conversations.update_title, conversation_id, title)
+            except Exception as e:
+                logger.warning("Failed to generate title: %s", e)
+
+        # --- Step 12: Done event ---
+        yield StreamEvent(
+            type=EventType.DONE,
+            data={
+                "conversation_id": conversation_id,
+                "intent": intent,
+                "tool_results_count": len(gen.tool_results),
+                "lessons_used": len(ctx.used_lesson_ids),
+                "kg_facts_used": ctx.kg_facts_count,
+                "reflexions_used": ctx.reflexions_count,
+                "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
+            },
+        )
+
+        # --- Step 13: Post-processing ---
+        async for event in _run_post_processing(
+            svc, query, final_content, intent, conversation_id,
+            gen.tool_results, ctx.matched_skill, ctx.used_lesson_ids,
+            gen.is_error, reflexion_quality, reflexion_reason,
+            had_kg=bool(ctx.kg_facts_text),
+            had_docs=bool(ctx.retrieved_context),
+            channel=channel,
+            saved_msg_id=saved_msg_id,
+        ):
+            yield event
+
+        # --- Step 14: Mark lessons helpful/unhelpful based on quality ---
+        if ctx.used_lesson_ids and intent != "correction" and svc.learning:
+            for lid in ctx.used_lesson_ids:
+                try:
+                    if reflexion_quality is not None and reflexion_quality >= 0.6:
+                        await asyncio.to_thread(svc.learning.mark_lesson_helpful, lid)
+                    elif reflexion_quality is not None and reflexion_quality < 0.4:
+                        await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, lid)
+                except Exception:
+                    pass
+
+    finally:
+        if _conv_lock is not None and _conv_lock_acquired and _conv_lock.locked():
+            _conv_lock.release()
+            _conv_lock_acquired = False
 
 
-async def _extract_kg_triples(kg, query: str, answer: str) -> None:
+_SOURCE_CONFIDENCE: dict[str, float] = {
+    "Domain Study: Science": 0.75,
+    "Domain Study: Technology": 0.75,
+    "Domain Study: Finance": 0.70,
+    "Domain Study: Current Events": 0.65,
+    "World Awareness": 0.60,
+    "Curiosity Research": 0.60,
+}
+_DEFAULT_SOURCE_CONFIDENCE = 0.65
+
+
+async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = "") -> None:
     """Extract (subject, predicate, object) triples from a Q&A pair.
 
     Runs as a background task — failures are logged, never raised.
@@ -1427,7 +1838,8 @@ async def _extract_kg_triples(kg, query: str, answer: str) -> None:
         "Extract factual (subject, predicate, object) triples from this Q&A.\n"
         f"Use ONLY these predicates: {predicates_str}\n"
         "Return a JSON array. Max 5 triples. Only verifiable facts, not opinions.\n"
-        'Example: [{"subject": "python", "predicate": "created_by", "object": "guido van rossum"}]\n\n'
+        "Rate each triple's confidence: 0.3 (uncertain/speculative) to 0.95 (well-established fact).\n"
+        'Example: [{"subject": "python", "predicate": "created_by", "object": "guido van rossum", "confidence": 0.9}]\n\n'
         f"Q: {query}\nA: {answer[:1000]}"
     )
 
@@ -1437,7 +1849,7 @@ async def _extract_kg_triples(kg, query: str, answer: str) -> None:
             json_mode=True,
             json_prefix="[{",
         )
-        if not raw:
+        if raw is None or not raw:
             return
 
         data = json.loads(raw) if isinstance(raw, str) else raw
@@ -1461,15 +1873,22 @@ async def _extract_kg_triples(kg, query: str, answer: str) -> None:
                 logger.debug("KG quality gate rejected: %s %s %s", s, p, o)
                 continue
 
+            # Resolve confidence: LLM-scored with source-tiered fallback
+            raw_conf = triple.get("confidence")
+            if isinstance(raw_conf, (int, float)) and raw_conf > 0.0:
+                conf = max(0.3, min(0.95, float(raw_conf)))
+            else:
+                conf = _SOURCE_CONFIDENCE.get(source_name, _DEFAULT_SOURCE_CONFIDENCE)
+
             # Contradiction check: resolve conflicts before adding
             try:
-                safe = await kg.check_and_resolve_contradictions(s, p, o, 0.7)
+                safe = await kg.check_and_resolve_contradictions(s, p, o, conf)
                 if not safe:
                     continue
-            except Exception:
-                pass  # On failure, allow the fact through
+            except Exception as e:
+                logger.warning("KG contradiction check failed (allowing fact): %s", e)
 
-            if kg.add_fact(s, p, o, confidence=0.7, source="extracted"):
+            if await kg.add_fact(s, p, o, confidence=conf, source="extracted", provenance=source_name):
                 added += 1
 
         if added:

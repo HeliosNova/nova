@@ -8,22 +8,45 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from app.config import config
-from app.tools.base import BaseTool, ToolResult
+from app.core.access_tiers import requires_tier
+from app.tools.base import BaseTool, ToolResult, ErrorCategory
 from app.tools.http_fetch import _is_safe_url
 
 logger = logging.getLogger(__name__)
 
-_SCREENSHOT_DIR = Path("/data/screenshots")
+_SCREENSHOT_DIR = Path(config.SCREENSHOT_DIR)
 
 
 class ScreenshotTool(BaseTool):
     name = "screenshot"
     description = (
-        "Take a screenshot of a web page. Saves to /data/screenshots/ and returns "
-        "the file path. Useful for visual analysis, archiving, or debugging."
+        "Take a screenshot of a web page using a headless Playwright browser. Saves PNG to "
+        "/data/screenshots/ and returns the file path, page title, and dimensions. Supports full-page "
+        "capture and element-specific screenshots via CSS selector. Use for visual analysis, archiving, "
+        "or debugging web pages. Do NOT use for interactive browsing (use the browser tool) or fetching "
+        "page content as text (use http_fetch)."
     )
     parameters = "url: str, full_page: bool, selector: str"
+    input_schema = {
+        "type": "object",
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "URL of the web page to screenshot.",
+            },
+            "full_page": {
+                "type": "boolean",
+                "description": "If true, capture the full scrollable page. Defaults to false (viewport only).",
+            },
+            "selector": {
+                "type": "string",
+                "description": "CSS selector to screenshot a specific element instead of the full page.",
+            },
+        },
+        "required": ["url"],
+    }
 
+    @requires_tier("standard", "full")
     async def execute(
         self,
         *,
@@ -33,10 +56,10 @@ class ScreenshotTool(BaseTool):
         **kwargs,
     ) -> ToolResult:
         if not url:
-            return ToolResult(output="", success=False, error="No URL provided")
+            return ToolResult(output="", success=False, error="No URL provided", error_category=ErrorCategory.VALIDATION)
 
         if not _is_safe_url(url):
-            return ToolResult(output="", success=False, error="URL blocked: internal/private addresses not allowed")
+            return ToolResult(output="", success=False, error="URL blocked: internal/private addresses not allowed", error_category=ErrorCategory.PERMISSION)
 
         try:
             from playwright.async_api import async_playwright
@@ -45,6 +68,7 @@ class ScreenshotTool(BaseTool):
                 output="",
                 success=False,
                 error="Playwright not installed. Screenshot tool unavailable.",
+                error_category=ErrorCategory.INTERNAL,
             )
 
         try:
@@ -60,7 +84,8 @@ class ScreenshotTool(BaseTool):
                 page = await context.new_page()
 
                 try:
-                    await page.goto(url, wait_until="networkidle")
+                    await page.goto(url, wait_until="domcontentloaded")
+                    await page.wait_for_timeout(2000)
                     title = await page.title()
 
                     parsed = urlparse(url)
@@ -80,6 +105,7 @@ class ScreenshotTool(BaseTool):
                                 output="",
                                 success=False,
                                 error=f"Selector '{selector}' not found on page",
+                                error_category=ErrorCategory.NOT_FOUND,
                             )
                     else:
                         screenshot_args["full_page"] = full_page
@@ -100,4 +126,4 @@ class ScreenshotTool(BaseTool):
                     await browser.close()
 
         except Exception as e:
-            return ToolResult(output="", success=False, error=f"Screenshot failed: {e}")
+            return ToolResult(output="", success=False, error=f"Screenshot failed: {e}", error_category=ErrorCategory.TRANSIENT)

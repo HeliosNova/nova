@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import JSONResponse
 
+from app import __version__
 from app.auth import require_auth
-from app.config import config
+from app.config import config, _MUTABLE_FIELDS
 from app.database import get_db
 from app.schema import HealthResponse, StatusResponse
 
@@ -21,40 +22,105 @@ router = APIRouter(tags=["system"])
 
 @router.get("/health", response_model=HealthResponse)
 async def health() -> HealthResponse:
-    """Health check — reports LLM provider and DB connectivity."""
-    from app.core import llm
-
-    llm_ok = False
-    try:
-        llm_ok = await llm.check_health()
-    except Exception:
-        pass
-
-    db_ok = False
-    try:
-        db = get_db()
-        db.fetchone("SELECT 1")
-        db_ok = True
-    except Exception:
-        pass
-
-    provider = config.LLM_PROVIDER
-
+    """Health check — minimal status for unauthenticated monitoring."""
     return HealthResponse(
-        status="ok" if (llm_ok and db_ok) else "degraded",
-        version="1.0.0",
-        model=config.LLM_MODEL,
-        provider=provider,
-        llm_connected=llm_ok,
-        ollama_connected=llm_ok if provider == "ollama" else False,
-        db_connected=db_ok,
+        status="ok",
+        timestamp=datetime.now(timezone.utc).isoformat(),
     )
+
+
+# ---------------------------------------------------------------------------
+# Provider Health
+# ---------------------------------------------------------------------------
+
+@router.get("/providers/health", dependencies=[Depends(require_auth)])
+async def providers_health():
+    """Check health of all configured LLM providers.
+
+    Returns a map like {"ollama": "healthy", "openai": "unavailable"}.
+    Only checks providers that have credentials/URLs configured.
+    """
+    import asyncio
+
+    results: dict[str, str] = {}
+
+    # Always check the active provider
+    from app.core.llm import get_provider
+    active_provider = get_provider()
+    active_name = config.LLM_PROVIDER
+
+    # Build list of configured providers to check
+    providers_to_check: dict[str, object] = {}
+
+    # Ollama: always configured (has default URL)
+    if config.OLLAMA_URL:
+        if active_name == "ollama":
+            providers_to_check["ollama"] = active_provider
+        else:
+            from app.core.providers.ollama import OllamaProvider
+            providers_to_check["ollama"] = OllamaProvider(base_url=config.OLLAMA_URL)
+
+    # OpenAI: configured if API key is set
+    if config.OPENAI_API_KEY:
+        if active_name == "openai":
+            providers_to_check["openai"] = active_provider
+        else:
+            from app.core.providers.openai import OpenAIProvider
+            providers_to_check["openai"] = OpenAIProvider(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
+
+    # Anthropic: configured if API key is set
+    if config.ANTHROPIC_API_KEY:
+        if active_name == "anthropic":
+            providers_to_check["anthropic"] = active_provider
+        else:
+            from app.core.providers.anthropic import AnthropicProvider
+            providers_to_check["anthropic"] = AnthropicProvider(api_key=config.ANTHROPIC_API_KEY, model=config.ANTHROPIC_MODEL)
+
+    # Google: configured if API key is set
+    if config.GOOGLE_API_KEY:
+        if active_name == "google":
+            providers_to_check["google"] = active_provider
+        else:
+            from app.core.providers.google import GoogleProvider
+            providers_to_check["google"] = GoogleProvider(api_key=config.GOOGLE_API_KEY, model=config.GOOGLE_MODEL)
+
+    if not providers_to_check:
+        return {"active": active_name, "providers": {"ollama": "not_configured"}}
+
+    # Run health checks concurrently with a timeout
+    async def _check(name: str, provider) -> tuple[str, str]:
+        try:
+            healthy = await asyncio.wait_for(provider.check_health(), timeout=10.0)
+            return name, "healthy" if healthy else "unavailable"
+        except asyncio.TimeoutError:
+            return name, "timeout"
+        except Exception:
+            return name, "unavailable"
+
+    tasks = [_check(name, prov) for name, prov in providers_to_check.items()]
+    check_results = await asyncio.gather(*tasks)
+
+    # Clean up temporary provider clients (not the active one)
+    for name, prov in providers_to_check.items():
+        if prov is not active_provider and hasattr(prov, "close"):
+            try:
+                await prov.close()
+            except Exception:
+                pass
+
+    for name, status in check_results:
+        results[name] = status
+
+    return {"active": active_name, "providers": results}
 
 
 _ALLOWED_TABLES = frozenset({
     "conversations", "messages", "user_facts", "lessons", "skills", "documents",
     "kg_facts", "reflexions", "custom_tools",
 })
+
+# Pre-built SQL queries — no f-string interpolation
+_TABLE_QUERIES = {t: f"SELECT COUNT(*) as c FROM {t}" for t in _ALLOWED_TABLES}
 
 
 @router.get("/status", response_model=StatusResponse, dependencies=[Depends(require_auth)])
@@ -63,9 +129,9 @@ async def status() -> StatusResponse:
     db = get_db()
 
     def count(table: str) -> int:
-        if table not in _ALLOWED_TABLES:
+        if table not in _TABLE_QUERIES:
             raise ValueError(f"Table '{table}' is not allowed")
-        row = db.fetchone(f"SELECT COUNT(*) as c FROM {table}")
+        row = db.fetchone(_TABLE_QUERIES[table])
         return row["c"] if row else 0
 
     training_examples = 0
@@ -95,8 +161,9 @@ async def status() -> StatusResponse:
 @router.get("/integrations", dependencies=[Depends(require_auth)])
 async def get_integrations():
     """Return all integration templates with configuration status."""
-    from app.integrations.registry import IntegrationRegistry
-    registry = IntegrationRegistry()
+    from app.tools.integration import _registry as integration_registry
+    if integration_registry is None:
+        return []
     return [
         {
             "name": i.name,
@@ -106,7 +173,7 @@ async def get_integrations():
             "endpoint_count": len(i.endpoints),
             "description": i.description,
         }
-        for i in registry.get_all()
+        for i in integration_registry.get_all()
     ]
 
 
@@ -161,8 +228,83 @@ async def get_full_config():
     return config.to_dict(redact_sensitive=True)
 
 
+from pydantic import BaseModel, Field
+
+class ConfigUpdateRequest(BaseModel):
+    """Validated config update request. Only known mutable fields accepted.
+
+    Keep in sync with _MUTABLE_FIELDS in app/config.py.
+    """
+    model_config = {"extra": "forbid"}
+
+    LLM_PROVIDER: str | None = None
+    LLM_MODEL: str | None = None
+    OLLAMA_URL: str | None = None
+    OPENAI_MODEL: str | None = None
+    ANTHROPIC_MODEL: str | None = None
+    GOOGLE_MODEL: str | None = None
+    VISION_MODEL: str | None = None
+    FAST_MODEL: str | None = None
+    HEAVY_MODEL: str | None = None
+    EMBEDDING_MODEL: str | None = None
+    RETRIEVAL_TOP_K: int | None = Field(None, ge=1, le=50)
+    CHUNK_SIZE: int | None = Field(None, ge=64, le=4096)
+    CHUNK_OVERLAP: int | None = Field(None, ge=0, le=512)
+    MAX_HISTORY_MESSAGES: int | None = Field(None, ge=1, le=100)
+    MAX_LESSONS_IN_PROMPT: int | None = Field(None, ge=0, le=20)
+    MAX_SKILLS_CHECK: int | None = Field(None, ge=0, le=50)
+    MAX_CONTEXT_TOKENS: int | None = Field(None, ge=1000, le=128000)
+    RECENT_MESSAGES_KEEP: int | None = Field(None, ge=1, le=100)
+    CODE_EXEC_TIMEOUT: int | None = Field(None, ge=1, le=300)
+    MAX_TOOL_ROUNDS: int | None = Field(None, ge=1, le=20)
+    SHELL_EXEC_TIMEOUT: int | None = Field(None, ge=1, le=300)
+    BROWSER_TIMEOUT: int | None = Field(None, ge=1, le=300)
+    TOOL_TIMEOUT: int | None = Field(None, ge=10, le=600)
+    GENERATION_TIMEOUT: int | None = Field(None, ge=30, le=1200)
+    INTERNAL_LLM_TIMEOUT: int | None = Field(None, ge=5, le=120)
+    ENABLE_PLANNING: bool | None = None
+    ENABLE_CRITIQUE: bool | None = None
+    ENABLE_CUSTOM_TOOLS: bool | None = None
+    ENABLE_EXTENDED_THINKING: bool | None = None
+    ENABLE_DELEGATION: bool | None = None
+    ENABLE_CURIOSITY: bool | None = None
+    ENABLE_VOICE: bool | None = None
+    ENABLE_MODEL_ROUTING: bool | None = None
+    ENABLE_HEARTBEAT: bool | None = None
+    HEARTBEAT_INTERVAL: int | None = Field(None, ge=1)
+    ENABLE_PROACTIVE: bool | None = None
+    ENABLE_SHELL_EXEC: bool | None = None
+    ENABLE_MCP: bool | None = None
+    ENABLE_MCP_SERVER: bool | None = None
+    ENABLE_AUTO_SKILL_CREATION: bool | None = None
+    ENABLE_INJECTION_DETECTION: bool | None = None
+    ENABLE_DESKTOP_AUTOMATION: bool | None = None
+    ENABLE_WEBHOOKS: bool | None = None
+    ENABLE_EMAIL_SEND: bool | None = None
+    ENABLE_INTEGRATIONS: bool | None = None
+    ENABLE_CALENDAR: bool | None = None
+    ALLOWED_ORIGINS: str | None = None
+    MAX_SYSTEM_TOKENS: int | None = Field(None, ge=500, le=16000)
+    MAX_USER_FACTS: int | None = Field(None, ge=1, le=100)
+    MAX_KG_FACTS: int | None = Field(None, ge=100, le=100000)
+    MAX_CURIOSITY_PENDING: int | None = Field(None, ge=1, le=500)
+    MAX_CURIOSITY_ATTEMPTS: int | None = Field(None, ge=1, le=10)
+    MAX_CUSTOM_TOOL_CODE_LENGTH: int | None = Field(None, ge=100, le=50000)
+    MAX_CUSTOM_TOOLS: int | None = Field(None, ge=1, le=200)
+    RATE_LIMIT_RPM: int | None = Field(None, ge=10, le=1000)
+    MAX_KG_FACTS_IN_PROMPT: int | None = Field(None, ge=1, le=50)
+    MAX_REFLEXIONS_IN_PROMPT: int | None = Field(None, ge=0, le=20)
+    MAX_SUCCESS_PATTERNS_IN_PROMPT: int | None = Field(None, ge=0, le=10)
+    MAX_REFLEXIONS: int | None = Field(None, ge=10, le=1000)
+    CRITIQUE_ANSWER_LIMIT: int | None = Field(None, ge=100, le=10000)
+    CRITIQUE_SOURCES_LIMIT: int | None = Field(None, ge=100, le=10000)
+    CRITIQUE_FACTS_LIMIT: int | None = Field(None, ge=100, le=10000)
+    MAX_CRITIQUE_ROUNDS: int | None = Field(None, ge=1, le=10)
+    DIGEST_HOUR: int | None = Field(None, ge=0, le=23)
+
+
 @router.patch("/config", dependencies=[Depends(require_auth)])
-async def update_config(updates: dict):
+async def update_config(body: ConfigUpdateRequest):
     """Update config values at runtime. Persists to overrides file.
     Returns {updated: [...], warnings: [...], restart_required: bool}
     """
@@ -176,12 +318,16 @@ async def update_config(updates: dict):
     # Fields that need full restart
     RESTART_FIELDS = {"DB_PATH", "CHROMADB_PATH", "HOST", "PORT"}
 
-    # Filter to valid config fields only
-    valid_updates = {k: v for k, v in updates.items()
-                     if hasattr(config, k) and not k.startswith('_')}
+    # Filter to valid, mutable config fields only (uses _MUTABLE_FIELDS from config.py)
+    valid_updates = {k: v for k, v in body.model_dump(exclude_none=True).items()
+                     if k in _MUTABLE_FIELDS and hasattr(config, k)}
 
     if not valid_updates:
         return {"updated": [], "warnings": ["No valid config fields provided"], "restart_required": False}
+
+    # Floor RATE_LIMIT_RPM at 10
+    if "RATE_LIMIT_RPM" in valid_updates:
+        valid_updates["RATE_LIMIT_RPM"] = max(10, int(valid_updates["RATE_LIMIT_RPM"]))
 
     changed_keys = list(valid_updates.keys())
     warnings = config.update(**valid_updates)
@@ -212,7 +358,11 @@ async def update_config(updates: dict):
 # ---------------------------------------------------------------------------
 
 @router.get("/kg/facts", dependencies=[Depends(require_auth)])
-async def get_kg_facts(limit: int = 50, offset: int = 0, search: str = ""):
+async def get_kg_facts(
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+    search: str = "",
+):
     """List KG facts with pagination and optional search."""
     from app.core.brain import get_services
     svc = get_services()
@@ -297,7 +447,7 @@ async def get_curiosity_queue():
 # ---------------------------------------------------------------------------
 
 @router.get("/export", dependencies=[Depends(require_auth)])
-async def export_all():
+async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
     """Export all Nova data as JSON.
 
     Includes: conversations, messages, user_facts, lessons, skills, training_data.
@@ -306,11 +456,11 @@ async def export_all():
 
     # Conversations + messages
     conversations = []
-    conv_rows = db.fetchall("SELECT * FROM conversations ORDER BY created_at")
+    conv_rows = db.fetchall("SELECT * FROM conversations ORDER BY created_at LIMIT ?", (limit,))
     for conv in conv_rows:
         msg_rows = db.fetchall(
-            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at",
-            (conv["id"],),
+            "SELECT * FROM messages WHERE conversation_id = ? ORDER BY created_at LIMIT ?",
+            (conv["id"], limit),
         )
         conversations.append({
             "id": conv["id"],
@@ -332,14 +482,14 @@ async def export_all():
         })
 
     # User facts
-    fact_rows = db.fetchall("SELECT * FROM user_facts ORDER BY key")
+    fact_rows = db.fetchall("SELECT * FROM user_facts ORDER BY key LIMIT ?", (limit,))
     user_facts = [
         {"key": r["key"], "value": r["value"], "source": r["source"], "confidence": r["confidence"]}
         for r in fact_rows
     ]
 
     # Lessons
-    lesson_rows = db.fetchall("SELECT * FROM lessons ORDER BY id")
+    lesson_rows = db.fetchall("SELECT * FROM lessons ORDER BY id LIMIT ?", (limit,))
     lessons = [
         {
             "id": r["id"],
@@ -357,7 +507,7 @@ async def export_all():
     ]
 
     # Skills
-    skill_rows = db.fetchall("SELECT * FROM skills ORDER BY id")
+    skill_rows = db.fetchall("SELECT * FROM skills ORDER BY id LIMIT ?", (limit,))
     skills = [
         {
             "id": r["id"],
@@ -388,7 +538,7 @@ async def export_all():
                         pass
 
     # KG facts
-    kg_rows = db.fetchall("SELECT * FROM kg_facts ORDER BY id")
+    kg_rows = db.fetchall("SELECT * FROM kg_facts ORDER BY id LIMIT ?", (limit,))
     kg_facts = [
         {
             "subject": r["subject"], "predicate": r["predicate"], "object": r["object"],
@@ -398,7 +548,7 @@ async def export_all():
     ]
 
     # Reflexions
-    ref_rows = db.fetchall("SELECT * FROM reflexions ORDER BY id")
+    ref_rows = db.fetchall("SELECT * FROM reflexions ORDER BY id LIMIT ?", (limit,))
     reflexions_data = [
         {
             "task_summary": r["task_summary"], "outcome": r["outcome"],
@@ -409,7 +559,7 @@ async def export_all():
     ]
 
     # Custom tools
-    ct_rows = db.fetchall("SELECT * FROM custom_tools ORDER BY id")
+    ct_rows = db.fetchall("SELECT * FROM custom_tools ORDER BY id LIMIT ?", (limit,))
     custom_tools_data = [
         {
             "name": r["name"], "description": r["description"],
@@ -422,7 +572,7 @@ async def export_all():
 
     export = {
         "version": "1.0",
-        "exported_at": datetime.now().isoformat(),
+        "exported_at": datetime.now(timezone.utc).isoformat(),
         "conversations": conversations,
         "user_facts": user_facts,
         "lessons": lessons,
@@ -563,31 +713,78 @@ async def import_all(file: UploadFile = File(...)):
                 )
                 stats["reflexions"] = stats.get("reflexions", 0) + 1
 
-        # Import custom tools
+        # Import custom tools (validate code before importing via AST analysis)
+        from app.tools.code_exec import _check_code_safety
         for ct in data.get("custom_tools", []):
             existing = tx.fetchone(
                 "SELECT id FROM custom_tools WHERE name = ?", (ct["name"],)
             )
             if not existing:
+                code = ct.get("code", "")
+                # Validate code against access tier restrictions using AST-based check
+                safety_error = _check_code_safety(code)
+                if safety_error:
+                    logger.warning("Rejected imported custom tool '%s': %s", ct["name"], safety_error)
+                    continue
                 tx.execute(
                     "INSERT INTO custom_tools (name, description, parameters, code, times_used, success_rate, enabled) "
                     "VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
-                        ct["name"], ct["description"], ct["parameters"], ct["code"],
+                        ct["name"], ct["description"], ct["parameters"], code,
                         ct.get("times_used", 0), ct.get("success_rate", 1.0),
                         int(ct.get("enabled", True)),
                     ),
                 )
                 stats["custom_tools"] = stats.get("custom_tools", 0) + 1
 
-    # Training data written to file (outside transaction)
+    # Training data written to file (outside transaction) with deduplication
+    # Uses atomic temp-file + os.replace to prevent corruption on crash.
     training_entries = data.get("training_data", [])
     if training_entries:
+        import hashlib
+        import os
+        import tempfile
+
         p = Path(config.TRAINING_DATA_PATH)
         p.parent.mkdir(parents=True, exist_ok=True)
-        with open(p, "a", encoding="utf-8") as f:
-            for entry in training_entries:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
+        # Read existing lines + build hash set for dedup
+        existing_lines: list[str] = []
+        existing_hashes: set[str] = set()
+        if p.exists():
+            with open(p, encoding="utf-8") as f:
+                for line in f:
+                    stripped = line.strip()
+                    if stripped:
+                        existing_hashes.add(hashlib.sha256(stripped.encode()).hexdigest())
+                        existing_lines.append(stripped)
+
+        # Compute new lines to append
+        new_lines: list[str] = []
+        for entry in training_entries:
+            entry_line = json.dumps(entry, ensure_ascii=False)
+            entry_hash = hashlib.sha256(entry_line.encode()).hexdigest()
+            if entry_hash not in existing_hashes:
+                new_lines.append(entry_line)
+                existing_hashes.add(entry_hash)
                 stats["training_data"] += 1
+
+        if new_lines:
+            fd, tmp_path = tempfile.mkstemp(
+                dir=str(p.parent), suffix=".tmp", prefix=".training_import_",
+            )
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    for line in existing_lines:
+                        f.write(line + "\n")
+                    for line in new_lines:
+                        f.write(line + "\n")
+                os.replace(tmp_path, str(p))
+            except BaseException:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+                raise
 
     return {"status": "imported", "stats": stats}

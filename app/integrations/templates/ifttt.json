@@ -1,10 +1,25 @@
 {
   "name": "ifttt",
-  "description": "IFTTT — trigger webhooks and applets",
-  "base_url": "https://maker.ifttt.com/trigger",
+  "description": "IFTTT — trigger webhooks and applets. Create IFTTT Webhooks applets at ifttt.com/maker_webhooks, then trigger them from Nova. Set IFTTT_KEY to your Webhooks key.",
+  "base_url": "https://maker.ifttt.com",
   "auth_type": "none",
   "auth_env_var": "IFTTT_KEY",
   "endpoints": [
-    {"name": "trigger", "method": "POST", "path": "/{event}/with/key/{key}", "required_params": ["event", "key"]}
+    {
+      "name": "trigger",
+      "method": "POST",
+      "path": "/trigger/{event}/with/key/{key}",
+      "required_params": ["event", "key"],
+      "optional_params": ["value1", "value2", "value3"],
+      "description": "Trigger an IFTTT Webhook event. Pass up to 3 values as ingredients. Example: event=lights_on, key=your_ifttt_key"
+    },
+    {
+      "name": "trigger_json",
+      "method": "POST",
+      "path": "/trigger/{event}/json/with/key/{key}",
+      "required_params": ["event", "key"],
+      "optional_params": ["body"],
+      "description": "Trigger with JSON body for richer data. The body is passed as-is to the applet."
+    }
   ]
 }

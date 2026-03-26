@@ -123,6 +123,7 @@ class TestHttpFetchTool:
         mock_resp.status_code = 200
         mock_resp.url = "https://example.com"
         mock_resp.headers = {}
+        mock_resp.is_redirect = False
 
         mock_client = MagicMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -139,6 +140,7 @@ class TestHttpFetchTool:
         mock_resp.status_code = 200
         mock_resp.url = "https://api.example.com/data"
         mock_resp.headers = {}
+        mock_resp.is_redirect = False
 
         mock_client = MagicMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -163,6 +165,7 @@ class TestHttpFetchTool:
         mock_resp.status_code = 404
         mock_resp.url = "https://api.example.com/missing"
         mock_resp.headers = {}
+        mock_resp.is_redirect = False
 
         mock_client = MagicMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -180,6 +183,7 @@ class TestHttpFetchTool:
         mock_resp.status_code = 200
         mock_resp.url = "https://example.com/big"
         mock_resp.headers = {"content-type": "text/plain"}
+        mock_resp.is_redirect = False
 
         mock_client = MagicMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -198,6 +202,7 @@ class TestHttpFetchTool:
         mock_resp.status_code = 200
         mock_resp.url = "https://example.com"
         mock_resp.headers = {}
+        mock_resp.is_redirect = False
 
         mock_client = MagicMock()
         mock_client.request = AsyncMock(return_value=mock_resp)

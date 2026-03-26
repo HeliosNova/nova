@@ -12,6 +12,7 @@ import ChatInput from "../components/ChatInput";
 import ThinkingIndicator from "../components/ThinkingIndicator";
 import ToolCallCard from "../components/ToolCallCard";
 import { ErrorBanner } from "../components/ui";
+import { toast } from "sonner";
 
 // Helper to get store actions without causing re-renders
 const actions = () => useChatStore.getState();
@@ -72,6 +73,8 @@ export default function ChatPage() {
     s.resetStream();
     s.setStreaming(true);
 
+    // Abort any previous stream before creating a new one
+    abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
 
@@ -102,12 +105,16 @@ export default function ChatPage() {
                 id: uid(),
                 tool: d.tool,
                 status: "executing",
+                tool_call_id: d.tool_call_id,
+                args: d.args,
               });
             } else {
-              const tc = useChatStore
-                .getState()
-                .toolCalls.find(
-                  (t) => t.tool === d.tool && t.status === "executing"
+              // Use findLast to match the most recent tool call with duplicate names
+              const tcs = useChatStore.getState().toolCalls;
+              const tc = tcs.slice().reverse().find(
+                  (t) =>
+                    (d.tool_call_id && t.tool_call_id === d.tool_call_id) ||
+                    (!d.tool_call_id && t.tool === d.tool && t.status === "executing")
                 );
               if (tc) {
                 a.updateToolCall(tc.id, {
@@ -144,7 +151,7 @@ export default function ChatPage() {
           case "warning": {
             const d = event.data as { message?: string };
             if (d.message) {
-              import("sonner").then(({ toast }) => toast.warning(d.message));
+              toast.warning(d.message);
             }
             break;
           }
@@ -165,6 +172,11 @@ export default function ChatPage() {
 
   const handleStop = useCallback(() => {
     abortRef.current?.abort();
+    // Save partial tokens as assistant message before clearing
+    const currentTokens = useChatStore.getState().streamedTokens;
+    if (currentTokens) {
+      actions().finalizeAssistantMessage(useChatStore.getState().activeConversationId || "");
+    }
     actions().setStreaming(false);
   }, []);
 
@@ -195,19 +207,30 @@ export default function ChatPage() {
 
       <div className="flex flex-1 flex-col min-w-0 min-h-0">
         {/* Messages area */}
-        <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto py-4">
+        <div ref={scrollContainerRef} className="relative flex-1 overflow-y-auto py-4" role="log" aria-live="polite">
           {messages.length === 0 && !streaming && (
             <div className="flex h-full items-center justify-center">
               <div className="text-center animate-fade-in">
-                {/* Nova_ logo */}
+                {/* Nova logo */}
                 <div className="relative mx-auto mb-6 h-16 w-16">
                   <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-nova-accent/20 to-nova-glow/10 blur-xl" />
                   <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-nova-border bg-nova-surface shadow-[var(--shadow-nova-glow)]">
                     <MessageSquare size={28} strokeWidth={1.5} className="text-nova-accent" />
                   </div>
                 </div>
-                <p className="text-2xl font-bold bg-gradient-to-r from-nova-text to-nova-glow bg-clip-text text-transparent">Nova_</p>
+                <p className="text-2xl font-bold bg-gradient-to-r from-nova-text to-nova-glow bg-clip-text text-transparent">Nova</p>
                 <p className="mt-1.5 text-sm text-nova-text-dim">Start a conversation</p>
+                <div className="mt-6 flex flex-wrap justify-center gap-2 max-w-md">
+                  {["What's happening in the markets?", "Search for the latest AI news", "What do you know about me?", "What's the weather in LA?"].map((prompt) => (
+                    <button
+                      key={prompt}
+                      onClick={() => handleSend(prompt)}
+                      className="rounded-lg border border-nova-border px-3 py-1.5 text-xs text-nova-text-dim hover:text-nova-text hover:border-nova-accent/30 hover:bg-nova-accent/5 transition-all"
+                    >
+                      {prompt}
+                    </button>
+                  ))}
+                </div>
               </div>
             </div>
           )}

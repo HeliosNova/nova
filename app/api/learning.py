@@ -10,6 +10,7 @@ GET  /api/learning/finetune/status — Fine-tuning readiness check
 POST /api/learning/finetune/trigger — Trigger automated fine-tuning
 GET  /api/learning/finetune/history — List past fine-tuning runs
 GET  /api/learning/training-data — View training data entries
+POST /api/learning/lessons/bulk-delete — Bulk delete lessons by ID
 """
 
 from __future__ import annotations
@@ -21,10 +22,15 @@ import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel, Field
 
 from app.auth import require_auth
 from app.config import config
 from app.core.brain import get_services
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int] = Field(..., min_length=1, max_length=100)
 
 logger = logging.getLogger(__name__)
 
@@ -81,6 +87,21 @@ async def delete_lesson(lesson_id: int):
     return {"status": "deleted", "lesson_id": lesson_id}
 
 
+@router.post("/lessons/bulk-delete")
+async def bulk_delete_lessons(body: BulkDeleteRequest):
+    """Bulk delete lessons by ID. Max 100 per request."""
+    svc = get_services()
+    if not svc.learning:
+        raise HTTPException(status_code=503, detail="Learning engine not initialized")
+    deleted_ids, not_found_ids = svc.learning.bulk_delete_lessons(body.ids)
+    return {
+        "status": "ok",
+        "deleted": deleted_ids,
+        "not_found": not_found_ids,
+        "deleted_count": len(deleted_ids),
+    }
+
+
 @router.get("/skills")
 async def list_skills(limit: int = Query(default=50, ge=1, le=500)):
     """List all learned skills."""
@@ -105,7 +126,7 @@ async def list_skills(limit: int = Query(default=50, ge=1, le=500)):
 
 
 @router.post("/skills/{skill_id}/toggle")
-async def toggle_skill(skill_id: int, enabled: bool = True):
+async def toggle_skill(skill_id: int, enabled: bool = Query(...)):
     """Enable or disable a skill."""
     svc = get_services()
     if not svc.skills:
@@ -175,8 +196,6 @@ async def finetune_status():
         "pairs_with_rejected": has_rejected,
         "min_recommended": min_recommended,
         "recommendation": recommendation,
-        "data_path": str(path),
-        "command": "docker compose stop ollama && python scripts/finetune.py && docker compose start ollama",
     }
 
 
@@ -289,6 +308,22 @@ async def _finetune_trigger_inner(force: bool = False):
         ),
         "command": "python scripts/finetune_auto.py" + (" --force" if force else ""),
     }
+
+
+@router.patch("/finetune/status")
+async def finetune_update_status(status: str = "running"):
+    """Update the active fine-tune job status (called by external training scripts)."""
+    global _active_finetune_job
+    valid_statuses = {"running", "completed", "failed", "cancelled"}
+    if status not in valid_statuses:
+        raise HTTPException(status_code=400, detail=f"Status must be one of {valid_statuses}")
+    if not _active_finetune_job:
+        raise HTTPException(status_code=404, detail="No active fine-tuning job")
+    _active_finetune_job["status"] = status
+    if status in ("completed", "failed", "cancelled"):
+        from datetime import datetime, timezone
+        _active_finetune_job["completed_at"] = datetime.now(timezone.utc).isoformat()
+    return {"job_id": _active_finetune_job["job_id"], "status": status}
 
 
 @router.get("/finetune/history")

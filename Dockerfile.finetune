@@ -1,0 +1,31 @@
+FROM nvidia/cuda:12.4.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+WORKDIR /app
+
+# Install Python 3.11 from deadsnakes PPA + git
+RUN apt-get update && apt-get install -y software-properties-common && \
+    add-apt-repository ppa:deadsnakes/ppa && \
+    apt-get update && apt-get install -y python3.11 python3.11-venv python3.11-dev git && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/bin/python3.11 /usr/bin/python && \
+    python -m ensurepip --upgrade && \
+    python -m pip install --upgrade pip
+
+# Install latest compatible stack: torch 2.6 + TRL + transformers 5.x
+RUN pip install --no-cache-dir \
+    torch --index-url https://download.pytorch.org/whl/cu124 && \
+    pip install --no-cache-dir \
+    "transformers>=5.2.0" \
+    "trl>=0.16.0" \
+    "peft>=0.13.0" \
+    "bitsandbytes>=0.44.0" \
+    "datasets>=3.0.0" \
+    "accelerate>=1.0.0" \
+    safetensors
+
+COPY scripts/finetune.py scripts/finetune.py
+COPY scripts/finetune_auto.py scripts/finetune_auto.py
+COPY scripts/eval_harness.py scripts/eval_harness.py
+
+CMD ["python", "scripts/finetune.py", "--dry-run"]

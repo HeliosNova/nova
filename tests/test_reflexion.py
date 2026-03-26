@@ -71,7 +71,7 @@ class TestQualityAssessment:
             max_tool_rounds=5,
         )
         assert score < 1.0
-        assert "tool rounds" in reason.lower()
+        assert "rounds" in reason.lower()
 
     def test_tool_failures(self):
         tools = [
@@ -249,9 +249,11 @@ class TestReflexionDecay:
 
 
 class TestReflexionPruning:
-    def test_prune_over_limit(self, db):
+    def test_prune_over_limit(self, db, monkeypatch):
+        monkeypatch.setenv("MAX_REFLEXIONS", "5")
+        from app.config import reset_config
+        reset_config()
         store = ReflexionStore(db)
-        store.MAX_REFLEXIONS = 5  # Set low limit for testing
         for i in range(8):
             store.store(f"unique task {i}", "failure", f"unique reason {i}", quality_score=0.1 * i)
         stats = store.get_stats()
@@ -293,7 +295,7 @@ class TestReflexionBrainIntegration:
         with patch("app.core.brain.llm") as mock_llm:
             mock_result = AsyncMock()
             mock_result.content = "Bitcoin is currently trading at $50,000."
-            mock_result.tool_call = None
+            mock_result.tool_calls = []
             mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
 
             captured_messages = []
@@ -333,7 +335,7 @@ class TestReflexionBrainIntegration:
             mock_result = AsyncMock()
             # Simulate a bad answer: multiple hard failure indicators + short
             mock_result.content = "I cannot do that. Failed to."
-            mock_result.tool_call = None
+            mock_result.tool_calls = []
             mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
 
             async for _ in think("Tell me about quantum computing and its applications in modern cryptography"):

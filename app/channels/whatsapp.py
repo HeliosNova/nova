@@ -1,9 +1,13 @@
-"""WhatsApp channel adapter — connects Nova_ to WhatsApp via Business API webhooks."""
+"""WhatsApp channel adapter — connects Nova to WhatsApp via Business API webhooks."""
 
 from __future__ import annotations
 
+import asyncio
 import collections
+import json
 import logging
+
+import hmac
 
 import httpx
 from fastapi import APIRouter, Query, Request
@@ -26,8 +30,10 @@ class WhatsAppBot:
         self.default_chat_id = config.WHATSAPP_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
         self._conversations: collections.OrderedDict[str, str] = collections.OrderedDict()  # whatsapp phone → conv_id
+        self._conv_store = None  # lazy-init DB store
+        self._conv_lock = asyncio.Lock()
         self._client = httpx.AsyncClient(timeout=30)
-        self._processed_ids: collections.OrderedDict[str, None] = collections.OrderedDict()  # dedup
+        self._dedup_db = None  # lazy-init SQLite dedup
 
     @staticmethod
     def _parse_allowed_users() -> set[str]:
@@ -47,22 +53,54 @@ class WhatsAppBot:
             return True
         return phone in self._allowed_users
 
+    def _get_dedup_db(self):
+        """Lazy-init SQLite dedup table."""
+        if self._dedup_db is None:
+            from app.database import get_db
+            self._dedup_db = get_db()
+            self._dedup_db.execute(
+                "CREATE TABLE IF NOT EXISTS channel_dedup "
+                "(msg_id TEXT PRIMARY KEY, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)"
+            )
+        return self._dedup_db
+
+    def _check_dedup(self, msg_id: str) -> bool:
+        """Return True if msg_id was already processed."""
+        db = self._get_dedup_db()
+        row = db.fetchone("SELECT 1 FROM channel_dedup WHERE msg_id = ?", (msg_id,))
+        return row is not None
+
+    def _record_dedup(self, msg_id: str) -> None:
+        """Record a processed msg_id and clean up old entries."""
+        db = self._get_dedup_db()
+        db.execute("INSERT OR IGNORE INTO channel_dedup (msg_id) VALUES (?)", (msg_id,))
+        # Periodic cleanup of entries older than 24 hours
+        db.execute(
+            "DELETE FROM channel_dedup WHERE created_at < datetime('now', '-24 hours')"
+        )
+
     async def _handle_query(self, query: str, sender_phone: str) -> str:
         """Run query through think() and collect the response."""
         from app.core.brain import think, get_services
 
         # Get or create conversation for this user
-        conv_id = self._conversations.get(sender_phone)
-        if conv_id:
-            # Move to end so it's marked as recently used
-            self._conversations.move_to_end(sender_phone)
-        else:
-            svc = get_services()
-            conv_id = svc.conversations.create_conversation()
-            self._conversations[sender_phone] = conv_id
-            # LRU eviction: cap at 1000 entries
-            while len(self._conversations) > 1000:
-                self._conversations.popitem(last=False)
+        async with self._conv_lock:
+            conv_id = self._conversations.get(sender_phone)
+            if conv_id:
+                self._conversations.move_to_end(sender_phone)
+            else:
+                # Try DB recovery
+                if self._conv_store is None:
+                    from app.database import get_db, ChannelConversationStore
+                    self._conv_store = ChannelConversationStore(get_db())
+                conv_id = self._conv_store.get("whatsapp", str(sender_phone))
+                if not conv_id:
+                    svc = get_services()
+                    conv_id = svc.conversations.create_conversation()
+                    self._conv_store.set("whatsapp", str(sender_phone), conv_id)
+                self._conversations[sender_phone] = conv_id
+                while len(self._conversations) > 1000:  # LRU cap for personal bot
+                    self._conversations.popitem(last=False)
 
         try:
             tokens = []
@@ -148,7 +186,9 @@ class WhatsAppBot:
             hub_challenge: str = Query(None, alias="hub.challenge"),
         ):
             """WhatsApp webhook verification (hub challenge)."""
-            if hub_mode == "subscribe" and hub_verify_token == self.verify_token:
+            if not self.verify_token:
+                return PlainTextResponse("Verify token not configured", status_code=403)
+            if hub_mode == "subscribe" and hmac.compare_digest(hub_verify_token or "", self.verify_token):
                 logger.info("[WhatsApp] Webhook verified")
                 return PlainTextResponse(hub_challenge)
             logger.warning("[WhatsApp] Webhook verification failed")
@@ -157,8 +197,27 @@ class WhatsAppBot:
         @router.post("/webhook")
         async def receive_message(request: Request):
             """Handle incoming WhatsApp messages."""
+            # Fail-closed: reject all webhooks if app secret is not configured
+            if not config.WHATSAPP_APP_SECRET:
+                return JSONResponse({"status": "webhook not configured"}, status_code=503)
+
+            # HMAC-SHA256 signature verification
+            import hashlib
+            import hmac as _hmac
+            raw_body = await request.body()
+            signature = request.headers.get("x-hub-signature-256", "")
+            if not signature:
+                return JSONResponse({"status": "missing signature"}, status_code=403)
+            expected = "sha256=" + _hmac.new(
+                config.WHATSAPP_APP_SECRET.encode(),
+                raw_body,
+                hashlib.sha256,
+            ).hexdigest()
+            if not _hmac.compare_digest(signature, expected):
+                logger.warning("[WhatsApp] Invalid webhook signature")
+                return JSONResponse({"status": "invalid signature"}, status_code=403)
             try:
-                body = await request.json()
+                body = json.loads(raw_body)
             except Exception:
                 return JSONResponse({"status": "invalid body"}, status_code=400)
 
@@ -182,14 +241,10 @@ class WhatsAppBot:
                 msg_type = msg.get("type", "")
                 sender_phone = msg.get("from", "")
 
-                # Dedup — WhatsApp may send the same webhook multiple times
-                if msg_id in self._processed_ids:
+                # Dedup — WhatsApp may send the same webhook multiple times (persistent via SQLite)
+                if self._check_dedup(msg_id):
                     return JSONResponse({"status": "ok"})
-                self._processed_ids[msg_id] = None
-
-                # Cap dedup dict to prevent unbounded growth — pop oldest entries
-                while len(self._processed_ids) > 10000:
-                    self._processed_ids.popitem(last=False)
+                self._record_dedup(msg_id)
 
                 # Only handle text messages
                 if msg_type != "text":
@@ -227,4 +282,8 @@ class WhatsAppBot:
     async def close(self) -> None:
         """Close the httpx client."""
         if self._client:
-            await self._client.aclose()
+            try:
+                await self._client.aclose()
+            except Exception:
+                pass
+            self._client = None

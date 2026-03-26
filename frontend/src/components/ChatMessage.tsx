@@ -51,6 +51,38 @@ const markdownComponents = {
       </div>
     );
   },
+  code({ className, children, ...props }: React.ComponentPropsWithoutRef<"code"> & { inline?: boolean }) {
+    // Extract language from className (react-markdown sets "language-xxx")
+    const match = /language-(\w+)/.exec(className || "");
+    const lang = match ? match[1] : undefined;
+    // Fenced code blocks are wrapped in <pre>, inline code is not.
+    // We detect inline by checking if there's no language and content is short / single-line.
+    const isInline = !lang && typeof children === "string" && !children.includes("\n");
+    if (isInline) {
+      return (
+        <code
+          className={`${className || ""} rounded bg-nova-bg/80 px-1.5 py-0.5 text-[0.85em] font-mono text-nova-glow`}
+          {...props}
+        >
+          {children}
+        </code>
+      );
+    }
+    return (
+      <code
+        className={`${className || ""} language-${lang || "text"} block bg-nova-bg rounded-lg border border-nova-border p-4 font-mono text-[0.85em] leading-relaxed overflow-x-auto text-nova-text`}
+        data-language={lang}
+        {...props}
+      >
+        {lang && (
+          <span className="block mb-2 text-[10px] font-sans font-medium uppercase tracking-wider text-nova-text-dim/60 select-none">
+            {lang}
+          </span>
+        )}
+        {children}
+      </code>
+    );
+  },
 };
 
 export default React.memo(function ChatMessage({ message }: Props) {
@@ -67,9 +99,9 @@ export default React.memo(function ChatMessage({ message }: Props) {
   return (
     <div className={`group relative flex ${isUser ? "justify-end" : "justify-start"} px-4 py-1.5 animate-fade-in`}>
       <div
-        className={`max-w-[75%] rounded-xl px-4 py-3 text-sm leading-relaxed transition-shadow duration-300 ${
+        className={`max-w-[90%] md:max-w-[75%] rounded-xl px-4 py-3 text-sm leading-relaxed transition-shadow duration-300 ${
           isUser
-            ? "bg-gradient-to-br from-nova-accent to-indigo-600 text-white shadow-[var(--shadow-nova-md)]"
+            ? "bg-gradient-to-br from-nova-accent to-nova-accent-hover text-white shadow-[var(--shadow-nova-md)]"
             : "bg-nova-surface border-l-2 border-nova-accent/20 border border-l-nova-accent/30 border-nova-border text-nova-text shadow-[var(--shadow-nova-sm)] hover:shadow-[var(--shadow-nova-md)]"
         }`}
       >
@@ -85,7 +117,11 @@ export default React.memo(function ChatMessage({ message }: Props) {
             {imageExpanded && (
               <div
                 className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in"
+                role="dialog"
+                aria-label="Expanded image"
                 onClick={() => setImageExpanded(false)}
+                onKeyDown={(e) => { if (e.key === "Escape") setImageExpanded(false); }}
+                tabIndex={0}
               >
                 <img
                   src={imageSrc}
@@ -115,7 +151,7 @@ export default React.memo(function ChatMessage({ message }: Props) {
           <div className="mt-2.5 border-t border-nova-border/30 pt-2">
             <button
               onClick={() => setShowLessons(!showLessons)}
-              className="flex items-center gap-1.5 rounded-full bg-nova-accent/[0.08] px-2.5 py-1 text-[11px] font-medium text-nova-accent/80 hover:text-nova-accent hover:bg-nova-accent/[0.12] transition-all"
+              className="flex items-center gap-1.5 rounded-full bg-nova-accent/[0.12] border border-nova-accent/20 px-3 py-1.5 text-xs font-medium text-nova-accent hover:bg-nova-accent/[0.18] transition-all shadow-[0_0_8px_rgba(99,102,241,0.1)]"
             >
               <BookOpen size={11} />
               {message.lessons_used.length} lesson{message.lessons_used.length > 1 ? "s" : ""} applied

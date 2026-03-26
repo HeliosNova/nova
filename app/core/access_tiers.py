@@ -13,7 +13,10 @@ Tiers:
 
 from __future__ import annotations
 
+import contextvars
+import functools
 import logging
+import sys
 from pathlib import Path
 
 from app.config import config
@@ -22,13 +25,54 @@ logger = logging.getLogger(__name__)
 
 VALID_TIERS = {"sandboxed", "standard", "full", "none"}
 
+# ContextVar override for access tier — used by delegate to constrain sub-agents.
+# When set, _tier() returns this value instead of config.SYSTEM_ACCESS_LEVEL.
+_access_tier_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "access_tier_override", default=None
+)
+
+
+def get_access_tier_override() -> str | None:
+    return _access_tier_override.get()
+
+
+def set_access_tier_override(tier: str | None) -> None:
+    _access_tier_override.set(tier)
+
 
 def _tier() -> str:
+    # Check ContextVar override first (set by delegate for sub-agents)
+    override = _access_tier_override.get()
+    if override is not None:
+        t = override.lower()
+        if t in VALID_TIERS:
+            return t
+        logger.warning("Invalid access tier override '%s', falling back to config", override)
+
     t = config.SYSTEM_ACCESS_LEVEL.lower()
     if t not in VALID_TIERS:
         logger.warning("Invalid SYSTEM_ACCESS_LEVEL '%s', falling back to 'sandboxed'", t)
         return "sandboxed"
     return t
+
+
+def requires_tier(*allowed_tiers: str):
+    """Decorator to restrict tool execution to specific access tiers."""
+    from app.tools.base import ToolResult, ErrorCategory
+
+    def decorator(execute_method):
+        @functools.wraps(execute_method)
+        async def wrapper(self, **kwargs):
+            current = _tier()
+            if current not in allowed_tiers and current != "none":
+                return ToolResult(
+                    output="", success=False,
+                    error=f"Tool '{self.name}' requires tier {'/'.join(allowed_tiers)}, current: {current}",
+                    error_category=ErrorCategory.PERMISSION,
+                )
+            return await execute_method(self, **kwargs)
+        return wrapper
+    return decorator
 
 
 # ---------------------------------------------------------------------------
@@ -78,6 +122,32 @@ def get_blocked_shell_commands() -> set[str]:
     return blocked
 
 
+def is_command_blocked(base_cmd: str) -> str | None:
+    """Check if a base command is blocked, with prefix matching for interpreters.
+
+    Returns the matched blocked command name if blocked, None if allowed.
+    Handles versioned interpreters like python3.11, node18, ruby3.2, etc.
+    """
+    blocked = get_blocked_shell_commands()
+
+    # Exact match first (covers all non-interpreter commands too)
+    if base_cmd in blocked:
+        return base_cmd
+
+    # Prefix match for interpreters: e.g. python3.11 matches python3
+    # Only match if the suffix after the blocked name is digits/dots (version suffix)
+    tier = _tier()
+    if tier == "sandboxed":
+        for interp in _INTERPRETER_COMMANDS:
+            if base_cmd.startswith(interp) and len(base_cmd) > len(interp):
+                suffix = base_cmd[len(interp):]
+                # Allow only version-like suffixes (digits and dots)
+                if all(c in "0123456789." for c in suffix):
+                    return interp
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Filesystem access
 # ---------------------------------------------------------------------------
@@ -91,6 +161,23 @@ _ALWAYS_PROTECTED_PATHS = {
 }
 # Directories where no path under them is writable (prefix matching)
 _ALWAYS_PROTECTED_DIRS = {"/proc", "/sys"}
+
+if sys.platform == "win32":
+    import os
+    _system_root = Path(os.environ.get("SYSTEMROOT", "C:\\Windows"))
+    _ALWAYS_PROTECTED_PATHS.update({
+        _system_root / "System32" / "config" / "SAM",
+        _system_root / "System32" / "config" / "SYSTEM",
+        _system_root / "System32" / "config" / "SECURITY",
+        _system_root / "System32" / "config" / "SOFTWARE",
+        _system_root / "System32" / "config" / "DEFAULT",
+        Path(os.environ.get("USERPROFILE", "C:\\Users\\Default")) / ".ssh",
+    })
+    _ALWAYS_PROTECTED_DIRS.update({
+        _system_root / "System32" / "drivers",
+        _system_root / "System32" / "config" / "RegBack",
+        _system_root / "Boot",
+    })
 
 
 def get_allowed_read_roots() -> list[Path]:

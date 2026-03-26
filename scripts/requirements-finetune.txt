@@ -9,8 +9,9 @@
 # Requires: CUDA 12.x, RTX 3090 (24GB)
 
 # Unsloth — optimized fine-tuning for consumer GPUs
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git
-unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git
+# Pinned to specific commits for reproducibility
+unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git@2025.3.19
+unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@2025.3.6
 
 # TRL — Transformers Reinforcement Learning (DPO trainer)
 trl>=0.12.0

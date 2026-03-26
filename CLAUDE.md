@@ -1,11 +1,11 @@
-# Nova_ — Development Guide
+# Nova — Development Guide
 
 ## What This Is
 
 Nova is a sovereign personal AI assistant with multi-provider LLM support (Ollama, OpenAI, Anthropic, Google).
 Default: FastAPI backend + Ollama (Qwen3.5:27b) on RTX 3090. Supports MCP (Model Context Protocol) for external tools.
 It learns from corrections, remembers user facts, uses tools, and generates DPO training data for fine-tuning.
-~74 files, not 238. Learning is the product.
+~79 files, not 238. Learning is the product.
 
 ## Architecture (Single Pipeline, No Framework)
 
@@ -31,7 +31,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 | `app/core/llm.py` | Provider-agnostic LLM interface: `invoke_nothink()`, `generate_with_tools()`, JSON extraction |
 | `app/core/providers/` | LLM backends: `ollama.py`, `openai.py`, `anthropic.py`, `google.py` |
 | `app/tools/mcp.py` | MCP client: discovers external MCP tools, wraps as BaseTool |
-| `app/mcp_server.py` | MCP server: exposes Nova_ as MCP server (memory, KG, lessons, docs) |
+| `app/mcp_server.py` | MCP server: exposes Nova as MCP server (memory, KG, lessons, docs) |
 | `app/core/prompt.py` | System prompt builder (8 blocks with truncation priority) |
 | `app/core/memory.py` | ConversationStore + UserFactStore + fact extraction |
 | `app/core/learning.py` | Correction detection (regex+LLM), lessons, training data |
@@ -47,7 +47,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 | `app/tools/desktop.py` | Desktop automation (screenshot, click, type, hotkey) |
 | `app/core/voice.py` | WhisperTranscriber — local speech-to-text |
 | `app/api/voice.py` | Voice API endpoints (transcribe, chat) |
-| `app/config.py` | ~75 settings from .env (frozen dataclass) |
+| `app/config.py` | ~85 settings from .env (frozen dataclass) |
 | `app/database.py` | SafeDB singleton wrapping sqlite3 |
 | `app/tools/base.py` | BaseTool + ToolResult + ToolRegistry |
 | `app/api/chat.py` | POST /chat/stream (SSE) + POST /chat (sync) |
@@ -69,11 +69,21 @@ Main responses use `generate_with_tools()` (thinking suppressed for speed) or `s
 
 ### Tool Calling (Hybrid: Native + Text)
 Cloud providers (OpenAI, Anthropic, Google) use native structured tool calls returned in `result.tool_call`.
+Tools are now passed through `stream_with_thinking()` for all cloud providers, enabling streaming tool calls.
 Ollama uses prompt-based text extraction (Qwen3.5 native tool calling is broken, GitHub #14493):
 ```
 {"tool": "tool_name", "args": {"param": "value"}}
 ```
 `brain.py` checks `result.tool_call` first (structured), then falls back to `_extract_tool_calls()` (text parsing).
+
+### Provider-Aware Prompt Building
+`build_system_prompt()` accepts `provider` and `registered_tool_names` params:
+- **Date block**: Full emphatic repetition for Ollama (date confusion workaround), condensed for cloud providers
+- **Self-attribution**: Emphatic "REAL, live results" framing for Ollama, neutral for cloud
+- **Tool examples**: Filtered to only registered tools (no phantom examples)
+
+### Provider Base URLs
+All cloud provider base URLs are configurable via config: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL`, `ANTHROPIC_API_VERSION`. Supports self-hosted endpoints and proxy setups.
 
 ### Correction Detection (2-stage)
 1. **Regex pre-filter** -- `is_likely_correction()` in `learning.py` is the single source of truth
@@ -89,11 +99,15 @@ In `brain.py` step 13, the correction handler must **skip 1 assistant message** 
 [NEVER TRUNCATE] Block 1: Identity + Reasoning Methodology
 [NEVER TRUNCATE] Block 2: User Facts
 [NEVER TRUNCATE] Block 3: Learned Lessons
-[NEVER TRUNCATE] Block 8: Date/Time
-[TRUNCATE LAST]  Block 4: Tool Descriptions + Examples
+[NEVER TRUNCATE] Block 8: Date/Time (provider-aware: full for Ollama, condensed for cloud)
+[TRUNCATE LAST]  Block 4: Tool Descriptions + Examples (filtered to registered tools only)
 [TRUNCATE MID]   Block 5: Skills / Retrieved Context
-[TRUNCATE FIRST] Block 6-7: Past Conversations / Summary
+[TRUNCATE FIRST] Block 7: Conversation Summary
 ```
+
+### User Fact Source Authority
+`memory.py` enforces a source hierarchy when overwriting facts: `user (4) > correction (3) > inferred (2) > extracted (1)`.
+Lower-authority sources cannot overwrite higher-authority facts.
 
 ### SafeDB.execute() Returns Cursor
 Always truthy. Use `fetchone()` / `fetchall()` for SELECTs.
@@ -116,14 +130,19 @@ Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path 
 ### Monitor System (`app/monitors/heartbeat.py`)
 Background loop checks monitors on schedule, detects changes, sends alerts via Discord/Telegram/WhatsApp/Signal.
 
-**14 default monitors** (seeded on first startup):
-- **Operational**: Morning Check-in (daily), System Health (2h), Self-Reflection (daily)
-- **Domain Studies**: Science (12h), Technology (12h), Current Events (8h), Finance (12h) — query-type monitors that auto-extract KG triples
-- **World Awareness** (4h) — global non-tech news
-- **Teaching**: Lesson Quiz (6h), Skill Validation (12h)
-- **Autonomous**: Curiosity Research (1h), Auto-Monitor Detector (daily)
-- **Maintenance**: System Maintenance (daily) — decay stale KG/reflexions/lessons, prune curiosity
-- **Intelligence**: Fine-Tune Check (weekly) — reports when enough new DPO pairs exist for retraining
+**51 default monitors** (seeded on first startup):
+- **Operational** (6): Morning Check-in (daily), System Health (2h), Self-Reflection (daily), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
+- **Self-Improvement** (3): Lesson Quiz (6h), Skill Validation (12h), Curiosity Research (1h)
+- **Financial Intelligence** (7): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h)
+- **International** (6): China Tech (8h), Russia & E.Europe (12h), Middle East (12h), India (12h), Europe & EU (12h), Geopolitics (8h)
+- **Science/Tech** (9): Science, Technology, AI & ML, Space, Quantum, Robotics, Physics, Biotech, Semiconductors (8-24h)
+- **Policy/Security** (4): US Policy, Cybersecurity, Energy & Climate, Defense & Military (12h)
+- **Culture/Local** (5): Sports (6h), Entertainment (12h), Social Media (12h), LA Local (12h), Climate & Weather (12h)
+- **Developer/Business** (3): Open Source & GitHub (12h), Developer Ecosystem (12h), Startups & VC (12h)
+- **Global** (5): World Awareness (4h), Current Events (8h), Economics & Markets (12h), Supply Chain (12h), Research Frontiers (24h)
+- **Geographic** (3): Latin America (24h), Africa & Emerging (24h), Research Frontiers (24h)
+
+All query-type monitors auto-extract KG triples. All prompts anchored to "past 24-48 hours" with today's date injected.
 
 ### Self-Improvement Pipeline
 1. **Reflexion** (`reflexion.py`): Heuristic + LLM critique after each response. Failures stored and retrieved on similar future queries.
@@ -134,7 +153,9 @@ Background loop checks monitors on schedule, detects changes, sends alerts via D
 6. **Recurring Failure Promotion**: 3+ similar failures auto-promote to a lesson.
 
 ### Key Details
-- KG extraction only fires for `Domain Study` monitors (not all query types)
+- KG extraction fires for all query-type monitors except Morning Check-in and Self-Reflection
+- Auto-monitors use query type (brain.think()) not search (raw web_search)
+- Cross-monitor feedback loops run during daily maintenance: quiz failures→curiosity re-research, degrading skills→early validation
 - Decay (KG, reflexions, lessons) runs via the daily maintenance monitor, not at startup
 - Skill success rate uses EMA (α=0.15) — recent failures degrade quickly
 - Lesson confidence uses dampened adjustments — `delta / (1 + times_helpful)`
@@ -156,7 +177,7 @@ Background loop checks monitors on schedule, detects changes, sends alerts via D
 7. Lessons must have all fields: `topic`, `correct_answer`, `wrong_answer`, `lesson_text`.
 8. DPO training pairs: query=original question, chosen=correct, rejected=wrong.
 9. Facts are extracted, not hallucinated. Only extract from explicit user statements.
-10. Context budget: 4000 tokens max (MAX_SYSTEM_TOKENS in prompt.py). Summarize older messages, keep 6 recent.
+10. Context budget: 6000 tokens max (MAX_SYSTEM_TOKENS in prompt.py). Summarize older messages, keep 6 recent.
 
 ## Dependencies
 
@@ -174,7 +195,7 @@ docker compose up          # Start all services
 docker compose stop ollama # Free VRAM for fine-tuning
 ```
 
-Services: helios-ollama (11434), helios-nova (8000), helios-searxng (8888)
+Services: nova-ollama (11434), nova-app (8000), nova-searxng (8888)
 
 ## Testing
 
@@ -183,7 +204,7 @@ Services: helios-ollama (11434), helios-nova (8000), helios-searxng (8888)
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 
 # Copy files if needed
-docker cp tests/. nova-app:/app/tests
+docker cp tests/. nova-app:/app/tests/
 docker cp pytest.ini nova-app:/app/pytest.ini
 ```
 
@@ -214,7 +235,7 @@ Compares base vs fine-tuned model on holdout queries. Uses LLM-as-judge with ran
 
 ## MCP Server
 
-Nova_ exposes its intelligence as MCP tools for external agents (Claude Code, Cursor, etc.):
+Nova exposes its intelligence as MCP tools for external agents (Claude Code, Cursor, etc.):
 
 ```bash
 python scripts/mcp_server_runner.py                     # Runs over stdio
@@ -286,6 +307,15 @@ In-process `asyncio.create_task` system for long-running work that shouldn't blo
 - Auto-pruning keeps last 50 completed tasks
 - `BackgroundTaskTool` (`app/tools/background_task.py`): 4 actions — submit, status, list, cancel
 - Submit spawns ephemeral `brain.think()` calls for parallel research
+
+## New Config Fields (Deep Audit)
+- `MAX_QUERY_LENGTH` (50000) — query length validation in brain.think()
+- `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL` — provider base URLs
+- `ANTHROPIC_API_VERSION` — Anthropic API version header
+- `TRUSTED_PROXY` — enable X-Forwarded-For only when set
+
+## Version Source of Truth
+`app/__init__.__version__` is the single source. Imported by system.py and schema.py.
 
 ## Desktop Automation (`app/tools/desktop.py`)
 

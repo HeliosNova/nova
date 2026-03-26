@@ -110,6 +110,13 @@ class TestRegistry:
 
 
 class TestIntegrationTool:
+    @pytest.fixture(autouse=True)
+    def _set_tier(self):
+        """IntegrationTool requires standard/full tier."""
+        with patch("app.core.access_tiers.config") as mock_cfg:
+            mock_cfg.SYSTEM_ACCESS_LEVEL = "standard"
+            yield
+
     @pytest.fixture
     def tool_with_registry(self, templates_dir, monkeypatch):
         monkeypatch.setenv("GITHUB_TOKEN", "ghp_test")
@@ -148,6 +155,7 @@ class TestIntegrationTool:
         mock_resp.text = '[{"name": "my-repo"}]'
         mock_resp.status_code = 200
         mock_resp.url = "https://api.github.com/user/repos"
+        mock_resp.is_redirect = False
 
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -166,6 +174,7 @@ class TestIntegrationTool:
         mock_resp.text = '{"id": 1}'
         mock_resp.status_code = 201
         mock_resp.url = "https://api.github.com/repos/me/proj/issues"
+        mock_resp.is_redirect = False
 
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(return_value=mock_resp)
@@ -199,6 +208,7 @@ class TestIntegrationTool:
         mock_resp.text = '{"temp": 20}'
         mock_resp.status_code = 200
         mock_resp.url = "https://api.openweathermap.org/data/2.5/weather?q=London"
+        mock_resp.is_redirect = False
 
         mock_client = AsyncMock()
         mock_client.request = AsyncMock(return_value=mock_resp)

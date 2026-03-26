@@ -70,7 +70,7 @@ export default function NavSidebar({ activeTab, onTabChange }: Props) {
           <div className="flex w-full items-center justify-between">
             <div className="flex items-center gap-2">
               <div className="h-2 w-2 rounded-full bg-nova-accent animate-breathe shadow-[0_0_8px_rgba(99,102,241,0.4)]" />
-              <span className="text-lg font-bold tracking-tight bg-gradient-to-r from-nova-text to-nova-glow bg-clip-text text-transparent">Nova_</span>
+              <span className="text-lg font-bold tracking-tight bg-gradient-to-r from-nova-text to-nova-glow bg-clip-text text-transparent">Nova</span>
             </div>
             {isMobile ? (
               <button onClick={() => setMobileOpen(false)} className="rounded-lg p-1.5 text-nova-text-dim hover:text-nova-text hover:bg-nova-border/50 transition-colors">

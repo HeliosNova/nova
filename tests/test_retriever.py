@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock
+
 import pytest
 
 from app.core.retriever import (
@@ -200,8 +202,10 @@ class TestRetrieverFTS5:
 # ===========================================================================
 
 class TestFTS5EscapeExtended:
-    def test_strips_period(self):
+    def test_escapes_period(self):
+        # Periods cause FTS5 syntax errors — must be removed
         assert "." not in _escape_fts5("hello.world")
+        assert "hello" in _escape_fts5("hello.world")
 
     def test_strips_comma(self):
         assert "," not in _escape_fts5("hello, world")
@@ -211,7 +215,7 @@ class TestFTS5EscapeExtended:
 
     def test_sentence_with_punctuation(self):
         result = _escape_fts5("Dr. Smith, Jr.; the professor")
-        assert "." not in result
+        assert "." not in result  # periods cause FTS5 syntax errors
         assert "," not in result
         assert ";" not in result
         assert "Dr" in result
@@ -315,3 +319,21 @@ class TestRetrieverEdgeCases:
         # "a" appears in both, should be top-ranked
         assert result[0].chunk_id == "a"
         assert len(result) == 3
+
+
+# ===========================================================================
+# ChromaDB Cleanup (from test_audit_consolidated)
+# ===========================================================================
+
+class TestChromaDBCleanup:
+
+    def test_retriever_has_close_method(self):
+        from app.core.retriever import Retriever
+        r = Retriever.__new__(Retriever)
+        r._db = None
+        r._collection = None
+        r._chroma_client = MagicMock()
+        r._collection_lock = MagicMock()
+        r.close()
+        assert r._chroma_client is None
+        assert r._collection is None
