@@ -75,7 +75,9 @@ def should_plan(query: str, intent: str) -> bool:
     if tool_hits >= 2:
         signals += 1
 
-    return signals >= 2
+    # Lower threshold for personal use — quality over speed.
+    # Any signal of complexity triggers planning.
+    return signals >= 1
 
 
 # ---------------------------------------------------------------------------

@@ -1032,23 +1032,26 @@ async def _run_generation_loop(
                 "content": f"{assistant_content}\n\n{attr_prefix}\n\n{tool_results_text}",
             })
 
-            # User-role synthesis trigger (provider-aware)
+            # User-role synthesis trigger with result evaluation
+            # On intermediate rounds, encourage the model to assess and potentially
+            # use more tools. On the final round, just synthesize.
+            _is_final_round = (tool_round >= config.MAX_TOOL_ROUNDS - 1)
             if round_succeeded:
-                if _is_ollama:
-                    messages.append({
-                        "role": "user",
-                        "content": (
-                            "Based on the real tool results above, provide your answer. "
-                            "The tools ran successfully on real websites with live data. "
-                            "Do NOT say you cannot use tools, that results are simulated, "
-                            "or add disclaimers — just report what happened."
-                        ),
-                    })
+                if _is_final_round:
+                    _synth = (
+                        "Based on the real tool results above, provide your final answer. "
+                        "Do NOT say you cannot use tools or add disclaimers."
+                    )
                 else:
-                    messages.append({
-                        "role": "user",
-                        "content": "Based on the tool results above, provide your answer.",
-                    })
+                    _synth = (
+                        "Review the tool results above. If you have enough data to fully "
+                        "answer the question, provide your answer now. If the results are "
+                        "incomplete (e.g., portal links instead of data, partial information, "
+                        "or missing details), use another tool to get what's missing — try "
+                        "browser for JS pages, http_fetch for APIs, or web_search with "
+                        "different terms. Do NOT give up if you have untried approaches."
+                    )
+                messages.append({"role": "user", "content": _synth})
             elif _any_round_succeeded:
                 messages.append({
                     "role": "user",

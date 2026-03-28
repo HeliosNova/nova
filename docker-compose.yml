@@ -8,7 +8,7 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "3"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KEEP_ALIVE: "24h"
-      OLLAMA_NUM_CTX: "16384"
+      OLLAMA_NUM_CTX: "32768"
       # Required models (pull manually or via entrypoint):
       #   ollama pull qwen3.5:27b      (main model)
       #   ollama pull qwen3.5:9b       (vision model)
@@ -21,7 +21,7 @@ services:
               count: all
               capabilities: [gpu]
         limits:
-          memory: 20g
+          memory: 32g
     volumes:
       - ollama_data:/root/.ollama
       # - C:/data/finetune/merged:/finetune-model:ro  # Temp mount for model import
