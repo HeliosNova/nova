@@ -46,7 +46,31 @@ BASE_MODEL = os.getenv("FINETUNE_BASE_MODEL", "Qwen/Qwen3.5-9B")
 MIN_PAIRS = int(os.getenv("FINETUNE_MIN_NEW_PAIRS", "15"))
 EPOCHS = int(os.getenv("FINETUNE_EPOCHS", "3"))
 OLLAMA_CONTAINER = os.getenv("OLLAMA_CONTAINER", "nova-ollama")
-MODEL_NAME = "nova-ft-v2"
+MODEL_NAME = None  # Auto-detected by detect_next_version()
+
+
+def detect_next_version() -> str:
+    """Auto-detect the next nova-ft version by checking Ollama models."""
+    global MODEL_NAME
+    result = subprocess.run(
+        ["docker", "exec", OLLAMA_CONTAINER, "ollama", "list"],
+        capture_output=True, text=True, timeout=30,
+    )
+    max_ver = 0
+    for line in result.stdout.splitlines():
+        # Match nova-ft-v3, nova-ft-v2, etc.
+        for token in line.split():
+            if token.startswith("nova-ft-v"):
+                try:
+                    ver = int(token.split("nova-ft-v")[1].split(":")[0])
+                    max_ver = max(max_ver, ver)
+                except (ValueError, IndexError):
+                    pass
+            elif token == "nova-ft:latest" or token.startswith("nova-ft:"):
+                max_ver = max(max_ver, 1)
+    MODEL_NAME = f"nova-ft-v{max_ver + 1}"
+    print(f"  Next model version: {MODEL_NAME}")
+    return MODEL_NAME
 
 
 def run(cmd, **kwargs):
@@ -145,8 +169,8 @@ def step_4_convert_gguf():
         print(f"  ERROR: Merged model not found at {MERGED_DIR}")
         return False
 
-    bf16_path = FINETUNE_DIR / "nova-ft-v2-bf16.gguf"
-    q4km_path = FINETUNE_DIR / "nova-ft-v2-q4km.gguf"
+    bf16_path = FINETUNE_DIR / f"{MODEL_NAME}-bf16.gguf"
+    q4km_path = FINETUNE_DIR / f"{MODEL_NAME}-q4km.gguf"
 
     # Find converter
     venv_python = NOVA_DIR / "finetune_env" / "Scripts" / "python.exe"
@@ -201,7 +225,7 @@ def step_5_register_ollama():
     """Register the GGUF model with Ollama."""
     print("\n=== Step 5: Register with Ollama ===")
 
-    q4km_path = FINETUNE_DIR / "nova-ft-v2-q4km.gguf"
+    q4km_path = FINETUNE_DIR / f"{MODEL_NAME}-q4km.gguf"
     if not q4km_path.exists():
         print(f"  ERROR: GGUF not found at {q4km_path}")
         return False
@@ -211,11 +235,11 @@ def step_5_register_ollama():
     time.sleep(15)
 
     # Copy GGUF to container
-    run(["docker", "cp", str(q4km_path), f"{OLLAMA_CONTAINER}:/root/.ollama/nova-ft-v2.gguf"], timeout=300)
+    run(["docker", "cp", str(q4km_path), f"{OLLAMA_CONTAINER}:/root/.ollama/{MODEL_NAME}.gguf"], timeout=300)
 
     # Create Modelfile and register
     modelfile = (
-        "FROM /root/.ollama/nova-ft-v2.gguf\n"
+        f"FROM /root/.ollama/{MODEL_NAME}.gguf\n"
         "TEMPLATE {{ .Prompt }}\n"
         "RENDERER qwen3.5\n"
         "PARSER qwen3.5\n"
@@ -245,15 +269,16 @@ def step_5_register_ollama():
 def step_6_update_env():
     """Update .env to use the new model."""
     print("\n=== Step 6: Update .env ===")
+    import re as _re
     env_content = ENV_FILE.read_text()
     if f"LLM_MODEL={MODEL_NAME}" not in env_content:
-        env_content = env_content.replace(
-            f"LLM_MODEL=nova-ft",
+        # Replace any existing LLM_MODEL line (nova-ft-vN, qwen3.5:*, etc.)
+        env_content = _re.sub(
+            r"^LLM_MODEL=.*$",
             f"LLM_MODEL={MODEL_NAME}",
+            env_content,
+            flags=_re.MULTILINE,
         )
-        # Handle other model names too
-        for old in ["LLM_MODEL=qwen3.5:27b", "LLM_MODEL=qwen3.5:9b"]:
-            env_content = env_content.replace(old, f"LLM_MODEL={MODEL_NAME}")
         ENV_FILE.write_text(env_content)
         print(f"  Updated .env: LLM_MODEL={MODEL_NAME}")
     else:
@@ -301,6 +326,9 @@ def main():
     print("=" * 60)
     print("  Nova One-Click Fine-Tuning Pipeline")
     print("=" * 60)
+
+    # Auto-detect next version
+    detect_next_version()
 
     # Check readiness
     ready, pairs = check_readiness()

@@ -342,21 +342,6 @@ class MonitorStore:
                 "cooldown_minutes": 240,
                 "notify_condition": "on_change",
             },
-            {
-                "name": "Self-Reflection",
-                "check_type": "query",
-                "check_config": {
-                    "query": (
-                        "Review the conversations and learning activity shown in the system "
-                        "context. What did you learn from any corrections? What new facts did "
-                        "you discover about your owner? Are any skills degrading? "
-                        "Summarize in 2-3 sentences."
-                    ),
-                },
-                "schedule_seconds": 86400,  # daily
-                "cooldown_minutes": 1380,
-                "notify_condition": "always",
-            },
             # --- Teaching monitors ---
             {
                 "name": "Domain Study: Science",
@@ -493,8 +478,6 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find physics and mathematics developments from the past 48 hours: theoretical results, experimental confirmations, major papers, breakthrough proofs. Include dates.\n• Result 1: ...\n• Result 2: ...\n• Result 3: ..."}},
             {"name": "Domain Study: Biotech and Genetics", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 biotechnology and genetics developments from the past 48 hours: CRISPR advances, gene therapy trials, synthetic biology, longevity research, biotech milestones. Include dates.\n• Advance 1: ...\n• Advance 2: ...\n• Advance 3: ..."}},
-            {"name": "Local: Los Angeles", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
-             "check_config": {"query": "Use web_search to find 2-3 significant Los Angeles area news from TODAY: local politics, infrastructure, weather/fires, sports, culture, tech scene. Include specific dates.\n• News 1: ...\n• News 2: ...\n• News 3: ..."}},
             {"name": "Domain Study: Economics and Markets", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 macroeconomic developments from TODAY: GDP data, unemployment, inflation reports, central bank decisions, housing market. Include specific numbers and dates.\n• Data 1: ...\n• Data 2: ...\n• Data 3: ..."}},
             # --- Tier 1: Financial/Trading Intelligence + International ---
@@ -523,12 +506,6 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find trending open source projects and notable GitHub activity from the past 24-48 hours. Search 'GitHub trending today', 'new open source projects', 'popular repositories this week'. Cover: trending repos gaining stars, notable tool releases, major version releases, license changes. Include project names, languages, star counts.\n• Project 1: [name] ([language]) - [description] - [stars/growth]\n• Project 2: ...\n• Project 3: ..."}},
             {"name": "Domain Study: Defense and Military Tech", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 defense and military technology developments from the past 24-48 hours. Cover: new weapons systems, drones, autonomous military platforms, AI in defense, defense contracts (Lockheed Martin, Raytheon, Northrop), space militarization, hypersonic weapons. Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
-            {"name": "Domain Study: Social Media Platforms", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
-             "check_config": {"query": "Use web_search to find 2-3 notable social media and platform developments from the past 24-48 hours. Cover: feature launches or algorithm changes (X/Twitter, Meta, TikTok, YouTube, Reddit, Bluesky), content moderation shifts, user metrics, creator economy, regulatory threats. Include dates.\n• Change 1: [platform] - [what changed] - [impact]\n• Change 2: ...\n• Change 3: ..."}},
-            {"name": "Domain Study: Sports", "check_type": "query", "schedule_seconds": 21600, "cooldown_minutes": 300, "notify_condition": "always",
-             "check_config": {"query": "Use web_search to find notable sports developments from TODAY. If web_search only returns portal links without actual scores, use browser to navigate to https://www.espn.com/nba/scoreboard or https://www.espn.com/nfl/scoreboard to get today's game results. Cover: major game results (NBA, NFL, MLB, NHL, Premier League, Champions League, F1, UFC), trades, records broken, star injuries. Include scores, stats, player names, and dates.\n• Result 1: [league] [teams/players] - [score/outcome] - [notable detail]\n• Result 2: ...\n• Result 3: ..."}},
-            {"name": "Domain Study: Entertainment and Gaming", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
-             "check_config": {"query": "Use web_search to find 2-3 notable entertainment, streaming, or gaming developments from the past 24-48 hours. Cover: movie/show releases and box office, game releases, streaming platform competition (Netflix, Disney+, Apple TV+), music industry, gaming M&A. Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
             {"name": "Domain Study: DeFi and Protocols", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 notable DeFi and blockchain protocol developments from the past 24 hours. Cover: protocol upgrades, governance decisions, TVL changes, bridge hacks/exploits, airdrop announcements, L2/rollup developments (Arbitrum, Optimism, Base, zkSync). Include protocol names, TVL/volume impact, and dates.\n• Update 1: [protocol] - [change] - [impact]\n• Update 2: ...\n• Update 3: ..."}},
             {"name": "Domain Study: Developer Ecosystem", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
@@ -542,8 +519,21 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find 2-3 supply chain and global trade developments from the past 24-48 hours. Cover: shipping disruptions (Red Sea, Panama Canal), tariff changes, reshoring/nearshoring, container rates, critical minerals (rare earths, lithium). Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
             {"name": "Domain Study: Research Frontiers", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 notable research papers or preprints gaining attention in the past 48 hours. Search 'trending arxiv papers', 'notable research papers this week', 'science paper viral'. Cover: AI/ML papers, biology/medicine papers, physics/materials breakthroughs. Include paper title, authors/institution, and key finding.\n• Paper 1: [title] by [authors] - [key finding]\n• Paper 2: ...\n• Paper 3: ..."}},
-            {"name": "Domain Study: Climate and Weather", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
-             "check_config": {"query": "Use web_search to find 2-3 significant climate and extreme weather events from the past 24-48 hours. Cover: hurricanes/typhoons, wildfires (especially California), record temperatures, droughts/flooding, climate policy milestones, CO2/ice sheet data. Include locations, severity, and dates.\n• Event 1: [type] in [location] - [severity] - [impact]\n• Event 2: ...\n• Event 3: ..."}},
+            # --- High-Value Intelligence ---
+            {"name": "Hacker News Top Stories", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to search for \"site:news.ycombinator.com\" to find current top Hacker News stories. Also search for \"hacker news front page today top stories\". Report the top 5 trending stories with title and why they are notable. Focus on AI, programming, open source, and startup stories.\n• Story 1: ...\n• Story 2: ...\n• Story 3: ...\n• Story 4: ...\n• Story 5: ..."}},
+            {"name": "Product Hunt Trending", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find trending products on Product Hunt from TODAY. Search for \"product hunt today trending\". Report: product name, tagline, category, and upvote count for the top 3-5 products. Focus on AI, developer tools, and productivity.\n• Product 1: [name] - [tagline] - [category] - [upvotes]\n• Product 2: ...\n• Product 3: ..."}},
+            {"name": "FDA Drug Approvals", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find recent FDA drug approvals and notable clinical trial results from the past 48 hours. Search for \"FDA approval today\" and \"clinical trial results today\". Report: drug name, company, condition treated, and significance. Relevant for biotech investing.\n• Approval 1: ...\n• Approval 2: ..."}},
+            {"name": "FOMC and Fed Watch", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find the current Federal Reserve stance and next FOMC meeting date. Report: next meeting date, current fed funds rate, market expectations for rate change, and any recent Fed official statements. This affects all markets.\n• Rate: ...\n• Next meeting: ...\n• Expectations: ..."}},
+            {"name": "SEC Insider Trading", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find notable SEC insider trading filings from TODAY. Search for \"SEC insider trading filings today\" and \"notable insider buys sells\". Report: company name, insider name/title, buy or sell, number of shares, dollar amount. Focus on large transactions over $1M. Include dates.\n• Filing 1: [company] [insider] [buy/sell] [shares] [$amount]\n• Filing 2: ...\n• Filing 3: ..."}},
+            {"name": "GitHub Security Advisories", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find recent GitHub security advisories and critical CVEs from the past 24-48 hours. Search for \"github security advisory critical\" and \"CVE critical\". Report: CVE ID, affected software, severity, and description. Focus on widely-used packages.\n• CVE 1: [ID] [software] [severity] - [description]\n• CVE 2: ...\n• CVE 3: ..."}},
+            {"name": "Government Contract Awards", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find major US government contract awards from the past 48 hours. Search for \"government contract award today\" and \"defense contract awarded\". Report: contractor, agency, dollar amount, and purpose. Focus on tech, defense, and AI contracts over $10M.\n• Contract 1: [contractor] [agency] [$amount] - [purpose]\n• Contract 2: ...\n• Contract 3: ..."}},
         ]
 
         count = 0

@@ -262,7 +262,7 @@ async def lifespan(app: FastAPI):
         topic_tracker = TopicTracker(db)
         logger.info("Curiosity engine initialized")
 
-    # External skills loader (AgentSkills / OpenClaw)
+    # External skills loader (AgentSkills format)
     external_skills = None
     try:
         from app.core.skill_loader import load_skills

@@ -34,3 +34,4 @@ node_modules/
 dist/
 build/
 *.whl
+finetune_progress.log

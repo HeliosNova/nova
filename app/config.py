@@ -97,7 +97,7 @@ class Config:
     ENABLE_MCP_SERVER: bool = field(default_factory=lambda: _env("ENABLE_MCP_SERVER", "true").lower() == "true")
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
-    # External skills (AgentSkills / OpenClaw)
+    # External skills (AgentSkills format)
     SKILLS_DIR: str = field(default_factory=lambda: _env("SKILLS_DIR", "/data/skills"))
 
     # Memory

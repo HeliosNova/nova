@@ -10,13 +10,13 @@ Hey HN, I built Nova — a personal AI assistant that runs entirely on your hard
 
 The core idea: every time you correct Nova, it extracts a lesson, generates a DPO training pair, and when enough pairs accumulate, it automatically fine-tunes itself with A/B evaluation before deploying the new model.
 
-No other open-source AI assistant has this learning loop.
+No other open-source project combines all of these in one system.
 
 **What it does:**
 - Correction detection (2-stage: regex + LLM) → lesson extraction → DPO training data → automated fine-tuning with A/B eval
-- Temporal knowledge graph (20 predicates, fact supersession, provenance tracking)
+- Temporal knowledge graph (31 predicates, fact supersession, provenance tracking)
 - Hybrid retrieval (ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)
-- 21 tools, 4 messaging channels (Discord/Telegram/WhatsApp/Signal), 51 autonomous monitors across 29 domains
+- 20 tools, 4 messaging channels (Discord/Telegram/WhatsApp/Signal), 52 monitors across 35+ domains
 - MCP client AND server (expose Nova's intelligence to Claude Code, Cursor, etc.)
 
 **What it's not:**
@@ -24,9 +24,9 @@ No other open-source AI assistant has this learning loop.
 - Not a LangChain/LangGraph project — single async pipeline, ~79 files of plain Python
 - Not a coding agent — it's a personal assistant (but you can connect it to coding agents via MCP)
 
-**Security:** 4-tier access control, prompt injection detection (4 categories), SSRF protection, HMAC skill signing, Docker hardening (read-only root, no-new-privileges, all caps dropped). Built with OWASP Agentic Security in mind — unlike certain 200K-star projects that got CVE'd within weeks of launch.
+**Security:** 4-tier access control, prompt injection detection (4 categories), SSRF protection, HMAC skill signing, Docker hardening (read-only root, no-new-privileges, all caps dropped). Built with OWASP Agentic Security in mind.
 
-**Stack:** Python, FastAPI, httpx, Ollama, ChromaDB, SQLite, React. 1,453 tests.
+**Stack:** Python, FastAPI, httpx, Ollama, ChromaDB, SQLite, React. 1,689 tests.
 
 No GPU? Set `LLM_PROVIDER=openai` and use cloud inference while keeping all data local.
 
@@ -50,12 +50,12 @@ I've been building Nova for a while and just open-sourced it. It's a personal AI
 6. On future similar queries, retrieves the lesson and gets it right
 7. When enough training pairs accumulate, runs automated DPO fine-tuning with A/B evaluation
 
-No other open-source project has this full pipeline.
+No other open-source project combines all of these capabilities.
 
 **Beyond the learning loop:**
 - Temporal knowledge graph (facts track when they were valid, supersession chains)
 - Hybrid retrieval (ChromaDB + FTS5 + RRF fusion — not just vector search)
-- 51 autonomous monitors across 29 domains doing scheduled research, self-reflection, skill validation
+- 52 monitors across 35+ domains doing scheduled research, self-reflection, skill validation
 - Curiosity engine — detects knowledge gaps and queues background research
 - 4 messaging channels (Discord, Telegram, WhatsApp, Signal)
 - MCP client + server
@@ -64,7 +64,7 @@ No other open-source project has this full pipeline.
 
 **Not a LangChain project.** Single async pipeline, ~79 files of Python. No frameworks.
 
-1,453 tests. AGPL-3.0.
+1,689 tests. AGPL-3.0.
 
 https://github.com/HeliosNova/nova
 
@@ -78,7 +78,7 @@ https://github.com/HeliosNova/nova
 
 Just open-sourced Nova, a personal AI assistant designed for self-hosting.
 
-**Why I built it:** Every "self-hosted AI" I tried was either a ChatGPT UI wrapper (Open WebUI), needed cloud APIs to function (OpenClaw), or had no memory between conversations. I wanted an AI that:
+**Why I built it:** Every "self-hosted AI" I tried was either a ChatGPT UI wrapper (Open WebUI), needed cloud APIs to function, or had no memory between conversations. I wanted an AI that:
 - Runs 100% offline on my hardware
 - Remembers what I tell it across conversations
 - Actually learns from its mistakes
@@ -93,7 +93,7 @@ Just open-sourced Nova, a personal AI assistant designed for self-hosting.
 
 `docker compose up -d` and you're running.
 
-**Security:** Read-only root filesystem, no-new-privileges, all capabilities dropped, non-root user, 4-tier access control, prompt injection detection, SSRF protection, rate limiting, auth lockout. After seeing what happened with OpenClaw (CVE-2026-25253, ClawHavoc supply chain attack), I built security in from the start.
+**Security:** Read-only root filesystem, no-new-privileges, all capabilities dropped, non-root user, 4-tier access control, prompt injection detection, SSRF protection, rate limiting, auth lockout. Built with OWASP Agentic Security in mind from the start.
 
 **Channels:** Talk to it via Discord, Telegram, WhatsApp, or Signal — all with phone-number allowlisting.
 
@@ -105,7 +105,7 @@ https://github.com/HeliosNova/nova
 
 ## 4. Reddit r/opensource
 
-**Title:** Nova — AGPL-3.0 personal AI that learns from corrections and fine-tunes itself. 1,453 tests, zero cloud dependency.
+**Title:** Nova — AGPL-3.0 personal AI that learns from corrections and fine-tunes itself. 1,689 tests, zero cloud dependency.
 
 **Body:**
 
@@ -118,11 +118,11 @@ No other open-source project combines:
 - Sovereign (zero cloud dependency, bundled Ollama)
 - Knowledge graph (temporal, with fact supersession)
 - Hybrid retrieval (vectors + BM25 + reciprocal rank fusion)
-- Proactive (51 autonomous monitors doing scheduled research across finance, geopolitics, science, crypto, sports, and 24 more domains)
+- Proactive (52 scheduled monitors doing research across finance, geopolitics, science, crypto, sports, and 30+ more domains)
 - Secure (4-tier access, injection detection, HMAC signing, Docker hardening)
 
 Stack: Python, FastAPI, SQLite, ChromaDB, Ollama, React
-Tests: 1,453 across 60+ files
+Tests: 1,689 across 60+ files
 License: AGPL-3.0
 
 https://github.com/HeliosNova/nova
@@ -131,15 +131,15 @@ https://github.com/HeliosNova/nova
 
 ## 5. Dev.to / Medium
 
-**Title:** I built the personal AI that OpenClaw should have been
+**Title:** I built a self-improving personal AI that runs on your hardware
 
 **Tags:** ai, opensource, selfhosted, python
 
 ---
 
-OpenClaw hit 216,000 GitHub stars in six weeks. It proved that millions of people want a personal AI assistant they can run themselves. Then came CVE-2026-25253. Then the ClawHavoc supply chain attack — 341 malicious skills, 9,000 compromised installations. Cisco and Palo Alto flagged it for a "lethal trifecta" of security risks: unrestricted tool access, no prompt injection detection, and plaintext credential storage.
+The explosion of open-source personal AI assistants in early 2026 proved that millions of people want an AI they can run themselves. But most of these projects are glorified chat UIs — they don't learn, they don't improve, and they don't protect your data.
 
-I'd been building my own self-hosted AI assistant for months. When OpenClaw blew up — and then blew up differently — I decided to open-source it.
+I'd been building my own self-hosted AI assistant for months. I decided to open-source it.
 
 **It's called [Nova](https://github.com/HeliosNova/nova).**
 
@@ -165,7 +165,7 @@ That's not retrieval-augmented generation. That's not prompt engineering. The mo
 
 ## The learning loop — how it actually works
 
-Nova has a 7-stage self-improvement pipeline. No other open-source project has anything close to this.
+Nova has a 7-stage self-improvement pipeline. No other open-source project combines all seven stages.
 
 ### Stage 1: Correction Detection
 
@@ -237,7 +237,7 @@ Nova replaces a 9-node LangGraph pipeline with a single async generator function
 
 1. **Gather context** — load user facts, lessons, knowledge graph, reflexions, retrieved documents, skills
 2. **Build messages** — assemble system prompt from 8 prioritized blocks with truncation budget
-3. **Generate + tool loop** — up to 5 rounds of LLM generation + tool execution (21 built-in tools)
+3. **Generate + tool loop** — up to 5 rounds of LLM generation + tool execution (20 built-in tools)
 4. **Refine** — multi-round self-critique, plan coverage check, reflexion quality assessment
 5. **Post-process** — correction detection, fact extraction, KG updates, curiosity gap detection
 
@@ -245,16 +245,16 @@ No LangChain. No LangGraph. No agent frameworks. Just `async for event in think(
 
 ## Security — built in, not bolted on
 
-After watching OpenClaw's security meltdown, I built Nova with the [OWASP Agentic Security Top 10](https://genai.owasp.org/) in mind:
+Nova is built with the [OWASP Agentic Security Top 10](https://genai.owasp.org/) in mind:
 
-| Risk | OpenClaw | Nova |
-|------|----------|------|
-| Unrestricted tool access | All tools always available | 4-tier access control (sandboxed/standard/full/none) |
-| Prompt injection | No detection | 4-category heuristic detection on all external content |
-| Credential exposure | Plaintext storage flagged | No hardcoded secrets, `.env` gitignored, HMAC skill signing |
-| Training data poisoning | N/A (no learning) | Channel gating + confidence threshold for DPO pairs |
-| Container security | Basic Docker | Read-only root, no-new-privileges, all capabilities dropped |
-| Auth | Partial | Bearer token + per-IP brute-force lockout (10 failures = 5min ban) |
+| Risk | How Nova handles it |
+|------|---------------------|
+| Unrestricted tool access | 4-tier access control (sandboxed/standard/full/none) |
+| Prompt injection | 4-category heuristic detection on all external content |
+| Credential exposure | No hardcoded secrets, `.env` gitignored, HMAC skill signing |
+| Training data poisoning | Channel gating + confidence threshold for DPO pairs |
+| Container security | Read-only root, no-new-privileges, all capabilities dropped |
+| Auth | Bearer token + per-IP brute-force lockout (10 failures = 5min ban) |
 
 The prompt injection detector runs on every piece of external content — web search results, fetched pages, browser output, MCP tool results, imported skills. It checks 4 categories (role override, instruction injection, delimiter abuse, encoding tricks) with Unicode normalization and homoglyph detection. Suspicious content gets flagged, not stripped — the LLM sees it but is warned.
 
@@ -265,17 +265,17 @@ The prompt injection detector runs on every piece of external content — web se
 - **Frontend:** React + TypeScript + Vite
 - **Search:** SearXNG (privacy-respecting, self-hosted)
 - **Deployment:** Docker Compose (4 services)
-- **Tests:** 1,453 across 60+ files (including security offensive, stress, and behavioral tests)
+- **Tests:** 1,689 across 60+ files (including security offensive, stress, and behavioral tests)
 
 No GPU? Use `docker-compose.cloud.yml` — cloud handles inference, all data stays on your machine.
 
 ## What else it does
 
 - **Temporal knowledge graph** — facts track when they were valid, with supersession chains and provenance. Query what was true at any point in time.
-- **51 autonomous monitors across 29 domains** — scheduled domain research, self-reflection, lesson quizzes, skill validation, system maintenance. Nova works even when you're not talking to it.
+- **52 monitors across 35+ domains** — scheduled domain research, self-reflection, lesson quizzes, skill validation, system maintenance. Nova works even when you're not talking to it.
 - **4 messaging channels** — Discord, Telegram, WhatsApp, Signal. All with phone-number allowlisting.
 - **MCP dual-mode** — consumes external tools (client) AND exposes its intelligence to Claude Code, Cursor, etc. (server). No other personal AI does both.
-- **21 built-in tools** — web search, calculator, code execution, browser, email, calendar, webhooks, file ops, shell, and more.
+- **20 built-in tools** — web search, calculator, code execution, browser, email, calendar, webhooks, file ops, shell, and more.
 - **Voice** — local Whisper speech-to-text.
 - **Desktop automation** — PyAutoGUI-based GUI control.
 

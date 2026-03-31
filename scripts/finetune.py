@@ -32,25 +32,39 @@ import json
 import logging
 import os
 import sys
+
+# Fix CUDA fragmentation: original OOM had 8GB free but couldn't allocate 96MB
+# expandable_segments prevents fragmentation, must be set BEFORE torch import
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 from datetime import datetime
 from pathlib import Path
 
+# Force unbuffered output so progress is visible in real-time
+os.environ["PYTHONUNBUFFERED"] = "1"
+
+# Log to both console AND a progress file
+_LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "finetune_progress.log")
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(_LOG_FILE, mode="w"),
+    ],
 )
 logger = logging.getLogger(__name__)
+logger.info("=== Fine-tune log: %s ===", _LOG_FILE)
 
 # Defaults (configurable via env vars or CLI args)
 _NOVA_DATA_DIR = os.environ.get("NOVA_DATA_DIR", "/data")
 DEFAULT_DATA_PATH = os.getenv("TRAINING_DATA_PATH", os.path.join(_NOVA_DATA_DIR, "training_data.jsonl"))
 DEFAULT_OUTPUT_DIR = os.getenv("FINETUNE_OUTPUT_DIR", os.path.join(_NOVA_DATA_DIR, "finetune"))
 DEFAULT_MODEL = "Qwen/Qwen3.5-27B"
-DEFAULT_MAX_SEQ_LENGTH = 2048
+DEFAULT_MAX_SEQ_LENGTH = 1024
 DEFAULT_LORA_RANK = 16
 DEFAULT_EPOCHS = 3
 DEFAULT_BATCH_SIZE = 1
-DEFAULT_GRAD_ACCUM = 4
+DEFAULT_GRAD_ACCUM = 2
 DEFAULT_LR = 5e-5
 MIN_TRAINING_PAIRS = 10  # Minimum pairs before training is worthwhile
 
@@ -136,9 +150,10 @@ def train(
     grad_accum: int = DEFAULT_GRAD_ACCUM,
     learning_rate: float = DEFAULT_LR,
 ) -> str:
-    """Run DPO fine-tuning with QLoRA (vanilla HuggingFace stack).
+    """Run DPO fine-tuning with QLoRA (vanilla HF stack, no Unsloth patches).
 
-    Uses transformers + PEFT + TRL directly (no Unsloth).
+    Uses transformers + PEFT + TRL directly. The HF_ENABLE_PARALLEL_LOADING=false
+    env var (set at module top) prevents the transformers v5.3 OOM during loading.
     Returns path to the saved adapter.
     """
     import torch
@@ -151,7 +166,7 @@ def train(
     os.makedirs(adapter_dir, exist_ok=True)
 
     # --- Step 1: Load model with 4-bit quantization ---
-    logger.info("Loading %s with 4-bit quantization...", model_name)
+    logger.info("Loading %s with 4-bit quantization (sequential loading)...", model_name)
     bnb_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
@@ -206,22 +221,41 @@ def train(
         logging_steps=1,
         save_strategy="epoch",
         max_length=max_seq_length,
-        # max_prompt_length removed in TRL 0.16+ (auto-calculated)
         beta=0.1,
         bf16=True,
         report_to="none",
         gradient_checkpointing=True,
     )
 
-    # Patch for TRL 0.24 + Qwen3.5 compatibility: model needs warnings_issued attr
+    # Patch for TRL + Qwen3.5 compatibility
     if not hasattr(model, "warnings_issued"):
         model.warnings_issued = {}
+
+    # Progress callback — writes every step to log file so training is trackable
+    from transformers import TrainerCallback
+    class ProgressCallback(TrainerCallback):
+        def on_log(self, args, state, control, logs=None, **kwargs):
+            if logs and state.global_step > 0:
+                loss = logs.get("loss", logs.get("train_loss", "?"))
+                pct = (state.global_step / state.max_steps * 100) if state.max_steps else 0
+                eta_s = 0
+                if state.global_step > 0 and hasattr(state, 'log_history') and len(state.log_history) > 1:
+                    import time
+                    elapsed = time.time() - self._start
+                    eta_s = elapsed / state.global_step * (state.max_steps - state.global_step)
+                msg = (f"Step {state.global_step}/{state.max_steps} ({pct:.0f}%) | "
+                       f"loss={loss} | ETA: {eta_s/60:.0f}m")
+                logger.info(msg)
+        def on_train_begin(self, *a, **kw):
+            import time; self._start = time.time()
+            logger.info("Training started!")
 
     trainer = DPOTrainer(
         model=model,
         args=training_args,
         train_dataset=dataset,
         processing_class=tokenizer,
+        callbacks=[ProgressCallback()],
     )
 
     train_result = trainer.train()

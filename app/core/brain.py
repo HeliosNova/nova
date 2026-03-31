@@ -686,7 +686,7 @@ async def _gather_context(svc: Services, query: str, intent: str) -> _ThinkConte
         except Exception:
             pass
 
-    # --- External skills (AgentSkills / OpenClaw) ---
+    # --- External skills (AgentSkills format) ---
     if svc.external_skills:
         from app.core.skill_loader import match_skill, format_skill_summaries, format_skill_body
         ctx.external_skills_text = format_skill_summaries(svc.external_skills)

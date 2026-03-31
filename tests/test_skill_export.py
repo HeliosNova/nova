@@ -341,7 +341,7 @@ class TestCheckRequirements:
         os.environ["TEST_SKILL_VAR"] = "yes"
         try:
             met, missing = _check_requirements({
-                "metadata": {"openclaw": {"requires": {"env": ["TEST_SKILL_VAR"]}}}
+                "metadata": {"external": {"requires": {"env": ["TEST_SKILL_VAR"]}}}
             })
             assert met is True
         finally:
@@ -349,7 +349,7 @@ class TestCheckRequirements:
 
     def test_env_var_missing(self):
         met, missing = _check_requirements({
-            "metadata": {"openclaw": {"requires": {"env": ["NONEXISTENT_VAR_12345"]}}}
+            "metadata": {"external": {"requires": {"env": ["NONEXISTENT_VAR_12345"]}}}
         })
         assert met is False
         assert "env:NONEXISTENT_VAR_12345" in missing

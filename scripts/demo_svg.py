@@ -83,8 +83,8 @@ def main():
         console.print("[bold yellow]  >>> Lesson applied! Nova remembered the correction.[/]")
 
     # Step 6
-    console.print("\n[bold cyan]Step 6: Knowledge Graph (51 autonomous monitors)[/]")
-    console.print("[dim]  Monitors search 29 domains and extract KG triples[/]")
+    console.print("\n[bold cyan]Step 6: Knowledge Graph (52 autonomous monitors)[/]")
+    console.print("[dim]  Monitors search 35+ domains and extract KG triples[/]")
     console.print("[bold green]  You:[/] What is the current world population?")
     a4, _, tools = chat(
         "What is the current world population? Don't search, just tell me what you know."
@@ -104,7 +104,7 @@ def main():
     console.print()
     console.print(Panel.fit(
         "[white]  Corrections -> Lessons -> DPO -> Fine-Tuning -> Better Model[/]\n"
-        "[white]  51 monitors -> Web Research -> KG Triples -> Answers[/]\n\n"
+        "[white]  52 monitors -> Web Research -> KG Triples -> Answers[/]\n\n"
         "[bold]  Every correction and monitor cycle makes Nova smarter.[/]\n"
         "[cyan]  https://github.com/HeliosNova/nova[/]",
         border_style="cyan",

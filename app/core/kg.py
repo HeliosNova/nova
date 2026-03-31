@@ -1,7 +1,7 @@
 """Knowledge graph — structured facts as (subject, predicate, object) triples.
 
 SQLite-only, no NetworkX. 1-hop graph queries via recursive CTE.
-Predicate normalization to ~20 canonical forms.
+Predicate normalization to 31 canonical forms.
 Temporal tracking: facts have valid_from/valid_to for historical queries.
 """
 

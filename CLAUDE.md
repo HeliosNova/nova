@@ -47,7 +47,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 | `app/tools/desktop.py` | Desktop automation (screenshot, click, type, hotkey) |
 | `app/core/voice.py` | WhisperTranscriber — local speech-to-text |
 | `app/api/voice.py` | Voice API endpoints (transcribe, chat) |
-| `app/config.py` | ~85 settings from .env (frozen dataclass) |
+| `app/config.py` | ~150 settings from .env (frozen dataclass) |
 | `app/database.py` | SafeDB singleton wrapping sqlite3 |
 | `app/tools/base.py` | BaseTool + ToolResult + ToolRegistry |
 | `app/api/chat.py` | POST /chat/stream (SSE) + POST /chat (sync) |
@@ -119,8 +119,8 @@ Always truthy. Use `fetchone()` / `fetchall()` for SELECTs.
 - **none**: All restrictions disabled. No blocked commands, imports, builtins, or path checks.
 
 ### Tool Timeout
-`TOOL_TIMEOUT` (default 120s) controls the per-tool execution timeout in `brain.py`.
-`GENERATION_TIMEOUT` (default 480s) controls LLM generation timeout.
+`TOOL_TIMEOUT` (default 180s) controls the per-tool execution timeout in `brain.py`.
+`GENERATION_TIMEOUT` (default 900s) controls LLM generation timeout.
 
 ### Route Ordering
 Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path conflicts.
@@ -130,17 +130,17 @@ Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path 
 ### Monitor System (`app/monitors/heartbeat.py`)
 Background loop checks monitors on schedule, detects changes, sends alerts via Discord/Telegram/WhatsApp/Signal.
 
-**51 default monitors** (seeded on first startup):
-- **Operational** (6): Morning Check-in (daily), System Health (2h), Self-Reflection (daily), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
+**52 default monitors** (seeded on first startup):
+- **Operational** (5): Morning Check-in (daily), System Health (2h), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
 - **Self-Improvement** (3): Lesson Quiz (6h), Skill Validation (12h), Curiosity Research (1h)
-- **Financial Intelligence** (7): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h)
+- **Financial Intelligence** (10): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h), FOMC & Fed Watch (24h), SEC Insider Trading (12h), Economics & Markets (12h)
 - **International** (6): China Tech (8h), Russia & E.Europe (12h), Middle East (12h), India (12h), Europe & EU (12h), Geopolitics (8h)
 - **Science/Tech** (9): Science, Technology, AI & ML, Space, Quantum, Robotics, Physics, Biotech, Semiconductors (8-24h)
 - **Policy/Security** (4): US Policy, Cybersecurity, Energy & Climate, Defense & Military (12h)
-- **Culture/Local** (5): Sports (6h), Entertainment (12h), Social Media (12h), LA Local (12h), Climate & Weather (12h)
+- **Intelligence** (7): Hacker News (8h), Product Hunt (24h), FDA Drug Approvals (24h), GitHub Security Advisories (12h), Government Contract Awards (24h), Health & Medicine (12h), Research Frontiers (24h)
 - **Developer/Business** (3): Open Source & GitHub (12h), Developer Ecosystem (12h), Startups & VC (12h)
-- **Global** (5): World Awareness (4h), Current Events (8h), Economics & Markets (12h), Supply Chain (12h), Research Frontiers (24h)
-- **Geographic** (3): Latin America (24h), Africa & Emerging (24h), Research Frontiers (24h)
+- **Global** (3): World Awareness (4h), Current Events (8h), Supply Chain (12h)
+- **Geographic** (2): Latin America (24h), Africa & Emerging (24h)
 
 All query-type monitors auto-extract KG triples. All prompts anchored to "past 24-48 hours" with today's date injected.
 

@@ -176,8 +176,8 @@ def main():
     time.sleep(1)
 
     # --- Step 7: Show KG from monitors ---
-    header("Step 7: Knowledge Graph (built by 51 autonomous monitors)")
-    print("  \033[0;90mMonitors search 29 domains every 1-24h and extract KG triples.\033[0m")
+    header("Step 7: Knowledge Graph (built by 52 autonomous monitors)")
+    print("  \033[0;90mMonitors search 35+ domains every 1-24h and extract KG triples.\033[0m")
     print("  \033[0;90mNova uses these facts to answer without searching.\033[0m")
     print()
     time.sleep(1)
@@ -196,10 +196,10 @@ def main():
     print("  \033[1;37mThis is the Nova learning loop:\033[0m")
     print()
     print("  \033[0;37m  Corrections → Lessons → DPO Pairs → Fine-Tuning → Better Model\033[0m")
-    print("  \033[0;37m  51 monitors  → Web Research → KG Triples → Contextual Answers\033[0m")
+    print("  \033[0;37m  52 monitors  → Web Research → KG Triples → Contextual Answers\033[0m")
     print()
     print("  \033[0;37m  Every correction and every monitor cycle makes Nova smarter.\033[0m")
-    print("  \033[0;37m  No other AI assistant does this.\033[0m")
+    print("  \033[0;37m  No other open-source project combines all of this.\033[0m")
     print()
     print("  \033[1;36m  https://github.com/HeliosNova/nova\033[0m")
     print()
