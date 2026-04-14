@@ -35,3 +35,4 @@ dist/
 build/
 *.whl
 finetune_progress.log
+.tmp/
