@@ -27,6 +27,7 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("SYSTEM_ACCESS_LEVEL", "sandboxed")
     monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
+    monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
 
     # Tuning parameters — deterministic values for tests
     monkeypatch.setenv("RESPONSE_TOKEN_BUDGET", "600")

@@ -1097,13 +1097,23 @@ async def _run_generation_loop(
                     for tr in gen.tool_results:
                         gen.final_content += f"- {tr['tool']}: {tr['output'][:200]}\n"
 
-        # Log complex tool loops (3+ rounds) as tool creation candidates
-        if len(gen.tool_results) >= 3 and config.ENABLE_CUSTOM_TOOLS:
-            tools_used = [tr["tool"] for tr in gen.tool_results]
-            logger.info(
-                "Tool creation candidate: query='%s', %d rounds, tools=%s",
-                query[:100], len(gen.tool_results), tools_used,
-            )
+        # Autonomous tool creation — detect recurring multi-step patterns
+        if (
+            len(gen.tool_results) >= 3
+            and config.ENABLE_CUSTOM_TOOLS
+            and config.ENABLE_AUTONOMOUS_TOOL_CREATION
+        ):
+            from app.core.tool_triggers import maybe_trigger_tool_creation
+
+            async def _safe_trigger(q, trs, s):
+                try:
+                    await maybe_trigger_tool_creation(q, trs, s)
+                except Exception as _e:
+                    logger.debug("Auto-tool trigger failed: %s", _e)
+
+            _task = asyncio.create_task(_safe_trigger(query, gen.tool_results, svc))
+            _background_tasks.add(_task)
+            _task.add_done_callback(_background_tasks.discard)
 
     except LLMUnavailableError as e:
         logger.error("LLM unavailable: %s", e)
