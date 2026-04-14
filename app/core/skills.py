@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 from dataclasses import dataclass
 
 from app.config import config
@@ -52,14 +53,107 @@ class SkillStore:
 
     def __init__(self, db=None):
         self._db = db or get_db()
+        self._chroma_collection = None
+        self._chroma_client = None
+        self._chroma_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # ChromaDB skill collection — lazy init
+    # ------------------------------------------------------------------
+
+    def _get_skill_collection(self):
+        """Lazy-init ChromaDB collection for semantic skill lookup."""
+        if self._chroma_collection is not None:
+            return self._chroma_collection
+        with self._chroma_lock:
+            if self._chroma_collection is None:
+                import chromadb
+                self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
+                self._chroma_collection = self._chroma_client.get_or_create_collection(
+                    name="skills",
+                    metadata={"hnsw:space": "cosine"},
+                )
+        return self._chroma_collection
+
+    def _embed_skill(self, skill_id: int, name: str, trigger_pattern: str) -> None:
+        """Add or update a skill's embedding in ChromaDB."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return
+        try:
+            collection = self._get_skill_collection()
+            doc_id = f"skill_{skill_id}"
+            embed_text = f"{name}: {trigger_pattern}"
+            # Upsert: delete old entry if present, then add
+            try:
+                collection.delete(ids=[doc_id])
+            except Exception:
+                pass
+            collection.add(
+                ids=[doc_id],
+                documents=[embed_text],
+                metadatas=[{"skill_id": str(skill_id), "name": name}],
+            )
+        except Exception as e:
+            logger.warning("Failed to embed skill #%d '%s': %s", skill_id, name, e)
+
+    def _unembed_skill(self, skill_id: int) -> None:
+        """Remove a skill's embedding from ChromaDB."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return
+        try:
+            collection = self._get_skill_collection()
+            collection.delete(ids=[f"skill_{skill_id}"])
+        except Exception as e:
+            logger.debug("Failed to unembed skill #%d: %s", skill_id, e)
+
+    def sync_embeddings(self) -> int:
+        """Sync all enabled DB skills into ChromaDB. Safe to call at startup.
+
+        Returns the number of skills newly embedded.
+        """
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return 0
+        try:
+            collection = self._get_skill_collection()
+        except Exception as e:
+            logger.warning("Skill embedding sync skipped — ChromaDB unavailable: %s", e)
+            return 0
+
+        rows = self._db.fetchall("SELECT id, name, trigger_pattern FROM skills WHERE enabled = 1")
+        synced = 0
+        for row in rows:
+            doc_id = f"skill_{row['id']}"
+            try:
+                existing = collection.get(ids=[doc_id], include=[])
+                if not existing["ids"]:
+                    self._embed_skill(row["id"], row["name"], row["trigger_pattern"])
+                    synced += 1
+            except Exception as e:
+                logger.debug("Skill sync error for #%d: %s", row["id"], e)
+        if synced:
+            logger.info("Synced %d skill embedding(s) to ChromaDB", synced)
+        return synced
+
+    # ------------------------------------------------------------------
+    # Matching
+    # ------------------------------------------------------------------
 
     def get_matching_skill(self, query: str) -> Skill | None:
         """Find the best matching skill for a query.
 
-        Checks trigger_pattern (regex) against the query.
-        When multiple skills match, returns the one with the longest regex
-        pattern (more specific = higher priority).
+        1. Regex match (fast, exact trigger pattern check).
+        2. Semantic fallback via ChromaDB embedding similarity when no
+           regex match and ENABLE_SEMANTIC_SKILL_MATCHING is true.
         """
+        regex_hit = self._regex_match(query)
+        if regex_hit:
+            return regex_hit
+        if config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return self._semantic_match(query)
+        return None
+
+    def _regex_match(self, query: str) -> Skill | None:
+        """Regex-based skill lookup (original implementation)."""
         rows = self._db.fetchall(
             "SELECT * FROM skills WHERE enabled = 1 ORDER BY times_used DESC, success_rate DESC, id ASC LIMIT ?",
             (config.MAX_SKILLS_CHECK,),
@@ -90,6 +184,44 @@ class SkillStore:
             reverse=True,
         )
         return self._row_to_skill(matches[0])
+
+    def _semantic_match(self, query: str) -> Skill | None:
+        """Embedding-similarity skill lookup (fallback when regex misses).
+
+        Returns the best skill whose embedding similarity ≥ SKILL_SEMANTIC_THRESHOLD,
+        or None if no skill clears the bar.
+        """
+        try:
+            collection = self._get_skill_collection()
+            if collection.count() == 0:
+                return None
+            results = collection.query(
+                query_texts=[query],
+                n_results=1,
+                include=["distances", "metadatas"],
+            )
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            distance = results["distances"][0][0]
+            # ChromaDB cosine distance: 0=identical, 2=opposite → similarity = 1 − distance/2
+            similarity = 1.0 - (distance / 2.0)
+            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
+                logger.debug(
+                    "Semantic skill match below threshold: sim=%.3f threshold=%.3f",
+                    similarity, config.SKILL_SEMANTIC_THRESHOLD,
+                )
+                return None
+            skill_id = int(results["metadatas"][0][0]["skill_id"])
+            skill = self.get_skill(skill_id)
+            if skill and skill.enabled:
+                logger.info(
+                    "Semantic skill match: '%s' (id=%d, sim=%.3f)",
+                    skill.name, skill_id, similarity,
+                )
+                return skill
+        except Exception as e:
+            logger.warning("Semantic skill lookup failed: %s", e)
+        return None
 
     def create_skill(
         self,
@@ -134,7 +266,7 @@ class SkillStore:
             (name,),
         )
         if existing_by_name:
-            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>")
+            old_trigger = existing_by_name["trigger_pattern"] if existing_by_name["trigger_pattern"] else "<unknown>"
             self._db.execute(
                 "UPDATE skills SET trigger_pattern = ?, steps = ?, answer_template = ?, enabled = 1 WHERE id = ?",
                 (trigger_pattern, json.dumps(steps), answer_template, existing_by_name["id"]),
@@ -143,6 +275,7 @@ class SkillStore:
                 "Skill updated: #%d '%s' trigger changed from '%s' to '%s'",
                 existing_by_name["id"], name, old_trigger[:60], trigger_pattern[:60],
             )
+            self._embed_skill(existing_by_name["id"], name, trigger_pattern)
             return existing_by_name["id"]
 
         cursor = self._db.execute(
@@ -159,6 +292,7 @@ class SkillStore:
         )
         skill_id = cursor.lastrowid
         logger.info("Created skill #%d: '%s' (trigger: %s)", skill_id, name, trigger_pattern)
+        self._embed_skill(skill_id, name, trigger_pattern)
         return skill_id
 
     def record_use(self, skill_id: int, success: bool) -> None:
@@ -227,7 +361,10 @@ class SkillStore:
     def delete_skill(self, skill_id: int) -> bool:
         """Delete a skill."""
         cursor = self._db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
-        return cursor.rowcount > 0
+        if cursor.rowcount > 0:
+            self._unembed_skill(skill_id)
+            return True
+        return False
 
     async def refine_skill(self, skill_id: int, failure_context: str) -> bool:
         """Attempt to refine a failing skill instead of just degrading it.

@@ -110,6 +110,10 @@ async def lifespan(app: FastAPI):
     user_facts = UserFactStore(db)
     learning = LearningEngine(db)
     skills = SkillStore(db)
+    try:
+        skills.sync_embeddings()
+    except Exception as _e:
+        logger.warning("Skill embedding sync failed (ChromaDB may be unavailable): %s", _e)
 
     # Knowledge graph
     from app.core.kg import KnowledgeGraph
