@@ -30,6 +30,7 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
 
     # Tuning parameters — deterministic values for tests
+    monkeypatch.setenv("MAX_SYSTEM_TOKENS", "6000")
     monkeypatch.setenv("RESPONSE_TOKEN_BUDGET", "600")
     monkeypatch.setenv("RETRIEVAL_RELEVANCE_THRESHOLD", "0.15")
     monkeypatch.setenv("TEMPERATURE_DEFAULT", "0.7")
