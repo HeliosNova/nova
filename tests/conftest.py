@@ -28,6 +28,10 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
+    monkeypatch.setenv("ENABLE_EVAL_HARNESS", "true")
+    monkeypatch.setenv("EVAL_SUITE_PATH", "evals/suite.yaml")
+    monkeypatch.setenv("EVAL_REPORT_PATH", str(tmp_path / "eval_reports"))
+    monkeypatch.setenv("EVAL_REGRESSION_TOLERANCE", "0.10")
 
     # Tuning parameters — deterministic values for tests
     monkeypatch.setenv("MAX_SYSTEM_TOKENS", "6000")
