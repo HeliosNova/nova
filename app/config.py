@@ -73,6 +73,7 @@ _MUTABLE_FIELDS = {
     "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
+    "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
 }
 
 
@@ -146,6 +147,12 @@ class Config:
     MIN_MONITOR_SCHEDULE_SECONDS: int = field(default_factory=lambda: _env_int("MIN_MONITOR_SCHEDULE_SECONDS", 60))
     DIGEST_HOUR: int = field(default_factory=lambda: _env_int("DIGEST_HOUR", 21))
     USER_TIMEZONE: str = field(default_factory=lambda: _env("USER_TIMEZONE", "UTC"))
+
+    # Automated eval harness
+    ENABLE_EVAL_HARNESS: bool = field(default_factory=lambda: _env("ENABLE_EVAL_HARNESS", "true").lower() == "true")
+    EVAL_SUITE_PATH: str = field(default_factory=lambda: _env("EVAL_SUITE_PATH", "evals/suite.yaml"))
+    EVAL_REPORT_PATH: str = field(default_factory=lambda: _env("EVAL_REPORT_PATH", "/data/eval_reports"))
+    EVAL_REGRESSION_TOLERANCE: float = field(default_factory=lambda: _env_float("EVAL_REGRESSION_TOLERANCE", 0.10))
 
     # Learning
     TRAINING_DATA_PATH: str = field(default_factory=lambda: _env("TRAINING_DATA_PATH", "/data/training_data.jsonl"))
