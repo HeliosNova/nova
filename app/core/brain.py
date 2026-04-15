@@ -26,6 +26,7 @@ if TYPE_CHECKING:
     from app.core.curiosity import CuriosityQueue, TopicTracker
     from app.tools.base import ToolRegistry
     from app.monitors.heartbeat import MonitorStore, HeartbeatLoop
+    from app.core.agent_spawner import DecompositionPlan
 from app.core import llm
 from app.core.learning import is_likely_correction, response_pushes_back
 from app.core.llm import LLMUnavailableError, _extract_tool_calls
@@ -1604,6 +1605,205 @@ async def _run_post_processing(
 
 
 # ---------------------------------------------------------------------------
+# Multi-agent path
+# ---------------------------------------------------------------------------
+
+async def _run_multi_agent_path(
+    svc: Services,
+    query: str,
+    conversation_id: str,
+    intent: str,
+    ctx: "_ThinkContext",
+    decomp_plan: "DecompositionPlan",
+    is_new_conversation: bool,
+    ephemeral: bool,
+    channel: str,
+) -> AsyncGenerator[StreamEvent, None]:
+    """Execute the structural multi-agent decomposition path.
+
+    Yields the same SSE event stream as the normal think() path plus four
+    new event types: AGENT_META, AGENT_START, AGENT_DONE, AGENT_MERGE.
+    Post-processing (corrections, facts, reflexion) runs on the merged
+    response text, same as the normal path.
+    """
+    from app.core.agent_spawner import AgentSpawner, merge_agent_results
+
+    agent_count = len(decomp_plan.tasks)
+
+    # --- META: announce decomposition to the client ---
+    yield StreamEvent(
+        type=EventType.AGENT_META,
+        data={
+            "type": "decomposition",
+            "strategy": decomp_plan.strategy,
+            "agent_count": agent_count,
+            "fallback": False,
+        },
+    )
+
+    # --- AGENT_START: one event per task ---
+    for task in decomp_plan.tasks:
+        yield StreamEvent(
+            type=EventType.AGENT_START,
+            data={
+                "run_id": conversation_id,
+                "task_id": task.task_id,
+                "role": task.role,
+                "query": task.query[:200],
+            },
+        )
+
+    # --- Execute all sub-agents ---
+    total_timeout = config.TOOL_TIMEOUT * 2
+    spawner = AgentSpawner(decomp_plan, conversation_id)
+    try:
+        results = await asyncio.wait_for(spawner.run(), timeout=float(total_timeout))
+    except asyncio.TimeoutError:
+        logger.warning("Multi-agent decomposition timed out after %ds", total_timeout)
+        yield StreamEvent(
+            type=EventType.AGENT_META,
+            data={"type": "fallback", "reason": "total_timeout"},
+        )
+        fallback_text = "[Multi-agent decomposition timed out. Please try again.]"
+        yield StreamEvent(type=EventType.TOKEN, data={"text": fallback_text})
+        yield StreamEvent(
+            type=EventType.DONE,
+            data={
+                "conversation_id": conversation_id,
+                "intent": intent,
+                "tool_results_count": 0,
+                "lessons_used": len(ctx.used_lesson_ids),
+                "kg_facts_used": ctx.kg_facts_count,
+                "reflexions_used": ctx.reflexions_count,
+                "skill_used": None,
+                "decomposed": True,
+                "agent_count": agent_count,
+            },
+        )
+        return
+
+    # --- AGENT_DONE: one event per completed task ---
+    all_tools: list[str] = []
+    completed_count = 0
+    failed_count = 0
+    for result in results:
+        all_tools.extend(result.tools_invoked)
+        if result.error:
+            failed_count += 1
+        else:
+            completed_count += 1
+        yield StreamEvent(
+            type=EventType.AGENT_DONE,
+            data={
+                "task_id": result.task_id,
+                "role": result.role,
+                "latency_seconds": result.latency_seconds,
+                "tools": result.tools_invoked,
+                "skill_used": result.skill_used,
+                "error": result.error,
+            },
+        )
+
+    # --- AGENT_MERGE: announce synthesis ---
+    yield StreamEvent(
+        type=EventType.AGENT_MERGE,
+        data={
+            "strategy": decomp_plan.strategy,
+            "agents_completed": completed_count,
+            "agents_failed": failed_count,
+        },
+    )
+
+    # --- Merge sub-agent results ---
+    successful = [r for r in results if r.response and not r.error]
+    if not successful:
+        final_content = "[All sub-agents failed to produce results. Please try again.]"
+        is_error = True
+    else:
+        try:
+            final_content = await merge_agent_results(
+                results, decomp_plan.merge_instruction, query
+            )
+            is_error = False
+        except Exception as e:
+            logger.warning("Merge step failed: %s", e)
+            final_content = "\n\n".join(r.response for r in successful if r.response)
+            is_error = False
+
+    if final_content is None:
+        final_content = ""
+
+    # --- Emit TOOL_USE events for each unique tool used across sub-agents ---
+    # Required so the eval harness's tool_invoked assertions work correctly.
+    seen_tools: set[str] = set()
+    for tool_name in all_tools:
+        if tool_name not in seen_tools:
+            seen_tools.add(tool_name)
+            yield StreamEvent(
+                type=EventType.TOOL_USE,
+                data={"tool": tool_name, "args": {}, "source": "sub-agent"},
+            )
+
+    # --- Stream merged response ---
+    if final_content:
+        final_content = _sanitize_answer(final_content)
+        chunk_size = 20
+        for i in range(0, len(final_content), chunk_size):
+            yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
+
+    # --- Persist to conversation (non-ephemeral only) ---
+    saved_msg_id = None
+    if not ephemeral and svc.conversations:
+        saved_msg_id = await asyncio.to_thread(
+            lambda: svc.conversations.add_message(
+                conversation_id,
+                "assistant",
+                final_content,
+                tool_calls=None,
+                sources=None,
+            )
+        )
+        if is_new_conversation and final_content:
+            try:
+                title = await _generate_title(query)
+                await asyncio.to_thread(svc.conversations.update_title, conversation_id, title)
+            except Exception as e:
+                logger.warning("Failed to generate title: %s", e)
+
+    # --- DONE event (includes decomposed=True + agent_count) ---
+    yield StreamEvent(
+        type=EventType.DONE,
+        data={
+            "conversation_id": conversation_id,
+            "intent": intent,
+            "tool_results_count": len(all_tools),
+            "lessons_used": len(ctx.used_lesson_ids),
+            "kg_facts_used": ctx.kg_facts_count,
+            "reflexions_used": ctx.reflexions_count,
+            "skill_used": None,
+            "decomposed": True,
+            "agent_count": agent_count,
+        },
+    )
+
+    # --- Post-processing on merged response (non-ephemeral only) ---
+    if not ephemeral:
+        tool_results_for_pp = [
+            {"tool": t, "args": {}, "output": ""} for t in list(dict.fromkeys(all_tools))
+        ]
+        async for event in _run_post_processing(
+            svc, query, final_content, intent, conversation_id,
+            tool_results_for_pp, None, ctx.used_lesson_ids,
+            is_error, None, "",
+            had_kg=bool(ctx.kg_facts_text),
+            had_docs=bool(ctx.retrieved_context),
+            channel=channel,
+            saved_msg_id=saved_msg_id,
+        ):
+            yield event
+
+
+# ---------------------------------------------------------------------------
 # The Brain — think()
 # ---------------------------------------------------------------------------
 
@@ -1691,6 +1891,22 @@ async def think(
         # Save user message
         if not ephemeral:
             await asyncio.to_thread(svc.conversations.add_message, conversation_id, "user", query)
+
+        # --- Step 6.5: Multi-agent structural decomposition gate ---
+        # should_decompose() is heuristic-only (no LLM).  decompose_query() is also
+        # heuristic-only.  The actual sub-agents run inside _run_multi_agent_path().
+        # If decomposition fires and produces a valid plan, we bypass the normal
+        # generation loop entirely and return from _run_multi_agent_path().
+        from app.core.decomposer import should_decompose, decompose_query
+        if should_decompose(query, intent, was_planned, ephemeral):
+            decomp_plan = decompose_query(query, intent, was_planned, plan, conversation_id)
+            if decomp_plan is not None:
+                async for event in _run_multi_agent_path(
+                    svc, query, conversation_id, intent, ctx,
+                    decomp_plan, is_new_conversation, ephemeral, channel,
+                ):
+                    yield event
+                return
 
         # --- Step 7: Generate + Tool Loop ---
         yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})

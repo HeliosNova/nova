@@ -74,6 +74,7 @@ _MUTABLE_FIELDS = {
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
+    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
 }
 
 
@@ -182,9 +183,15 @@ class Config:
     CRITIQUE_SOURCES_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_SOURCES_LIMIT", 1500))
     CRITIQUE_FACTS_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_FACTS_LIMIT", 2000))
 
-    # Delegation (multi-agent)
+    # Delegation (LLM-driven, via DelegateTool)
     ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
     MAX_DELEGATION_DEPTH: int = field(default_factory=lambda: _env_int("MAX_DELEGATION_DEPTH", 1))
+
+    # Multi-agent structural decomposition
+    ENABLE_MULTI_AGENT: bool = field(default_factory=lambda: _env("ENABLE_MULTI_AGENT", "true").lower() == "true")
+    MULTI_AGENT_TRIGGER_THRESHOLD: int = field(default_factory=lambda: _env_int("MULTI_AGENT_TRIGGER_THRESHOLD", 4))
+    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 5))
+    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 90))
 
     # Background tasks
     MAX_BACKGROUND_TASKS: int = field(default_factory=lambda: _env_int("MAX_BACKGROUND_TASKS", 5))
