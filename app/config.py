@@ -75,6 +75,7 @@ _MUTABLE_FIELDS = {
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
     "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
+    "ENABLE_RERANKER", "RETRIEVAL_RERANK_MODEL", "RETRIEVAL_RRF_K",
 }
 
 
@@ -119,6 +120,9 @@ class Config:
     CHUNK_SIZE: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))
     CHUNK_OVERLAP: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 50))
     RRF_K: int = field(default_factory=lambda: _env_int("RRF_K", 60))
+    RETRIEVAL_RRF_K: int = field(default_factory=lambda: _env_int("RETRIEVAL_RRF_K", 60))
+    ENABLE_RERANKER: bool = field(default_factory=lambda: _env("ENABLE_RERANKER", "true").lower() == "true")
+    RETRIEVAL_RERANK_MODEL: str = field(default_factory=lambda: _env("RETRIEVAL_RERANK_MODEL", ""))
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))

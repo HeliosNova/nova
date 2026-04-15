@@ -50,6 +50,7 @@ class EvalTask:
     assertions: list[dict]
     timeout: int = 60
     seed_skill: dict | None = None
+    seed_document: dict | None = None  # {title, source, text} — seeded before retrieval tasks
     paraphrase_of: str | None = None
     tags: list[str] = field(default_factory=list)
 
@@ -90,6 +91,8 @@ class CategoryMetrics:
     multi_tool_rate: float | None = None
     # multi-agent specific
     decomposition_rate: float | None = None
+    # retrieval specific
+    retrieval_recall: float | None = None
 
 
 @dataclass
@@ -179,6 +182,12 @@ def check_assertion(
     if atype == "decomposition_not_fired":
         return not decomposed
 
+    if atype == "retrieval_recall":
+        # Passes if the seeded fact keyword appears in the response.
+        # The harness seeds the document before running the task; if retrieval
+        # works correctly, the response should contain the expected term.
+        return assertion["value"].lower() in response.lower()
+
     logger.warning("[EvalHarness] Unknown assertion type: %r", atype)
     return False
 
@@ -218,6 +227,9 @@ def format_assertion_failure(
         return "decomposition_fired — decomposition did not trigger"
     if atype == "decomposition_not_fired":
         return "decomposition_not_fired — decomposition unexpectedly triggered"
+    if atype == "retrieval_recall":
+        snippet = response[:80].replace("\n", " ")
+        return f"retrieval_recall({assertion['value']!r}) — not found in: {snippet!r}"
     return f"{atype} failed"
 
 
@@ -281,6 +293,11 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             decomposed = sum(1 for r in cat_results if r.decomposed)
             cm.decomposition_rate = decomposed / total if total else 0.0
 
+        if cat == "retrieval":
+            # retrieval_recall = fraction of tasks where the seeded fact was found
+            # Uses pass_rate as proxy (each retrieval task has a retrieval_recall assertion)
+            cm.retrieval_recall = cm.pass_rate
+
         metrics[cat] = cm
     return metrics
 
@@ -316,6 +333,7 @@ def detect_regressions(
         ("recall_at_threshold", "recall_at_threshold"),
         ("multi_tool_rate", "multi_tool_rate"),
         ("decomposition_rate", "decomposition_rate"),
+        ("retrieval_recall", "retrieval_recall"),
         ("reflexion_mean", "reflexion_mean"),
     ]
 
@@ -413,6 +431,8 @@ def render_markdown(report: EvalReport) -> str:
             extras.append(f"multi_tool_rate={cm.multi_tool_rate:.1%}")
         if cm.decomposition_rate is not None:
             extras.append(f"decomposition_rate={cm.decomposition_rate:.1%}")
+        if cm.retrieval_recall is not None:
+            extras.append(f"retrieval_recall={cm.retrieval_recall:.1%}")
         if cm.reflexion_std is not None:
             extras.append(f"reflexion_std={cm.reflexion_std:.2f}")
         if cm.reflexion_p10 is not None:
@@ -505,6 +525,7 @@ class EvalHarness:
                 assertions=raw.get("assertions", []),
                 timeout=raw.get("timeout", 60),
                 seed_skill=seed,
+                seed_document=raw.get("seed_document"),
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
             ))
@@ -554,6 +575,38 @@ class EvalHarness:
                     logger.debug("[EvalHarness] Skill %r already exists (name dedup)", seed["name"])
             except Exception as e:
                 logger.warning("[EvalHarness] Skill seed failed for %r: %s", seed["name"], e)
+
+    # --- Document seeding ---
+
+    async def _seed_documents(self, tasks: list[EvalTask]) -> None:
+        """Ingest any eval documents listed in task seed_document fields.
+
+        Idempotent: Retriever.ingest() uses doc_id to delete and re-insert,
+        so re-running does not accumulate duplicates.
+        """
+        from app.core.retriever import Retriever
+
+        retriever = Retriever()
+        seen_titles: set[str] = set()
+        for task in tasks:
+            doc = task.seed_document
+            if not doc or doc.get("title", "") in seen_titles:
+                continue
+            seen_titles.add(doc.get("title", ""))
+            try:
+                doc_id, n_chunks = await retriever.ingest(
+                    text=doc["text"],
+                    title=doc.get("title", "eval-seed"),
+                    source=doc.get("source", "eval"),
+                )
+                logger.debug(
+                    "[EvalHarness] Seeded document %r → %d chunk(s) (doc_id=%s)",
+                    doc.get("title"), n_chunks, doc_id,
+                )
+            except Exception as e:
+                logger.warning(
+                    "[EvalHarness] Document seed failed for %r: %s", doc.get("title"), e
+                )
 
     # --- Single task execution ---
 
@@ -650,8 +703,9 @@ class EvalHarness:
 
         logger.info("[EvalHarness] Starting eval run %s — %d tasks", run_id, len(tasks))
 
-        # Seed eval skills into live SkillStore before testing
+        # Seed eval skills and documents into live stores before testing
         self._seed_skills(tasks)
+        await self._seed_documents(tasks)
 
         # Run tasks sequentially to avoid confounding latency metrics
         task_results: list[TaskResult] = []

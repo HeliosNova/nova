@@ -462,3 +462,68 @@ tasks:
       - type: answer_contains
         value: "4"
       - type: decomposition_not_fired
+
+  # =========================================================================
+  # Category: retrieval  (3 tasks)
+  # Tests: BM25 exact-keyword recall, semantic paraphrase recall, reranker probe.
+  # Each task seeds a document via seed_document before running.
+  # Task 3 (reranker_regression_probe) is designed to fail if the reranker
+  # is disabled — catches regressions in ENABLE_RERANKER.
+  # =========================================================================
+
+  - id: retrieval_exact_keyword
+    category: retrieval
+    query: "eval-retrieval: What is Merkle tree cryptographic hash structure?"
+    timeout: 60
+    tags: [bm25-dominant]
+    seed_document:
+      title: "Merkle Trees in Cryptography"
+      source: "eval-seed"
+      text: |
+        A Merkle tree is a tree data structure in which every leaf node is labelled
+        with the cryptographic hash of a data block, and every non-leaf node is
+        labelled with the cryptographic hash of its child nodes. Merkle trees allow
+        efficient and secure verification of the contents of large data structures.
+        They are used in Bitcoin, Ethereum, and other distributed systems to
+        verify block integrity without downloading the full blockchain.
+    assertions:
+      - type: retrieval_recall
+        value: "Merkle"
+
+  - id: retrieval_semantic_paraphrase
+    category: retrieval
+    query: "eval-retrieval: How does gradient descent minimize loss in training?"
+    timeout: 60
+    tags: [vector-dominant]
+    seed_document:
+      title: "Backpropagation and Optimization"
+      source: "eval-seed"
+      text: |
+        Optimization algorithms iteratively adjust model parameters to reduce
+        the error function. The most widely used approach computes partial
+        derivatives of the cost function with respect to each weight and moves
+        in the direction that decreases the objective. This iterative parameter
+        update process converges toward a local minimum of the error surface,
+        enabling neural networks to fit training data accurately.
+    assertions:
+      - type: retrieval_recall
+        value: "parameter"
+
+  - id: retrieval_reranker_regression_probe
+    category: retrieval
+    query: "eval-retrieval: What is the boiling point of water at sea level in Celsius?"
+    timeout: 60
+    tags: [reranker-probe]
+    seed_document:
+      title: "Physical Properties of Water"
+      source: "eval-seed"
+      text: |
+        Water boils at 100 degrees Celsius (212 degrees Fahrenheit) at standard
+        atmospheric pressure (sea level, 1 atm). At higher altitudes where
+        atmospheric pressure is lower, water boils at temperatures below 100C.
+        The boiling point of water is one of the fixed reference points used to
+        define the Celsius temperature scale. This property makes water essential
+        for cooking and industrial thermal processes.
+    assertions:
+      - type: retrieval_recall
+        value: "100"
