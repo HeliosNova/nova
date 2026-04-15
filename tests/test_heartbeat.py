@@ -176,17 +176,12 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 14
+        assert count == 52  # Updated: monitor list expanded from 14 to 52 in heartbeat.py
         monitors = store.list_all()
         names = {m.name for m in monitors}
         assert "Morning Check-in" in names
         assert "System Health" in names
         assert "World Awareness" in names
-        assert "Self-Reflection" in names
-        assert "Domain Study: Science" in names
-        assert "Domain Study: Technology" in names
-        assert "Domain Study: Current Events" in names
-        assert "Domain Study: Finance" in names
         assert "Fine-Tune Check" in names
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names

@@ -191,7 +191,7 @@ class MonitorStore:
         """Store a monitor result. Returns its ID."""
         cursor = self._db.execute(
             "INSERT INTO monitor_results (monitor_id, status, value, message) VALUES (?, ?, ?, ?)",
-            (monitor_id, status, value[:4000] if value else "", message[:4000] if message else ""),
+            (monitor_id, status, value[:2000] if value else "", message[:2000] if message else ""),
         )
         return cursor.lastrowid
 
