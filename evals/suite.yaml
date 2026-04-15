@@ -418,3 +418,47 @@ tasks:
       - type: reflexion_in_range
         min: 0.1
         max: 0.9
+
+  # =========================================================================
+  # Category: multi-agent  (3 tasks)
+  # Tests structural decomposition.  Two tasks should trigger decomposition
+  # (parallel-decomposable, sequential-decomposable); one should NOT.
+  #
+  # The decomposition_fired / decomposition_not_fired assertion types check
+  # the DONE event's `decomposed` field, which is set by _run_multi_agent_path.
+  # Regression probe: set MULTI_AGENT_TRIGGER_THRESHOLD=1 → everything fires →
+  # non-decomposable task fails decomposition_not_fired → decomposition_rate
+  # drifts away from baseline → regression flagged automatically.
+  # =========================================================================
+
+  - id: multi_agent_parallel_compare
+    category: multi-agent
+    query: "Compare Python and JavaScript: how are they different in terms of typing system, execution model, and primary use cases? Give me a detailed comparison of both."
+    timeout: 120
+    tags: [parallel-decomposable]
+    assertions:
+      - type: response_not_empty
+      - type: decomposition_fired
+      - type: answer_matches
+        value: "\\b(?:Python|JavaScript|typing|static|dynamic|execution)\\b"
+
+  - id: multi_agent_sequential_research
+    category: multi-agent
+    query: "First search for the current Python version, then based on that result calculate how many years have passed since Python 1.0 was released in 1994 and how many major versions there have been."
+    timeout: 150
+    tags: [sequential-decomposable]
+    assertions:
+      - type: response_not_empty
+      - type: decomposition_fired
+      - type: tool_invoked
+        value: web_search
+
+  - id: multi_agent_no_decompose
+    category: multi-agent
+    query: "What is 2 plus 2?"
+    timeout: 45
+    tags: [should-not-decompose]
+    assertions:
+      - type: answer_contains
+        value: "4"
+      - type: decomposition_not_fired

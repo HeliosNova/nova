@@ -67,6 +67,7 @@ class TaskResult:
     latency_seconds: float
     failed_assertions: list[str]
     error: str | None = None
+    decomposed: bool = False  # True when structural multi-agent decomposition fired
 
 
 @dataclass
@@ -87,6 +88,8 @@ class CategoryMetrics:
     recall_at_threshold: float | None = None
     # autonomous-tool specific
     multi_tool_rate: float | None = None
+    # multi-agent specific
+    decomposition_rate: float | None = None
 
 
 @dataclass
@@ -128,6 +131,7 @@ def check_assertion(
     tools_invoked: list[str],
     skill_used: str | None,
     reflexion_score: float | None,
+    decomposed: bool = False,
 ) -> bool:
     """Return True if the assertion passes."""
     atype = assertion.get("type", "")
@@ -169,6 +173,12 @@ def check_assertion(
     if atype == "response_not_empty":
         return len(response.replace(" ", "").replace("\n", "")) >= 20
 
+    if atype == "decomposition_fired":
+        return decomposed
+
+    if atype == "decomposition_not_fired":
+        return not decomposed
+
     logger.warning("[EvalHarness] Unknown assertion type: %r", atype)
     return False
 
@@ -204,6 +214,10 @@ def format_assertion_failure(
         return f"reflexion_below({assertion['value']}) — got {reflexion_score}"
     if atype == "response_not_empty":
         return f"response_not_empty — response has {len(response.strip())} chars"
+    if atype == "decomposition_fired":
+        return "decomposition_fired — decomposition did not trigger"
+    if atype == "decomposition_not_fired":
+        return "decomposition_not_fired — decomposition unexpectedly triggered"
     return f"{atype} failed"
 
 
@@ -263,6 +277,10 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             multi_tool = sum(1 for r in cat_results if len(r.tools_invoked) >= 2)
             cm.multi_tool_rate = multi_tool / total if total else 0.0
 
+        if cat == "multi-agent":
+            decomposed = sum(1 for r in cat_results if r.decomposed)
+            cm.decomposition_rate = decomposed / total if total else 0.0
+
         metrics[cat] = cm
     return metrics
 
@@ -297,6 +315,7 @@ def detect_regressions(
         ("hit_rate", "hit_rate"),
         ("recall_at_threshold", "recall_at_threshold"),
         ("multi_tool_rate", "multi_tool_rate"),
+        ("decomposition_rate", "decomposition_rate"),
         ("reflexion_mean", "reflexion_mean"),
     ]
 
@@ -392,6 +411,8 @@ def render_markdown(report: EvalReport) -> str:
             extras.append(f"semantic_recall={cm.recall_at_threshold:.1%}")
         if cm.multi_tool_rate is not None:
             extras.append(f"multi_tool_rate={cm.multi_tool_rate:.1%}")
+        if cm.decomposition_rate is not None:
+            extras.append(f"decomposition_rate={cm.decomposition_rate:.1%}")
         if cm.reflexion_std is not None:
             extras.append(f"reflexion_std={cm.reflexion_std:.2f}")
         if cm.reflexion_p10 is not None:
@@ -545,6 +566,7 @@ class EvalHarness:
         tokens: list[str] = []
         tools_invoked: list[str] = []
         skill_used: str | None = None
+        decomposed: bool = False
         error: str | None = None
 
         start = time.monotonic()
@@ -559,6 +581,7 @@ class EvalHarness:
                             tools_invoked.append(tool_name)
                     elif event.type == EventType.DONE:
                         skill_used = event.data.get("skill_used")
+                        decomposed = bool(event.data.get("decomposed", False))
         except asyncio.TimeoutError:
             error = f"Timeout after {task.timeout}s"
             logger.warning("[EvalHarness] Task %s timed out", task.id)
@@ -587,7 +610,10 @@ class EvalHarness:
             failed_assertions = [f"task_error: {error}"]
         else:
             for a in task.assertions:
-                if not check_assertion(a, response_text, tools_invoked, skill_used, reflexion_score):
+                if not check_assertion(
+                    a, response_text, tools_invoked, skill_used, reflexion_score,
+                    decomposed=decomposed,
+                ):
                     failed_assertions.append(
                         format_assertion_failure(
                             a, response_text, tools_invoked, skill_used, reflexion_score
@@ -608,6 +634,7 @@ class EvalHarness:
             latency_seconds=round(latency, 2),
             failed_assertions=failed_assertions,
             error=error,
+            decomposed=decomposed,
         )
 
     # --- Full suite run ---
