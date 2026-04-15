@@ -554,3 +554,57 @@ class TestCaptureGroupMismatchGuard:
             await maybe_extract_skill("bitcoin price", _make_tool_results(2), "BTC is $70k", skills)
 
         assert len(db.fetchall("SELECT * FROM skills")) == 0
+
+
+# ===========================================================================
+# P0-2: Broadness guard — temporal-framing queries catch over-broad patterns
+# Audit finding: ids 45/48 escaped with only 1 match against 20 test queries.
+# ===========================================================================
+
+class TestBroadnessGuardTemporalQueries:
+    """Extended _BROADNESS_TEST_QUERIES catches temporal-only over-broad patterns."""
+
+    def test_single_word_today_pattern_flagged(self):
+        """Pattern matching only 'today' is over-broad (matches unrelated queries)."""
+        from app.core.skills import _is_too_broad
+        # id=45-style: (?i)(current|right now|today|latest)
+        assert _is_too_broad(r"(?i)(current|right\s+now|today|latest)")
+
+    def test_temporal_word_list_pattern_flagged(self):
+        """Pattern id=48-style: matching today/current/latest/recent/now → over-broad."""
+        from app.core.skills import _is_too_broad
+        pattern = r"(?i)(today|current|latest|recent|up-to-date|now|this week|this month)"
+        assert _is_too_broad(pattern)
+
+    def test_temporal_combined_with_domain_not_flagged(self):
+        """A temporal word anchored to a specific domain is NOT over-broad."""
+        from app.core.skills import _is_too_broad
+        # 'current' + 'crypto' domain: won't match chess/gossip/bus queries
+        assert not _is_too_broad(r"(?i)\b(?:current|latest)\b.*\b(?:bitcoin|btc|crypto)\b")
+
+    def test_domain_specific_pattern_not_flagged(self):
+        """Existing well-anchored domain patterns still pass."""
+        from app.core.skills import _is_too_broad
+        assert not _is_too_broad(r"(?i)\b(?:price|cost|value)\b.*\b(?:gold|oil|silver|copper)\b")
+        assert not _is_too_broad(r"(?i)\b(?:world|global|international)\b.*\b(?:news|events|headlines)\b")
+
+    def test_create_skill_rejects_temporal_only_pattern(self, db):
+        """SkillStore.create_skill() rejects a temporal-only over-broad pattern."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="real_time_data_search",
+            trigger_pattern=r"(?i)(current|right\s+now|today|latest)",
+            steps=[{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}],
+        )
+        assert result is None
+        assert len(db.fetchall("SELECT * FROM skills")) == 0
+
+    def test_create_skill_accepts_domain_anchored_temporal_pattern(self, db):
+        """A temporal word anchored to a crypto domain still passes."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="crypto_price_now",
+            trigger_pattern=r"(?i)\b(?:current|latest)\b.*\b(?:bitcoin|btc|ethereum)\b",
+            steps=[{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}],
+        )
+        assert result is not None

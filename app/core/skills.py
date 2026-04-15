@@ -514,6 +514,15 @@ _BROADNESS_TEST_QUERIES = [
     "Who won the World Cup?",
     "What should I eat for dinner?",
     "How much is a flight to Paris?",
+    # Temporal-framing unrelated queries — catch patterns anchored on
+    # "today / current / latest / now / recent" without a domain constraint.
+    # Audit P0-2: patterns like (?i)(current|today|latest) matched 1 existing
+    # query (the weather one above) but needed a second hit to be flagged.
+    "Today I want to learn how to play chess",
+    "Give me the current bus schedule for downtown",
+    "What's the latest gossip about celebrity drama?",
+    "Tell me what's happening right now in my neighborhood",
+    "I need the most recent study tips for exams",
     # Non-English queries to prevent non-English patterns from always passing
     "¿Cuál es el clima hoy?",          # Spanish
     "今天天气怎么样？",                    # Chinese
