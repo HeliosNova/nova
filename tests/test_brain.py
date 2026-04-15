@@ -211,7 +211,7 @@ class TestPromptBuilder:
         # Huge context should be truncated
         big_context = "x" * 20000
         prompt = build_system_prompt(retrieved_context=big_context)
-        assert len(prompt) < 25000  # Must be truncated well below 20K+identity (MAX_SYSTEM_TOKENS=6000)
+        assert len(prompt) < 25000  # Must be truncated well below 20K+identity (conftest sets MAX_SYSTEM_TOKENS=6000)
         assert "truncated" in prompt.lower()
 
     def test_mandatory_blocks_never_truncated(self):
@@ -865,7 +865,7 @@ class TestCritiqueSources:
     def test_critique_includes_user_facts(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             critique_answer(
                 "What is my name?",
                 "Your name is Marcus.",
@@ -883,7 +883,7 @@ class TestCritiqueSources:
     def test_critique_includes_kg_facts(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             critique_answer(
                 "Tell me about bitcoin",
                 "Bitcoin is a cryptocurrency.",
@@ -901,7 +901,7 @@ class TestCritiqueSources:
     def test_empty_facts_not_added(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.get_event_loop().run_until_complete(
+        asyncio.run(
             critique_answer(
                 "What is 2+2?",
                 "2+2 equals 4.",

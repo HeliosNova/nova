@@ -659,7 +659,7 @@ class TestActionsAPI:
         with patch("app.api.actions.get_db", return_value=db):
             import asyncio
             from app.api.actions import list_actions
-            result = asyncio.get_event_loop().run_until_complete(list_actions())
+            result = asyncio.run(list_actions())
             assert result["count"] == 0
             assert result["actions"] == []
 
@@ -675,7 +675,7 @@ class TestActionsAPI:
         with patch("app.api.actions.get_db", return_value=db):
             import asyncio
             from app.api.actions import list_actions
-            result = asyncio.get_event_loop().run_until_complete(list_actions(action_type="email"))
+            result = asyncio.run(list_actions(action_type="email"))
             assert result["count"] == 1
             assert result["actions"][0]["action_type"] == "email"
 
@@ -685,7 +685,7 @@ class TestActionsAPI:
             from app.api.actions import get_action
             from fastapi import HTTPException
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.get_event_loop().run_until_complete(get_action(9999))
+                asyncio.run(get_action(9999))
             assert exc_info.value.status_code == 404
 
 
