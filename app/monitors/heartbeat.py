@@ -451,6 +451,14 @@ class MonitorStore:
                 "cooldown_minutes": 10000,   # ~7 days
                 "notify_condition": "on_change",
             },
+            {
+                "name": "Quality Eval Harness",
+                "check_type": "eval",
+                "check_config": {},
+                "schedule_seconds": 86400,   # nightly
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 3 notable AI/ML developments from TODAY or the past 24-48 hours: new model releases, research breakthroughs, benchmark results, or major company announcements. For each: what happened, who did it, the date, and why it matters.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
@@ -1137,6 +1145,9 @@ class HeartbeatLoop:
 
         elif monitor.check_type == "finetune":
             return await self._execute_finetune_check(cfg)
+
+        elif monitor.check_type == "eval":
+            return await self._execute_eval_harness(cfg)
 
         return f"[Unknown check_type: {monitor.check_type}]"
 
@@ -2189,6 +2200,54 @@ class HeartbeatLoop:
             logger.error("[Heartbeat] ALL notification channels failed for '%s'", monitor.name)
         else:
             logger.warning("[Heartbeat] No channels configured for alert '%s'", monitor.name)
+
+    async def _execute_eval_harness(self, cfg: dict) -> str:
+        """Run the automated eval suite and return a summary string for the monitor result."""
+        if not config.ENABLE_EVAL_HARNESS:
+            return "[Eval harness disabled — set ENABLE_EVAL_HARNESS=true to enable]"
+
+        try:
+            from app.monitors.eval_harness import EvalHarness
+        except ImportError as e:
+            return f"[Eval harness import failed: {e}]"
+
+        suite_path = cfg.get("suite_path") or config.EVAL_SUITE_PATH
+        report_dir = cfg.get("report_dir") or config.EVAL_REPORT_PATH
+
+        harness = EvalHarness(suite_path=suite_path, report_dir=report_dir)
+
+        # Verify suite file exists before attempting to run
+        import pathlib
+        if not pathlib.Path(suite_path).exists():
+            return f"[Eval suite not found: {suite_path}]"
+
+        try:
+            report, json_path, md_path = await harness.run_and_persist()
+        except Exception as e:
+            logger.error("[Heartbeat] Eval harness run failed: %s", e, exc_info=True)
+            return f"[Eval harness run failed: {e}]"
+
+        flagged = [r for r in report.regressions if r.flagged]
+        status = "REGRESSION" if flagged else "OK"
+        reg_str = ""
+        if flagged:
+            reg_str = " | regressions: " + ", ".join(
+                f"{r.metric}({r.baseline:.2f}→{r.current:.2f})" for r in flagged
+            )
+
+        cat_summary = " | ".join(
+            f"{cat}:{cm.pass_rate:.0%}"
+            for cat, cm in report.categories.items()
+        )
+
+        return (
+            f"EVAL {status} | "
+            f"pass={report.passed}/{report.total_tasks} ({report.pass_rate:.0%}) | "
+            f"duration={report.duration_seconds:.0f}s | "
+            f"{cat_summary}"
+            f"{reg_str} | "
+            f"report={json_path.name}"
+        )
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""
