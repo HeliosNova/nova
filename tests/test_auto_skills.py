@@ -461,11 +461,20 @@ class TestCaptureGroupMismatchGuard:
         steps = [{"tool": "web_search", "args_template": {"q": "current {crypto_name} price USD"}}]
         assert _has_capture_group_mismatch(pattern, steps, None)
 
-    def test_undefined_placeholder_in_answer_template_fails(self):
-        """{gold_value} in answer_template with no named group → mismatch."""
+    def test_named_placeholder_in_answer_template_passes(self):
+        """{named} placeholders in answer_template are LLM guidance text (never Python-substituted).
+        They are always allowed — the guard only checks numeric back-references ($N, {capture_N})
+        in answer_template, not {named} placeholders."""
         pattern = r"compare gold and silver"
         steps = [{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}]
         answer = "Gold: {gold_value}, Silver: {silver_value}"
+        assert not _has_capture_group_mismatch(pattern, steps, answer)
+
+    def test_numeric_backref_out_of_range_in_answer_template_fails(self):
+        """$2 in answer_template with 0 capture groups → mismatch (numeric check still applies)."""
+        pattern = r"compare gold and silver"  # 0 groups
+        steps = [{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}]
+        answer = "First: $1, Second: $2"
         assert _has_capture_group_mismatch(pattern, steps, answer)
 
     def test_numbered_backref_out_of_range_fails(self):

@@ -609,11 +609,14 @@ def _is_too_broad(pattern: str) -> bool:
 def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template: str | None) -> bool:
     """Check if templates reference capture groups or named placeholders that don't exist.
 
-    Catches three classes of mismatch:
+    Catches three classes of mismatch in args_template (step tool arguments):
     - $N  numbered back-references where N > actual group count
     - {capture_N} references where N > actual group count
     - {named_placeholder} that is not {query}, not a named capture group
       (?P<name>…), and not an output_key produced by an earlier step
+
+    answer_template is injected as raw LLM guidance text (never Python-substituted),
+    so only $N / {capture_N} numeric mismatches are checked there — not {named}.
     """
     try:
         compiled = re.compile(pattern)
@@ -622,7 +625,7 @@ def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template
     except re.error:
         return True
 
-    # Valid named bindings available to every template:
+    # Valid named bindings available to every args_template:
     #   {query}          — always available (the user's raw query)
     #   {capture_N}      — handled by the numeric check below; skip in named check
     #   {output_key}     — each step's output_key is available to subsequent steps
@@ -636,34 +639,39 @@ def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template
     _EXEMPT = frozenset({"query"})
     valid_named = _EXEMPT | named_groups | output_keys
 
-    # Collect all template strings to check
-    templates: list[str] = []
-    if answer_template:
-        templates.append(answer_template)
+    def _check_numeric(tmpl: str) -> bool:
+        """Return True if tmpl has a $N or {capture_N} that exceeds num_groups."""
+        for match in re.finditer(r"\$(\d+)", tmpl):
+            if int(match.group(1)) > num_groups:
+                return True
+        for match in re.finditer(r"\{capture_(\d+)\}", tmpl):
+            if int(match.group(1)) > num_groups:
+                return True
+        return False
+
+    # answer_template: only check numeric back-references — {named} are LLM hints.
+    if answer_template and _check_numeric(answer_template):
+        return True
+
+    # args_template in each step: full check including {named} placeholders.
     for step in steps:
         args = step.get("args_template", {})
+        templates: list[str] = []
         if isinstance(args, dict):
             templates.extend(str(v) for v in args.values())
         elif isinstance(args, str):
             templates.append(args)
 
-    for tmpl in templates:
-        # $N numbered back-references
-        for match in re.finditer(r"\$(\d+)", tmpl):
-            if int(match.group(1)) > num_groups:
+        for tmpl in templates:
+            if _check_numeric(tmpl):
                 return True
-        # {capture_N} style
-        for match in re.finditer(r"\{capture_(\d+)\}", tmpl):
-            if int(match.group(1)) > num_groups:
-                return True
-        # {named_placeholder} — must resolve to a known binding
-        for match in re.finditer(r"\{(\w+)\}", tmpl):
-            name = match.group(1)
-            # Skip {capture_N} — already handled above
-            if re.match(r"^capture_\d+$", name):
-                continue
-            if name not in valid_named:
-                return True
+            # {named_placeholder} — must resolve to a known binding
+            for match in re.finditer(r"\{(\w+)\}", tmpl):
+                name = match.group(1)
+                if re.match(r"^capture_\d+$", name):
+                    continue
+                if name not in valid_named:
+                    return True
 
     return False
 
