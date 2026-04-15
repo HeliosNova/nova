@@ -924,9 +924,9 @@ class TestComputeCategoryMetricsMultiAgent:
 
     def test_decomposition_rate_computed(self):
         results = [
-            _make_ma_result("m1", passed=True, decomposed=True),
-            _make_ma_result("m2", passed=True, decomposed=True),
-            _make_ma_result("m3", passed=True, decomposed=False),
+            self._make_ma_result("m1", passed=True, decomposed=True),
+            self._make_ma_result("m2", passed=True, decomposed=True),
+            self._make_ma_result("m3", passed=True, decomposed=False),
         ]
         metrics = compute_category_metrics(results)
         cm = metrics.get("multi-agent")
@@ -936,16 +936,16 @@ class TestComputeCategoryMetricsMultiAgent:
 
     def test_decomposition_rate_all_decomposed(self):
         results = [
-            _make_ma_result("m1", passed=True, decomposed=True),
-            _make_ma_result("m2", passed=True, decomposed=True),
+            self._make_ma_result("m1", passed=True, decomposed=True),
+            self._make_ma_result("m2", passed=True, decomposed=True),
         ]
         metrics = compute_category_metrics(results)
         assert metrics["multi-agent"].decomposition_rate == 1.0
 
     def test_decomposition_rate_none_decomposed(self):
         results = [
-            _make_ma_result("m1", passed=False, decomposed=False),
-            _make_ma_result("m2", passed=True, decomposed=False),
+            self._make_ma_result("m1", passed=False, decomposed=False),
+            self._make_ma_result("m2", passed=True, decomposed=False),
         ]
         metrics = compute_category_metrics(results)
         assert metrics["multi-agent"].decomposition_rate == 0.0
@@ -1053,7 +1053,7 @@ class TestMultiAgentEmpiricalRegression:
         if "2 plus 2" in query.lower():
             text = "The answer is 4."
         else:
-            text = "Comparison result: Python and JavaScript differ."
+            text = "Comparison result: Python and JavaScript differ in typing, execution, and use cases."
         yield StreamEvent(type=EventType.TOKEN, data={"text": text})
         yield StreamEvent(type=EventType.DONE, data={
             "conversation_id": "stub", "intent": "general",
@@ -1066,7 +1066,10 @@ class TestMultiAgentEmpiricalRegression:
         """Stub: reports decomposed correctly — True for compare/search, False for simple."""
         from app.schema import EventType, StreamEvent
         is_complex = "compare" in query.lower() or "search" in query.lower()
-        text = "The answer is 4." if "2 plus 2" in query.lower() else "Result."
+        if "2 plus 2" in query.lower():
+            text = "The answer is 4."
+        else:
+            text = "Comparison result: Python and JavaScript differ in typing, execution, and use cases."
         yield StreamEvent(type=EventType.TOKEN, data={"text": text})
         yield StreamEvent(type=EventType.DONE, data={
             "conversation_id": "stub", "intent": "general",

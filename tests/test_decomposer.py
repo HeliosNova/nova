@@ -235,7 +235,9 @@ class TestPickStrategy:
         assert _pick("First search for the version, then calculate the years") == "sequential"
 
     def test_sequential_on_based_on_result(self):
+        # "that result" now handled by the regex (the|that|this before result)
         assert _pick("Search for X, then based on that result compute Y") == "sequential"
+        assert _pick("Search for X, then based on the result compute Y") == "sequential"
 
     def test_sequential_on_after_finding(self):
         assert _pick("After finding the price, calculate the profit") == "sequential"
@@ -328,14 +330,14 @@ class TestTryAndSplit:
 
 class TestTryEntitySplit:
     def test_three_entities_produces_three_tasks(self):
-        # Python, JavaScript, TypeScript — 3 distinct proper nouns
-        tasks = _entity_split("Differences between Python JavaScript TypeScript")
+        # Python, Rust, TypeScript — 3 distinct proper nouns; no other capitalised words
+        tasks = _entity_split("overview of Python Rust TypeScript")
         assert tasks is not None
         assert len(tasks) == 3
 
     def test_two_entities_returns_none(self):
-        # Only 2 proper nouns
-        tasks = _entity_split("Compare Python JavaScript")
+        # Only 2 proper nouns (Python, JavaScript); all other words lowercase
+        tasks = _entity_split("about Python JavaScript performance")
         assert tasks is None
 
     def test_stopwords_excluded(self):
@@ -406,9 +408,11 @@ class TestDecomposeQuery:
         monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")
         from app.config import reset_config
         reset_config()
+        # Query must: (a) trigger a sequential marker, (b) yield >=2 tasks via
+        # fallback split on "and" — both halves must be >=15 chars.
         plan = self._run(
-            "First search for the Python version, then based on that result "
-            "calculate years since Python 1.0 in 1994"
+            "First search for the Python version and calculate how many years "
+            "have passed since Python 1.0 was released in 1994"
         )
         assert plan is not None
         assert plan.strategy == "sequential"

@@ -66,7 +66,7 @@ _STOPWORDS = frozenset({
 _SEQUENTIAL_MARKERS = re.compile(
     r"\b(?:first\s+(?:search|find|get|look)|then\s+(?:use|calculate|compute)|"
     r"after\s+(?:that|finding|searching)|step\s+by\s+step|in\s+(?:that\s+)?order|"
-    r"based\s+on\s+(?:the\s+)?(?:result|output|answer)|"
+    r"based\s+on\s+(?:(?:the|that|this)\s+)?(?:result|output|answer)|"
     r"using\s+the\s+(?:result|output|data)\s+(?:from|of))\b",
     re.IGNORECASE,
 )
