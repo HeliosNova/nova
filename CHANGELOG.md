@@ -1,5 +1,27 @@
 # Changelog
 
+## [1.4.0] - 2026-03-28
+
+### Added
+- **Native Ollama tool calling** — `stream_with_thinking()` now parses `message.tool_calls` from stream chunks instead of relying solely on text extraction. Ollama 0.17+ structured tool calls flow end-to-end through the pipeline
+- **DPO training curriculum v2** — 221 expert reasoning traces across 8 categories: tool chaining & fallback (25), response discipline (25), search vs knowledge boundary (25), financial analysis (25), tool result evaluation (25), multi-step planning (25), error recovery (21), context & memory usage (25). Deployed as `nova-ft-v3`
+- **Result evaluation between tool rounds** — `brain.py` now prompts the model to evaluate intermediate tool results. If data is sufficient, it synthesizes early; if incomplete, it continues tool calls. Prevents wasted rounds
+- **One-click fine-tuning pipeline** — `scripts/finetune_oneclick.py` handles the full cycle: stop Ollama → DPO train → merge LoRA → convert to GGUF → quantize Q4_K_M → register model → restart Ollama
+- **Smart desktop automation** — `smart_click` (vision-based element finding), `smart_type` (find input + type), `autonomous_workflow` (multi-step loop with action repetition guard). Uses Ollama vision model to locate UI elements from screenshots
+- **Browser CDP fallback** — when `connect_over_cdp()` to host browser fails, automatically falls back to headless Chromium launch inside container
+- **7 high-value monitors** — FDA Drug Approvals (24h), FOMC and Fed Watch (24h), GitHub Security Advisories (12h), Government Contract Awards (24h), Hacker News Top Stories (8h), Product Hunt Trending (24h), SEC Insider Trading (12h)
+- **Auto-monitor quality filter** — rejects questions, price queries, time queries, math, and generation requests from becoming recurring monitors
+
+### Fixed
+- **Native tool calls silently dropped** — `stream_with_thinking()` in ollama.py never parsed the `tool_calls` field from stream message chunks, so all native tool calls were lost even though `supports_native_tools=True` was set
+- **HTTP fetch SSL cert mismatch on CDN** — DNS pinning replaced hostname with raw IP in HTTPS requests, breaking SSL certificate validation on CDN-served sites. Now skips DNS pinning for HTTPS (SSL validates server identity)
+- **Monitor garbage creation** — no quality filter on auto-monitor detector meant test queries and simple questions became recurring monitors
+
+### Changed
+- **Quality over speed** — constraints loosened for personal hardware: `MAX_TOOL_ROUNDS` 5→10, `MAX_SYSTEM_TOKENS` 6000→10000, `GENERATION_TIMEOUT` 480→900s, `TOOL_TIMEOUT` 120→180s, `OLLAMA_NUM_CTX` 16384→32768, Ollama container memory 20g→32g
+- **Planning threshold lowered** — `signals >= 2` → `signals >= 1` in `planning.py`. Any signal of complexity triggers the planning step
+- **Monitor cleanup** — removed 6 low-value monitors (Sports, Entertainment, Social Media, Climate/Weather, Local LA, Self-Reflection), added 7 high-value intelligence monitors. Net: 52 monitors focused on actionable intelligence
+
 ## [1.3.0] - 2026-03-26
 
 ### Added
@@ -25,7 +47,7 @@
 ## [1.2.0] - 2026-03-26
 
 ### Added
-- **51 autonomous monitors** — expanded from 14 to 51 across 29 domains: financial intelligence (whale watch, top trades, commodities, DeFi), international perspectives (China, Russia, Middle East, India, EU, Latin America, Africa), science/tech deep dives (AI/ML, semiconductors, quantum, robotics, biotech), policy/security (cybersecurity, defense, US regulation), culture (sports, entertainment, social media), developer ecosystem (GitHub trending, framework releases), and local news (Los Angeles)
+- **52 autonomous monitors** — expanded from 14 to 52 across 35+ domains: financial intelligence (whale watch, top trades, commodities, DeFi), international perspectives (China, Russia, Middle East, India, EU, Latin America, Africa), science/tech deep dives (AI/ML, semiconductors, quantum, robotics, biotech), policy/security (cybersecurity, defense, US regulation), special intelligence (FDA, FOMC, SEC, GitHub security advisories, govt contracts), developer ecosystem (GitHub trending, framework releases)
 - **Temporal freshness enforcement** — `_think_query()` now injects today's date into every monitor query context; all monitor prompts anchored to "past 24-48 hours" instead of vague "recently"
 - **Ollama thinking fallback** — provider catches "does not support thinking" 400 errors and retries with `think=false` instead of crashing
 - **Fact extraction for life changes** — added patterns for "I moved to", "I switched to", "I joined", "I left", "I no longer", "I used to" so corrections about personal info are captured

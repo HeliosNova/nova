@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1%2C453%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1%2C689%20passing-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
@@ -21,7 +21,7 @@ You: "What's the capital of Australia?"
 Nova: "Canberra"  ← learned permanently
 ```
 
-No other AI assistant does this.
+No other open-source project combines all of these capabilities.
 
 ### See it in action
 
@@ -35,17 +35,17 @@ No other AI assistant does this.
 
 Nova is a sovereign personal AI that runs entirely on your hardware with zero cloud dependencies. It doesn't just answer questions — it gets permanently smarter through a self-improvement pipeline that no other open-source project has:
 
-| | Nova | OpenClaw (216K stars) | Khoj (32K stars) | Open WebUI (124K stars) |
-|---|---|---|---|---|
-| Learns from corrections | **Full pipeline** | No | No | No |
-| Fine-tunes itself | **DPO + A/B eval** | No | No | No |
-| Knowledge graph | **Temporal** | No | Experimental | No |
-| Hybrid retrieval | **Vector + BM25 + RRF** | No | Vector only | Vector only |
-| Zero cloud dependency | **Yes (bundled Ollama)** | No (needs API keys) | Partial | Partial |
-| Prompt injection defense | **4-category detection** | No (CVE'd) | No | No |
-| Messaging channels | **4 (all with allowlisting)** | 22+ | 3 | 0 |
-| Proactive monitors | **51 across 29 domains** | Heartbeat | Automations | No |
-| MCP (client + server) | **Both** | No | No | Client only |
+| | Nova | Khoj (32K stars) | Open WebUI (124K stars) |
+|---|---|---|---|
+| Learns from corrections | **Full pipeline** | No | No |
+| Fine-tunes itself | **DPO + A/B eval** | No | No |
+| Knowledge graph | **Temporal** | Experimental | No |
+| Hybrid retrieval | **Vector + BM25 + RRF** | Vector only | Vector only |
+| Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
+| Prompt injection defense | **4-category detection** | No | No |
+| Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
+| Proactive monitors | **52 across 35+ domains** | Automations | No |
+| MCP (client + server) | **Both** | No | Client only |
 
 ## Quick Start
 
@@ -81,12 +81,12 @@ User query -> brain.think()
   -> retrieve documents (ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)
   -> build system prompt (8 prioritized blocks with truncation budget)
   -> generate response (Ollama / OpenAI / Anthropic / Google)
-  -> tool loop if needed (max 5 rounds, 21 tools available)
+  -> tool loop if needed (max 5 rounds, 20 built-in tools)
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
-Meanwhile, 51 monitors run autonomously:
-  -> web search across 29 domains every 1-24h
+Meanwhile, 52 monitors run autonomously:
+  -> web search across 35+ domains every 1-24h
   -> extract knowledge graph triples from every result
   -> send alerts via Discord/Telegram when something changes
   -> quiz itself on learned lessons, validate skills, research gaps
@@ -101,8 +101,8 @@ This is what makes Nova unique. Every conversation makes it smarter:
 1. **Correction Detection** (2-stage) — regex pre-filter + LLM confirmation extracts what was wrong and what's correct
 2. **Lesson Storage** — topic, wrong answer, correct answer, lesson text — retrieved on future similar queries
 3. **DPO Training Pairs** — every correction generates `{query, chosen, rejected}` data for fine-tuning
-4. **Reflexion** — silent failure detection (bad tool choices, hallucinations, exhausted loops) stored as warnings
-5. **Curiosity Engine** — detects knowledge gaps ("I don't know", hedging, tool failures), queues background research
+4. **Reflexion** *(experimental)* — heuristic failure detection (bad tool choices, short answers, exhausted loops) stored as warnings for future reference
+5. **Curiosity Engine** *(experimental)* — detects knowledge gaps ("I don't know", hedging, tool failures), queues background research via scheduled monitors
 6. **Success Patterns** — high-quality responses (score >= 0.8) stored as positive reinforcement
 7. **Automated Fine-Tuning** — when enough pairs accumulate, runs DPO training with A/B evaluation before deploying
 
@@ -111,7 +111,7 @@ python scripts/finetune_auto.py --check   # Check readiness
 python scripts/finetune_auto.py           # Full pipeline: train -> eval -> deploy
 ```
 
-## Tools (21 built-in)
+## Tools (20 built-in)
 
 | Tool | What it does |
 |------|-------------|
@@ -153,27 +153,27 @@ All channels support phone-number allowlisting, message splitting, and graceful 
 
 ## Heartbeat Monitors
 
-51 autonomous monitors run on schedule across 29 domains — Nova works even when you're not talking to it:
+52 autonomous monitors run on schedule across 35+ domains — Nova works even when you're not talking to it:
 
 | Category | Monitors | Schedule | What they do |
 |----------|----------|----------|-------------|
-| **Operational** | Morning Check-in, System Health, Self-Reflection, System Maintenance, Fine-Tune Check | 2h-weekly | Health checks, self-assessment, data hygiene |
-| **Self-Improvement** | Lesson Quiz, Skill Validation, Curiosity Research, Auto-Monitor Detector | 1-12h | Self-tests on learned lessons, validates skills, researches knowledge gaps |
+| **Operational** | Morning Check-in, System Health, System Maintenance, Fine-Tune Check, Auto-Monitor Detector | 2h-weekly | Health checks, data hygiene, fine-tune readiness |
+| **Self-Improvement** | Lesson Quiz, Skill Validation, Curiosity Research | 1-12h | Self-tests on learned lessons, validates skills, researches knowledge gaps |
 | **Financial Intelligence** | Finance, Crypto & Web3, DeFi & Protocols, Whale Watch, Top Trades & Positioning, Commodities & Forex, Earnings & Corporate Events, Economics & Markets | 6-12h | Whale movements, trader positioning, commodity prices, earnings, macro data |
 | **International** | China Tech & Economy, Russia & Eastern Europe, Middle East, India, Europe & EU, Latin America, Africa & Emerging Markets | 8-24h | Regional perspectives from every major economic zone |
 | **Science & Tech** | Science, Technology, AI & ML, Space & Astronomy, Quantum Computing, Robotics & Autonomy, Physics & Mathematics, Biotech & Genetics, Semiconductors | 8-24h | Research breakthroughs, model releases, chip industry, gene therapy |
 | **Policy & Security** | US Policy & Regulation, Cybersecurity, Energy & Climate, Defense & Military Tech | 12h | Regulation, CVEs, climate policy, defense contracts |
-| **Culture & Local** | Sports, Entertainment & Gaming, Social Media Platforms, Local: Los Angeles | 6-12h | Scores, releases, platform changes, local news |
 | **Developer** | Open Source & GitHub, Developer Ecosystem, Startups & VC | 12h | Trending repos, framework releases, funding rounds |
-| **Global** | World Awareness, Current Events, Geopolitics, Supply Chain & Trade, Climate & Weather, Research Frontiers | 4-24h | Breaking news, trade disruptions, trending papers |
+| **Global & News** | World Awareness, Current Events, Geopolitics, Supply Chain & Trade, Research Frontiers, Hacker News Top Stories | 4-24h | Breaking news, trade disruptions, trending papers |
+| **Special Intelligence** | Product Hunt Trending, FDA Drug Approvals, FOMC & Fed Watch, SEC Insider Trading, GitHub Security Advisories, Government Contract Awards | 12-24h | Product launches, drug approvals, monetary policy, insider trades, CVEs, govt contracts |
 
 Every query-type monitor auto-extracts knowledge graph triples. All results include today's date — no stale content.
 
 ## Knowledge Graph
 
-Temporal knowledge graph that grows autonomously — 200+ new facts per day from 37 domain monitors:
+Temporal knowledge graph that grows autonomously from 52 scheduled monitors:
 
-- 20 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, etc.)
+- 31 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, `works_at`, `member_of`, etc.)
 - `valid_from` / `valid_to` — when a fact was true
 - `superseded_by` — tracks how facts change over time (old facts aren't deleted, they're versioned)
 - `provenance` — which source/conversation created it
@@ -205,7 +205,7 @@ Switch providers with one env var:
 | **Anthropic** | `LLM_PROVIDER=anthropic` + key | claude-sonnet |
 | **Google** | `LLM_PROVIDER=google` + key | gemini-2.0-flash |
 
-Automatic model routing: fast model for greetings, heavy model for complex reasoning, vision model for images.
+Model routing *(experimental)*: configurable fast model for greetings, heavy model for complex reasoning, vision model for images. Set via `FAST_MODEL`, `HEAVY_MODEL`, `VISION_MODEL` env vars.
 
 ## Security
 
@@ -236,7 +236,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-1,453 tests across 60+ files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
+1,689 tests across 64 files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
 
 ## Hardware Requirements
 
@@ -273,7 +273,7 @@ docker compose up -d
 
 ## Configuration
 
-All settings via `.env`. See [CLAUDE.md](CLAUDE.md) for the full list of 75+ config fields.
+All settings via `.env`. See [CLAUDE.md](CLAUDE.md) for the full list of 150+ config fields.
 
 ## Contributing
 

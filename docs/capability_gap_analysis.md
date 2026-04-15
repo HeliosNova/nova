@@ -1,14 +1,14 @@
 # Nova — Complete Capability Gap Analysis (March 2026)
 
 ## Methodology
-Cross-referenced Nova's 21 tools against OpenClaw (26 tools + 53 skills + 13K community skills),
+Cross-referenced Nova's 20 built-in tools against leading self-hosted AI assistants,
 Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user expectations.
 
 ---
 
 ## CATEGORY 1: COMMUNICATION
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Send email (SMTP) | YES (action_email) | YES (gog skill) | YES (Gmail/Outlook) | No |
 | Read email (IMAP/API) | NO | YES (Gmail via gog) | YES (Gmail/Outlook) | **YES** |
@@ -28,7 +28,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 2: CALENDAR & SCHEDULING
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Local calendar (.ics) | YES (action_calendar) | NO (uses Google/Apple) | NO | — |
 | Google Calendar sync | NO | YES (gog skill) | YES (OAuth2) | **YES** |
@@ -45,7 +45,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 3: TASK & PROJECT MANAGEMENT
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | To-do list / tasks | NO | YES (Apple Reminders, Todoist) | YES (Notion) | **YES** |
 | Trello/Jira boards | NO | YES (trello skill) | NO | **YES** |
@@ -61,7 +61,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 4: FILE & DOCUMENT MANAGEMENT
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Read/write local files | YES (file_ops) | YES (read/write tools) | NO | No |
 | List/search files | YES (file_ops) | YES (list/search tools) | NO | No |
@@ -78,7 +78,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 5: WEB & BROWSER
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Web search | YES (web_search) | YES (Brave/Perplexity/etc.) | YES (Brave) | No |
 | HTTP fetch | YES (http_fetch) | YES (web_fetch) | NO | No |
@@ -92,7 +92,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 6: SYSTEM & DEVELOPMENT
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Shell commands | YES (shell_exec) | YES (exec) | NO | No |
 | Code execution (sandbox) | YES (code_exec) | YES | NO | No |
@@ -104,13 +104,13 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 | Cron/scheduled scripts | Via monitors | YES (schedule/heartbeat) | NO | Partial |
 | Image generation | NO | YES (image_gen: DALL-E/SD) | NO | **YES** |
 
-**Nova's gap:** No direct database tool, no SSH, no image generation. Git/Docker possible but not structured. Monitors are actually stronger than OpenClaw's heartbeat.
+**Nova's gap:** No direct database tool, no SSH, no image generation. Git/Docker possible but not structured. Monitors are stronger than typical competitor heartbeat systems.
 
 ---
 
 ## CATEGORY 7: SMART HOME & IoT
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Home Assistant | Via webhook only | YES (home-assistant skill) | NO | **YES** |
 | Philips Hue | NO | Community skill | NO | **YES** |
@@ -123,7 +123,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 8: MEDIA & ENTERTAINMENT
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Spotify control | NO | YES (spotify skill) | NO | **YES** |
 | YouTube summary | Via web_search | Community skill | NO | Partial |
@@ -136,20 +136,20 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 9: FINANCE & DATA
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Stock/crypto prices | Via web_search | YES (finance skills) | NO | Partial |
 | Portfolio tracking | NO | Community skill | NO | **YES** |
 | Weather | Via web_search | YES (weather skill) | NO | Partial |
 | News aggregation | YES (domain study monitors) | Community skill | NO | No (Nova wins) |
 
-**Nova's gap:** Domain study monitors are actually better than OpenClaw for news/research. Financial tools are weak.
+**Nova's gap:** Domain study monitors excel at news/research compared to typical competitors. Financial tools are weak.
 
 ---
 
 ## CATEGORY 10: VOICE & MULTIMODAL
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Speech-to-text (STT) | YES (Whisper) | NO (via skills) | NO | No (Nova wins) |
 | Text-to-speech (TTS) | NO | Community skill | NO | **YES** |
@@ -162,14 +162,14 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 11: AUTOMATION & WORKFLOWS
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
-| Scheduled checks/monitors | YES (51 monitors, 29 domains) | YES (heartbeat/schedule) | NO | No (Nova wins) |
+| Scheduled checks/monitors | YES (52 monitors, 35+ domains) | YES (heartbeat/schedule) | NO | No (Nova wins) |
 | Conditional actions (if X then Y) | NO (alert only) | Via skill logic | NO | **YES** |
 | Multi-step workflows | Partial (delegate) | YES (skill chains) | YES (via plugins) | **YES** |
 | Webhook triggers | YES (action_webhook) | YES | NO | No |
 | OAuth2 flows | NO | YES (per-skill) | YES (built-in) | **YES** |
-| Community skill/plugin system | NO | YES (ClawHub: 13K+) | YES (plugin system) | **YES** |
+| Community skill/plugin system | NO | YES (community plugins) | YES (plugin system) | **YES** |
 | Reminders | YES (action_reminder) | YES | YES | No |
 
 **Nova's gap:** The biggest structural gap. No conditional actions, no OAuth2, no community skills ecosystem.
@@ -178,7 +178,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 
 ## CATEGORY 12: LEARNING & INTELLIGENCE (Nova's Moat)
 
-| Capability | Nova | OpenClaw | Open Assistant | Gap? |
+| Capability | Nova | Competitors | Open Assistant | Gap? |
 |---|---|---|---|---|
 | Learn from corrections | YES (full pipeline) | NO | NO | Nova wins |
 | DPO training data gen | YES | NO | NO | Nova wins |
@@ -189,7 +189,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 | Reflexion (failure learning) | YES | NO | NO | Nova wins |
 | Domain studies (proactive research) | YES | NO | NO | Nova wins |
 | Skill auto-creation | YES | NO | NO | Nova wins |
-| Prompt injection detection | YES (4-category) | NO (CVE'd) | NO | Nova wins |
+| Prompt injection detection | YES (4-category) | NO | NO | Nova wins |
 | MCP server (expose intelligence) | YES | NO | NO | Nova wins |
 
 **No gap here.** This is Nova's moat. No competitor has any of this.
@@ -224,7 +224,7 @@ Open Assistant (self-hosted, OAuth2-based integrations), CoPaw, and 2026 user ex
 19. **ZIP/compression**
 20. **Weather widget** (dedicated, not web search)
 21. **Portfolio/finance tracking**
-22. **Skill sharing format** (Nova's version of ClawHub)
+22. **Skill sharing format** (community skill marketplace)
 
 ---
 
@@ -236,7 +236,7 @@ Don't lose sight of this — Nova has things NO competitor has:
 - Hybrid retrieval (vector + BM25 + RRF fusion)
 - Curiosity engine (auto-detects gaps, researches autonomously)
 - Reflexion store (learns from silent failures)
-- 51 autonomous monitors across 29 domains (finance, geopolitics, crypto, science, sports, etc.)
+- 52 autonomous monitors across 35+ domains (finance, geopolitics, crypto, science, tech, etc.)
 - MCP server (exposes intelligence to other agents)
 - Prompt injection detection (4-category heuristic)
 - True sovereignty (zero cloud dependency)

@@ -13,7 +13,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     # Voice transcription (Whisper needs ffmpeg for audio decoding)
     ffmpeg \
     # Desktop automation deps (PyAutoGUI — optional, used with ENABLE_DESKTOP_AUTOMATION)
-    xvfb scrot x11-utils \
+    xvfb scrot x11-utils python3-tk python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps

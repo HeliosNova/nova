@@ -270,7 +270,11 @@ class BrowserTool(BaseTool):
                     host_port = f"{cdp_parsed.hostname}:{cdp_parsed.port or 9222}"
                     ws_url = f"ws://{host_port}{ws_parsed.path}"
             except Exception as e:
-                raise RuntimeError(f"Cannot reach host browser at {cdp_url}: {e}")
+                # CDP unavailable — fall back to headless launch
+                logger.warning("[Browser] Cannot reach host browser at %s: %s — launching headless", cdp_url, e)
+                cdp_url = None  # Fall through to headless launch below
+
+        if cdp_url:
             BrowserTool._browser = await BrowserTool._playwright.chromium.connect_over_cdp(ws_url)
             logger.info("[Browser] Connected to host browser at %s", cdp_url)
         else:

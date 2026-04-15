@@ -1,4 +1,4 @@
-"""External skill loader — loads AgentSkills / OpenClaw SKILL.md files.
+"""External skill loader — loads AgentSkills SKILL.md files.
 
 Scans a skills/ directory for */SKILL.md files, parses YAML frontmatter,
 checks requirements, and makes skills available for prompt injection.
@@ -28,11 +28,11 @@ class ExternalSkill:
     body: str                          # Full markdown body (instructions)
     metadata: dict = field(default_factory=dict)
     requirements_met: bool = True
-    tool_mapping: dict = field(default_factory=dict)  # OpenClaw tool -> Nova tool
+    tool_mapping: dict = field(default_factory=dict)  # external tool -> Nova tool
     _description_words: set = field(default_factory=set, repr=False)
 
 
-# Maps OpenClaw/AgentSkills tool names to Nova tool names
+# Maps AgentSkills tool names to Nova tool names
 _TOOL_MAP = {
     "bash": "shell_exec",
     "read": "file_ops",
@@ -133,7 +133,7 @@ def _check_requirements(metadata: dict) -> tuple[bool, list[str]]:
     missing = []
     requires = metadata.get("metadata", {})
     if isinstance(requires, dict):
-        requires = requires.get("openclaw", requires)
+        requires = requires.get("external", requires)  # legacy key name for external skill requirements
         if isinstance(requires, dict):
             requires = requires.get("requires", {})
 
@@ -162,7 +162,7 @@ def _check_requirements(metadata: dict) -> tuple[bool, list[str]]:
 
 
 def _map_tools(metadata: dict) -> dict[str, str]:
-    """Map OpenClaw allowed-tools to Nova tool names."""
+    """Map external skill allowed-tools to Nova tool names."""
     allowed = metadata.get("allowed-tools", [])
     if isinstance(allowed, str):
         allowed = [allowed]

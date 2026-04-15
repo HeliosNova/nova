@@ -21,7 +21,9 @@ if sys.platform == "win32":
 import httpx
 
 API = os.getenv("NOVA_API_URL", "http://localhost:8000")
+API_KEY = os.getenv("NOVA_API_KEY", "")
 SLOW = 0.03  # typing speed (seconds per char)
+_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
 
 
 def slow_print(text: str, speed: float = SLOW, color: str = ""):
@@ -67,6 +69,7 @@ def chat(query: str, conversation_id: str | None = None) -> tuple[str, str, list
     resp = httpx.post(
         f"{API}/api/chat",
         json=payload,
+        headers=_HEADERS,
         timeout=300.0,
     )
     resp.raise_for_status()
@@ -75,12 +78,12 @@ def chat(query: str, conversation_id: str | None = None) -> tuple[str, str, list
 
 
 def get_status() -> dict:
-    resp = httpx.get(f"{API}/api/status", timeout=10.0)
+    resp = httpx.get(f"{API}/api/status", headers=_HEADERS, timeout=10.0)
     return resp.json()
 
 
 def get_lessons() -> list:
-    resp = httpx.get(f"{API}/api/learning/lessons", timeout=10.0)
+    resp = httpx.get(f"{API}/api/learning/lessons", headers=_HEADERS, timeout=10.0)
     return resp.json()
 
 
@@ -172,16 +175,31 @@ def main():
     print(f"  Training Pairs:{status.get('training_examples', 0)} → {status2.get('training_examples', 0)}")
     time.sleep(1)
 
+    # --- Step 7: Show KG from monitors ---
+    header("Step 7: Knowledge Graph (built by 52 autonomous monitors)")
+    print("  \033[0;90mMonitors search 35+ domains every 1-24h and extract KG triples.\033[0m")
+    print("  \033[0;90mNova uses these facts to answer without searching.\033[0m")
+    print()
+    time.sleep(1)
+
+    user_says("What do you know about the world population?")
+    answer4, _, tools4 = chat("What is the current world population? Don't search, just tell me what you know.")
+    nova_says(answer4[:300])
+    if not tools4:
+        nova_event(">>> Answered from knowledge graph — no web search needed!")
+    time.sleep(2)
+
     # --- Outro ---
     print()
     print(f"\033[1;36m{'─' * 60}\033[0m")
     print()
     print("  \033[1;37mThis is the Nova learning loop:\033[0m")
     print()
-    print("  \033[0;37m  Correction → Lesson → DPO Pair → Fine-Tuning → Better Model\033[0m")
+    print("  \033[0;37m  Corrections → Lessons → DPO Pairs → Fine-Tuning → Better Model\033[0m")
+    print("  \033[0;37m  52 monitors  → Web Research → KG Triples → Contextual Answers\033[0m")
     print()
-    print("  \033[0;37m  Every correction makes Nova permanently smarter.\033[0m")
-    print("  \033[0;37m  No other AI assistant does this.\033[0m")
+    print("  \033[0;37m  Every correction and every monitor cycle makes Nova smarter.\033[0m")
+    print("  \033[0;37m  No other open-source project combines all of this.\033[0m")
     print()
     print("  \033[1;36m  https://github.com/HeliosNova/nova\033[0m")
     print()

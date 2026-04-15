@@ -120,8 +120,14 @@ export default function MonitorsPage() {
   const handleTrigger = async (id: number) => {
     setTriggering(id);
     try {
-      await triggerMonitor(id);
-      toast.success("Monitor triggered");
+      const result = await triggerMonitor(id);
+      const status = result?.status || "ok";
+      const value = result?.value || "";
+      if (status === "error") {
+        toast.error(`Monitor failed: ${value.slice(0, 100)}`);
+      } else {
+        toast.success(`Monitor complete: ${value.slice(0, 120)}...`, { duration: 8000 });
+      }
       refresh();
     } catch {
       toast.error("Failed to trigger monitor");

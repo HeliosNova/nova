@@ -47,7 +47,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 | `app/tools/desktop.py` | Desktop automation (screenshot, click, type, hotkey) |
 | `app/core/voice.py` | WhisperTranscriber — local speech-to-text |
 | `app/api/voice.py` | Voice API endpoints (transcribe, chat) |
-| `app/config.py` | ~85 settings from .env (frozen dataclass) |
+| `app/config.py` | ~150 settings from .env (frozen dataclass) |
 | `app/database.py` | SafeDB singleton wrapping sqlite3 |
 | `app/tools/base.py` | BaseTool + ToolResult + ToolRegistry |
 | `app/api/chat.py` | POST /chat/stream (SSE) + POST /chat (sync) |
@@ -70,7 +70,7 @@ Main responses use `generate_with_tools()` (thinking suppressed for speed) or `s
 ### Tool Calling (Hybrid: Native + Text)
 Cloud providers (OpenAI, Anthropic, Google) use native structured tool calls returned in `result.tool_call`.
 Tools are now passed through `stream_with_thinking()` for all cloud providers, enabling streaming tool calls.
-Ollama uses prompt-based text extraction (Qwen3.5 native tool calling is broken, GitHub #14493):
+Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as fallback:
 ```
 {"tool": "tool_name", "args": {"param": "value"}}
 ```
@@ -119,8 +119,8 @@ Always truthy. Use `fetchone()` / `fetchall()` for SELECTs.
 - **none**: All restrictions disabled. No blocked commands, imports, builtins, or path checks.
 
 ### Tool Timeout
-`TOOL_TIMEOUT` (default 120s) controls the per-tool execution timeout in `brain.py`.
-`GENERATION_TIMEOUT` (default 480s) controls LLM generation timeout.
+`TOOL_TIMEOUT` (default 180s) controls the per-tool execution timeout in `brain.py`.
+`GENERATION_TIMEOUT` (default 900s) controls LLM generation timeout.
 
 ### Route Ordering
 Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path conflicts.
@@ -130,17 +130,17 @@ Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path 
 ### Monitor System (`app/monitors/heartbeat.py`)
 Background loop checks monitors on schedule, detects changes, sends alerts via Discord/Telegram/WhatsApp/Signal.
 
-**51 default monitors** (seeded on first startup):
-- **Operational** (6): Morning Check-in (daily), System Health (2h), Self-Reflection (daily), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
+**52 default monitors** (seeded on first startup):
+- **Operational** (5): Morning Check-in (daily), System Health (2h), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
 - **Self-Improvement** (3): Lesson Quiz (6h), Skill Validation (12h), Curiosity Research (1h)
-- **Financial Intelligence** (7): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h)
+- **Financial Intelligence** (10): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h), FOMC & Fed Watch (24h), SEC Insider Trading (12h), Economics & Markets (12h)
 - **International** (6): China Tech (8h), Russia & E.Europe (12h), Middle East (12h), India (12h), Europe & EU (12h), Geopolitics (8h)
 - **Science/Tech** (9): Science, Technology, AI & ML, Space, Quantum, Robotics, Physics, Biotech, Semiconductors (8-24h)
 - **Policy/Security** (4): US Policy, Cybersecurity, Energy & Climate, Defense & Military (12h)
-- **Culture/Local** (5): Sports (6h), Entertainment (12h), Social Media (12h), LA Local (12h), Climate & Weather (12h)
+- **Intelligence** (7): Hacker News (8h), Product Hunt (24h), FDA Drug Approvals (24h), GitHub Security Advisories (12h), Government Contract Awards (24h), Health & Medicine (12h), Research Frontiers (24h)
 - **Developer/Business** (3): Open Source & GitHub (12h), Developer Ecosystem (12h), Startups & VC (12h)
-- **Global** (5): World Awareness (4h), Current Events (8h), Economics & Markets (12h), Supply Chain (12h), Research Frontiers (24h)
-- **Geographic** (3): Latin America (24h), Africa & Emerging (24h), Research Frontiers (24h)
+- **Global** (3): World Awareness (4h), Current Events (8h), Supply Chain (12h)
+- **Geographic** (2): Latin America (24h), Africa & Emerging (24h)
 
 All query-type monitors auto-extract KG triples. All prompts anchored to "past 24-48 hours" with today's date injected.
 
@@ -338,3 +338,108 @@ Local Whisper STT (speech-to-text). Gated by `ENABLE_VOICE`.
 - Model size via `WHISPER_MODEL_SIZE` (default "base"), max duration via `VOICE_MAX_DURATION` (300s)
 - 25MB file size limit, audio extension validation
 - GPU auto-unloaded on shutdown
+
+## Automated Eval Harness (`app/monitors/eval_harness.py`)
+
+Self-testing pipeline that runs a curated task suite through the real brain,
+computes quality metrics, and flags regressions.  Runs as a nightly heartbeat
+monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `evals/suite.yaml` | 30 evaluation tasks across 6 categories |
+| `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
+| `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
+| `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
+| `/data/eval_reports/eval_history.jsonl` | Time-series log — one line per run, appended |
+| `/data/eval_reports/eval_baseline.json` | Regression baseline (written on first run) |
+
+### Categories
+
+| Category | Tasks | What it tests |
+|----------|-------|---------------|
+| `reasoning` | 5 | Arithmetic, logic, definitions — no tools, high reflexion expected |
+| `tool-use` | 6 | calculator, code_exec, web_search invocation + answer correctness |
+| `skill-match` | 6 | Seeded "Eval: *" skills matched by exact regex (eval-probe: prefix) |
+| `semantic-match` | 5 | Paraphrase queries that must hit same skill via ChromaDB at threshold 0.65 |
+| `autonomous-tool` | 4 | Multi-step queries; metric = fraction using ≥2 tools |
+| `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
+
+### Metrics
+
+- **Per-category**: pass_rate, latency P50/P95, reflexion mean/std/P10/P90
+- **skill-match**: hit_rate (fraction of queries that matched any skill)
+- **semantic-match**: recall_at_threshold (paraphrases matching at 0.65)
+- **autonomous-tool**: multi_tool_rate (fraction using ≥2 tools)
+- **Regression flags**: any metric dropping >EVAL_REGRESSION_TOLERANCE (10%) from baseline
+
+### How to add a task
+
+Add an entry to `evals/suite.yaml`:
+
+```yaml
+- id: my_task_001          # unique snake_case id
+  category: reasoning       # one of the 6 categories above
+  query: "What is 2+2?"
+  timeout: 45               # seconds (default 60)
+  assertions:
+    - type: answer_contains
+      value: "4"
+    - type: reflexion_above
+      value: 0.5
+```
+
+For a skill-match task with a seeded skill:
+
+```yaml
+- id: skill_match_myskill
+  category: skill-match
+  query: "eval-probe: do my thing"
+  seed_skill:
+    name: "Eval: My Skill"
+    trigger_pattern: "(?i)\\beval-probe[:\\s]+.*do\\s+my\\s+thing\\b"
+    steps:
+      - tool: web_search
+        args_template: {q: "{query}"}
+        output_key: result
+  assertions:
+    - type: skill_matched
+```
+
+### How to interpret a drift flag
+
+A `RegressionFlag` in the report JSON means a metric dropped more than
+`EVAL_REGRESSION_TOLERANCE` (default 0.10 = 10 percentage points) below the
+stored baseline.  Common causes:
+
+- **skill-match.hit_rate drops** — skill patterns broken or SkillStore corrupted
+- **semantic-match.recall_at_threshold drops** — `SKILL_SEMANTIC_THRESHOLD` too high
+  (was the regression we proved empirically: raising to 0.99 drops recall to 0%)
+- **tool-use.pass_rate drops** — tool registry broken or tool unreachable
+- **reflexion_mean drifts upward** — score inflation (quality heuristic too lenient)
+
+To update the baseline after intentional improvements:
+
+```python
+from app.monitors.eval_harness import EvalHarness
+harness = EvalHarness()
+# Load any recent report JSON as the new baseline
+import json
+with open("/data/eval_reports/eval_<ts>.json") as f:
+    data = json.load(f)
+# Then write it as baseline directly
+import shutil
+shutil.copy("/data/eval_reports/eval_<ts>.json",
+            "/data/eval_reports/eval_baseline.json")
+```
+
+### Config flags
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_EVAL_HARNESS` | `true` | Enable/disable the harness monitor |
+| `EVAL_SUITE_PATH` | `evals/suite.yaml` | Path to task suite YAML |
+| `EVAL_REPORT_PATH` | `/data/eval_reports` | Output directory for reports |
+| `EVAL_REGRESSION_TOLERANCE` | `0.10` | Allowed metric drop before flagging |

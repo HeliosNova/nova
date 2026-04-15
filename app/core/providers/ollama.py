@@ -43,7 +43,7 @@ class OllamaProvider:
         from app.core.llm import ProviderCapabilities
         return ProviderCapabilities(
             needs_emphatic_prompts=True,
-            supports_native_tools=False,
+            supports_native_tools=True,
             supports_thinking=True,
             json_prefix_behavior="prepend",
         )
@@ -80,6 +80,7 @@ class OllamaProvider:
         *,
         json_mode: bool = False,
         json_prefix: str = "[{",
+        json_schema: dict | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.1,
         model: str | None = None,
@@ -112,7 +113,8 @@ class OllamaProvider:
         }
 
         if json_mode:
-            payload["format"] = "json"
+            # Schema enforcement (Ollama 0.17+) or generic JSON mode
+            payload["format"] = json_schema if json_schema else "json"
 
         try:
             resp = await retry_on_transient(client, "POST", "/api/chat", json=payload)
@@ -169,17 +171,27 @@ class OllamaProvider:
         if is_qwen and not config.ENABLE_EXTENDED_THINKING:
             send_messages.append({"role": "assistant", "content": "<think>\n\n</think>\n"})
 
+        # Build payload with native tool calling
+        payload: dict = {
+            "model": model,
+            "stream": False,
+            "think": False,
+            "messages": send_messages,
+            "options": {
+                "num_predict": max_tokens,
+                "temperature": temperature,
+            },
+        }
+        # Pass tools for native tool calling (Ollama 0.17+)
+        # Disabled by default: native tools + thinking causes empty responses
+        if tools and self.capabilities.supports_native_tools:
+            payload["tools"] = [
+                {"type": "function", "function": t} if "function" not in t else t
+                for t in tools
+            ]
+
         try:
-            resp = await retry_on_transient(client, "POST", "/api/chat", json={
-                "model": model,
-                "stream": False,
-                "think": False,
-                "messages": send_messages,
-                "options": {
-                    "num_predict": max_tokens,
-                    "temperature": temperature,
-                },
-            })
+            resp = await retry_on_transient(client, "POST", "/api/chat", json=payload)
         except httpx.ConnectError:
             raise LLMUnavailableError("Cannot connect to Ollama. Is it running?")
         except httpx.TimeoutException:
@@ -188,7 +200,8 @@ class OllamaProvider:
             raise
 
         data = resp.json()
-        content = data.get("message", {}).get("content", "")
+        msg = data.get("message", {})
+        content = msg.get("content", "")
         content = _strip_think_tags(content).strip()
 
         # Populate usage from Ollama response
@@ -202,11 +215,31 @@ class OllamaProvider:
             logger.warning("Ollama response truncated (done_reason=length)")
             content += "\n\n[Warning: Response was truncated due to token limit]"
 
-        tool_call = _extract_tool_call(content, tools)
+        # Native tool calls from Ollama (structured, like OpenAI)
+        native_tool_calls = msg.get("tool_calls", [])
+        tool_calls_out: list[ToolCall] = []
+        if native_tool_calls:
+            for tc in native_tool_calls:
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", {})
+                if isinstance(args, str):
+                    try:
+                        args = json.loads(args)
+                    except (json.JSONDecodeError, TypeError):
+                        args = {}
+                if name:
+                    tool_calls_out.append(ToolCall(tool=name, args=args))
+
+        # Fallback to text parsing if no native tool calls found
+        if not tool_calls_out:
+            text_tool_call = _extract_tool_call(content, tools)
+            if text_tool_call:
+                tool_calls_out = [text_tool_call]
 
         return GenerationResult(
             content=content,
-            tool_calls=[tool_call] if tool_call else [],
+            tool_calls=tool_calls_out,
             raw=data,
             usage=usage,
             stop_reason=data.get("done_reason", ""),
@@ -220,27 +253,31 @@ class OllamaProvider:
         model: str | None = None,
         temperature: float = 0.6,
         max_tokens: int = 4000,
-        tool_choice: str | None = None,  # ignored — Ollama has no native tool calling
+        tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream a response with thinking enabled. Yields incremental chunks.
 
-        Note: tools are not passed to Ollama streaming — Qwen3.5 native tool
-        calling via Ollama is broken (GitHub ollama/ollama#14493). Tool calls
-        are extracted from text output by the brain's _extract_tool_calls().
+        Tools are passed to Ollama for native tool calling (Ollama 0.17+).
+        Brain.py still has text-parsing fallback for older Ollama versions.
         """
         model = model or self._llm_model
         client = self._get_client()
         use_think = True  # Fallback to False if model doesn't support thinking
+
+        # Convert tools to Ollama format
+        ollama_tools = None
+        if tools:
+            ollama_tools = [
+                {"type": "function", "function": t} if "function" not in t else t
+                for t in tools
+            ]
 
         _yielded_done = False
         max_stream_retries = 2
         try:
             for _stream_attempt in range(max_stream_retries + 1):
                 try:
-                    async with client.stream(
-                        "POST",
-                        "/api/chat",
-                        json={
+                    payload = {
                             "model": model,
                             "stream": True,
                             **({"think": True} if use_think else {}),
@@ -249,7 +286,13 @@ class OllamaProvider:
                                 "num_predict": max_tokens,
                                 "temperature": temperature,
                             },
-                        },
+                        }
+                    if ollama_tools and self.capabilities.supports_native_tools:
+                        payload["tools"] = ollama_tools
+                    async with client.stream(
+                        "POST",
+                        "/api/chat",
+                        json=payload,
                         timeout=httpx.Timeout(float(config.GENERATION_TIMEOUT), connect=10.0, read=300.0),
                     ) as resp:
                         # Catch models that don't support thinking (missing RENDERER/PARSER)
@@ -277,13 +320,30 @@ class OllamaProvider:
                             content_delta = msg.get("content", "")
                             done = chunk_data.get("done", False)
 
-                            if thinking_delta or content_delta or done:
+                            # Native tool calls in stream (Ollama 0.17+)
+                            stream_tool_calls = msg.get("tool_calls")
+                            stream_tool: ToolCall | None = None
+                            if stream_tool_calls:
+                                for tc in stream_tool_calls:
+                                    func = tc.get("function", {})
+                                    name = func.get("name", "")
+                                    args = func.get("arguments", {})
+                                    if isinstance(args, str):
+                                        try:
+                                            args = json.loads(args)
+                                        except (json.JSONDecodeError, TypeError):
+                                            args = {}
+                                    if name:
+                                        stream_tool = ToolCall(tool=name, args=args)
+
+                            if thinking_delta or content_delta or done or stream_tool:
                                 if done:
                                     _yielded_done = True
                                 yield StreamChunk(
                                     thinking=thinking_delta,
                                     content=content_delta,
                                     done=done,
+                                    tool_call=stream_tool,
                                 )
                     return  # Success — exit retry loop
                 except httpx.ReadError:

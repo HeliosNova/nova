@@ -49,7 +49,8 @@ _MUTABLE_FIELDS = {
     "ENABLE_VOICE", "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
     "ENABLE_SHELL_EXEC", "ENABLE_MCP", "ENABLE_MCP_SERVER",
-    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_INJECTION_DETECTION",
+    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
+    "AUTO_TOOL_CREATION_THRESHOLD", "ENABLE_INJECTION_DETECTION",
     "ENABLE_DESKTOP_AUTOMATION", "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
     "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
@@ -67,10 +68,13 @@ _MUTABLE_FIELDS = {
     "TEMPERATURE_DEFAULT", "TEMPERATURE_INTERNAL", "TEMPERATURE_REFLEXION",
     "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
+    "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
     "SKILL_EMA_ALPHA", "INJECTION_SUSPICIOUS_THRESHOLD",
     "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
+    "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
+    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
 }
 
 
@@ -97,7 +101,7 @@ class Config:
     ENABLE_MCP_SERVER: bool = field(default_factory=lambda: _env("ENABLE_MCP_SERVER", "true").lower() == "true")
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
-    # External skills (AgentSkills / OpenClaw)
+    # External skills (AgentSkills format)
     SKILLS_DIR: str = field(default_factory=lambda: _env("SKILLS_DIR", "/data/skills"))
 
     # Memory
@@ -122,13 +126,13 @@ class Config:
     WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "google,duckduckgo,brave"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
     CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 10))
-    MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 5))
+    MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 10))
     SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 30))
     BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 30))
     BROWSER_CDP_URL: str = field(default_factory=lambda: _env("BROWSER_CDP_URL", ""))  # http:// CDP URL to connect to host browser
-    TOOL_TIMEOUT: int = field(default_factory=lambda: _env_int("TOOL_TIMEOUT", 120))
+    TOOL_TIMEOUT: int = field(default_factory=lambda: _env_int("TOOL_TIMEOUT", 180))
     TOOL_OUTPUT_MAX_CHARS: int = field(default_factory=lambda: _env_int("TOOL_OUTPUT_MAX_CHARS", 10000))
-    GENERATION_TIMEOUT: int = field(default_factory=lambda: _env_int("GENERATION_TIMEOUT", 480))
+    GENERATION_TIMEOUT: int = field(default_factory=lambda: _env_int("GENERATION_TIMEOUT", 900))
     INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 30))
     ENABLE_SHELL_EXEC: bool = field(default_factory=lambda: _env("ENABLE_SHELL_EXEC", "false").lower() == "true")
 
@@ -144,6 +148,12 @@ class Config:
     MIN_MONITOR_SCHEDULE_SECONDS: int = field(default_factory=lambda: _env_int("MIN_MONITOR_SCHEDULE_SECONDS", 60))
     DIGEST_HOUR: int = field(default_factory=lambda: _env_int("DIGEST_HOUR", 21))
     USER_TIMEZONE: str = field(default_factory=lambda: _env("USER_TIMEZONE", "UTC"))
+
+    # Automated eval harness
+    ENABLE_EVAL_HARNESS: bool = field(default_factory=lambda: _env("ENABLE_EVAL_HARNESS", "true").lower() == "true")
+    EVAL_SUITE_PATH: str = field(default_factory=lambda: _env("EVAL_SUITE_PATH", "evals/suite.yaml"))
+    EVAL_REPORT_PATH: str = field(default_factory=lambda: _env("EVAL_REPORT_PATH", "/data/eval_reports"))
+    EVAL_REGRESSION_TOLERANCE: float = field(default_factory=lambda: _env_float("EVAL_REGRESSION_TOLERANCE", 0.10))
 
     # Learning
     TRAINING_DATA_PATH: str = field(default_factory=lambda: _env("TRAINING_DATA_PATH", "/data/training_data.jsonl"))
@@ -173,9 +183,15 @@ class Config:
     CRITIQUE_SOURCES_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_SOURCES_LIMIT", 1500))
     CRITIQUE_FACTS_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_FACTS_LIMIT", 2000))
 
-    # Delegation (multi-agent)
+    # Delegation (LLM-driven, via DelegateTool)
     ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
     MAX_DELEGATION_DEPTH: int = field(default_factory=lambda: _env_int("MAX_DELEGATION_DEPTH", 1))
+
+    # Multi-agent structural decomposition
+    ENABLE_MULTI_AGENT: bool = field(default_factory=lambda: _env("ENABLE_MULTI_AGENT", "true").lower() == "true")
+    MULTI_AGENT_TRIGGER_THRESHOLD: int = field(default_factory=lambda: _env_int("MULTI_AGENT_TRIGGER_THRESHOLD", 4))
+    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 5))
+    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 90))
 
     # Background tasks
     MAX_BACKGROUND_TASKS: int = field(default_factory=lambda: _env_int("MAX_BACKGROUND_TASKS", 5))
@@ -183,6 +199,10 @@ class Config:
 
     # Auto skill creation
     ENABLE_AUTO_SKILL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTO_SKILL_CREATION", "true").lower() == "true")
+
+    # Autonomous tool creation (self-extending pipeline)
+    ENABLE_AUTONOMOUS_TOOL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTONOMOUS_TOOL_CREATION", "true").lower() == "true")
+    AUTO_TOOL_CREATION_THRESHOLD: int = field(default_factory=lambda: _env_int("AUTO_TOOL_CREATION_THRESHOLD", 3))
 
     # Skill import/export signing
     REQUIRE_SIGNED_SKILLS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_SKILLS", "true").lower() == "true")
@@ -196,7 +216,7 @@ class Config:
     VOICE_MAX_DURATION: int = field(default_factory=lambda: _env_int("VOICE_MAX_DURATION", 300))
 
     # Limits
-    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 6000))
+    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 10000))
     MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
     MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 1000))
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
@@ -232,6 +252,8 @@ class Config:
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
+    ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
+    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.65))
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
     INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
     FACT_INJECTION_SKIP_THRESHOLD: float = field(default_factory=lambda: _env_float("FACT_INJECTION_SKIP_THRESHOLD", 0.3))

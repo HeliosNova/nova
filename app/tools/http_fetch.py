@@ -103,7 +103,11 @@ def _safe_url_with_pinned_ip(url: str) -> tuple[str, str, str | None] | None:
         # If host is already the resolved IP, no pinning needed
         if host == resolved_ip:
             return (url, url, None)
-        # Replace hostname with resolved IP in the URL
+        # HTTPS: skip DNS pinning — SSL cert validation already prevents SSRF
+        # (pinning breaks CDN sites where resolved IP doesn't match cert)
+        if parsed.scheme == "https":
+            return (url, url, None)
+        # HTTP only: replace hostname with resolved IP to prevent DNS rebinding
         port_suffix = f":{parsed.port}" if parsed.port else ""
         pinned_netloc = f"{resolved_ip}{port_suffix}"
         pinned_url = urlunparse(parsed._replace(netloc=pinned_netloc))

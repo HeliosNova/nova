@@ -14,6 +14,7 @@ sympy==1.13.3
 # Utilities
 python-multipart==0.0.22
 pydantic>=2.11.0,<3.0.0
+PyYAML>=6.0
 
 # Channels
 discord.py==2.4.0
@@ -28,6 +29,7 @@ playwright==1.49.1
 
 # Desktop automation (optional — only used when ENABLE_DESKTOP_AUTOMATION=true)
 pyautogui==0.9.54
+Pillow>=10.0.0
 
 # Voice (optional — only used when ENABLE_VOICE=true)
 openai-whisper==20250625

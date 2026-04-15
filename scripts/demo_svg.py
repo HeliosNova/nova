@@ -1,108 +1,123 @@
 #!/usr/bin/env python3
-"""Generate an SVG demo of the Nova learning loop.
+"""Generate demo.svg by running the learning loop against the live API."""
 
-Produces a static SVG showing the correction → lesson → recall flow.
-No live API needed — uses pre-recorded data from a real run.
-"""
+import os
+import time
 
-import io
-import sys
-
+import httpx
 from rich.console import Console
 from rich.panel import Panel
-from rich.text import Text
-from rich.table import Table
 
-# Force Rich to use file-based output (avoids Windows legacy console encoding)
-console = Console(record=True, width=80, file=io.StringIO(), force_terminal=True)
+API = os.getenv("NOVA_API_URL", "http://localhost:8000")
+KEY = os.getenv("NOVA_API_KEY", "")
+H = {"Authorization": f"Bearer {KEY}"} if KEY else {}
 
-console.print()
-console.print(
-    Panel.fit(
+console = Console(record=True, width=90)
+
+
+def chat(query, conv_id=None):
+    payload = {"query": query}
+    if conv_id:
+        payload["conversation_id"] = conv_id
+    r = httpx.post(f"{API}/api/chat", json=payload, headers=H, timeout=300)
+    r.raise_for_status()
+    d = r.json()
+    return d["answer"], d["conversation_id"], d.get("tool_results", [])
+
+
+def status():
+    return httpx.get(f"{API}/api/status", headers=H, timeout=10).json()
+
+
+def main():
+    console.print()
+    console.print(Panel.fit(
         "[bold white]Nova — The AI that learns from its mistakes[/]\n"
         "[dim]Live demo of the self-improvement pipeline[/]",
         border_style="cyan",
+    ))
+
+    # Step 1
+    console.print("\n[bold cyan]Step 1: System Status[/]")
+    s = status()
+    lessons = s.get("lessons", 0)
+    kg = s.get("kg_facts", 0)
+    dpo = s.get("training_examples", 0)
+    console.print(f"  Lessons: {lessons}  |  KG Facts: {kg}  |  DPO Pairs: {dpo}")
+
+    # Step 2
+    console.print("\n[bold cyan]Step 2: Ask a question[/]")
+    console.print("[bold green]  You:[/] Who wrote the novel '1984'?")
+    a1, cid, _ = chat("Who wrote the novel '1984'?")
+    console.print(f"[bold magenta]  Nova:[/] {a1[:250]}")
+
+    # Step 3
+    console.print("\n[bold cyan]Step 3: Correct Nova (triggers learning pipeline)[/]")
+    console.print("[dim]  2-stage: regex pre-filter then LLM extraction[/]")
+    correction = (
+        "Actually, remember that 1984 was written by Eric Arthur Blair, "
+        "better known by his pen name George Orwell. Always use his real name."
     )
-)
+    console.print(f"[bold green]  You:[/] {correction}")
+    a2, _, _ = chat(correction, conv_id=cid)
+    console.print(f"[bold magenta]  Nova:[/] {a2[:250]}")
+    time.sleep(3)
 
-# Step 1
-console.print("\n[bold cyan]── Step 1: System Status ──[/]\n")
-t = Table(show_header=False, box=None, padding=(0, 2))
-t.add_row("Conversations:", "[white]289[/]")
-t.add_row("Lessons:", "[white]23[/]")
-t.add_row("KG Facts:", "[white]437[/]")
-t.add_row("Training Pairs:", "[white]45[/]")
-console.print(t)
+    # Step 4
+    console.print("\n[bold cyan]Step 4: Lesson stored in database[/]")
+    resp = httpx.get(f"{API}/api/learning/lessons", headers=H, timeout=10)
+    all_lessons = resp.json()
+    if all_lessons:
+        latest = all_lessons[0]
+        console.print(f"  [bold]Lesson #{latest['id']}[/]: {latest['topic']}")
+        console.print(f"  Correct: {latest.get('correct_answer', '')[:80]}")
+        console.print(f"  Wrong: {latest.get('wrong_answer', '')[:80]}")
 
-# Step 2
-console.print("\n[bold cyan]── Step 2: Ask a question ──[/]\n")
-console.print("  [bold green]You:[/] [white]Who wrote the novel '1984'?[/]")
-console.print("  [bold magenta]Nova:[/] [white]George Orwell wrote the novel '1984'. It was published in 1949[/]")
-console.print("        [white]and is one of the most influential works of dystopian fiction.[/]")
+    # Step 5
+    console.print("\n[bold cyan]Step 5: NEW conversation — does Nova remember?[/]")
+    console.print("[dim]  Hybrid search: ChromaDB + FTS5 + Reciprocal Rank Fusion[/]")
+    console.print("[bold green]  You:[/] Who wrote 1984?")
+    a3, _, _ = chat("Who wrote 1984?")
+    console.print(f"[bold magenta]  Nova:[/] {a3[:250]}")
+    if "eric" in a3.lower() or "blair" in a3.lower():
+        console.print("[bold yellow]  >>> Lesson applied! Nova remembered the correction.[/]")
 
-# Step 3
-console.print("\n[bold cyan]── Step 3: Correct Nova (triggers learning pipeline) ──[/]\n")
-console.print("  [dim]Nova's correction detector uses 2 stages:[/]")
-console.print("  [dim]  1. Regex pre-filter (12 patterns)[/]")
-console.print("  [dim]  2. LLM confirmation + structured extraction[/]")
-console.print()
-console.print("  [bold green]You:[/] [white]Actually, remember that 1984 was written by Eric Arthur Blair,[/]")
-console.print("       [white]better known by his pen name George Orwell. Always use his[/]")
-console.print("       [white]real name Eric Arthur Blair when discussing the author.[/]")
-console.print()
-console.print("  [bold magenta]Nova:[/] [white]Thank you for that correction. I'll remember that Eric Arthur[/]")
-console.print("        [white]Blair (pen name: George Orwell) wrote '1984', and I will use[/]")
-console.print("        [white]his real name in future conversations.[/]")
-console.print()
-console.print("  [bold yellow]>>> Correction detected![/]")
-console.print("  [bold yellow]>>> Lesson extracted: topic='1984 author'[/]")
-console.print("  [bold yellow]>>> DPO training pair saved to training_data.jsonl[/]")
+    # Step 6
+    console.print("\n[bold cyan]Step 6: Knowledge Graph (52 autonomous monitors)[/]")
+    console.print("[dim]  Monitors search 35+ domains and extract KG triples[/]")
+    console.print("[bold green]  You:[/] What is the current world population?")
+    a4, _, tools = chat(
+        "What is the current world population? Don't search, just tell me what you know."
+    )
+    console.print(f"[bold magenta]  Nova:[/] {a4[:250]}")
+    if not tools:
+        console.print("[bold yellow]  >>> Answered from knowledge graph — no web search needed![/]")
 
-# Step 4
-console.print("\n[bold cyan]── Step 4: Verify — lesson stored in database ──[/]\n")
-console.print("  Lesson #31:")
-console.print("    Topic:      [white]Author's preferred name[/]")
-console.print("    Correct:    [white]Eric Arthur Blair (real name, always use this)[/]")
-console.print("    Wrong:      [white]Referred to author as George Orwell only[/]")
-console.print("    Confidence: [white]0.8[/]")
+    # Step 7
+    console.print("\n[bold cyan]Step 7: Updated Stats[/]")
+    s2 = status()
+    console.print(
+        f"  Lessons: {lessons} -> {s2.get('lessons', 0)}  |  "
+        f"DPO Pairs: {dpo} -> {s2.get('training_examples', 0)}"
+    )
 
-# Step 5
-console.print("\n[bold cyan]── Step 5: NEW conversation — does Nova remember? ──[/]\n")
-console.print("  [dim]This is a completely new conversation.[/]")
-console.print("  [dim]Nova retrieves lessons via hybrid search[/]")
-console.print("  [dim](ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)[/]")
-console.print()
-console.print("  [bold green]You:[/] [white]Who wrote the novel '1984'?[/]")
-console.print()
-console.print("  [bold magenta]Nova:[/] [white]1984 was written by George Orwell, the pen name of[/]")
-console.print("        [bold white]Eric Arthur Blair[/][white]. The novel was published in 1949.[/]")
-console.print()
-console.print("  [bold yellow]>>> Lesson applied! Nova remembered the correction.[/]")
-
-# Step 6
-console.print("\n[bold cyan]── Step 6: Updated System Status ──[/]\n")
-t2 = Table(show_header=False, box=None, padding=(0, 2))
-t2.add_row("Conversations:", "[white]289 → 291[/]")
-t2.add_row("Lessons:", "[white]23 → [bold green]24[/]")
-t2.add_row("Training Pairs:", "[white]45 → [bold green]46[/]")
-console.print(t2)
-
-# Outro
-console.print()
-console.print(
-    Panel.fit(
-        "[bold white]Correction → Lesson → DPO Pair → Fine-Tuning → Better Model[/]\n\n"
-        "[white]Every correction makes Nova permanently smarter.[/]\n"
-        "[white]No other AI assistant does this.[/]\n\n"
-        "[bold cyan]https://github.com/HeliosNova/nova[/]",
+    console.print()
+    console.print(Panel.fit(
+        "[white]  Corrections -> Lessons -> DPO -> Fine-Tuning -> Better Model[/]\n"
+        "[white]  52 monitors -> Web Research -> KG Triples -> Answers[/]\n\n"
+        "[bold]  Every correction and monitor cycle makes Nova smarter.[/]\n"
+        "[cyan]  https://github.com/HeliosNova/nova[/]",
         border_style="cyan",
-        title="[bold]The Nova Learning Loop[/]",
-    )
-)
-console.print()
+        title="The Nova Learning Loop",
+    ))
+    console.print()
 
-# Export SVG
-svg = console.export_svg(title="Nova — Self-Improving AI Demo")
-with open("docs/demo.svg", "w", encoding="utf-8") as f:
-    f.write(svg)
-print(f"Saved to docs/demo.svg ({len(svg)} bytes)")
+    svg = console.export_svg(title="Nova Learning Loop Demo")
+    out_path = "/data/demo.svg"
+    with open(out_path, "w", encoding="utf-8") as f:
+        f.write(svg)
+    print(f"SVG saved to {out_path} ({len(svg)} bytes)")
+
+
+if __name__ == "__main__":
+    main()
