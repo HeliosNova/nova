@@ -8,7 +8,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.core.auto_skills import maybe_extract_skill
-from app.core.skills import SkillStore
+from app.core.skills import SkillStore, _has_capture_group_mismatch
 
 
 # ===========================================================================
@@ -424,3 +424,133 @@ class TestDeduplication:
         # Still only one skill (name-deduped)
         rows = db.fetchall("SELECT * FROM skills")
         assert len(rows) == 1
+
+
+# ===========================================================================
+# P0-1: Capture group mismatch guard — applies at create_skill() level
+# Audit finding: correction-path skills bypass auto_skills pre-check.
+# ===========================================================================
+
+class TestCaptureGroupMismatchGuard:
+    """_has_capture_group_mismatch and the create_skill() gate."""
+
+    # --- Unit tests for the guard function itself ---
+
+    def test_valid_query_placeholder_passes(self):
+        """{query} is always a valid placeholder."""
+        steps = [{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}]
+        assert not _has_capture_group_mismatch(r"bitcoin price", steps, None)
+
+    def test_valid_output_key_chaining_passes(self):
+        """Step 2 can reference step 1's output_key as {output_key}."""
+        steps = [
+            {"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "search_result"},
+            {"tool": "browser", "args_template": {"url": "{search_result}"}, "output_key": "page"},
+        ]
+        assert not _has_capture_group_mismatch(r"fetch url (\S+)", steps, None)
+
+    def test_named_capture_group_placeholder_passes(self):
+        """A {name} placeholder that maps to (?P<name>…) is valid."""
+        pattern = r"price of (?P<coin>\w+) today"
+        steps = [{"tool": "web_search", "args_template": {"q": "{coin} price USD"}, "output_key": "r"}]
+        assert not _has_capture_group_mismatch(pattern, steps, None)
+
+    def test_undefined_named_placeholder_fails(self):
+        """{crypto_name} with no (?P<crypto_name>…) group → mismatch."""
+        pattern = r"bitcoin price today"  # no named groups
+        steps = [{"tool": "web_search", "args_template": {"q": "current {crypto_name} price USD"}}]
+        assert _has_capture_group_mismatch(pattern, steps, None)
+
+    def test_undefined_placeholder_in_answer_template_fails(self):
+        """{gold_value} in answer_template with no named group → mismatch."""
+        pattern = r"compare gold and silver"
+        steps = [{"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "r"}]
+        answer = "Gold: {gold_value}, Silver: {silver_value}"
+        assert _has_capture_group_mismatch(pattern, steps, answer)
+
+    def test_numbered_backref_out_of_range_fails(self):
+        """$2 with only 1 capture group → mismatch."""
+        pattern = r"price of (\w+)"  # 1 group
+        steps = [{"tool": "web_search", "args_template": {"q": "price $2"}}]
+        assert _has_capture_group_mismatch(pattern, steps, None)
+
+    def test_capture_n_out_of_range_fails(self):
+        """{capture_2} with only 1 group → mismatch."""
+        pattern = r"price of (\w+)"
+        steps = [{"tool": "web_search", "args_template": {"q": "{capture_2} price"}}]
+        assert _has_capture_group_mismatch(pattern, steps, None)
+
+    def test_capture_n_in_range_passes(self):
+        """{capture_1} with 1 group → valid."""
+        pattern = r"price of (\w+)"
+        steps = [{"tool": "web_search", "args_template": {"q": "{capture_1} price"}}]
+        assert not _has_capture_group_mismatch(pattern, steps, None)
+
+    # --- Integration: create_skill() rejects on mismatch ---
+
+    def test_create_skill_rejects_undefined_named_placeholder(self, db):
+        """create_skill() returns None when args_template has {undefined}."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="broken_crypto",
+            trigger_pattern=r"bitcoin price today",  # no named groups
+            steps=[{"tool": "web_search", "args_template": {"q": "current {crypto_name} USD"}}],
+        )
+        assert result is None
+        rows = db.fetchall("SELECT * FROM skills")
+        assert len(rows) == 0
+
+    def test_create_skill_accepts_query_placeholder(self, db):
+        """create_skill() accepts {query} as a built-in placeholder."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="valid_search",
+            trigger_pattern=r"(?i)\b(?:bitcoin|btc)\b.*\bprice\b",
+            steps=[{"tool": "web_search", "args_template": {"q": "current {query} USD"}}],
+        )
+        assert result is not None
+
+    def test_create_skill_accepts_named_capture_group(self, db):
+        """create_skill() accepts {coin} when pattern has (?P<coin>…)."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="named_group_skill",
+            trigger_pattern=r"price of (?P<coin>\w+) today",
+            steps=[{"tool": "web_search", "args_template": {"q": "{coin} price USD"}}],
+        )
+        assert result is not None
+
+    def test_create_skill_accepts_output_key_chaining(self, db):
+        """create_skill() accepts {step_output} when it is the output_key of a prior step."""
+        store = SkillStore(db)
+        result = store.create_skill(
+            name="chained_steps",
+            trigger_pattern=r"(?i)\bfetch\b.*\burl\b",
+            steps=[
+                {"tool": "web_search", "args_template": {"q": "{query}"}, "output_key": "link"},
+                {"tool": "http_fetch", "args_template": {"url": "{link}"}, "output_key": "page"},
+            ],
+        )
+        assert result is not None
+
+    @pytest.mark.asyncio
+    async def test_auto_path_still_blocked_before_create(self, db, monkeypatch):
+        """Auto-extraction path: mismatch caught by auto_skills pre-check (before create_skill)."""
+        monkeypatch.setenv("ENABLE_AUTO_SKILL_CREATION", "true")
+        from app.config import reset_config
+        reset_config()
+
+        skills = SkillStore(db)
+        resp = {
+            "name": "broken_auto",
+            "trigger_pattern": r"bitcoin price",
+            "steps": [{"tool": "web_search", "args_template": {"q": "current {undefined_var} price"}, "output_key": "r"}],
+        }
+        with patch("app.core.auto_skills.llm") as mock_llm, \
+             patch("app.core.auto_skills._get_tool_names", return_value={"web_search"}):
+            mock_llm.invoke_nothink = AsyncMock(return_value=json.dumps(resp))
+            mock_llm.extract_json_object = lambda x: json.loads(x)
+
+            await maybe_extract_skill("bitcoin price", _make_tool_results(2), "BTC is $70k", skills)
+
+        assert len(db.fetchall("SELECT * FROM skills")) == 0

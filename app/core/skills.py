@@ -243,6 +243,16 @@ class SkillStore:
             logger.warning("Skill '%s' rejected: trigger too broad (%s)", name, trigger_pattern)
             return None
 
+        # Guard: reject skills whose args_template references undefined placeholders.
+        # This catches correction-path skills that bypass the auto_skills pre-check.
+        if _has_capture_group_mismatch(trigger_pattern, steps, answer_template):
+            logger.warning(
+                "Skill '%s' rejected: args_template references undefined placeholder "
+                "(add (?P<name>…) groups or use {query}/{output_key})",
+                name,
+            )
+            return None
+
         # Deduplication — if same trigger pattern exists, boost confidence
         existing = self._db.fetchone(
             "SELECT id, success_rate FROM skills WHERE trigger_pattern = ?",
@@ -524,14 +534,37 @@ def _is_too_broad(pattern: str) -> bool:
 
 
 def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template: str | None) -> bool:
-    """Check if templates reference capture groups that don't exist in the regex."""
+    """Check if templates reference capture groups or named placeholders that don't exist.
+
+    Catches three classes of mismatch:
+    - $N  numbered back-references where N > actual group count
+    - {capture_N} references where N > actual group count
+    - {named_placeholder} that is not {query}, not a named capture group
+      (?P<name>…), and not an output_key produced by an earlier step
+    """
     try:
-        num_groups = re.compile(pattern).groups
+        compiled = re.compile(pattern)
+        num_groups = compiled.groups
+        named_groups: set[str] = set(compiled.groupindex.keys())
     except re.error:
         return True
 
+    # Valid named bindings available to every template:
+    #   {query}          — always available (the user's raw query)
+    #   {capture_N}      — handled by the numeric check below; skip in named check
+    #   {output_key}     — each step's output_key is available to subsequent steps
+    #   (?P<name>…)      — named capture groups from the trigger pattern
+    output_keys: set[str] = set()
+    for step in steps:
+        ok = step.get("output_key", "")
+        if ok and isinstance(ok, str):
+            output_keys.add(ok)
+
+    _EXEMPT = frozenset({"query"})
+    valid_named = _EXEMPT | named_groups | output_keys
+
     # Collect all template strings to check
-    templates = []
+    templates: list[str] = []
     if answer_template:
         templates.append(answer_template)
     for step in steps:
@@ -541,13 +574,22 @@ def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template
         elif isinstance(args, str):
             templates.append(args)
 
-    # Look for $N or {capture_N} references
     for tmpl in templates:
+        # $N numbered back-references
         for match in re.finditer(r"\$(\d+)", tmpl):
             if int(match.group(1)) > num_groups:
                 return True
+        # {capture_N} style
         for match in re.finditer(r"\{capture_(\d+)\}", tmpl):
             if int(match.group(1)) > num_groups:
+                return True
+        # {named_placeholder} — must resolve to a known binding
+        for match in re.finditer(r"\{(\w+)\}", tmpl):
+            name = match.group(1)
+            # Skip {capture_N} — already handled above
+            if re.match(r"^capture_\d+$", name):
+                continue
+            if name not in valid_named:
                 return True
 
     return False
