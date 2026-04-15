@@ -269,6 +269,83 @@ KG facts now track change over time:
 - `get_fact_history(subject, predicate)` — all versions of a fact over time
 - `get_changes_since(since)` — what changed recently
 
+## Multi-Agent Structural Decomposition
+
+Structural decomposition is a separate path from `DelegateTool`. `DelegateTool` is LLM-driven, tool-call-based delegation. Structural decomposition fires heuristically before the LLM generates, based on query signals.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `app/core/decomposer.py` | Signal scoring, gate logic (`should_decompose`), strategy selection, task extraction (`decompose_query`) |
+| `app/core/agent_spawner.py` | `AgentSpawner`: executes `DecompositionPlan` via parallel/sequential/map-reduce `think()` sub-agents; `merge_agent_results()` |
+
+### Config Flags
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_MULTI_AGENT` | `true` | Enable/disable structural decomposition entirely |
+| `MULTI_AGENT_TRIGGER_THRESHOLD` | `4` | Minimum signal score to fire decomposition |
+| `MAX_AGENT_COUNT` | `5` | Maximum sub-agents per decomposition |
+| `AGENT_TASK_TIMEOUT` | `90` | Per-sub-agent timeout in seconds |
+
+### Signal Scoring (threshold = 4)
+
+| Signal | Points |
+|--------|--------|
+| Parallel markers (`compare`, `versus`, `side by side`, …) | +2 |
+| Delegation words (`run in parallel agents`, `break this down`, …) | +2 |
+| ≥ 3 distinct proper-noun candidates | +1 |
+| Multiple question marks in query | +1 |
+| Query length > 200 chars AND ≥ 2 tool-type keywords | +1 |
+| Query was planned (`was_planned=True`) | +1 |
+
+### Safety Gates (in `should_decompose`)
+
+1. `ENABLE_MULTI_AGENT=false` → never fires
+2. `_structural_depth.get() > 0` → sub-agents cannot themselves decompose (max depth = 1)
+3. `intent in ("greeting", "correction")` → always skip
+4. `score < MULTI_AGENT_TRIGGER_THRESHOLD` → skip
+
+`ephemeral=True` is NOT a gate — the eval harness runs `think(ephemeral=True)` and must be able to test the decomposition path.
+
+### Execution Strategies
+
+- **parallel** (default): all sub-agents run concurrently under `asyncio.Semaphore(max_parallel=3)`
+- **sequential**: sub-agents run in order; each receives prior results in `shared_findings`
+- **map-reduce**: all-but-last tasks run in parallel; last task receives all map results
+
+### SSE Events Emitted
+
+```
+AGENT_META    — decomposition plan summary (strategy, task count)
+AGENT_START   — fired once per sub-agent at start
+AGENT_DONE    — fired once per sub-agent when complete
+AGENT_MERGE   — fired before merge LLM call
+TOKEN         — merged response tokens (streamed)
+TOOL_USE      — re-emitted for each unique tool used by sub-agents
+DONE          — includes decomposed=True, agent_count=N
+```
+
+### _structural_depth ContextVar
+
+Lives in `agent_spawner.py`, distinct from `DelegateTool`'s `_delegation_depth` in `delegate.py`.
+
+- Set to `depth+1` before each `think()` sub-agent call via `token = _structural_depth.set(...)`
+- Restored via `_structural_depth.reset(token)` in `finally` — correct even on exception/timeout
+- `asyncio.gather()` copies the context to each Task at creation time, so parallel sub-agents are naturally isolated
+- Sequential sub-agents must explicitly reset because they run in the same coroutine
+
+### Eval Regression Probe
+
+Three multi-agent tasks in `evals/suite.yaml` (category `multi-agent`):
+
+1. `multi_agent_parallel_compare` — compare query, asserts `decomposition_fired`
+2. `multi_agent_sequential_research` — search+calculate, asserts `decomposition_fired` + `tool_invoked: web_search`
+3. `multi_agent_no_decompose` — "What is 2 plus 2?", asserts `answer_contains: 4` + `decomposition_not_fired`
+
+**Regression detection**: `decomposition_rate` metric in the `multi-agent` category. Setting `MULTI_AGENT_TRIGGER_THRESHOLD=1` makes everything decompose → `multi_agent_no_decompose` fails `decomposition_not_fired` → `decomposition_rate` drifts from baseline → regression flagged.
+
 ## Security
 
 ### Prompt Injection Detection (`app/core/injection.py`)

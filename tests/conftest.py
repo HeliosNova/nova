@@ -28,6 +28,10 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
+    monkeypatch.setenv("ENABLE_MULTI_AGENT", "false")  # opt-in per test
+    monkeypatch.setenv("MULTI_AGENT_TRIGGER_THRESHOLD", "4")
+    monkeypatch.setenv("MAX_AGENT_COUNT", "5")
+    monkeypatch.setenv("AGENT_TASK_TIMEOUT", "90")
     monkeypatch.setenv("ENABLE_EVAL_HARNESS", "true")
     monkeypatch.setenv("EVAL_SUITE_PATH", "evals/suite.yaml")
     monkeypatch.setenv("EVAL_REPORT_PATH", str(tmp_path / "eval_reports"))
