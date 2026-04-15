@@ -293,3 +293,146 @@ class TestSyncEmbeddings:
         count = store.sync_embeddings()
         assert count == 0
         mock_col.add.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Semantic dedup guard — insert-time near-duplicate rejection
+# ---------------------------------------------------------------------------
+
+class TestSemanticDedupGuard:
+    """_find_semantic_duplicate() is called during create_skill() to block
+    near-duplicate skills from accumulating in the corpus."""
+
+    def _dup_collection(self, similarity: float, existing_id: int = 1,
+                        existing_name: str = "existing_skill") -> MagicMock:
+        """Mock collection that returns one result at the given similarity."""
+        col = MagicMock()
+        col.count.return_value = 1
+        distance = 2.0 * (1.0 - similarity)
+        col.query.return_value = {
+            "ids": [[f"skill_{existing_id}"]],
+            "distances": [[distance]],
+            "metadatas": [[{"skill_id": str(existing_id), "name": existing_name}]],
+        }
+        col.get.return_value = {"ids": []}
+        return col
+
+    def test_duplicate_above_threshold_rejected(self, db, monkeypatch):
+        """create_skill() returns None when similarity ≥ threshold."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        # Plant an existing skill in the DB so the name-check doesn't short-circuit
+        db.execute(
+            "INSERT INTO skills (name, trigger_pattern, steps, success_rate) "
+            "VALUES (?, ?, ?, ?)",
+            ("existing_skill", r"existing trigger (\w+)", "[]", 0.7),
+        )
+        mock_col = self._dup_collection(similarity=0.92, existing_id=1)
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="new_duplicate_skill",
+            trigger_pattern=r"duplicate trigger (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is None, "Skill above dedup threshold should be rejected"
+        # Nothing new should have been inserted
+        rows = db.fetchall("SELECT * FROM skills")
+        assert len(rows) == 1  # only the pre-existing one
+
+    def test_unique_below_threshold_accepted(self, db, monkeypatch):
+        """create_skill() succeeds when similarity is below threshold."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        db.execute(
+            "INSERT INTO skills (name, trigger_pattern, steps, success_rate) "
+            "VALUES (?, ?, ?, ?)",
+            ("existing_skill", r"existing trigger (\w+)", "[]", 0.7),
+        )
+        # Similarity 0.50 < 0.65 threshold → should pass
+        mock_col = self._dup_collection(similarity=0.50, existing_id=1)
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="genuinely_new_skill",
+            trigger_pattern=r"totally different topic (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None, "Skill below dedup threshold should be accepted"
+
+    def test_empty_collection_skips_dedup(self, db, monkeypatch):
+        """When the collection is empty, dedup check is skipped (nothing to compare)."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        mock_col = MagicMock()
+        mock_col.count.return_value = 0
+        mock_col.get.return_value = {"ids": []}
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="first_skill",
+            trigger_pattern=r"first ever skill (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None
+
+    def test_semantic_disabled_skips_dedup(self, db, monkeypatch):
+        """With ENABLE_SEMANTIC_SKILL_MATCHING=false, dedup check never runs."""
+        store = _make_store(db, monkeypatch, semantic=False)
+        # Even if collection somehow existed, query should never be called
+        mock_col = MagicMock()
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="semantic_off_skill",
+            trigger_pattern=r"semantic off test (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None
+        mock_col.query.assert_not_called()
+
+    def test_same_name_update_not_blocked(self, db, monkeypatch):
+        """Name-dedup (update) path fires before semantic check — same-name update allowed."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        mock_col = MagicMock()
+        mock_col.get.return_value = {"ids": []}
+        store._chroma_collection = mock_col
+
+        # Create a skill
+        sid = store.create_skill(
+            name="updateable_skill",
+            trigger_pattern=r"original trigger (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert sid is not None
+
+        # Now update with the same name but different trigger — name-dedup runs first
+        # and should succeed even if semantic similarity would be high.
+        mock_col.reset_mock()
+        mock_col.get.return_value = {"ids": []}
+        # Simulate high similarity (same conceptual skill, updated trigger)
+        mock_col.query.return_value = {
+            "ids": [[f"skill_{sid}"]],
+            "distances": [[0.02]],  # very high similarity
+            "metadatas": [[{"skill_id": str(sid), "name": "updateable_skill"}]],
+        }
+
+        result = store.create_skill(
+            name="updateable_skill",  # same name → name-dedup path, no semantic check
+            trigger_pattern=r"updated trigger (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None, "Same-name update should bypass semantic dedup"
+
+    def test_dedup_check_failure_is_non_critical(self, db, monkeypatch):
+        """If ChromaDB query throws, dedup check is skipped and skill is accepted."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        mock_col = MagicMock()
+        mock_col.count.return_value = 5
+        mock_col.query.side_effect = RuntimeError("ChromaDB unavailable")
+        mock_col.get.return_value = {"ids": []}
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="fault_tolerant_skill",
+            trigger_pattern=r"fault tolerant test (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None, "ChromaDB error should not block skill creation"

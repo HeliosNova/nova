@@ -96,6 +96,59 @@ class SkillStore:
         except Exception as e:
             logger.warning("Failed to embed skill #%d '%s': %s", skill_id, name, e)
 
+    def _find_semantic_duplicate(self, name: str, trigger_pattern: str) -> int | None:
+        """Return an existing skill ID if trigger_pattern is semantically too close.
+
+        Embeds the candidate trigger pattern and queries ChromaDB.  If the nearest
+        existing skill has similarity ≥ SKILL_SEMANTIC_THRESHOLD, the candidate
+        would answer the same queries as that skill and is therefore a duplicate.
+
+        Returns the duplicate skill's ID, or None if no duplicate found
+        (or if semantic matching is disabled / collection is empty).
+
+        Called from create_skill() before the INSERT so near-duplicate skills
+        cannot accumulate in the corpus.
+        """
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return None
+        try:
+            collection = self._get_skill_collection()
+            if collection.count() == 0:
+                return None
+            embed_text = f"{name}: {trigger_pattern}"
+            results = collection.query(
+                query_texts=[embed_text],
+                n_results=1,
+                include=["distances", "metadatas"],
+            )
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            distance = results["distances"][0][0]
+            # ChromaDB cosine distance: 0 = identical, 2 = opposite.
+            similarity = 1.0 - (distance / 2.0)
+            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
+                return None
+            metadata = results["metadatas"][0][0]
+            existing_id = int(metadata["skill_id"])
+            existing_name = metadata.get("name", f"skill_{existing_id}")
+            # Exclude self-updates — same-name skills are handled by the name-dedup
+            # path that runs before this check; guard against edge-case order issues.
+            existing_row = self._db.fetchone(
+                "SELECT name FROM skills WHERE id = ?", (existing_id,)
+            )
+            if existing_row and existing_row["name"].lower() == name.lower():
+                return None
+            logger.info(
+                "Semantic dedup: '%s' is %.3f similar to existing #%d '%s' "
+                "(threshold %.2f)",
+                name, similarity, existing_id, existing_name,
+                config.SKILL_SEMANTIC_THRESHOLD,
+            )
+            return existing_id
+        except Exception as e:
+            logger.debug("Semantic dedup check failed (non-critical): %s", e)
+            return None
+
     def _unembed_skill(self, skill_id: int) -> None:
         """Remove a skill's embedding from ChromaDB."""
         if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
@@ -250,6 +303,17 @@ class SkillStore:
                 "Skill '%s' rejected: args_template references undefined placeholder "
                 "(add (?P<name>…) groups or use {query}/{output_key})",
                 name,
+            )
+            return None
+
+        # Guard: semantic dedup — reject if trigger embeds too close to an existing skill.
+        # Runs only when ChromaDB is initialised (i.e., at least one skill already exists).
+        dup_id = self._find_semantic_duplicate(name, trigger_pattern)
+        if dup_id is not None:
+            logger.warning(
+                "Skill '%s' rejected: semantically too similar to existing skill #%d "
+                "(similarity ≥ %.2f). Narrow the trigger or merge with the existing skill.",
+                name, dup_id, config.SKILL_SEMANTIC_THRESHOLD,
             )
             return None
 
