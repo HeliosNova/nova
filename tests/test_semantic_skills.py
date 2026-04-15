@@ -17,7 +17,7 @@ from app.core.skills import SkillStore
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_store(db, monkeypatch, *, semantic: bool = True, threshold: float = 0.82):
+def _make_store(db, monkeypatch, *, semantic: bool = True, threshold: float = 0.65):
     """Return a SkillStore with semantic matching configured."""
     flag = "true" if semantic else "false"
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", flag)
@@ -113,7 +113,7 @@ class TestSemanticFallback:
 
     def test_low_similarity_returns_none(self, db, monkeypatch):
         """Below threshold → semantic returns None."""
-        store = _make_store(db, monkeypatch, semantic=True, threshold=0.82)
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
         sid = store.create_skill(
             name="weather_skill",
             trigger_pattern=r"weather in (\w+)",
