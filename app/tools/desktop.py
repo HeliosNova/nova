@@ -184,10 +184,15 @@ class DesktopTool(BaseTool):
                 raise RuntimeError(f"Cannot create screenshot directory {self._screenshot_dir}: {e}")
             ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
             path = self._screenshot_dir / f"desktop_{ts}.png"
-            # Use scrot directly (more reliable than pyautogui.screenshot in headless)
-            result = subprocess.run(["scrot", str(path)], capture_output=True, timeout=10)
-            if result.returncode != 0:
-                # Fallback to pyautogui
+            # Use scrot when available (more reliable than pyautogui in headless Linux).
+            # Fall through to pyautogui if scrot is missing (Windows / macOS / no PATH).
+            scrot_ok = False
+            try:
+                result = subprocess.run(["scrot", str(path)], capture_output=True, timeout=10)
+                scrot_ok = result.returncode == 0
+            except (FileNotFoundError, OSError):
+                pass  # scrot not installed — use pyautogui fallback below
+            if not scrot_ok:
                 img = pyautogui.screenshot()
                 img.save(str(path))
             size = pyautogui.size()
