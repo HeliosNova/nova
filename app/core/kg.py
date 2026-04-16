@@ -131,6 +131,26 @@ def _normalize_words(text: str) -> set[str]:
     return _base_normalize(text, min_length=2)
 
 
+def normalize_entity(name: str) -> str:
+    """Normalize an entity name for consistent storage.
+
+    Strategy: strip whitespace, collapse internal whitespace, title-case for
+    readability.  Keeps acronyms (ALL-CAPS words ≤5 chars) uppercase.
+    """
+    name = " ".join(name.split())  # collapse whitespace
+    if not name:
+        return name
+    words = name.split()
+    normalized = []
+    for w in words:
+        # Keep short all-caps words (acronyms: AI, ML, US, EU, GDP)
+        if w.isupper() and len(w) <= 5:
+            normalized.append(w)
+        else:
+            normalized.append(w.capitalize())
+    return " ".join(normalized)
+
+
 # ---------------------------------------------------------------------------
 # Triple quality gate — heuristic pre-filter
 # ---------------------------------------------------------------------------
@@ -290,9 +310,9 @@ class KnowledgeGraph:
         different object), the old fact is superseded rather than deleted,
         creating a temporal trail.
         """
-        subject = subject.strip()
+        subject = normalize_entity(subject)
         predicate = normalize_predicate(predicate)
-        object_ = object_.strip()
+        object_ = normalize_entity(object_)
 
         if not subject or not object_ or len(subject) > 200 or len(object_) > 200:
             return False
@@ -795,6 +815,34 @@ class KnowledgeGraph:
         scored.sort(key=lambda x: (-x[0], -x[1]["confidence"]))
 
         top = scored[:limit]
+
+        # --- Graph-neighbor enrichment (1-hop) ---
+        # Expand top results by finding neighbors of matched entities.
+        # This clusters related concepts together instead of scattering them.
+        if top and len(top) < limit:
+            seen_ids = {row["id"] for _, row in top}
+            entities = set()
+            for _, row in top:
+                entities.add(row["subject"].lower())
+                entities.add(row["object"].lower())
+
+            # Find 1-hop neighbors of matched entities
+            neighbor_budget = limit - len(top)
+            if entities and neighbor_budget > 0:
+                placeholders = ",".join("?" for _ in entities)
+                neighbors = self._db.fetchall(
+                    f"SELECT * FROM kg_facts WHERE valid_to IS NULL "
+                    f"AND (LOWER(subject) IN ({placeholders}) OR LOWER(object) IN ({placeholders})) "
+                    f"ORDER BY confidence DESC LIMIT ?",
+                    tuple(entities) + tuple(entities) + (neighbor_budget * 3,),
+                )
+                for nrow in neighbors:
+                    if nrow["id"] not in seen_ids:
+                        seen_ids.add(nrow["id"])
+                        # Lower score than keyword matches (neighbor bonus = 1)
+                        top.append((1, nrow))
+                        if len(top) >= limit:
+                            break
 
         # Batch increment retrieval counts and update last_retrieved_at
         if top:
