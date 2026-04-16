@@ -263,6 +263,83 @@ KG facts now track change over time:
 - `get_fact_history(subject, predicate)` — all versions of a fact over time
 - `get_changes_since(since)` — what changed recently
 
+## Multi-Agent Structural Decomposition
+
+Structural decomposition is a separate path from `DelegateTool`. `DelegateTool` is LLM-driven, tool-call-based delegation. Structural decomposition fires heuristically before the LLM generates, based on query signals.
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `app/core/decomposer.py` | Signal scoring, gate logic (`should_decompose`), strategy selection, task extraction (`decompose_query`) |
+| `app/core/agent_spawner.py` | `AgentSpawner`: executes `DecompositionPlan` via parallel/sequential/map-reduce `think()` sub-agents; `merge_agent_results()` |
+
+### Config Flags
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_MULTI_AGENT` | `true` | Enable/disable structural decomposition entirely |
+| `MULTI_AGENT_TRIGGER_THRESHOLD` | `4` | Minimum signal score to fire decomposition |
+| `MAX_AGENT_COUNT` | `5` | Maximum sub-agents per decomposition |
+| `AGENT_TASK_TIMEOUT` | `90` | Per-sub-agent timeout in seconds |
+
+### Signal Scoring (threshold = 4)
+
+| Signal | Points |
+|--------|--------|
+| Parallel markers (`compare`, `versus`, `side by side`, …) | +2 |
+| Delegation words (`run in parallel agents`, `break this down`, …) | +2 |
+| ≥ 3 distinct proper-noun candidates | +1 |
+| Multiple question marks in query | +1 |
+| Query length > 200 chars AND ≥ 2 tool-type keywords | +1 |
+| Query was planned (`was_planned=True`) | +1 |
+
+### Safety Gates (in `should_decompose`)
+
+1. `ENABLE_MULTI_AGENT=false` → never fires
+2. `_structural_depth.get() > 0` → sub-agents cannot themselves decompose (max depth = 1)
+3. `intent in ("greeting", "correction")` → always skip
+4. `score < MULTI_AGENT_TRIGGER_THRESHOLD` → skip
+
+`ephemeral=True` is NOT a gate — the eval harness runs `think(ephemeral=True)` and must be able to test the decomposition path.
+
+### Execution Strategies
+
+- **parallel** (default): all sub-agents run concurrently under `asyncio.Semaphore(max_parallel=3)`
+- **sequential**: sub-agents run in order; each receives prior results in `shared_findings`
+- **map-reduce**: all-but-last tasks run in parallel; last task receives all map results
+
+### SSE Events Emitted
+
+```
+AGENT_META    — decomposition plan summary (strategy, task count)
+AGENT_START   — fired once per sub-agent at start
+AGENT_DONE    — fired once per sub-agent when complete
+AGENT_MERGE   — fired before merge LLM call
+TOKEN         — merged response tokens (streamed)
+TOOL_USE      — re-emitted for each unique tool used by sub-agents
+DONE          — includes decomposed=True, agent_count=N
+```
+
+### _structural_depth ContextVar
+
+Lives in `agent_spawner.py`, distinct from `DelegateTool`'s `_delegation_depth` in `delegate.py`.
+
+- Set to `depth+1` before each `think()` sub-agent call via `token = _structural_depth.set(...)`
+- Restored via `_structural_depth.reset(token)` in `finally` — correct even on exception/timeout
+- `asyncio.gather()` copies the context to each Task at creation time, so parallel sub-agents are naturally isolated
+- Sequential sub-agents must explicitly reset because they run in the same coroutine
+
+### Eval Regression Probe
+
+Three multi-agent tasks in `evals/suite.yaml` (category `multi-agent`):
+
+1. `multi_agent_parallel_compare` — compare query, asserts `decomposition_fired`
+2. `multi_agent_sequential_research` — search+calculate, asserts `decomposition_fired` + `tool_invoked: web_search`
+3. `multi_agent_no_decompose` — "What is 2 plus 2?", asserts `answer_contains: 4` + `decomposition_not_fired`
+
+**Regression detection**: `decomposition_rate` metric in the `multi-agent` category. Setting `MULTI_AGENT_TRIGGER_THRESHOLD=1` makes everything decompose → `multi_agent_no_decompose` fails `decomposition_not_fired` → `decomposition_rate` drifts from baseline → regression flagged.
+
 ## Security
 
 ### Prompt Injection Detection (`app/core/injection.py`)
@@ -302,6 +379,92 @@ In-process `asyncio.create_task` system for long-running work that shouldn't blo
 - `BackgroundTaskTool` (`app/tools/background_task.py`): 4 actions — submit, status, list, cancel
 - Submit spawns ephemeral `brain.think()` calls for parallel research
 
+## Prompt Self-Modification (`app/core/prompt_optimizer.py`)
+
+Conservative, eval-gated prompt optimization. Modifies instruction strings only — NOT model weights (Ollama GGUF is static).
+
+### How to Enable
+
+```bash
+ENABLE_PROMPT_SELF_MOD=true  # default false — opt-in required
+```
+
+The "Prompt Optimizer" heartbeat monitor (`check_type="prompt_analyzer"`, daily) is seeded disabled. Enable it alongside the flag:
+
+```sql
+UPDATE monitors SET enabled=1 WHERE name='Prompt Optimizer';
+```
+
+### Tunable Modules (6 total, hard allow-list)
+
+| Module | Source constant | Tuned when |
+|--------|-----------------|------------|
+| `critique_prompt` | `reflexion._CRITIQUE_PROMPT` | reflexion calibration drifts |
+| `extraction_prompt` | `learning._EXTRACTION_PROMPT` | reasoning/tool-use pass_rate drifts |
+| `skill_extraction_prompt` | `skills.py` inline | skill-match hit_rate drifts |
+| `merge_instruction_parallel` | `decomposer.py` inline | multi-agent pass_rate drifts |
+| `merge_instruction_sequential` | `decomposer.py` inline | multi-agent pass_rate drifts |
+| `kg_extraction_prompt` | `brain.py` inline | semantic-match recall drifts |
+
+Everything else (`IDENTITY_AND_REASONING`, harness prompts, safety instructions, `META_PROMPT`) is **hardcoded and unmodifiable by design**.
+
+### Firewall Guarantees
+
+- **Allow-list**: `get_active_module()` returns `None` for any name not in `_SELF_MOD_ALLOWED_MODULES`.
+- **Harness internal block**: `quiz_gen/quiz_answer/quiz_grade` are double-blocked by `_HARNESS_INTERNAL_MODULES`.
+- **Baseline immutability**: `is_baseline=1` rows are never overwritten; the optimizer only adds new versions.
+- **META_PROMPT**: Hardcoded constant, SHA-256 hash verified in `tests/test_prompt_optimizer.py::TestMetaPromptHashStability`.
+- **Kill switch**: All writes and promotions check `ENABLE_PROMPT_SELF_MOD` at entry.
+
+### Safety Caps (all configurable)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PROMPT_MOD_MAX_PROPOSALS_PER_DAY` | `2` | Per-module write cap |
+| `PROMPT_MOD_MAX_PENDING` | `3` | Max pending candidates per module |
+| `PROMPT_MOD_MAX_PROMOTIONS_PER_DAY` | `2` | System-wide daily promotion cap |
+| `PROMPT_MOD_MAX_DRIFT` | `0.25` | Jaccard distance from baseline (0=identical, 1=disjoint) |
+| `PROMPT_MOD_MIN_IMPROVEMENT_PP` | `2.0` | Min improvement (pp) needed to pass shadow eval |
+| `PROMPT_MOD_REGRESSION_TOLERANCE_PP` | `1.0` | Max allowed drop in non-target categories |
+| `PROMPT_MOD_LATENCY_OVERHEAD_MAX` | `1.15` | Latency P95 overhead limit (1.15 = +15%) |
+
+### Goodhart Firewall (critique_prompt candidates)
+
+When shadow-testing a `critique_prompt` candidate, `_SCORING_OVERRIDES` pins the **baseline** critique for the reflexion scoring path. The candidate can only improve generation quality — it cannot inflate its own scores.
+
+Calibration check: if `reflexion_p90 > 0.93` or `reflexion_mean > 0.80` during shadow eval, the run is marked `calibration_ok=False` and the candidate is rejected.
+
+### Manual Rollback
+
+```python
+from app.database import get_db
+from app.core.prompt_optimizer import PromptModuleStore
+store = PromptModuleStore(db=get_db())
+# Find the active promoted module id:
+active = store.get_active("critique_prompt")
+store.rollback(active.id)
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `PromptOptimizer: no new candidates` | Not enough eval history (< 3 runs) | Let eval harness run nightly for 3+ days |
+| `drift too high` in logs | Candidate text too different from baseline | Reduce `PROMPT_MOD_MAX_DRIFT` or let LLM draft a smaller change |
+| `calibration_ok=False` | Candidate inflates reflexion scores | Baseline scorer detected Goodhart loop — reject and quarantine expected |
+| Module stuck in `quarantined` | Expiry defaults to 24h | Wait or manually `UPDATE prompt_modules SET status='candidate', quarantined_until=NULL WHERE id=?` |
+
+## Hybrid Retrieval Config
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_RERANKER` | `true` | Apply composite score reranker after RRF fusion |
+| `RETRIEVAL_RRF_K` | `60` | RRF smoothing constant (alias `RRF_K`) |
+
+Reranker: composite heuristic `0.55·vec + 0.30·bm25 + 0.15·coverage`. No external model required.
+A cross-encoder path (sentence-transformers) was evaluated empirically on a 300-doc adversarial corpus
+and gave 0pp gain over composite on Recall@5/P@1/MRR — deleted (see commit for 4×4 table).
+
 ## New Config Fields (Deep Audit)
 - `MAX_QUERY_LENGTH` (50000) — query length validation in brain.think()
 - `TRUSTED_PROXY` — enable X-Forwarded-For only when set
@@ -330,3 +493,108 @@ Local Whisper STT (speech-to-text). Gated by `ENABLE_VOICE`.
 - Model size via `WHISPER_MODEL_SIZE` (default "base"), max duration via `VOICE_MAX_DURATION` (300s)
 - 25MB file size limit, audio extension validation
 - GPU auto-unloaded on shutdown
+
+## Automated Eval Harness (`app/monitors/eval_harness.py`)
+
+Self-testing pipeline that runs a curated task suite through the real brain,
+computes quality metrics, and flags regressions.  Runs as a nightly heartbeat
+monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
+
+### Files
+
+| File | Purpose |
+|------|---------|
+| `evals/suite.yaml` | 30 evaluation tasks across 6 categories |
+| `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
+| `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
+| `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
+| `/data/eval_reports/eval_history.jsonl` | Time-series log — one line per run, appended |
+| `/data/eval_reports/eval_baseline.json` | Regression baseline (written on first run) |
+
+### Categories
+
+| Category | Tasks | What it tests |
+|----------|-------|---------------|
+| `reasoning` | 5 | Arithmetic, logic, definitions — no tools, high reflexion expected |
+| `tool-use` | 6 | calculator, code_exec, web_search invocation + answer correctness |
+| `skill-match` | 6 | Seeded "Eval: *" skills matched by exact regex (eval-probe: prefix) |
+| `semantic-match` | 5 | Paraphrase queries that must hit same skill via ChromaDB at threshold 0.65 |
+| `autonomous-tool` | 4 | Multi-step queries; metric = fraction using ≥2 tools |
+| `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
+
+### Metrics
+
+- **Per-category**: pass_rate, latency P50/P95, reflexion mean/std/P10/P90
+- **skill-match**: hit_rate (fraction of queries that matched any skill)
+- **semantic-match**: recall_at_threshold (paraphrases matching at 0.65)
+- **autonomous-tool**: multi_tool_rate (fraction using ≥2 tools)
+- **Regression flags**: any metric dropping >EVAL_REGRESSION_TOLERANCE (10%) from baseline
+
+### How to add a task
+
+Add an entry to `evals/suite.yaml`:
+
+```yaml
+- id: my_task_001          # unique snake_case id
+  category: reasoning       # one of the 6 categories above
+  query: "What is 2+2?"
+  timeout: 45               # seconds (default 60)
+  assertions:
+    - type: answer_contains
+      value: "4"
+    - type: reflexion_above
+      value: 0.5
+```
+
+For a skill-match task with a seeded skill:
+
+```yaml
+- id: skill_match_myskill
+  category: skill-match
+  query: "eval-probe: do my thing"
+  seed_skill:
+    name: "Eval: My Skill"
+    trigger_pattern: "(?i)\\beval-probe[:\\s]+.*do\\s+my\\s+thing\\b"
+    steps:
+      - tool: web_search
+        args_template: {q: "{query}"}
+        output_key: result
+  assertions:
+    - type: skill_matched
+```
+
+### How to interpret a drift flag
+
+A `RegressionFlag` in the report JSON means a metric dropped more than
+`EVAL_REGRESSION_TOLERANCE` (default 0.10 = 10 percentage points) below the
+stored baseline.  Common causes:
+
+- **skill-match.hit_rate drops** — skill patterns broken or SkillStore corrupted
+- **semantic-match.recall_at_threshold drops** — `SKILL_SEMANTIC_THRESHOLD` too high
+  (was the regression we proved empirically: raising to 0.99 drops recall to 0%)
+- **tool-use.pass_rate drops** — tool registry broken or tool unreachable
+- **reflexion_mean drifts upward** — score inflation (quality heuristic too lenient)
+
+To update the baseline after intentional improvements:
+
+```python
+from app.monitors.eval_harness import EvalHarness
+harness = EvalHarness()
+# Load any recent report JSON as the new baseline
+import json
+with open("/data/eval_reports/eval_<ts>.json") as f:
+    data = json.load(f)
+# Then write it as baseline directly
+import shutil
+shutil.copy("/data/eval_reports/eval_<ts>.json",
+            "/data/eval_reports/eval_baseline.json")
+```
+
+### Config flags
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_EVAL_HARNESS` | `true` | Enable/disable the harness monitor |
+| `EVAL_SUITE_PATH` | `evals/suite.yaml` | Path to task suite YAML |
+| `EVAL_REPORT_PATH` | `/data/eval_reports` | Output directory for reports |
+| `EVAL_REGRESSION_TOLERANCE` | `0.10` | Allowed metric drop before flagging |

@@ -10,6 +10,7 @@ from app.core.curiosity import (
     TopicTracker,
     MAX_PENDING,
     MAX_ATTEMPTS,
+    MAX_QUEUE_SIZE,
 )
 
 
@@ -161,13 +162,43 @@ class TestCuriosityQueue:
         assert queue.get_next() is None
 
     def test_max_pending_evicts_lowest(self, queue):
-        # Fill to max
+        # "research topic number N about science" items deduplicate via Jaccard (>0.6).
+        # The cap (MAX_CURIOSITY_QUEUE_SIZE=100) is well above MAX_PENDING=50, so
+        # no eviction fires here — this test verifies add() handles many calls without error.
         for i in range(MAX_PENDING):
             queue.add(f"research topic number {i} about science", urgency=0.5)
-        # Adding one more should evict lowest urgency
         queue.add("urgent research topic about earthquakes", urgency=0.9)
         stats = queue.get_stats()
+        # Deduplication keeps actual pending count well below MAX_PENDING (50)
+        assert stats["pending"] >= 1
         assert stats["pending"] <= MAX_PENDING
+
+    def test_queue_size_cap_evicts_oldest_fifo(self, db, monkeypatch):
+        """When pending count hits MAX_CURIOSITY_QUEUE_SIZE, oldest item is evicted (FIFO)."""
+        monkeypatch.setenv("MAX_CURIOSITY_QUEUE_SIZE", "3")
+        from app.config import reset_config; reset_config()
+        queue = CuriosityQueue(db)
+
+        # Add 3 items — fills queue exactly to the cap
+        id1 = queue.add("oldest research topic about ancient history", urgency=0.5)
+        id2 = queue.add("middle research topic about medieval castles", urgency=0.5)
+        id3 = queue.add("newest research topic about modern architecture", urgency=0.5)
+        assert id1 > 0 and id2 > 0 and id3 > 0
+
+        # Adding a 4th should evict id1 (oldest, FIFO) regardless of urgency
+        id4 = queue.add("fourth research topic about quantum mechanics physics", urgency=0.1)
+        assert id4 > 0
+
+        stats = queue.get_stats()
+        assert stats["pending"] == 3  # cap holds
+
+        # Oldest item (id1) must have been evicted
+        rows = db.fetchall("SELECT id FROM curiosity_queue WHERE status='pending'")
+        pending_ids = {r["id"] for r in rows}
+        assert id1 not in pending_ids, "Oldest item should be evicted by FIFO"
+        assert id2 in pending_ids
+        assert id3 in pending_ids
+        assert id4 in pending_ids
 
     def test_get_stats(self, queue):
         queue.add("research topic about black holes")

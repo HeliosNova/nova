@@ -258,10 +258,14 @@ class LearningEngine:
                 user_message[:120],
             )
 
+            from app.core.prompt_optimizer import get_active_module
+            extraction_template = (
+                get_active_module("extraction_prompt") or _EXTRACTION_PROMPT
+            )
             result = await asyncio.wait_for(
                 llm.invoke_nothink(
                     [
-                        {"role": "system", "content": _EXTRACTION_PROMPT},
+                        {"role": "system", "content": extraction_template},
                         {"role": "user", "content": prompt_content},
                     ],
                     json_mode=True,

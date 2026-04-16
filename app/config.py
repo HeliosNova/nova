@@ -49,14 +49,15 @@ _MUTABLE_FIELDS = {
     "ENABLE_VOICE", "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
     "ENABLE_SHELL_EXEC", "ENABLE_MCP", "ENABLE_MCP_SERVER",
-    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_INJECTION_DETECTION",
+    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
+    "AUTO_TOOL_CREATION_THRESHOLD", "ENABLE_INJECTION_DETECTION",
     "ENABLE_DESKTOP_AUTOMATION", "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
     "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
     "WEB_SEARCH_TIMEOUT", "WEB_SEARCH_ENGINES", "WEB_SEARCH_MAX_RESULTS",
     "ALLOWED_ORIGINS",
     "MAX_SYSTEM_TOKENS", "MAX_USER_FACTS", "MAX_KG_FACTS",
-    "MAX_CURIOSITY_PENDING", "MAX_CURIOSITY_ATTEMPTS",
+    "MAX_CURIOSITY_PENDING", "MAX_CURIOSITY_ATTEMPTS", "MAX_CURIOSITY_QUEUE_SIZE",
     "MAX_CUSTOM_TOOL_CODE_LENGTH", "MAX_CUSTOM_TOOLS", "RATE_LIMIT_RPM",
     "MAX_KG_FACTS_IN_PROMPT", "MAX_REFLEXIONS_IN_PROMPT", "MAX_SUCCESS_PATTERNS_IN_PROMPT",
     "MAX_REFLEXIONS",
@@ -67,11 +68,21 @@ _MUTABLE_FIELDS = {
     "TEMPERATURE_DEFAULT", "TEMPERATURE_INTERNAL", "TEMPERATURE_REFLEXION",
     "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
-    "SKILL_EMA_ALPHA", "SKILL_SEMANTIC_THRESHOLD", "SKILL_STALE_DAYS",
+    "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
+    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
     "INJECTION_SUSPICIOUS_THRESHOLD",
     "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
+    "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
+    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
+    "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
+    # Prompt self-modification
+    "ENABLE_PROMPT_SELF_MOD",
+    "PROMPT_MOD_MAX_PROPOSALS_PER_DAY", "PROMPT_MOD_MAX_PENDING",
+    "PROMPT_MOD_MAX_PROMOTIONS_PER_DAY", "PROMPT_MOD_MAX_DRIFT",
+    "PROMPT_MOD_MIN_IMPROVEMENT_PP", "PROMPT_MOD_REGRESSION_TOLERANCE_PP",
+    "PROMPT_MOD_STABILITY_RUNS", "PROMPT_MOD_LATENCY_OVERHEAD_MAX",
 }
 
 
@@ -116,6 +127,8 @@ class Config:
     CHUNK_SIZE: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))
     CHUNK_OVERLAP: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 50))
     RRF_K: int = field(default_factory=lambda: _env_int("RRF_K", 60))
+    RETRIEVAL_RRF_K: int = field(default_factory=lambda: _env_int("RETRIEVAL_RRF_K", 60))
+    ENABLE_RERANKER: bool = field(default_factory=lambda: _env("ENABLE_RERANKER", "true").lower() == "true")
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))
@@ -147,6 +160,12 @@ class Config:
     DIGEST_HOUR: int = field(default_factory=lambda: _env_int("DIGEST_HOUR", 21))
     USER_TIMEZONE: str = field(default_factory=lambda: _env("USER_TIMEZONE", "UTC"))
 
+    # Automated eval harness
+    ENABLE_EVAL_HARNESS: bool = field(default_factory=lambda: _env("ENABLE_EVAL_HARNESS", "true").lower() == "true")
+    EVAL_SUITE_PATH: str = field(default_factory=lambda: _env("EVAL_SUITE_PATH", "evals/suite.yaml"))
+    EVAL_REPORT_PATH: str = field(default_factory=lambda: _env("EVAL_REPORT_PATH", "/data/eval_reports"))
+    EVAL_REGRESSION_TOLERANCE: float = field(default_factory=lambda: _env_float("EVAL_REGRESSION_TOLERANCE", 0.10))
+
     # Learning
     TRAINING_DATA_PATH: str = field(default_factory=lambda: _env("TRAINING_DATA_PATH", "/data/training_data.jsonl"))
     MAX_TRAINING_PAIRS: int = field(default_factory=lambda: _env_int("MAX_TRAINING_PAIRS", 10000))
@@ -175,9 +194,15 @@ class Config:
     CRITIQUE_SOURCES_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_SOURCES_LIMIT", 1500))
     CRITIQUE_FACTS_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_FACTS_LIMIT", 2000))
 
-    # Delegation (multi-agent)
+    # Delegation (LLM-driven, via DelegateTool)
     ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
     MAX_DELEGATION_DEPTH: int = field(default_factory=lambda: _env_int("MAX_DELEGATION_DEPTH", 1))
+
+    # Multi-agent structural decomposition
+    ENABLE_MULTI_AGENT: bool = field(default_factory=lambda: _env("ENABLE_MULTI_AGENT", "true").lower() == "true")
+    MULTI_AGENT_TRIGGER_THRESHOLD: int = field(default_factory=lambda: _env_int("MULTI_AGENT_TRIGGER_THRESHOLD", 4))
+    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 5))
+    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 90))
 
     # Background tasks
     MAX_BACKGROUND_TASKS: int = field(default_factory=lambda: _env_int("MAX_BACKGROUND_TASKS", 5))
@@ -185,6 +210,10 @@ class Config:
 
     # Auto skill creation
     ENABLE_AUTO_SKILL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTO_SKILL_CREATION", "true").lower() == "true")
+
+    # Autonomous tool creation (self-extending pipeline)
+    ENABLE_AUTONOMOUS_TOOL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTONOMOUS_TOOL_CREATION", "true").lower() == "true")
+    AUTO_TOOL_CREATION_THRESHOLD: int = field(default_factory=lambda: _env_int("AUTO_TOOL_CREATION_THRESHOLD", 3))
 
     # Skill import/export signing
     REQUIRE_SIGNED_SKILLS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_SKILLS", "true").lower() == "true")
@@ -203,6 +232,7 @@ class Config:
     MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 1000))
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
     MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
+    MAX_CURIOSITY_QUEUE_SIZE: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_QUEUE_SIZE", 100))
     MAX_CUSTOM_TOOL_CODE_LENGTH: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOL_CODE_LENGTH", 5000))
     MAX_CUSTOM_TOOLS: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOLS", 50))
     RATE_LIMIT_RPM: int = field(default_factory=lambda: _env_int("RATE_LIMIT_RPM", 60))
@@ -234,9 +264,10 @@ class Config:
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
+    ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
-    # Cosine distance threshold for semantic skill matching (lower = stricter, 0.35 ≈ 0.65 similarity)
-    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.35))
+    # Cosine similarity threshold for semantic skill matching (higher = stricter)
+    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.65))
     # Days without use before a skill is considered stale for decay/pruning
     SKILL_STALE_DAYS: int = field(default_factory=lambda: _env_int("SKILL_STALE_DAYS", 30))
     INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
@@ -247,6 +278,25 @@ class Config:
     REFLEXION_SUCCESS_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_SUCCESS_THRESHOLD", 0.8))
     KG_GRAPH_MAX_FRONTIER: int = field(default_factory=lambda: _env_int("KG_GRAPH_MAX_FRONTIER", 1000))
     AUTH_MAX_TRACKED_IPS: int = field(default_factory=lambda: _env_int("AUTH_MAX_TRACKED_IPS", 10000))
+
+    # Prompt self-modification (opt-in; default off for safety)
+    ENABLE_PROMPT_SELF_MOD: bool = field(default_factory=lambda: _env("ENABLE_PROMPT_SELF_MOD", "false").lower() == "true")
+    # Max candidate proposals per day per module
+    PROMPT_MOD_MAX_PROPOSALS_PER_DAY: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PROPOSALS_PER_DAY", 2))
+    # Max pending candidates per module before blocking new proposals
+    PROMPT_MOD_MAX_PENDING: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PENDING", 3))
+    # Max promotions system-wide per day
+    PROMPT_MOD_MAX_PROMOTIONS_PER_DAY: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PROMOTIONS_PER_DAY", 2))
+    # Max word-overlap drift from baseline (0.0-1.0; 0.25 ≈ meaningful rephrasing limit)
+    PROMPT_MOD_MAX_DRIFT: float = field(default_factory=lambda: _env_float("PROMPT_MOD_MAX_DRIFT", 0.25))
+    # Minimum improvement (percentage points) required on target metric to promote
+    PROMPT_MOD_MIN_IMPROVEMENT_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_MIN_IMPROVEMENT_PP", 2.0))
+    # Max regression allowed (pp) in any non-target category before blocking
+    PROMPT_MOD_REGRESSION_TOLERANCE_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_REGRESSION_TOLERANCE_PP", 1.0))
+    # Number of consecutive shadow runs required (candidate must pass K out of this many)
+    PROMPT_MOD_STABILITY_RUNS: int = field(default_factory=lambda: _env_int("PROMPT_MOD_STABILITY_RUNS", 3))
+    # Max latency overhead before blocking (1.15 = 15% overhead allowed)
+    PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))
 
     # OpenAI token counting: use completion_tokens instead of total_tokens
     OPENAI_USE_COMPLETION_TOKENS: bool = field(default_factory=lambda: _env("OPENAI_USE_COMPLETION_TOKENS", "false").lower() == "true")

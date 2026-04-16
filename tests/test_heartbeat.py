@@ -176,7 +176,7 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 50
+        assert count == 56  # 54 original + Quality Eval Harness + Prompt Optimizer
         monitors = store.list_all()
         names = {m.name for m in monitors}
         assert "System Health" in names
@@ -189,6 +189,7 @@ class TestMonitorStore:
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
         assert "Dream Consolidation" in names
+        assert "Quality Eval Harness" in names
 
     def test_quiz_and_skill_seeded_on_change(self, store):
         """Quiz and Skill Validation should seed with notify_condition='on_change'."""

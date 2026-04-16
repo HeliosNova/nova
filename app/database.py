@@ -205,6 +205,31 @@ CREATE TABLE IF NOT EXISTS capability_gaps (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Prompt self-modification module registry
+-- Immutable baseline rows (is_baseline=1) are never touched by the optimizer.
+-- Only module_names in _SELF_MOD_ALLOWED_MODULES (prompt_optimizer.py) are writable.
+CREATE TABLE IF NOT EXISTS prompt_modules (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_name             TEXT NOT NULL,
+    version                 INTEGER NOT NULL,
+    content                 TEXT NOT NULL,
+    is_baseline             INTEGER DEFAULT 0,
+    status                  TEXT NOT NULL DEFAULT 'candidate',
+    parent_version          INTEGER,
+    delta_description       TEXT,
+    promoted_at             TEXT,
+    promoted_eval_run_id    TEXT,
+    rolled_back_at          TEXT,
+    quarantined_until       TEXT,
+    shadow_eval_metrics     TEXT,
+    created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version
+    ON prompt_modules (module_name, version);
+CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status
+    ON prompt_modules (module_name, status);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
 CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
@@ -479,6 +504,46 @@ class SafeDB:
                     )"""
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (11,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 12: prompt_modules table ---
+        if 12 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "prompt_modules" not in tables:
+                    conn.execute("""
+                        CREATE TABLE prompt_modules (
+                            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                            module_name             TEXT NOT NULL,
+                            version                 INTEGER NOT NULL,
+                            content                 TEXT NOT NULL,
+                            is_baseline             INTEGER DEFAULT 0,
+                            status                  TEXT NOT NULL DEFAULT 'candidate',
+                            parent_version          INTEGER,
+                            delta_description       TEXT,
+                            promoted_at             TEXT,
+                            promoted_eval_run_id    TEXT,
+                            rolled_back_at          TEXT,
+                            quarantined_until       TEXT,
+                            shadow_eval_metrics     TEXT,
+                            created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version "
+                        "ON prompt_modules (module_name, version)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status "
+                        "ON prompt_modules (module_name, status)"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (12,))
                 conn.commit()
             except Exception:
                 conn.rollback()

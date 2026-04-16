@@ -103,6 +103,10 @@ async def lifespan(app: FastAPI):
     db.init_schema()
     logger.info("Database initialized at %s", config.DB_PATH)
 
+    # Seed prompt-module baselines (idempotent; no-op if already seeded)
+    from app.core.prompt_optimizer import init_prompt_optimizer
+    init_prompt_optimizer(db)
+
     # Restore auth lockout state from DB
     from app.auth import load_lockouts_from_db
     load_lockouts_from_db()
@@ -112,6 +116,10 @@ async def lifespan(app: FastAPI):
     user_facts = UserFactStore(db)
     learning = LearningEngine(db)
     skills = SkillStore(db)
+    try:
+        skills.sync_embeddings()
+    except Exception as _e:
+        logger.warning("Skill embedding sync failed (ChromaDB may be unavailable): %s", _e)
 
     # Knowledge graph
     from app.core.kg import KnowledgeGraph

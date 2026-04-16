@@ -66,104 +66,173 @@ class SkillStore:
 
     def __init__(self, db=None):
         self._db = db or get_db()
-        self._skills_collection = None
+        self._chroma_collection = None
         self._chroma_client = None
-        self._collection_lock = threading.Lock()
-        self._index_synced = False
+        self._chroma_lock = threading.Lock()
 
     # ------------------------------------------------------------------
-    # ChromaDB semantic index
+    # ChromaDB skill collection — lazy init
     # ------------------------------------------------------------------
 
-    def _get_skills_collection(self):
-        """Lazy-init ChromaDB skills collection. Returns None if unavailable."""
-        if self._skills_collection is not None:
-            return self._skills_collection
-        with self._collection_lock:
-            if self._skills_collection is not None:
-                return self._skills_collection
-            try:
+    def _get_skill_collection(self):
+        """Lazy-init ChromaDB collection for semantic skill lookup."""
+        if self._chroma_collection is not None:
+            return self._chroma_collection
+        with self._chroma_lock:
+            if self._chroma_collection is None:
                 import chromadb
                 self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._skills_collection = self._chroma_client.get_or_create_collection(
+                self._chroma_collection = self._chroma_client.get_or_create_collection(
                     name="skills",
                     metadata={"hnsw:space": "cosine"},
                 )
-                if not self._index_synced:
-                    self._sync_skill_index(self._skills_collection)
-                    self._index_synced = True
-                logger.debug(
-                    "Skills ChromaDB collection ready (%d indexed)",
-                    self._skills_collection.count(),
-                )
-            except Exception as e:
-                logger.debug("ChromaDB skills collection unavailable: %s", e)
-                return None
-        return self._skills_collection
+        return self._chroma_collection
 
-    def _sync_skill_index(self, collection) -> None:
-        """Upsert any enabled skills not yet reflected in the vector index."""
-        try:
-            existing = collection.get(include=["metadatas"])
-            indexed_ids: set[int] = {
-                int(m["skill_id"])
-                for m in (existing.get("metadatas") or [])
-                if m.get("skill_id") is not None
-            }
-            rows = self._db.fetchall("SELECT * FROM skills WHERE enabled = 1")
-            for row in rows:
-                if row["id"] not in indexed_ids:
-                    skill = self._row_to_skill(row)
-                    _index_skill(collection, skill)
-        except Exception as e:
-            logger.debug("Skill index sync failed: %s", e)
-
-    def _semantic_match(self, query: str) -> Skill | None:
-        """Find a skill via semantic similarity. Returns None if no confident match."""
-        collection = self._get_skills_collection()
-        if collection is None:
+    # Keep backward-compat alias used by HEAD's _index_skill / refine_skill / toggle_skill
+    def _get_skills_collection(self):
+        """Alias for _get_skill_collection (backward compat)."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
             return None
         try:
-            count = collection.count()
-            if count == 0:
+            return self._get_skill_collection()
+        except Exception:
+            return None
+
+    def _embed_skill(self, skill_id: int, name: str, trigger_pattern: str) -> None:
+        """Add or update a skill's embedding in ChromaDB."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return
+        try:
+            collection = self._get_skill_collection()
+            doc_id = f"skill_{skill_id}"
+            embed_text = f"{name}: {trigger_pattern}"
+            # Upsert: delete old entry if present, then add
+            try:
+                collection.delete(ids=[doc_id])
+            except Exception:
+                pass
+            collection.add(
+                ids=[doc_id],
+                documents=[embed_text],
+                metadatas=[{"skill_id": str(skill_id), "name": name}],
+            )
+        except Exception as e:
+            logger.warning("Failed to embed skill #%d '%s': %s", skill_id, name, e)
+
+    def _find_semantic_duplicate(self, name: str, trigger_pattern: str) -> int | None:
+        """Return an existing skill ID if trigger_pattern is semantically too close.
+
+        Embeds the candidate trigger pattern and queries ChromaDB.  If the nearest
+        existing skill has similarity >= SKILL_SEMANTIC_THRESHOLD, the candidate
+        would answer the same queries as that skill and is therefore a duplicate.
+
+        Returns the duplicate skill's ID, or None if no duplicate found
+        (or if semantic matching is disabled / collection is empty).
+
+        Called from create_skill() before the INSERT so near-duplicate skills
+        cannot accumulate in the corpus.
+        """
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return None
+        try:
+            collection = self._get_skill_collection()
+            if collection.count() == 0:
                 return None
+            embed_text = f"{name}: {trigger_pattern}"
             results = collection.query(
-                query_texts=[query],
-                n_results=min(3, count),
-                include=["metadatas", "distances"],
+                query_texts=[embed_text],
+                n_results=1,
+                include=["distances", "metadatas"],
             )
             if not results["ids"] or not results["ids"][0]:
                 return None
-            best_distance = results["distances"][0][0]
-            if best_distance > config.SKILL_SEMANTIC_THRESHOLD:
+            distance = results["distances"][0][0]
+            # ChromaDB cosine distance: 0 = identical, 2 = opposite.
+            similarity = 1.0 - (distance / 2.0)
+            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
                 return None
-            best_meta = results["metadatas"][0][0]
-            skill_id = best_meta.get("skill_id")
-            if skill_id is None:
+            metadata = results["metadatas"][0][0]
+            existing_id = int(metadata["skill_id"])
+            existing_name = metadata.get("name", f"skill_{existing_id}")
+            # Exclude self-updates -- same-name skills are handled by the name-dedup
+            # path that runs before this check; guard against edge-case order issues.
+            existing_row = self._db.fetchone(
+                "SELECT name FROM skills WHERE id = ?", (existing_id,)
+            )
+            if existing_row and existing_row["name"].lower() == name.lower():
                 return None
-            skill = self.get_skill(int(skill_id))
-            if skill and skill.enabled:
-                logger.info(
-                    "Skill semantic match: '%s' (distance=%.3f)", skill.name, best_distance
-                )
-                return skill
+            logger.info(
+                "Semantic dedup: '%s' is %.3f similar to existing #%d '%s' "
+                "(threshold %.2f)",
+                name, similarity, existing_id, existing_name,
+                config.SKILL_SEMANTIC_THRESHOLD,
+            )
+            return existing_id
         except Exception as e:
-            logger.debug("Semantic skill search failed: %s", e)
-        return None
+            logger.debug("Semantic dedup check failed (non-critical): %s", e)
+            return None
+
+    def _unembed_skill(self, skill_id: int) -> None:
+        """Remove a skill's embedding from ChromaDB."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return
+        try:
+            collection = self._get_skill_collection()
+            collection.delete(ids=[f"skill_{skill_id}"])
+        except Exception as e:
+            logger.debug("Failed to unembed skill #%d: %s", skill_id, e)
+
+    def sync_embeddings(self) -> int:
+        """Sync all enabled DB skills into ChromaDB. Safe to call at startup.
+
+        Returns the number of skills newly embedded.
+        """
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return 0
+        try:
+            collection = self._get_skill_collection()
+        except Exception as e:
+            logger.warning("Skill embedding sync skipped -- ChromaDB unavailable: %s", e)
+            return 0
+
+        rows = self._db.fetchall("SELECT id, name, trigger_pattern FROM skills WHERE enabled = 1")
+        synced = 0
+        for row in rows:
+            doc_id = f"skill_{row['id']}"
+            try:
+                existing = collection.get(ids=[doc_id], include=[])
+                if not existing["ids"]:
+                    self._embed_skill(row["id"], row["name"], row["trigger_pattern"])
+                    synced += 1
+            except Exception as e:
+                logger.debug("Skill sync error for #%d: %s", row["id"], e)
+        if synced:
+            logger.info("Synced %d skill embedding(s) to ChromaDB", synced)
+        return synced
 
     # ------------------------------------------------------------------
-    # Core matching
+    # Matching
     # ------------------------------------------------------------------
 
     def get_matching_skill(self, query: str) -> Skill | None:
         """Find the best matching skill for a query.
 
-        Stage 1 — Regex: checks all enabled skills, returns highest-specificity
+        Stage 1 -- Regex: checks all enabled skills, returns highest-specificity
         match (longer pattern = more specific = higher priority).
 
-        Stage 2 — Semantic: ChromaDB cosine similarity fallback when no regex
-        match is found. Uses SKILL_SEMANTIC_THRESHOLD to avoid false positives.
+        Stage 2 -- Semantic: ChromaDB cosine similarity fallback when no regex
+        match is found and ENABLE_SEMANTIC_SKILL_MATCHING is true.
+        Uses SKILL_SEMANTIC_THRESHOLD to avoid false positives.
         """
+        regex_hit = self._regex_match(query)
+        if regex_hit:
+            return regex_hit
+        if config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return self._semantic_match(query)
+        return None
+
+    def _regex_match(self, query: str) -> Skill | None:
+        """Regex-based skill lookup (original implementation)."""
         rows = self._db.fetchall(
             "SELECT * FROM skills WHERE enabled = 1 ORDER BY times_used DESC, success_rate DESC, id ASC LIMIT ?",
             (config.MAX_SKILLS_CHECK,),
@@ -199,6 +268,44 @@ class SkillStore:
     # CRUD
     # ------------------------------------------------------------------
 
+    def _semantic_match(self, query: str) -> Skill | None:
+        """Embedding-similarity skill lookup (fallback when regex misses).
+
+        Returns the best skill whose embedding similarity ≥ SKILL_SEMANTIC_THRESHOLD,
+        or None if no skill clears the bar.
+        """
+        try:
+            collection = self._get_skill_collection()
+            if collection.count() == 0:
+                return None
+            results = collection.query(
+                query_texts=[query],
+                n_results=1,
+                include=["distances", "metadatas"],
+            )
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            distance = results["distances"][0][0]
+            # ChromaDB cosine distance: 0=identical, 2=opposite → similarity = 1 − distance/2
+            similarity = 1.0 - (distance / 2.0)
+            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
+                logger.debug(
+                    "Semantic skill match below threshold: sim=%.3f threshold=%.3f",
+                    similarity, config.SKILL_SEMANTIC_THRESHOLD,
+                )
+                return None
+            skill_id = int(results["metadatas"][0][0]["skill_id"])
+            skill = self.get_skill(skill_id)
+            if skill and skill.enabled:
+                logger.info(
+                    "Semantic skill match: '%s' (id=%d, sim=%.3f)",
+                    skill.name, skill_id, similarity,
+                )
+                return skill
+        except Exception as e:
+            logger.warning("Semantic skill lookup failed: %s", e)
+        return None
+
     def create_skill(
         self,
         name: str,
@@ -221,6 +328,27 @@ class SkillStore:
         # Guard: reject overly broad trigger patterns
         if _is_too_broad(trigger_pattern):
             logger.warning("Skill '%s' rejected: trigger too broad (%s)", name, trigger_pattern)
+            return None
+
+        # Guard: reject skills whose args_template references undefined placeholders.
+        # This catches correction-path skills that bypass the auto_skills pre-check.
+        if _has_capture_group_mismatch(trigger_pattern, steps, answer_template):
+            logger.warning(
+                "Skill '%s' rejected: args_template references undefined placeholder "
+                "(add (?P<name>…) groups or use {query}/{output_key})",
+                name,
+            )
+            return None
+
+        # Guard: semantic dedup — reject if trigger embeds too close to an existing skill.
+        # Runs only when ChromaDB is initialised (i.e., at least one skill already exists).
+        dup_id = self._find_semantic_duplicate(name, trigger_pattern)
+        if dup_id is not None:
+            logger.warning(
+                "Skill '%s' rejected: semantically too similar to existing skill #%d "
+                "(similarity ≥ %.2f). Narrow the trigger or merge with the existing skill.",
+                name, dup_id, config.SKILL_SEMANTIC_THRESHOLD,
+            )
             return None
 
         # Deduplication — if same trigger pattern exists, boost confidence
@@ -246,7 +374,7 @@ class SkillStore:
             (name,),
         )
         if existing_by_name:
-            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>")
+            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>") or "<unknown>"
             import sqlite3 as _sqlite3
             try:
                 self._db.execute(
@@ -271,6 +399,7 @@ class SkillStore:
                 "Skill updated: #%d '%s' trigger changed from '%s' to '%s'",
                 existing_by_name["id"], name, old_trigger[:60], trigger_pattern[:60],
             )
+            self._embed_skill(existing_by_name["id"], name, trigger_pattern)
             return existing_by_name["id"]
 
         import sqlite3 as _sqlite3
@@ -307,13 +436,7 @@ class SkillStore:
             )
         skill_id = cursor.lastrowid
         logger.info("Created skill #%d: '%s' (trigger: %s)", skill_id, name, trigger_pattern)
-
-        # Index in ChromaDB for semantic search
-        collection = self._get_skills_collection()
-        if collection is not None:
-            skill = self.get_skill(skill_id)
-            if skill:
-                _index_skill(collection, skill)
+        self._embed_skill(skill_id, name, trigger_pattern)
 
         return skill_id
 
@@ -438,9 +561,7 @@ class SkillStore:
             # Re-index in ChromaDB
             skill = self.get_skill(skill_id)
             if skill:
-                collection = self._get_skills_collection()
-                if collection is not None:
-                    _index_skill(collection, skill)
+                self._embed_skill(skill_id, skill.name, skill.trigger_pattern)
         else:
             cursor = self._db.execute(
                 "UPDATE skills SET enabled = 0 WHERE id = ?",
@@ -452,13 +573,9 @@ class SkillStore:
         """Delete a skill and remove it from the vector index."""
         cursor = self._db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
         if cursor.rowcount > 0:
-            collection = self._get_skills_collection()
-            if collection is not None:
-                try:
-                    collection.delete(ids=[f"skill_{skill_id}"])
-                except Exception as e:
-                    logger.debug("Skill index delete failed for #%d: %s", skill_id, e)
-        return cursor.rowcount > 0
+            self._unembed_skill(skill_id)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Skill composition
@@ -650,9 +767,7 @@ class SkillStore:
                 # Re-index with updated description
                 updated = self.get_skill(skill_id)
                 if updated:
-                    collection = self._get_skills_collection()
-                    if collection is not None:
-                        _index_skill(collection, updated)
+                    self._embed_skill(skill_id, updated.name, new_trigger)
                 logger.info("Skill #%d refined: narrowed trigger to '%s'", skill_id, new_trigger)
                 return True
 
@@ -774,6 +889,15 @@ _BROADNESS_TEST_QUERIES = [
     "Who won the World Cup?",
     "What should I eat for dinner?",
     "How much is a flight to Paris?",
+    # Temporal-framing unrelated queries — catch patterns anchored on
+    # "today / current / latest / now / recent" without a domain constraint.
+    # Audit P0-2: patterns like (?i)(current|today|latest) matched 1 existing
+    # query (the weather one above) but needed a second hit to be flagged.
+    "Today I want to learn how to play chess",
+    "Give me the current bus schedule for downtown",
+    "What's the latest gossip about celebrity drama?",
+    "Tell me what's happening right now in my neighborhood",
+    "I need the most recent study tips for exams",
     # Non-English queries to prevent non-English patterns from always passing
     "¿Cuál es el clima hoy?",          # Spanish
     "今天天气怎么样？",                    # Chinese
@@ -794,29 +918,71 @@ def _is_too_broad(pattern: str) -> bool:
 
 
 def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template: str | None) -> bool:
-    """Check if templates reference capture groups that don't exist in the regex."""
+    """Check if templates reference capture groups or named placeholders that don't exist.
+
+    Catches three classes of mismatch in args_template (step tool arguments):
+    - $N  numbered back-references where N > actual group count
+    - {capture_N} references where N > actual group count
+    - {named_placeholder} that is not {query}, not a named capture group
+      (?P<name>…), and not an output_key produced by an earlier step
+
+    answer_template is injected as raw LLM guidance text (never Python-substituted),
+    so only $N / {capture_N} numeric mismatches are checked there — not {named}.
+    """
     try:
-        num_groups = re.compile(pattern).groups
+        compiled = re.compile(pattern)
+        num_groups = compiled.groups
+        named_groups: set[str] = set(compiled.groupindex.keys())
     except re.error:
         return True
 
-    templates = []
-    if answer_template:
-        templates.append(answer_template)
+    # Valid named bindings available to every args_template:
+    #   {query}          -- always available (the user's raw query)
+    #   {capture_N}      -- handled by the numeric check below; skip in named check
+    #   {output_key}     -- each step's output_key is available to subsequent steps
+    #   (?P<name>...)    -- named capture groups from the trigger pattern
+    output_keys: set[str] = set()
     for step in steps:
-        args = step.get("args_template", {})
-        if isinstance(args, dict):
-            templates.extend(str(v) for v in args.values())
-        elif isinstance(args, str):
-            templates.append(args)
+        ok = step.get("output_key", "")
+        if ok and isinstance(ok, str):
+            output_keys.add(ok)
 
-    for tmpl in templates:
+    _EXEMPT = frozenset({"query"})
+    valid_named = _EXEMPT | named_groups | output_keys
+
+    def _check_numeric(tmpl: str) -> bool:
+        """Return True if tmpl has a $N or {capture_N} that exceeds num_groups."""
         for match in re.finditer(r"\$(\d+)", tmpl):
             if int(match.group(1)) > num_groups:
                 return True
         for match in re.finditer(r"\{capture_(\d+)\}", tmpl):
             if int(match.group(1)) > num_groups:
                 return True
+        return False
+
+    # answer_template: only check numeric back-references — {named} are LLM hints.
+    if answer_template and _check_numeric(answer_template):
+        return True
+
+    # args_template in each step: full check including {named} placeholders.
+    for step in steps:
+        args = step.get("args_template", {})
+        templates: list[str] = []
+        if isinstance(args, dict):
+            templates.extend(str(v) for v in args.values())
+        elif isinstance(args, str):
+            templates.append(args)
+
+        for tmpl in templates:
+            if _check_numeric(tmpl):
+                return True
+            # {named_placeholder} — must resolve to a known binding
+            for match in re.finditer(r"\{(\w+)\}", tmpl):
+                name = match.group(1)
+                if re.match(r"^capture_\d+$", name):
+                    continue
+                if name not in valid_named:
+                    return True
 
     return False
 
@@ -885,26 +1051,31 @@ async def extract_skill_from_correction(
         tool_info = f"\n\nTool calls that happened: {json.dumps(tool_history)}"
 
     try:
+        from app.core.prompt_optimizer import get_active_module
+        _skill_extraction_default = (
+            "You extract reusable skills from corrections. A skill is a "
+            "trigger pattern (regex) and a sequence of tool calls.\n\n"
+            "Given a correction, create a skill if the user describes a "
+            "reusable procedure involving tool calls.\n\n"
+            "Respond with JSON:\n"
+            '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
+            '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
+            '"answer_template": "Use the result to answer: {result}"}\n\n'
+            "IMPORTANT:\n"
+            "- trigger_pattern must be a valid regex that matches similar future queries\n"
+            f"- steps must reference actual tools: {', '.join(_get_tool_names())}\n"
+            "- Use {query} as placeholder for the user's query in args_template\n\n"
+            'If this is NOT a reusable tool procedure, respond: {"skip": true}'
+        )
+        skill_extraction_prompt = (
+            get_active_module("skill_extraction_prompt") or _skill_extraction_default
+        )
         result = await asyncio.wait_for(
             llm.invoke_nothink(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "You extract reusable skills from corrections. A skill is a "
-                            "trigger pattern (regex) and a sequence of tool calls.\n\n"
-                            "Given a correction, create a skill if the user describes a "
-                            "reusable procedure involving tool calls.\n\n"
-                            "Respond with JSON:\n"
-                            '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
-                            '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
-                            '"answer_template": "Use the result to answer: {result}"}\n\n'
-                            "IMPORTANT:\n"
-                            "- trigger_pattern must be a valid regex that matches similar future queries\n"
-                            f"- steps must reference actual tools: {', '.join(_get_tool_names())}\n"
-                            "- Use {query} as placeholder for the user's query in args_template\n\n"
-                            'If this is NOT a reusable tool procedure, respond: {"skip": true}'
-                        ),
+                        "content": skill_extraction_prompt,
                     },
                     {
                         "role": "user",

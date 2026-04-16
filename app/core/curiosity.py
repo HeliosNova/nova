@@ -134,6 +134,7 @@ class _LazyConfigInt:
 
 MAX_PENDING = _LazyConfigInt("MAX_CURIOSITY_PENDING")
 MAX_ATTEMPTS = _LazyConfigInt("MAX_CURIOSITY_ATTEMPTS")
+MAX_QUEUE_SIZE = _LazyConfigInt("MAX_CURIOSITY_QUEUE_SIZE")
 
 
 @dataclass
@@ -261,16 +262,16 @@ class CuriosityQueue:
                 )
                 return row["id"]
 
-        # Cap pending items
+        # Cap pending items — FIFO eviction when queue exceeds MAX_CURIOSITY_QUEUE_SIZE
         pending_count = self._db.fetchone(
             "SELECT COUNT(*) AS c FROM curiosity_queue WHERE status = 'pending'"
         )["c"]
-        if pending_count >= MAX_PENDING:
-            # Remove lowest-urgency pending item
+        if pending_count >= MAX_QUEUE_SIZE:
+            # FIFO eviction: remove the oldest pending item (insertion order)
             self._db.execute(
                 "DELETE FROM curiosity_queue WHERE id = ("
                 "  SELECT id FROM curiosity_queue WHERE status = 'pending' "
-                "  ORDER BY urgency ASC LIMIT 1"
+                "  ORDER BY created_at ASC LIMIT 1"
                 ")"
             )
 

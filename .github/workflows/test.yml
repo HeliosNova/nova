@@ -2,9 +2,9 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    branches: ['**']
   pull_request:
-    branches: [main]
+    branches: ['**']
 
 jobs:
   test:
@@ -23,6 +23,10 @@ jobs:
         run: |
           pip install -r requirements.txt
 
+      - name: Verify import chain (catch missing deps early)
+        run: |
+          python -c "import app.core.skills; import app.core.brain; import app.monitors.heartbeat"
+
       - name: Run tests
         run: |
           python -m pytest tests/ -v --ignore=tests/test_mcp_server.py
@@ -32,3 +36,4 @@ jobs:
           OLLAMA_URL: http://localhost:11434
           SEARXNG_URL: http://localhost:8080
           TRAINING_DATA_PATH: /tmp/training_data.jsonl
+          MAX_SYSTEM_TOKENS: "6000"

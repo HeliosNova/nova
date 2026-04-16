@@ -298,8 +298,9 @@ def _build_tool_examples(registered_tool_names: set[str] | None = None) -> str:
 # Prompt Builder
 # ---------------------------------------------------------------------------
 
-# Maximum tokens for the full system prompt (32K context window)
-MAX_SYSTEM_TOKENS = config.MAX_SYSTEM_TOKENS  # Leave room for conversation + response
+# Maximum tokens for the full system prompt — read from config on each call so
+# that test env overrides via reset_config() / monkeypatch.setenv are respected.
+# Do not cache this at module level; config is a live proxy.
 
 
 def build_system_prompt(
@@ -451,7 +452,7 @@ def build_system_prompt(
 
     # Build full prompt, truncating if over budget using token estimation
     from app.core.text_utils import estimate_tokens
-    max_tokens_budget = MAX_SYSTEM_TOKENS
+    max_tokens_budget = config.MAX_SYSTEM_TOKENS
 
     # First pass: mandatory blocks
     mandatory = "".join(text for _, text, truncatable in blocks if not truncatable)

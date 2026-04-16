@@ -388,6 +388,12 @@ class HeartbeatLoop:
         elif monitor.check_type == "capability_review":
             return await self._execute_capability_review(cfg)
 
+        elif monitor.check_type == "eval":
+            return await self._execute_eval_harness(cfg)
+
+        elif monitor.check_type == "prompt_analyzer":
+            return await self._execute_prompt_analyzer(cfg)
+
         return f"[Unknown check_type: {monitor.check_type}]"
 
     async def _execute_system_health(self) -> str:
@@ -1554,6 +1560,63 @@ class HeartbeatLoop:
             logger.error("[Heartbeat] ALL notification channels failed for '%s'", monitor.name)
         else:
             logger.warning("[Heartbeat] No channels configured for alert '%s'", monitor.name)
+
+    async def _execute_eval_harness(self, cfg: dict) -> str:
+        """Run the automated eval suite and return a summary string for the monitor result."""
+        if not config.ENABLE_EVAL_HARNESS:
+            return "[Eval harness disabled -- set ENABLE_EVAL_HARNESS=true to enable]"
+
+        try:
+            from app.monitors.eval_harness import EvalHarness
+        except ImportError as e:
+            return f"[Eval harness import failed: {e}]"
+
+        suite_path = cfg.get("suite_path") or config.EVAL_SUITE_PATH
+        report_dir = cfg.get("report_dir") or config.EVAL_REPORT_PATH
+
+        harness = EvalHarness(suite_path=suite_path, report_dir=report_dir)
+
+        # Verify suite file exists before attempting to run
+        import pathlib
+        if not pathlib.Path(suite_path).exists():
+            return f"[Eval suite not found: {suite_path}]"
+
+        try:
+            report, json_path, md_path = await harness.run_and_persist()
+        except Exception as e:
+            logger.error("[Heartbeat] Eval harness run failed: %s", e, exc_info=True)
+            return f"[Eval harness run failed: {e}]"
+
+        flagged = [r for r in report.regressions if r.flagged]
+        status = "REGRESSION" if flagged else "OK"
+        reg_str = ""
+        if flagged:
+            reg_str = " | regressions: " + ", ".join(
+                f"{r.metric}({r.baseline:.2f}->{r.current:.2f})" for r in flagged
+            )
+
+        cat_summary = " | ".join(
+            f"{cat}:{cm.pass_rate:.0%}"
+            for cat, cm in report.categories.items()
+        )
+
+        return (
+            f"EVAL {status} | "
+            f"pass={report.passed}/{report.total_tasks} ({report.pass_rate:.0%}) | "
+            f"duration={report.duration_seconds:.0f}s | "
+            f"{cat_summary}"
+            f"{reg_str} | "
+            f"report={json_path.name}"
+        )
+
+    async def _execute_prompt_analyzer(self, cfg: dict) -> str:
+        """Run the PromptOptimizerAnalyzer: drift detection + candidate proposals."""
+        from app.monitors.prompt_optimizer_monitor import run_prompt_analyzer
+        try:
+            return await run_prompt_analyzer(cfg)
+        except Exception as e:
+            logger.error("[Heartbeat] Prompt analyzer failed: %s", e, exc_info=True)
+            return f"[Prompt analyzer failed: {e}]"
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""

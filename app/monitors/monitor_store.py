@@ -530,6 +530,23 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find recent GitHub security advisories and critical CVEs from the past 24-48 hours. Search for \"github security advisory critical\" and \"CVE critical\". Report: CVE ID, affected software, severity, and description. Focus on widely-used packages.\n• CVE 1: [ID] [software] [severity] - [description]\n• CVE 2: ...\n• CVE 3: ..."}},
             {"name": "Government Contract Awards", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find major US government contract awards from the past 48 hours. Search for \"government contract award today\" and \"defense contract awarded\". Report: contractor, agency, dollar amount, and purpose. Focus on tech, defense, and AI contracts over $10M.\n• Contract 1: [contractor] [agency] [$amount] - [purpose]\n• Contract 2: ...\n• Contract 3: ..."}},
+            # --- Eval & Prompt Optimization ---
+            {
+                "name": "Quality Eval Harness",
+                "check_type": "eval",
+                "check_config": {},
+                "schedule_seconds": 86400,   # nightly
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Prompt Optimizer",
+                "check_type": "prompt_analyzer",
+                "check_config": {},
+                "schedule_seconds": 90000,   # 25h -- runs after Quality Eval Harness
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
         ]
 
         count = 0
@@ -539,6 +556,17 @@ class MonitorStore:
             mid = self.create(**seed)
             if mid > 0:
                 count += 1
+
+        # Prompt Optimizer starts disabled -- user must set ENABLE_PROMPT_SELF_MOD=true
+        # and manually enable it. The handler also guards internally at runtime.
+        prompt_opt_row = self._db.fetchone(
+            "SELECT id FROM monitors WHERE name='Prompt Optimizer'"
+        )
+        if prompt_opt_row:
+            self._db.execute(
+                "UPDATE monitors SET enabled=0 WHERE id=? AND enabled=1",
+                (prompt_opt_row["id"],),
+            )
 
         # Migrate existing monitors: update domain study queries + fix check_types
         self._migrate_existing_monitors()
