@@ -305,111 +305,110 @@ class KnowledgeGraph:
         now = _now_iso()
         fact_valid_from = valid_from or now
 
-        # All DB operations under the write lock to prevent TOCTOU races
-        # (duplicate check, conflict resolution, insert, prune counter)
+        # All DB operations under the write lock to prevent TOCTOU races.
+        # Sync DB work runs in a thread to avoid blocking the event loop.
         async with self._write_lock:
-            # Check for exact duplicate (same subject+predicate+object) — current
-            # Use LOWER() for case-insensitive matching to preserve original casing
-            existing = self._db.fetchone(
-                "SELECT id, confidence FROM kg_facts "
-                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
-                "AND valid_to IS NULL",
-                (subject, predicate, object_),
+            result = await asyncio.to_thread(
+                self._sync_add_fact, subject, predicate, object_,
+                confidence, source, fact_valid_from, valid_to, provenance, now,
             )
+        return result
 
-            if existing:
-                if confidence > existing["confidence"]:
-                    self._db.execute(
-                        "UPDATE kg_facts SET confidence = ?, source = ?, "
-                        "provenance = CASE WHEN ? != '' THEN ? ELSE provenance END "
-                        "WHERE id = ?",
-                        (confidence, source, provenance, provenance, existing["id"]),
-                    )
-                    return True
-                return False
+    def _sync_add_fact(
+        self, subject, predicate, object_, confidence, source,
+        fact_valid_from, valid_to, provenance, now,
+    ) -> bool:
+        """Sync helper for add_fact — all DB operations happen here (off event loop)."""
+        # Check for exact duplicate
+        existing = self._db.fetchone(
+            "SELECT id, confidence FROM kg_facts "
+            "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+            "AND valid_to IS NULL",
+            (subject, predicate, object_),
+        )
 
-            # Check for contradicting facts (same subject+predicate, different object, still current)
-            # Also check reversed direction: same object+predicate, different subject
-            # (e.g. "Arsenal leads Premier League" contradicts "Man Utd leads Premier League")
-            conflicts = self._db.fetchall(
-                "SELECT id, object, confidence FROM kg_facts "
-                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
-                "AND valid_to IS NULL",
-                (subject, predicate, object_),
-            )
-            # Also find inverse contradictions: same object being "led" by a different subject
-            # Only for predicates that imply uniqueness (leads, is_leader_of, etc.)
-            _UNIQUE_PREDICATES = {"leads", "is_leader_of", "is_president_of", "is_ceo_of",
-                                  "is_capital_of", "is_champion_of"}
-            if predicate in _UNIQUE_PREDICATES:
-                inverse_conflicts = self._db.fetchall(
-                    "SELECT id, object, confidence FROM kg_facts "
-                    "WHERE LOWER(subject) != LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
-                    "AND valid_to IS NULL",
-                    (subject, predicate, object_),
+        if existing:
+            if confidence > existing["confidence"]:
+                self._db.execute(
+                    "UPDATE kg_facts SET confidence = ?, source = ?, "
+                    "provenance = CASE WHEN ? != '' THEN ? ELSE provenance END "
+                    "WHERE id = ?",
+                    (confidence, source, provenance, provenance, existing["id"]),
                 )
-                conflicts = list(conflicts) + list(inverse_conflicts)
+                return True
+            return False
 
-            # Supersede conflicting facts + insert new fact atomically
-            with self._db.transaction() as tx:
-                for conflict in conflicts:
-                    tx.execute(
-                        "UPDATE kg_facts SET valid_to = ? WHERE id = ?",
-                        (now, conflict["id"]),
-                    )
+        # Check for contradicting facts
+        conflicts = self._db.fetchall(
+            "SELECT id, object, confidence FROM kg_facts "
+            "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
+            "AND valid_to IS NULL",
+            (subject, predicate, object_),
+        )
+        _UNIQUE_PREDICATES = {"leads", "is_leader_of", "is_president_of", "is_ceo_of",
+                              "is_capital_of", "is_champion_of"}
+        if predicate in _UNIQUE_PREDICATES:
+            inverse_conflicts = self._db.fetchall(
+                "SELECT id, object, confidence FROM kg_facts "
+                "WHERE LOWER(subject) != LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                "AND valid_to IS NULL",
+                (subject, predicate, object_),
+            )
+            conflicts = list(conflicts) + list(inverse_conflicts)
 
-                # Check for a previously-superseded row with the same triple
-                # (the UNIQUE constraint means we can't INSERT a duplicate).
-                # If found, reactivate it instead of inserting.
-                old_superseded = tx.fetchone(
+        # Supersede conflicting facts + insert new fact atomically
+        with self._db.transaction() as tx:
+            for conflict in conflicts:
+                tx.execute(
+                    "UPDATE kg_facts SET valid_to = ? WHERE id = ?",
+                    (now, conflict["id"]),
+                )
+
+            old_superseded = tx.fetchone(
+                "SELECT id FROM kg_facts "
+                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                "AND valid_to IS NOT NULL",
+                (subject, predicate, object_),
+            )
+
+            if old_superseded:
+                tx.execute(
+                    "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
+                    "superseded_by = NULL, confidence = ?, source = ?, "
+                    "provenance = ? WHERE id = ?",
+                    (fact_valid_from, confidence, source, provenance, old_superseded["id"]),
+                )
+                new_id = old_superseded["id"]
+            else:
+                tx.execute(
+                    "INSERT INTO kg_facts "
+                    "(subject, predicate, object, confidence, source, valid_from, valid_to, provenance) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (subject, predicate, object_, confidence, source, fact_valid_from, valid_to, provenance),
+                )
+                new_row = tx.fetchone(
                     "SELECT id FROM kg_facts "
                     "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
-                    "AND valid_to IS NOT NULL",
+                    "AND valid_to IS NULL ORDER BY id DESC LIMIT 1",
                     (subject, predicate, object_),
                 )
+                new_id = new_row["id"] if new_row else None
 
-                if old_superseded:
-                    # Reactivate: clear valid_to/superseded_by, update metadata
+            if conflicts and new_id is not None:
+                for conflict in conflicts:
                     tx.execute(
-                        "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
-                        "superseded_by = NULL, confidence = ?, source = ?, "
-                        "provenance = ? WHERE id = ?",
-                        (fact_valid_from, confidence, source, provenance, old_superseded["id"]),
+                        "UPDATE kg_facts SET superseded_by = ? WHERE id = ?",
+                        (new_id, conflict["id"]),
                     )
-                    new_id = old_superseded["id"]
-                else:
-                    # Insert the new fact
-                    tx.execute(
-                        "INSERT INTO kg_facts "
-                        "(subject, predicate, object, confidence, source, valid_from, valid_to, provenance) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        (subject, predicate, object_, confidence, source, fact_valid_from, valid_to, provenance),
-                    )
-                    # Get the new fact's ID
-                    new_row = tx.fetchone(
-                        "SELECT id FROM kg_facts "
-                        "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
-                        "AND valid_to IS NULL ORDER BY id DESC LIMIT 1",
-                        (subject, predicate, object_),
-                    )
-                    new_id = new_row["id"] if new_row else None
+            logger.info(
+                "KG: superseded %d fact(s) for %s/%s -> %s",
+                len(conflicts), subject, predicate, object_,
+            )
 
-                # Set superseded_by on old conflicting facts
-                if conflicts and new_id is not None:
-                    for conflict in conflicts:
-                        tx.execute(
-                            "UPDATE kg_facts SET superseded_by = ? WHERE id = ?",
-                            (new_id, conflict["id"]),
-                        )
-                logger.info(
-                    "KG: superseded %d fact(s) for %s/%s -> %s",
-                    len(conflicts), subject, predicate, object_,
-                )
-
-            self._inserts_since_prune += 1
-            if self._inserts_since_prune >= _PRUNE_BATCH_SIZE:
-                self._prune()
-                self._inserts_since_prune = 0
+        self._inserts_since_prune += 1
+        if self._inserts_since_prune >= _PRUNE_BATCH_SIZE:
+            self._prune()
+            self._inserts_since_prune = 0
 
         return True
 
@@ -440,13 +439,20 @@ class KnowledgeGraph:
     async def delete_fact(self, subject: str, predicate: str, object_: str) -> bool:
         """Retire a specific fact triple (temporal retirement, not hard delete)."""
         async with self._write_lock:
-            row = self._db.fetchone(
-                "SELECT id FROM kg_facts WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) AND valid_to IS NULL",
-                (subject.strip(), normalize_predicate(predicate), object_.strip()),
+            return await asyncio.to_thread(
+                self._sync_delete_fact,
+                subject.strip(), normalize_predicate(predicate), object_.strip(),
             )
-            if row:
-                return self._retire_fact(row["id"])
-            return False
+
+    def _sync_delete_fact(self, subject: str, predicate: str, object_: str) -> bool:
+        """Sync helper for delete_fact."""
+        row = self._db.fetchone(
+            "SELECT id FROM kg_facts WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) AND valid_to IS NULL",
+            (subject, predicate, object_),
+        )
+        if row:
+            return self._retire_fact(row["id"])
+        return False
 
     async def check_and_resolve_contradictions(
         self,
@@ -467,7 +473,8 @@ class KnowledgeGraph:
 
         # Phase 1: Read under lock — snapshot the conflicts
         async with self._write_lock:
-            conflicts = self._db.fetchall(
+            conflicts = await asyncio.to_thread(
+                self._db.fetchall,
                 "SELECT id, object, confidence FROM kg_facts "
                 "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
                 "AND valid_to IS NULL",
@@ -507,10 +514,10 @@ class KnowledgeGraph:
                 logger.debug("KG contradiction check failed (allowing both): %s", e)
 
         # Phase 3: Re-read and write under lock — verify data hasn't gone stale
-        async with self._write_lock:
+        def _sync_resolve() -> bool | None:
+            """Returns False to reject new fact, None to continue (allow)."""
             for conflict, keep in decisions:
                 if keep == "B":
-                    # Re-check that the conflict row is still current (not retired by another task)
                     still_current = self._db.fetchone(
                         "SELECT id FROM kg_facts WHERE id = ? AND valid_to IS NULL",
                         (conflict["id"],),
@@ -525,10 +532,14 @@ class KnowledgeGraph:
                     )
                     logger.info("KG contradiction resolved: superseded old '%s' for new '%s'", conflict["object"], new_object)
                 elif keep == "A":
-                    # Old fact wins — don't add new
                     logger.info("KG contradiction resolved: kept old '%s', rejected new '%s'", conflict["object"], new_object)
                     return False
-                # "both" — not a real contradiction, allow both
+            return None
+
+        async with self._write_lock:
+            result = await asyncio.to_thread(_sync_resolve)
+            if result is False:
+                return False
 
         return True
 
@@ -549,9 +560,10 @@ class KnowledgeGraph:
 
         # Pass 1: Heuristic filters (only current facts)
         if heuristic:
-            all_facts = self._db.fetchall(
+            all_facts = await asyncio.to_thread(
+                self._db.fetchall,
                 "SELECT id, subject, predicate, object FROM kg_facts "
-                "WHERE valid_to IS NULL"
+                "WHERE valid_to IS NULL",
             )
             ids_to_delete = []
             for row in all_facts:
@@ -560,14 +572,17 @@ class KnowledgeGraph:
 
             if ids_to_delete:
                 async with self._write_lock:
-                    deleted_heuristic = self._retire_facts_batch(ids_to_delete)
+                    deleted_heuristic = await asyncio.to_thread(
+                        self._retire_facts_batch, ids_to_delete
+                    )
                 logger.info("KG curation: retired %d garbage facts (heuristic)", deleted_heuristic)
 
         if sample_size <= 0:
             return {"heuristic": deleted_heuristic, "llm": 0}
 
         # Pass 2: LLM validation of lowest-confidence current facts
-        low_facts = self._db.fetchall(
+        low_facts = await asyncio.to_thread(
+            self._db.fetchall,
             "SELECT id, subject, predicate, object, confidence FROM kg_facts "
             "WHERE valid_to IS NULL "
             "ORDER BY confidence ASC LIMIT ?",
@@ -1015,10 +1030,12 @@ class KnowledgeGraph:
         """Lower confidence on old current facts. Returns count affected."""
         cutoff = f"-{days} days"
         async with self._write_lock:
-            cursor = self._db.execute(
-                "UPDATE kg_facts SET confidence = MAX(0.1, confidence - ?) "
-                "WHERE created_at < datetime('now', ?) AND valid_to IS NULL "
-                "AND (last_retrieved_at IS NULL OR last_retrieved_at < datetime('now', ?))",
-                (decay_amount, cutoff, cutoff),
-            )
-            return cursor.rowcount
+            def _do_decay():
+                cursor = self._db.execute(
+                    "UPDATE kg_facts SET confidence = MAX(0.1, confidence - ?) "
+                    "WHERE created_at < datetime('now', ?) AND valid_to IS NULL "
+                    "AND (last_retrieved_at IS NULL OR last_retrieved_at < datetime('now', ?))",
+                    (decay_amount, cutoff, cutoff),
+                )
+                return cursor.rowcount
+            return await asyncio.to_thread(_do_decay)
