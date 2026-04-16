@@ -2063,15 +2063,22 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
     Includes quality gate (heuristic pre-filter) and contradiction detection.
     """
     from app.core.kg import CANONICAL_PREDICATES, is_garbage_triple
+    from app.core.prompt_optimizer import get_active_module
 
     predicates_str = ", ".join(sorted(CANONICAL_PREDICATES))
-    prompt = (
+    _kg_default = (
         "Extract factual (subject, predicate, object) triples from this Q&A.\n"
-        f"Use ONLY these predicates: {predicates_str}\n"
+        "Use ONLY these predicates: {predicates}\n"
         "Return a JSON array. Max 5 triples. Only verifiable facts, not opinions.\n"
         "Rate each triple's confidence: 0.3 (uncertain/speculative) to 0.95 (well-established fact).\n"
-        'Example: [{"subject": "python", "predicate": "created_by", "object": "guido van rossum", "confidence": 0.9}]\n\n'
-        f"Q: {query}\nA: {answer[:1000]}"
+        'Example: [{{"subject": "python", "predicate": "created_by", "object": "guido van rossum", "confidence": 0.9}}]\n\n'
+        "Q: {query}\nA: {answer}"
+    )
+    kg_template = get_active_module("kg_extraction_prompt") or _kg_default
+    prompt = kg_template.format(
+        predicates=predicates_str,
+        query=query,
+        answer=answer[:1000],
     )
 
     try:

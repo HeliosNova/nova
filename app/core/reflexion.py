@@ -204,7 +204,12 @@ async def critique_response(
         f"Current date: {now.strftime('%B %d, %Y')}. "
         f"The year {now.year} is the present year — this is the real system clock date, not a future or hypothetical date."
     )
-    prompt = _CRITIQUE_PROMPT.format(
+    # Load active module version (scoring=True enforces Goodhart firewall during shadow eval)
+    from app.core.prompt_optimizer import get_active_module
+    critique_template = (
+        get_active_module("critique_prompt", scoring=True) or _CRITIQUE_PROMPT
+    )
+    prompt = critique_template.format(
         query=query[:500],
         answer=answer[:1000],
         tools=tools_desc,

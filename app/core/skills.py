@@ -735,31 +735,36 @@ async def extract_skill_from_correction(
         tool_info = f"\n\nTool calls that happened: {json.dumps(tool_history)}"
 
     try:
+        from app.core.prompt_optimizer import get_active_module
+        _skill_extraction_default = (
+            "You extract reusable skills from corrections. A skill is a "
+            "trigger pattern (regex) and a sequence of tool calls.\n\n"
+            "Given a correction, create a skill if the user describes a "
+            "reusable procedure involving tool calls.\n\n"
+            "Respond with JSON:\n"
+            '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
+            '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
+            '"answer_template": "Use the result to answer: {result}"}\n\n'
+            "IMPORTANT:\n"
+            "- trigger_pattern must be a valid regex that matches similar future queries\n"
+            f"- steps must reference actual tools: {', '.join(_get_tool_names())}\n"
+            "- Use {query} as placeholder for the user's query in args_template\n\n"
+            'If this is NOT a reusable tool procedure, respond: {"skip": true}'
+        )
+        skill_extraction_prompt = (
+            get_active_module("skill_extraction_prompt") or _skill_extraction_default
+        )
         result = await asyncio.wait_for(
             llm.invoke_nothink(
                 [
                     {
                         "role": "system",
-                        "content": (
-                            "You extract reusable skills from corrections. A skill is a "
-                            "trigger pattern (regex) and a sequence of tool calls.\n\n"
-                            "Given a correction, create a skill if the user describes a "
-                            "reusable procedure involving tool calls.\n\n"
-                            "Respond with JSON:\n"
-                            '{"name": "short_name", "trigger_pattern": "regex_to_match_queries", '
-                            '"steps": [{"tool": "tool_name", "args_template": {"key": "{query}"}}], '
-                            '"answer_template": "Use the result to answer: {result}"}\n\n'
-                        "IMPORTANT:\n"
-                        "- trigger_pattern must be a valid regex that matches similar future queries\n"
-                        f"- steps must reference actual tools: {', '.join(_get_tool_names())}\n"
-                        "- Use {query} as placeholder for the user's query in args_template\n\n"
-                        'If this is NOT a reusable tool procedure, respond: {"skip": true}'
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": f"Correction: {correction_context}{tool_info}",
-                },
+                        "content": skill_extraction_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": f"Correction: {correction_context}{tool_info}",
+                    },
                 ],
                 json_mode=True,
                 json_prefix="{",

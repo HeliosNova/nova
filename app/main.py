@@ -101,6 +101,10 @@ async def lifespan(app: FastAPI):
     db.init_schema()
     logger.info("Database initialized at %s", config.DB_PATH)
 
+    # Seed prompt-module baselines (idempotent; no-op if already seeded)
+    from app.core.prompt_optimizer import init_prompt_optimizer
+    init_prompt_optimizer(db)
+
     # Restore auth lockout state from DB
     from app.auth import load_lockouts_from_db
     load_lockouts_from_db()

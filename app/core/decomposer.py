@@ -355,12 +355,15 @@ def _build_merge_instruction(
     tasks: "list[AgentTask]",
     strategy: str,
 ) -> str:
+    from app.core.prompt_optimizer import get_active_module
     roles = ", ".join(t.role for t in tasks)
     if strategy == "sequential":
-        return (
-            f"Synthesize the sequentially gathered findings ({roles}) into a "
-            f"complete, coherent answer. Original question: {query}"
+        template = (
+            get_active_module("merge_instruction_sequential")
+            or "Synthesize the sequentially gathered findings ({roles}) into a "
+               "complete, coherent answer. Original question: {query}"
         )
+        return template.format(roles=roles, query=query)
     elif strategy == "map-reduce":
         map_roles = ", ".join(t.role for t in tasks[:-1])
         return (
@@ -369,7 +372,9 @@ def _build_merge_instruction(
             f"Original question: {query}"
         )
     else:  # parallel
-        return (
-            f"Synthesize the parallel research findings ({roles}) into a "
-            f"single, direct, coherent answer. Original question: {query}"
+        template = (
+            get_active_module("merge_instruction_parallel")
+            or "Synthesize the parallel research findings ({roles}) into a "
+               "single, direct, coherent answer. Original question: {query}"
         )
+        return template.format(roles=roles, query=query)
