@@ -264,25 +264,26 @@ class TestNovaDocumentSearch:
 class TestMCPServerCallTool:
     """Test the MCP server tool handlers by invoking them through the server object.
 
-    The MCP `Server` class registers handlers via decorators. We can
-    access these through server.request_handlers (a dict keyed by
-    method name like "tools/list" and "tools/call").
+    The MCP `Server` class registers handlers via decorators. We access them
+    through server.request_handlers (a dict keyed by request TYPE CLASS —
+    e.g. ListToolsRequest, CallToolRequest — in the current MCP SDK).
     """
 
     async def test_list_tools_via_server(self, server):
         """Verify list_tools returns 5 tools through the server."""
-        handler = server.request_handlers.get("tools/list")
-        if handler is None:
-            pytest.skip("Cannot access tools/list handler on mcp.Server")
-
-        # The handler expects a request object; build a minimal one
         from mcp.types import ListToolsRequest
-        try:
-            result = await handler(ListToolsRequest(method="tools/list"))
-            assert len(result.tools) == 5
-        except TypeError:
-            # Some versions of the mcp package use different handler signatures
-            pytest.skip("Handler signature incompatible with direct invocation")
+
+        # request_handlers is keyed by request type class (not string) in current MCP SDK
+        handler = server.request_handlers.get(ListToolsRequest)
+        assert handler is not None, (
+            "tools/list handler not registered — "
+            "check that list_tools decorator is applied in create_mcp_server()"
+        )
+
+        result = await handler(ListToolsRequest(method="tools/list"))
+        # ServerResult wraps the actual result in .root
+        tools = result.root.tools
+        assert len(tools) == 5
 
     async def test_facts_about_via_service(self, services):
         """Test the facts_about logic end-to-end using the services directly."""
@@ -399,23 +400,25 @@ class TestMCPServerCallTool:
 
     async def test_unknown_tool_returns_error(self, server):
         """Calling an unknown tool should return an error response."""
-        handler = server.request_handlers.get("tools/call")
-        if handler is None:
-            pytest.skip("Cannot access tools/call handler on mcp.Server")
+        from mcp.types import CallToolRequest, CallToolRequestParams
 
-        from mcp.types import CallToolRequest
-        try:
-            result = await handler(
-                CallToolRequest(
-                    method="tools/call",
-                    params={"name": "nonexistent_tool", "arguments": {}},
-                )
+        # request_handlers is keyed by request type class (not string) in current MCP SDK
+        handler = server.request_handlers.get(CallToolRequest)
+        assert handler is not None, (
+            "tools/call handler not registered — "
+            "check that call_tool decorator is applied in create_mcp_server()"
+        )
+
+        result = await handler(
+            CallToolRequest(
+                method="tools/call",
+                params=CallToolRequestParams(name="nonexistent_tool", arguments={}),
             )
-            data = json.loads(result.content[0].text)
-            assert "error" in data
-            assert "Unknown tool" in data["error"]
-        except (TypeError, AttributeError):
-            pytest.skip("Handler signature incompatible with direct invocation")
+        )
+        # ServerResult wraps the actual CallToolResult in .root
+        data = json.loads(result.root.content[0].text)
+        assert "error" in data
+        assert "Unknown tool" in data["error"]
 
 
 # ---------------------------------------------------------------------------
@@ -449,9 +452,12 @@ class TestMCPServerCreation:
 
     def test_server_has_handlers(self, server):
         """The server should have request handlers registered."""
+        from mcp.types import ListToolsRequest, CallToolRequest
+
         assert hasattr(server, "request_handlers")
-        # At minimum, tools/list and tools/call should be registered
-        assert len(server.request_handlers) >= 2
+        # request_handlers is keyed by request type class in current MCP SDK
+        assert server.request_handlers.get(ListToolsRequest) is not None
+        assert server.request_handlers.get(CallToolRequest) is not None
 
 
 # ===========================================================================
