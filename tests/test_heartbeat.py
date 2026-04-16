@@ -176,7 +176,7 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 52
+        assert count == 57  # 52 original + 5 system health monitors
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors

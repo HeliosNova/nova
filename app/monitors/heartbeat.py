@@ -534,6 +534,17 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find recent GitHub security advisories and critical CVEs from the past 24-48 hours. Search for \"github security advisory critical\" and \"CVE critical\". Report: CVE ID, affected software, severity, and description. Focus on widely-used packages.\n• CVE 1: [ID] [software] [severity] - [description]\n• CVE 2: ...\n• CVE 3: ..."}},
             {"name": "Government Contract Awards", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find major US government contract awards from the past 48 hours. Search for \"government contract award today\" and \"defense contract awarded\". Report: contractor, agency, dollar amount, and purpose. Focus on tech, defense, and AI contracts over $10M.\n• Contract 1: [contractor] [agency] [$amount] - [purpose]\n• Contract 2: ...\n• Contract 3: ..."}},
+            # --- System Health Monitors ---
+            {"name": "DB Size Monitor", "check_type": "db_size", "schedule_seconds": 14400, "cooldown_minutes": 240, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 20}},
+            {"name": "Ollama Latency Monitor", "check_type": "ollama_latency", "schedule_seconds": 7200, "cooldown_minutes": 120, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 50}},
+            {"name": "Skill Quality Monitor", "check_type": "skill_quality", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "ChromaDB Integrity", "check_type": "chromadb_integrity", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "KG Health Monitor", "check_type": "kg_health", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
         ]
 
         count = 0
@@ -856,7 +867,7 @@ class HeartbeatLoop:
                     if due:
                         logger.info("[Heartbeat] %d monitor(s) due", len(due))
 
-                        _FAST_TYPES = {"system_health", "maintenance"}
+                        _FAST_TYPES = {"system_health", "maintenance", "db_size", "ollama_latency", "skill_quality", "chromadb_integrity", "kg_health"}
                         fast = [m for m in due if m.check_type in _FAST_TYPES]
                         slow = [m for m in due if m.check_type not in _FAST_TYPES]
 
@@ -1137,6 +1148,21 @@ class HeartbeatLoop:
 
         elif monitor.check_type == "finetune":
             return await self._execute_finetune_check(cfg)
+
+        elif monitor.check_type == "db_size":
+            return await self._execute_db_size_check()
+
+        elif monitor.check_type == "ollama_latency":
+            return await self._execute_ollama_latency_check()
+
+        elif monitor.check_type == "skill_quality":
+            return await self._execute_skill_quality_check()
+
+        elif monitor.check_type == "chromadb_integrity":
+            return await self._execute_chromadb_integrity_check()
+
+        elif monitor.check_type == "kg_health":
+            return await self._execute_kg_health_check()
 
         return f"[Unknown check_type: {monitor.check_type}]"
 
@@ -1898,6 +1924,159 @@ class HeartbeatLoop:
         if created:
             return f"AUTO-MONITORS CREATED | count={len(created)} | topics={', '.join(t[:40] for t in created)}"
         return "[No new monitors needed — all candidates already covered]"
+
+    async def _execute_db_size_check(self) -> str:
+        """Check SQLite database file size and table row counts."""
+        from app.core.brain import get_services
+        import os
+
+        svc = get_services()
+        parts = []
+
+        # DB file size
+        try:
+            db_path = config.DB_PATH if hasattr(config, "DB_PATH") else "/data/nova.db"
+            if os.path.exists(db_path):
+                size_bytes = os.path.getsize(db_path)
+                size_mb = size_bytes / (1024 * 1024)
+                parts.append(f"DB size: {size_mb:.1f} MB")
+                # WAL file size
+                wal_path = db_path + "-wal"
+                if os.path.exists(wal_path):
+                    wal_mb = os.path.getsize(wal_path) / (1024 * 1024)
+                    parts.append(f"WAL: {wal_mb:.1f} MB")
+            else:
+                parts.append(f"DB not found: {db_path}")
+        except Exception as e:
+            parts.append(f"DB size error: {e}")
+
+        # Table row counts
+        db = get_db()
+        for table in ("conversations", "messages", "lessons", "reflexions", "skills", "kg_facts", "monitors"):
+            try:
+                row = db.fetchone(f"SELECT count(*) as c FROM {table}")
+                parts.append(f"{table}: {row['c']} rows")
+            except Exception:
+                pass
+
+        return " | ".join(parts)
+
+    async def _execute_ollama_latency_check(self) -> str:
+        """Measure Ollama response latency with a trivial prompt."""
+        import time
+        try:
+            from app.core import llm
+            provider = llm.get_provider()
+            start = time.monotonic()
+            healthy = await provider.check_health()
+            elapsed_ms = (time.monotonic() - start) * 1000
+            if healthy:
+                return f"Ollama latency: {elapsed_ms:.0f}ms (healthy)"
+            else:
+                return f"Ollama latency: {elapsed_ms:.0f}ms (UNHEALTHY)"
+        except Exception as e:
+            return f"Ollama latency: error ({e})"
+
+    async def _execute_skill_quality_check(self) -> str:
+        """Check skill corpus quality: success rates, disabled skills, dedup guard rate."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        if not svc.skills:
+            return "Skill store not available"
+
+        try:
+            db = svc.skills._db
+            total = db.fetchone("SELECT count(*) as c FROM skills")["c"]
+            enabled = db.fetchone("SELECT count(*) as c FROM skills WHERE enabled = 1")["c"]
+            disabled = total - enabled
+
+            # Average success rate of enabled skills
+            avg_row = db.fetchone("SELECT avg(success_rate) as avg_sr FROM skills WHERE enabled = 1")
+            avg_sr = avg_row["avg_sr"] if avg_row and avg_row["avg_sr"] is not None else 0.0
+
+            # Degrading skills (success_rate < 0.5 and used 3+ times)
+            degrading = db.fetchone(
+                "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
+            )["c"]
+
+            parts = [
+                f"Total: {total}",
+                f"Enabled: {enabled}",
+                f"Disabled: {disabled}",
+                f"Avg success rate: {avg_sr:.2f}",
+                f"Degrading: {degrading}",
+            ]
+            return " | ".join(parts)
+        except Exception as e:
+            return f"Skill quality error: {e}"
+
+    async def _execute_chromadb_integrity_check(self) -> str:
+        """Check ChromaDB collection health: doc count, collection status."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        parts = []
+
+        if svc.retriever:
+            try:
+                collection = svc.retriever._get_collection()
+                doc_count = collection.count()
+                parts.append(f"ChromaDB docs: {doc_count}")
+            except Exception as e:
+                parts.append(f"ChromaDB error: {e}")
+        else:
+            parts.append("Retriever not available")
+
+        # FTS5 doc count from SQLite
+        try:
+            db = get_db()
+            fts_row = db.fetchone("SELECT count(*) as c FROM chunks_fts")
+            parts.append(f"FTS5 chunks: {fts_row['c']}")
+        except Exception:
+            pass
+
+        return " | ".join(parts)
+
+    async def _execute_kg_health_check(self) -> str:
+        """Check Knowledge Graph health: node count, edge count, fragmentation."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        if not svc.kg:
+            return "KG not available"
+
+        try:
+            stats = svc.kg.get_stats()
+            parts = [
+                f"Facts: {stats.get('total_facts', 0)}",
+                f"Active: {stats.get('active_facts', 0)}",
+                f"Superseded: {stats.get('superseded_facts', 0)}",
+            ]
+
+            # Unique entities count
+            db = svc.kg._db
+            entities_row = db.fetchone(
+                "SELECT count(DISTINCT subject) + count(DISTINCT object) as c FROM kg_facts WHERE valid_to IS NULL"
+            )
+            if entities_row:
+                parts.append(f"Unique entities: {entities_row['c']}")
+
+            # Orphan count (entities with only 1 connection)
+            orphans_row = db.fetchone("""
+                SELECT count(*) as c FROM (
+                    SELECT subject as entity FROM kg_facts WHERE valid_to IS NULL
+                    GROUP BY subject HAVING count(*) = 1
+                    EXCEPT
+                    SELECT object as entity FROM kg_facts WHERE valid_to IS NULL
+                )
+            """)
+            if orphans_row:
+                parts.append(f"Orphans: {orphans_row['c']}")
+
+            return " | ".join(parts)
+        except Exception as e:
+            return f"KG health error: {e}"
 
     async def _execute_maintenance(self, cfg: dict) -> str:
         """Run periodic maintenance: decay stale lessons, KG facts, reflexions, prune curiosity."""
