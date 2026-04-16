@@ -459,6 +459,17 @@ class MonitorStore:
                 "cooldown_minutes": 1380,    # 23 hours
                 "notify_condition": "on_change",
             },
+            {
+                "name": "Prompt Optimizer",
+                "check_type": "prompt_analyzer",
+                "check_config": {},
+                "schedule_seconds": 90000,   # 25h — runs after Quality Eval Harness
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+                # Note: created via create() which inserts enabled=1 by default,
+                # then immediately disabled below.  The check_type handler also
+                # guards on config.ENABLE_PROMPT_SELF_MOD at runtime.
+            },
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 3 notable AI/ML developments from TODAY or the past 24-48 hours: new model releases, research breakthroughs, benchmark results, or major company announcements. For each: what happened, who did it, the date, and why it matters.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
@@ -551,6 +562,17 @@ class MonitorStore:
             mid = self.create(**seed)
             if mid > 0:
                 count += 1
+
+        # Prompt Optimizer starts disabled — user must set ENABLE_PROMPT_SELF_MOD=true
+        # and manually enable it. The handler also guards internally at runtime.
+        prompt_opt_row = self._db.fetchone(
+            "SELECT id FROM monitors WHERE name='Prompt Optimizer'"
+        )
+        if prompt_opt_row:
+            self._db.execute(
+                "UPDATE monitors SET enabled=0 WHERE id=? AND enabled=1",
+                (prompt_opt_row["id"],),
+            )
 
         # Migrate existing monitors: update domain study queries + fix check_types
         self._migrate_existing_monitors()
@@ -1148,6 +1170,9 @@ class HeartbeatLoop:
 
         elif monitor.check_type == "eval":
             return await self._execute_eval_harness(cfg)
+
+        elif monitor.check_type == "prompt_analyzer":
+            return await self._execute_prompt_analyzer(cfg)
 
         return f"[Unknown check_type: {monitor.check_type}]"
 
@@ -2248,6 +2273,15 @@ class HeartbeatLoop:
             f"{reg_str} | "
             f"report={json_path.name}"
         )
+
+    async def _execute_prompt_analyzer(self, cfg: dict) -> str:
+        """Run the PromptOptimizerAnalyzer: drift detection + candidate proposals."""
+        from app.monitors.prompt_optimizer_monitor import run_prompt_analyzer
+        try:
+            return await run_prompt_analyzer(cfg)
+        except Exception as e:
+            logger.error("[Heartbeat] Prompt analyzer failed: %s", e, exc_info=True)
+            return f"[Prompt analyzer failed: {e}]"
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""
