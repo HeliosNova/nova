@@ -208,11 +208,10 @@ class TestPromptBuilder:
         assert "revenue" in prompt
 
     def test_truncation_occurs(self):
-        # Context must exceed the token budget to trigger truncation.
-        # MAX_SYSTEM_TOKENS=10000, identity ~1800 tokens, so remaining ~8200 tokens (~33K chars).
+        # Huge context should be truncated (MAX_SYSTEM_TOKENS read from config)
         big_context = "x" * 50000
         prompt = build_system_prompt(retrieved_context=big_context)
-        assert len(prompt) < 25000  # Must be truncated well below 20K+identity (conftest sets MAX_SYSTEM_TOKENS=6000)
+        assert len(prompt) < 45000  # Must be truncated well below 50K+identity
         assert "truncated" in prompt.lower()
 
     def test_mandatory_blocks_never_truncated(self):

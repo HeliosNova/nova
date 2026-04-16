@@ -194,6 +194,9 @@ class TestMonitorStore:
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
         assert "Quality Eval Harness" in names
+        assert "Curiosity Research" in names
+        assert "Hacker News Top Stories" in names
+        assert "FOMC and Fed Watch" in names
 
     def test_quiz_and_skill_seeded_on_change(self, store):
         """Quiz and Skill Validation should seed with notify_condition='on_change'."""
