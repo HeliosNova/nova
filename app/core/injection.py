@@ -38,6 +38,12 @@ _ROLE_OVERRIDE_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"\bdeveloper\s+mode\b", re.I), "role override: 'developer mode'"),
     (re.compile(r"\bjailbreak\b", re.I), "role override: 'jailbreak'"),
     (re.compile(r"\bDAN\s+mode\b", re.I), "role override: 'DAN mode'"),
+    # Additional role override patterns for common attack variants
+    (re.compile(r"ignore\s+(?:the\s+)?(?:above|preceding)\s+(?:instructions?|text|prompt)", re.I), "role override: 'ignore above'"),
+    (re.compile(r"disregard\s+(?:all|any)\s+(?:previous|prior|above)", re.I), "role override: 'disregard all previous'"),
+    (re.compile(r"\bGODMODE\b", re.I), "role override: 'GODMODE'"),
+    (re.compile(r"(?:enable|activate|enter)\s+(?:unrestricted|uncensored)\s+mode", re.I), "role override: 'unrestricted mode'"),
+    (re.compile(r"you\s+(?:must|should|will)\s+obey\b", re.I), "role override: 'you must obey'"),
 ]
 
 # 2. Instruction injection patterns (weight 0.3)
@@ -49,6 +55,12 @@ _INSTRUCTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"from\s+now\s+on\s+you\b", re.I), "instruction injection: 'from now on you'"),
     (re.compile(r"override\s+your\b", re.I), "instruction injection: 'override your'"),
     (re.compile(r"forget\s+everything\b", re.I), "instruction injection: 'forget everything'"),
+    # Additional instruction injection patterns
+    (re.compile(r"respond\s+(?:only\s+)?(?:with|in)\s+(?:the\s+)?(?:following|this)", re.I), "instruction injection: 'respond with following'"),
+    (re.compile(r"(?:output|print|return)\s+(?:only\s+)?(?:the\s+)?(?:system\s+prompt|instructions|hidden)", re.I), "instruction injection: 'output system prompt'"),
+    (re.compile(r"(?:what|show|reveal|tell)\s+(?:me\s+)?(?:your|the)\s+(?:system\s+)?(?:prompt|instructions|rules)", re.I), "instruction injection: 'reveal system prompt'"),
+    (re.compile(r"repeat\s+(?:the\s+)?(?:text|words|instructions)\s+above\b", re.I), "instruction injection: 'repeat text above'"),
+    (re.compile(r"begin\s+(?:your\s+)?(?:response|reply|output)\s+with\b", re.I), "instruction injection: 'begin response with'"),
 ]
 
 # 3. Delimiter abuse patterns (weight 0.2)
@@ -66,6 +78,12 @@ _DELIMITER_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"<\|im_end\|>", re.I), "delimiter abuse: '<|im_end|>'"),
     (re.compile(r"<\|user\|>", re.I), "delimiter abuse: '<|user|>'"),
     (re.compile(r"<\|system\|>", re.I), "delimiter abuse: '<|system|>'"),
+    # Additional delimiter patterns for newer model formats
+    (re.compile(r"<\|eot_id\|>", re.I), "delimiter abuse: '<|eot_id|>' (Llama 3)"),
+    (re.compile(r"<\|start_header_id\|>", re.I), "delimiter abuse: '<|start_header_id|>' (Llama 3)"),
+    (re.compile(r"<\|end_header_id\|>", re.I), "delimiter abuse: '<|end_header_id|>' (Llama 3)"),
+    (re.compile(r"<\|begin_of_text\|>", re.I), "delimiter abuse: '<|begin_of_text|>' (Llama 3)"),
+    (re.compile(r"</?(?:tool_call|function_call|tools?)>", re.I), "delimiter abuse: fake tool/function tag"),
 ]
 
 # 4. Encoding tricks — patterns checked differently
