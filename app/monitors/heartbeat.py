@@ -1185,6 +1185,7 @@ class HeartbeatLoop:
         elif monitor.check_type == "prompt_analyzer":
             return await self._execute_prompt_analyzer(cfg)
 
+
         elif monitor.check_type == "db_size":
             return await self._execute_db_size_check()
 
