@@ -469,6 +469,18 @@ def render_markdown(report: EvalReport) -> str:
         )
 
     lines.append("")
+
+    # Prompt-module health section
+    module_versions = report.config_snapshot.get("prompt_module_versions", {})
+    if module_versions:
+        lines.append("## Prompt Module Health")
+        lines.append("| Module | Active version |")
+        lines.append("|--------|---------------|")
+        for mod, ver in sorted(module_versions.items()):
+            marker = " (baseline)" if ver == 1 else ""
+            lines.append(f"| {mod} | v{ver}{marker} |")
+        lines.append("")
+
     lines.append(f"*Baseline run: {report.baseline_run_id or 'none (first run)'}*")
 
     return "\n".join(lines)
@@ -494,6 +506,24 @@ class EvalHarness:
             if regression_tolerance is not None
             else config.EVAL_REGRESSION_TOLERANCE
         )
+        # Shadow-eval module overrides (set via set_module_overrides())
+        self._module_overrides: dict[str, str] = {}
+        self._scoring_module_overrides: dict[str, str] = {}
+
+    def set_module_overrides(
+        self,
+        overrides: dict[str, str],
+        scoring_overrides: dict[str, str] | None = None,
+    ) -> None:
+        """Inject prompt-module overrides for all tasks in this run.
+
+        Used by shadow-eval: the candidate module content is injected via
+        ContextVar so brain.think() (and all callees) see it without any
+        global state mutation.  scoring_overrides pins the critique version
+        used for internal reflexion scoring to the baseline (Goodhart firewall).
+        """
+        self._module_overrides = overrides
+        self._scoring_module_overrides = scoring_overrides or {}
 
     # --- Suite loading ---
 
@@ -615,12 +645,17 @@ class EvalHarness:
         from app.core.brain import think
         from app.core.reflexion import assess_quality
         from app.schema import EventType
+        from app.core.prompt_optimizer import _MODULE_OVERRIDES, _SCORING_OVERRIDES
 
         tokens: list[str] = []
         tools_invoked: list[str] = []
         skill_used: str | None = None
         decomposed: bool = False
         error: str | None = None
+
+        # Inject shadow-eval module overrides (no-op when empty)
+        _token1 = _MODULE_OVERRIDES.set(self._module_overrides)
+        _token2 = _SCORING_OVERRIDES.set(self._scoring_module_overrides)
 
         start = time.monotonic()
         try:
@@ -641,6 +676,10 @@ class EvalHarness:
         except Exception as e:
             error = str(e)
             logger.warning("[EvalHarness] Task %s failed: %s", task.id, e)
+        finally:
+            # Always restore ContextVars regardless of outcome
+            _MODULE_OVERRIDES.reset(_token1)
+            _SCORING_OVERRIDES.reset(_token2)
 
         latency = time.monotonic() - start
         response_text = "".join(tokens).strip()
@@ -741,6 +780,11 @@ class EvalHarness:
             )
 
         # Config snapshot (only eval-relevant fields)
+        from app.core.prompt_optimizer import PromptModuleStore as _PMS
+        try:
+            _active_versions = _PMS().get_active_versions()
+        except Exception:
+            _active_versions = {}
         cfg_snap = {
             "ENABLE_SEMANTIC_SKILL_MATCHING": config.ENABLE_SEMANTIC_SKILL_MATCHING,
             "SKILL_SEMANTIC_THRESHOLD": config.SKILL_SEMANTIC_THRESHOLD,
@@ -748,6 +792,7 @@ class EvalHarness:
             "EVAL_REGRESSION_TOLERANCE": config.EVAL_REGRESSION_TOLERANCE,
             "LLM_MODEL": config.LLM_MODEL,
             "LLM_PROVIDER": config.LLM_PROVIDER,
+            "prompt_module_versions": _active_versions,
         }
 
         report = EvalReport(
