@@ -325,6 +325,59 @@ class TestRetrieverEdgeCases:
 # ChromaDB Cleanup (from test_audit_consolidated)
 # ===========================================================================
 
+class TestGracefulDegradation:
+    """Test that retrieval degrades gracefully when backends fail."""
+
+    @pytest.mark.asyncio
+    async def test_vector_search_failure_falls_back_to_fts5(self):
+        """If ChromaDB crashes, search still returns FTS5 results."""
+        from app.core.retriever import Retriever
+        r = Retriever.__new__(Retriever)
+        r._db = MagicMock()
+        r._collection = None
+        r._chroma_client = None
+        r._collection_lock = MagicMock()
+
+        # Make _get_collection raise
+        def explode():
+            raise RuntimeError("ChromaDB is down")
+        r._get_collection = explode
+
+        # FTS5 should still work — mock it
+        fts_chunk = Chunk(chunk_id="fts-1", document_id="doc-1",
+                          content="found via fts", score=1.0)
+
+        def mock_fts(query, top_k):
+            return [fts_chunk]
+
+        r._fts5_search = mock_fts
+
+        results = await r.search("test query")
+        assert len(results) >= 1
+        assert any(c.content == "found via fts" for c in results)
+
+    @pytest.mark.asyncio
+    async def test_both_backends_fail_returns_empty(self):
+        """If both vector and FTS5 fail, search returns empty list (no crash)."""
+        from app.core.retriever import Retriever
+        r = Retriever.__new__(Retriever)
+        r._db = MagicMock()
+        r._collection = None
+        r._chroma_client = None
+        r._collection_lock = MagicMock()
+
+        def explode_vector():
+            raise RuntimeError("ChromaDB down")
+        r._get_collection = explode_vector
+
+        def explode_fts(query, top_k):
+            raise RuntimeError("FTS5 down")
+        r._fts5_search = explode_fts
+
+        results = await r.search("test query")
+        assert results == []
+
+
 class TestChromaDBCleanup:
 
     def test_retriever_has_close_method(self):
