@@ -247,7 +247,7 @@ class TestKnowledgeGraph:
         await kg.add_fact("Python", "is_a", "language", confidence=0.5)
         await kg.add_fact("Python", "is_a", "language", confidence=0.9)
         results = kg.query("Python")
-        lang_facts = [r for r in results if r["object"] == "language"]
+        lang_facts = [r for r in results if r["object"].lower() == "language"]
         assert len(lang_facts) == 1
 
     def test_query_nonexistent_entity(self, kg):

@@ -677,7 +677,7 @@ class KnowledgeGraph:
         seen_ids: set[int] = set()
         visited: set[str] = set()
         results: list[dict] = []
-        frontier: set[str] = {entity}
+        frontier: set[str] = {entity.lower()}
 
         for depth in range(hops + 1):
             if not frontier or len(results) >= max_results:
