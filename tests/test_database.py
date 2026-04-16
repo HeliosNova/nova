@@ -178,6 +178,71 @@ class TestTransaction:
             assert len(rows) == 2
 
 
+class TestWALMode:
+    """Test that WAL mode and pragmas are correctly applied."""
+
+    def test_wal_mode_enabled(self, db):
+        row = db.fetchone("PRAGMA journal_mode")
+        assert row[0] == "wal"
+
+    def test_busy_timeout_set(self, db):
+        row = db.fetchone("PRAGMA busy_timeout")
+        assert row[0] == 5000
+
+    def test_foreign_keys_enabled(self, db):
+        row = db.fetchone("PRAGMA foreign_keys")
+        assert row[0] == 1
+
+
+class TestConcurrentWrites:
+    """Test that WAL mode allows concurrent writes without errors."""
+
+    def test_concurrent_threaded_writes(self, tmp_path):
+        """Multiple threads writing simultaneously should not raise."""
+        import threading
+
+        db_path = str(tmp_path / "concurrent.db")
+        _db = SafeDB(db_path)
+        conn = _db._get_conn()
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS kg_facts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                subject TEXT NOT NULL, predicate TEXT NOT NULL,
+                object TEXT NOT NULL, confidence REAL DEFAULT 0.8,
+                source TEXT DEFAULT 'extracted', valid_from TIMESTAMP,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(subject, predicate, object)
+            )
+        """)
+        conn.commit()
+        _db.init_schema()
+
+        errors = []
+        barrier = threading.Barrier(4)
+
+        def writer(thread_id):
+            try:
+                barrier.wait(timeout=5)
+                for i in range(25):
+                    _db.execute(
+                        "INSERT INTO conversations (id, title) VALUES (?, ?)",
+                        (f"t{thread_id}-{i}", f"Thread {thread_id} conv {i}"),
+                    )
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(t,)) for t in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=30)
+
+        assert not errors, f"Concurrent writes failed: {errors}"
+        rows = _db.fetchall("SELECT count(*) as cnt FROM conversations")
+        assert rows[0]["cnt"] == 100
+        _db.close()
+
+
 class TestSchemaCreation:
     """Test that init_schema creates the expected tables."""
 
