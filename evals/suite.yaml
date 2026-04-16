@@ -465,10 +465,11 @@ tasks:
 
   # =========================================================================
   # Category: retrieval  (3 tasks)
-  # Tests: BM25 exact-keyword recall, semantic paraphrase recall, reranker probe.
-  # Each task seeds a document via seed_document before running.
-  # Task 3 (reranker_regression_probe) is designed to fail if the reranker
-  # is disabled — catches regressions in ENABLE_RERANKER.
+  # Tests: BM25 exact-keyword recall, semantic paraphrase recall, adversarial
+  # confounder probe. Corpus: subset of the 300-doc adversarial eval corpus in
+  # scripts/eval_retrieval.py (50 core docs + 250 confounders, 10 domains).
+  # Task 3 exercises the composite reranker against a same-keyword confounder;
+  # it catches regressions if ENABLE_RERANKER is disabled.
   # =========================================================================
 
   - id: retrieval_exact_keyword
@@ -511,19 +512,20 @@ tasks:
 
   - id: retrieval_reranker_regression_probe
     category: retrieval
-    query: "eval-retrieval: What is the boiling point of water at sea level in Celsius?"
+    query: "eval-retrieval: MVCC snapshot isolation readers writers PostgreSQL VACUUM dead tuples"
     timeout: 60
-    tags: [reranker-probe]
+    tags: [reranker-probe, adversarial-confounder]
     seed_document:
-      title: "Physical Properties of Water"
+      title: "PostgreSQL MVCC and Concurrency"
       source: "eval-seed"
       text: |
-        Water boils at 100 degrees Celsius (212 degrees Fahrenheit) at standard
-        atmospheric pressure (sea level, 1 atm). At higher altitudes where
-        atmospheric pressure is lower, water boils at temperatures below 100C.
-        The boiling point of water is one of the fixed reference points used to
-        define the Celsius temperature scale. This property makes water essential
-        for cooking and industrial thermal processes.
+        PostgreSQL uses Multi-Version Concurrency Control (MVCC) to allow readers
+        and writers to operate concurrently without blocking each other. Each
+        transaction sees a snapshot of the database as it existed at the start of
+        the transaction. Old row versions (dead tuples) accumulate as rows are
+        updated or deleted; the VACUUM process reclaims this space. Snapshot
+        isolation prevents dirty reads and non-repeatable reads, making PostgreSQL
+        well-suited for OLTP workloads with mixed read/write concurrency.
     assertions:
       - type: retrieval_recall
-        value: "100"
+        value: "MVCC"
