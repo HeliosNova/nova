@@ -2,10 +2,10 @@
 
 ## What This Is
 
-Nova is a sovereign personal AI assistant with multi-provider LLM support (Ollama, OpenAI, Anthropic, Google).
+Nova is a sovereign personal AI assistant. Ollama only — runs entirely on your hardware.
 Default: FastAPI backend + Ollama (Qwen3.5:27b) on RTX 3090. Supports MCP (Model Context Protocol) for external tools.
-It learns from corrections, remembers user facts, uses tools, and generates DPO training data for fine-tuning.
-~79 files, not 238. Learning is the product.
+It learns from corrections, remembers user facts, uses tools, and generates training data for SimPO fine-tuning.
+~89 files. Learning is the product.
 
 ## Architecture (Single Pipeline, No Framework)
 
@@ -15,7 +15,7 @@ User query -> brain.think()
   -> classify intent (regex, no LLM)
   -> retrieve documents if needed (ChromaDB + FTS5 + RRF)
   -> build system prompt (8 prioritized blocks)
-  -> generate response (LLM provider: Ollama, OpenAI, Anthropic, or Google)
+  -> generate response (Ollama — local inference)
   -> tool loop if tool call detected (max 5 rounds)
   -> stream tokens via SSE
   -> post-response: corrections, fact extraction, skill creation
@@ -29,7 +29,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 |------|---------|
 | `app/core/brain.py` | THE core: `think()` generator -- the entire pipeline |
 | `app/core/llm.py` | Provider-agnostic LLM interface: `invoke_nothink()`, `generate_with_tools()`, JSON extraction |
-| `app/core/providers/` | LLM backends: `ollama.py`, `openai.py`, `anthropic.py`, `google.py` |
+| `app/core/providers/` | LLM backend: `ollama.py` |
 | `app/tools/mcp.py` | MCP client: discovers external MCP tools, wraps as BaseTool |
 | `app/mcp_server.py` | MCP server: exposes Nova as MCP server (memory, KG, lessons, docs) |
 | `app/core/prompt.py` | System prompt builder (8 blocks with truncation priority) |
@@ -68,8 +68,6 @@ Main responses use `generate_with_tools()` (thinking suppressed for speed) or `s
 - Use `extract_json_object()` as fallback parser (balanced brace matching)
 
 ### Tool Calling (Hybrid: Native + Text)
-Cloud providers (OpenAI, Anthropic, Google) use native structured tool calls returned in `result.tool_call`.
-Tools are now passed through `stream_with_thinking()` for all cloud providers, enabling streaming tool calls.
 Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as fallback:
 ```
 {"tool": "tool_name", "args": {"param": "value"}}
@@ -78,12 +76,9 @@ Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as f
 
 ### Provider-Aware Prompt Building
 `build_system_prompt()` accepts `provider` and `registered_tool_names` params:
-- **Date block**: Full emphatic repetition for Ollama (date confusion workaround), condensed for cloud providers
-- **Self-attribution**: Emphatic "REAL, live results" framing for Ollama, neutral for cloud
 - **Tool examples**: Filtered to only registered tools (no phantom examples)
 
 ### Provider Base URLs
-All cloud provider base URLs are configurable via config: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL`, `ANTHROPIC_API_VERSION`. Supports self-hosted endpoints and proxy setups.
 
 ### Correction Detection (2-stage)
 1. **Regex pre-filter** -- `is_likely_correction()` in `learning.py` is the single source of truth
@@ -99,7 +94,7 @@ In `brain.py` step 13, the correction handler must **skip 1 assistant message** 
 [NEVER TRUNCATE] Block 1: Identity + Reasoning Methodology
 [NEVER TRUNCATE] Block 2: User Facts
 [NEVER TRUNCATE] Block 3: Learned Lessons
-[NEVER TRUNCATE] Block 8: Date/Time (provider-aware: full for Ollama, condensed for cloud)
+[NEVER TRUNCATE] Block 8: Date/Time (date emphasis for local models)
 [TRUNCATE LAST]  Block 4: Tool Descriptions + Examples (filtered to registered tools only)
 [TRUNCATE MID]   Block 5: Skills / Retrieved Context
 [TRUNCATE FIRST] Block 7: Conversation Summary
@@ -130,7 +125,7 @@ Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path 
 ### Monitor System (`app/monitors/heartbeat.py`)
 Background loop checks monitors on schedule, detects changes, sends alerts via Discord/Telegram/WhatsApp/Signal.
 
-**52 default monitors** (seeded on first startup):
+**50 default monitors** (seeded on first startup):
 - **Operational** (5): Morning Check-in (daily), System Health (2h), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
 - **Self-Improvement** (3): Lesson Quiz (6h), Skill Validation (12h), Curiosity Research (1h)
 - **Financial Intelligence** (10): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h), FOMC & Fed Watch (24h), SEC Insider Trading (12h), Economics & Markets (12h)
@@ -169,13 +164,13 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 
 ## Rules
 1. Never add features without asking. The rebuild is lean by design.
-2. Never add config flags without approval. ~45 settings, not 281.
+2. Never add config flags without approval. Settings are managed in config.py.
 3. Never rate quality without evidence (test output, logs, actual behavior).
 4. If unsure whether something is broken, TEST IT before changing it.
 5. Port patterns from nova/ when they're battle-tested. Don't reinvent.
 6. No duplicate correction patterns. `learning.py` is the single source of truth.
 7. Lessons must have all fields: `topic`, `correct_answer`, `wrong_answer`, `lesson_text`.
-8. DPO training pairs: query=original question, chosen=correct, rejected=wrong.
+8. Training pairs: query=original question, chosen=correct, rejected=wrong. Used for SimPO (default) or DPO fine-tuning.
 9. Facts are extracted, not hallucinated. Only extract from explicit user statements.
 10. Context budget: 6000 tokens max (MAX_SYSTEM_TOKENS in prompt.py). Summarize older messages, keep 6 recent.
 
@@ -183,7 +178,6 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 
 - **Runtime**: FastAPI, uvicorn, httpx, chromadb, sympy, pydantic
 - **LLM (default)**: Ollama 0.17.5+ with qwen3.5:27b (17GB VRAM)
-- **LLM (cloud, optional)**: OpenAI (gpt-4o), Anthropic (claude-sonnet), Google (gemini-2.0-flash)
 - **MCP (optional)**: `mcp` package for Model Context Protocol tool integration
 - **Embedding**: nomic-embed-text-v2-moe (0.5GB VRAM)
 - **Fine-tuning** (separate venv): unsloth, trl, torch (see `scripts/requirements-finetune.txt`)
@@ -473,8 +467,6 @@ and gave 0pp gain over composite on Recall@5/P@1/MRR — deleted (see commit for
 
 ## New Config Fields (Deep Audit)
 - `MAX_QUERY_LENGTH` (50000) — query length validation in brain.think()
-- `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL` — provider base URLs
-- `ANTHROPIC_API_VERSION` — Anthropic API version header
 - `TRUSTED_PROXY` — enable X-Forwarded-For only when set
 
 ## Version Source of Truth

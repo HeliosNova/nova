@@ -99,6 +99,57 @@ class TaskManager:
         logger.info("[TaskManager] Submitted task %s: %s", task_id, description)
         return task_id
 
+    def track_existing(self, task: asyncio.Task, description: str) -> str:
+        """Track an already-running asyncio.Task. Returns task ID.
+
+        Used by auto-background promotion: the tool coroutine is already running
+        as a Task, and we just need TaskManager to track its lifecycle.
+        """
+        active = sum(1 for t in self._tasks.values() if t.status in ("pending", "running"))
+        if active >= self.max_concurrent:
+            return ""  # Signal: at capacity
+
+        task_id = str(uuid.uuid4())[:8]
+        bg = BackgroundTask(
+            id=task_id,
+            description=description[:200],
+            status="running",
+            created_at=datetime.now(timezone.utc).isoformat(),
+            _task=task,
+        )
+
+        def _on_done(t: asyncio.Task):
+            try:
+                result = t.result()
+                if result is not None:
+                    # Tool execution returns (output_str, ToolResult) tuple
+                    if isinstance(result, tuple) and len(result) == 2:
+                        bg.result = str(result[0])[:3000]
+                    else:
+                        bg.result = str(result)[:3000]
+                else:
+                    bg.result = "Completed"
+                bg.status = "complete"
+            except asyncio.CancelledError:
+                bg.status = "cancelled"
+            except Exception as e:
+                bg.error = str(e)[:500]
+                bg.status = "failed"
+            bg.completed_at = datetime.now(timezone.utc).isoformat()
+            bg._task = None
+
+        task.add_done_callback(_on_done)
+        self._tasks[task_id] = bg
+
+        # Prune old completed tasks (keep last 50)
+        completed = [t for t in self._tasks.values() if t.status in ("complete", "failed", "cancelled")]
+        if len(completed) > 50:
+            for old in sorted(completed, key=lambda t: t.created_at)[:len(completed) - 50]:
+                del self._tasks[old.id]
+
+        logger.info("[TaskManager] Tracking existing task %s: %s", task_id, description[:100])
+        return task_id
+
     def get_status(self, task_id: str) -> BackgroundTask | None:
         return self._tasks.get(task_id)
 

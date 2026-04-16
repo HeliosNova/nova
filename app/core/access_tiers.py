@@ -40,6 +40,44 @@ def set_access_tier_override(tier: str | None) -> None:
     _access_tier_override.set(tier)
 
 
+# ContextVar for tool whitelist — restricts which tools a sub-agent can call.
+# When set, only tools in the whitelist can execute; all others get PERMISSION error.
+_tool_whitelist: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
+    "tool_whitelist", default=None
+)
+
+
+def get_tool_whitelist() -> frozenset[str] | None:
+    """Get the current tool whitelist (None = all tools allowed)."""
+    return _tool_whitelist.get()
+
+
+def set_tool_whitelist(tools: list[str] | frozenset[str] | None) -> None:
+    """Set the tool whitelist for the current async context.
+
+    Args:
+        tools: Frozenset of allowed tool names, or None to allow all.
+    """
+    _tool_whitelist.set(frozenset(tools) if tools is not None else None)
+
+
+def is_tool_allowed(tool_name: str) -> bool:
+    """Check if a tool is allowed under the current whitelist (if any)."""
+    whitelist = _tool_whitelist.get()
+    if whitelist is None:
+        return True  # No whitelist = all tools allowed
+    return tool_name in whitelist
+
+
+# Predefined whitelist sets for different isolation modes
+MAINTENANCE_TOOLS = frozenset({
+    "memory_search", "knowledge_search", "context_detail", "calculator",
+})
+CURIOSITY_TOOLS = MAINTENANCE_TOOLS | frozenset({
+    "web_search", "http_fetch", "browser",
+})
+
+
 def _tier() -> str:
     # Check ContextVar override first (set by delegate for sub-agents)
     override = _access_tier_override.get()

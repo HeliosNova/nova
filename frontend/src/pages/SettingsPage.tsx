@@ -21,10 +21,11 @@ import {
   updateConfig,
   getCustomTools,
   deleteCustomTool,
+  getProviderHealth,
 } from "../lib/api";
 import type {
   StatusResponse, UserFact, IntegrationInfo, AccessTierInfo,
-  FullConfig, CustomToolInfo,
+  FullConfig, CustomToolInfo, ProviderHealthResult,
 } from "../lib/types";
 import {
   PageHeader,
@@ -165,6 +166,8 @@ export default function SettingsPage() {
   const [heavyModel, setHeavyModel] = useState("");
   const [providerSaving, setProviderSaving] = useState(false);
   const [providerWarnings, setProviderWarnings] = useState<string[]>([]);
+  const [providerHealth, setProviderHealth] = useState<ProviderHealthResult | null>(null);
+  const [testingConnection, setTestingConnection] = useState(false);
 
   // Toggles loading state (per key)
   const [toggleLoading, setToggleLoading] = useState<Record<string, boolean>>({});
@@ -273,6 +276,25 @@ export default function SettingsPage() {
       toast.error(`Save failed: ${(err as Error).message}`);
     } finally {
       setProviderSaving(false);
+    }
+  };
+
+  // ── Test connection handler ──
+  const handleTestConnection = async () => {
+    setTestingConnection(true);
+    try {
+      const result = await getProviderHealth();
+      setProviderHealth(result);
+      const activeStatus = result.providers[result.active];
+      if (activeStatus === "healthy") {
+        toast.success(`${result.active} is healthy`);
+      } else {
+        toast.warning(`${result.active}: ${activeStatus}`);
+      }
+    } catch (err) {
+      toast.error(`Connection test failed: ${(err as Error).message}`);
+    } finally {
+      setTestingConnection(false);
     }
   };
 
@@ -405,6 +427,54 @@ export default function SettingsPage() {
     input.click();
   };
 
+  const handleExportLessons = async () => {
+    try {
+      const { exportLessons } = await import("../lib/api");
+      const blob = await exportLessons();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `nova-lessons-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Lessons exported");
+    } catch (err) {
+      toast.error(`Export failed: ${(err as Error).message}`);
+    }
+  };
+
+  const handleExportKGFacts = async () => {
+    try {
+      const { exportKGFacts } = await import("../lib/api");
+      const blob = await exportKGFacts();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `nova-kg-facts-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("KG facts exported");
+    } catch (err) {
+      toast.error(`Export failed: ${(err as Error).message}`);
+    }
+  };
+
+  const handleExportBundle = async () => {
+    try {
+      const { exportBundle } = await import("../lib/api");
+      const blob = await exportBundle();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `nova-bundle-${new Date().toISOString().slice(0, 10)}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+      toast.success("Bundle exported");
+    } catch (err) {
+      toast.error(`Export failed: ${(err as Error).message}`);
+    }
+  };
+
   return (
     <div className="flex-1 overflow-y-auto">
       <div className="mx-auto max-w-2xl w-full space-y-8 px-4 md:px-6 py-6">
@@ -512,6 +582,28 @@ export default function SettingsPage() {
               <Button onClick={handleSaveProvider} loading={providerSaving}>
                 Save Provider Settings
               </Button>
+              <Button variant="secondary" onClick={handleTestConnection} loading={testingConnection}>
+                Test Connection
+              </Button>
+
+              {providerHealth && (
+                <div className="flex flex-wrap gap-2">
+                  {Object.entries(providerHealth.providers).map(([name, status]) => (
+                    <span
+                      key={name}
+                      className={`rounded-full px-3 py-1 text-xs font-medium ${
+                        status === "healthy"
+                          ? "bg-nova-success/20 text-nova-success"
+                          : status === "timeout"
+                          ? "bg-nova-warning/20 text-nova-warning"
+                          : "bg-nova-error/20 text-nova-error"
+                      }`}
+                    >
+                      {name}: {status}
+                    </span>
+                  ))}
+                </div>
+              )}
             </div>
           )}
         </Card>
@@ -689,6 +781,15 @@ export default function SettingsPage() {
                 className={health.status === "ok" ? "" : "border-nova-warning"}
               />
               <StatCard label="Timestamp" value={health.timestamp || "\u2014"} />
+              {providerHealth && (
+                <>
+                  <StatCard label="Active Provider" value={providerHealth.active} />
+                  <StatCard
+                    label="Provider Status"
+                    value={providerHealth.providers[providerHealth.active] || "unknown"}
+                  />
+                </>
+              )}
             </div>
           ) : (
             <Skeleton lines={2} />
@@ -854,13 +955,26 @@ export default function SettingsPage() {
         {/* ═══ Export / Import (existing) ═══ */}
         <Card>
           <h2 className="mb-3 text-sm font-medium text-nova-text-dim">Data</h2>
-          <div className="flex gap-3">
-            <Button variant="secondary" onClick={handleExport} icon={<Download size={16} />}>
-              Export JSON
-            </Button>
-            <Button variant="secondary" onClick={handleImport} icon={<Upload size={16} />}>
-              Import JSON
-            </Button>
+          <div className="space-y-3">
+            <div className="flex flex-wrap gap-3">
+              <Button variant="secondary" onClick={handleExport} icon={<Download size={16} />}>
+                Export All (JSON)
+              </Button>
+              <Button variant="secondary" onClick={handleImport} icon={<Upload size={16} />}>
+                Import JSON
+              </Button>
+            </div>
+            <div className="flex flex-wrap gap-3">
+              <Button variant="secondary" size="sm" onClick={handleExportLessons} icon={<Download size={14} />}>
+                Export Lessons
+              </Button>
+              <Button variant="secondary" size="sm" onClick={handleExportKGFacts} icon={<Download size={14} />}>
+                Export KG Facts
+              </Button>
+              <Button variant="secondary" size="sm" onClick={handleExportBundle} icon={<Download size={14} />}>
+                Export Bundle
+              </Button>
+            </div>
           </div>
         </Card>
 

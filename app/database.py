@@ -194,6 +194,17 @@ CREATE TABLE IF NOT EXISTS auth_lockouts (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Capability gaps (detected when no skill/tool covers a query + low quality)
+CREATE TABLE IF NOT EXISTS capability_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    reason TEXT,
+    tools_tried TEXT DEFAULT '[]',
+    quality_score REAL,
+    reviewed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Prompt self-modification module registry
 -- Immutable baseline rows (is_baseline=1) are never touched by the optimizer.
 -- Only module_names in _SELF_MOD_ALLOWED_MODULES (prompt_optimizer.py) are writable.
@@ -441,47 +452,29 @@ class SafeDB:
                 conn.rollback()
                 raise
 
-        # --- Migration 9: prompt_modules table ---
+        # --- Migration 9: skill quality + composition columns ---
         if 9 not in applied:
             conn.execute("BEGIN")
             try:
-                tables = {row[0] for row in conn.execute(
-                    "SELECT name FROM sqlite_master WHERE type='table'"
-                ).fetchall()}
-                if "prompt_modules" not in tables:
-                    conn.execute("""
-                        CREATE TABLE prompt_modules (
-                            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-                            module_name             TEXT NOT NULL,
-                            version                 INTEGER NOT NULL,
-                            content                 TEXT NOT NULL,
-                            is_baseline             INTEGER DEFAULT 0,
-                            status                  TEXT NOT NULL DEFAULT 'candidate',
-                            parent_version          INTEGER,
-                            delta_description       TEXT,
-                            promoted_at             TEXT,
-                            promoted_eval_run_id    TEXT,
-                            rolled_back_at          TEXT,
-                            quarantined_until       TEXT,
-                            shadow_eval_metrics     TEXT,
-                            created_at              TEXT NOT NULL DEFAULT (datetime('now'))
-                        )
-                    """)
-                    conn.execute(
-                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version "
-                        "ON prompt_modules (module_name, version)"
-                    )
-                    conn.execute(
-                        "CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status "
-                        "ON prompt_modules (module_name, status)"
-                    )
+                skill_cols = {row[1] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+                if "last_used_at" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN last_used_at TIMESTAMP")
+                if "consecutive_failures" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+                if "source" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN source TEXT DEFAULT 'correction'")
+                if "composed_of" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN composed_of TEXT DEFAULT '[]'")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at)"
+                )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (9,))
                 conn.commit()
             except Exception:
                 conn.rollback()
                 raise
 
-        # --- Migration 10: skill quality + composition columns ---
+        # --- Migration 10: re-apply skill columns for DBs where migration 9 ran empty ---
         # Migration 9 was recorded before the ALTER TABLE statements were added to the code,
         # so existing databases have version=9 but are missing the columns. This migration
         # unconditionally ensures the columns exist.
@@ -522,6 +515,46 @@ class SafeDB:
                     )"""
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (11,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 12: prompt_modules table ---
+        if 12 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "prompt_modules" not in tables:
+                    conn.execute("""
+                        CREATE TABLE prompt_modules (
+                            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                            module_name             TEXT NOT NULL,
+                            version                 INTEGER NOT NULL,
+                            content                 TEXT NOT NULL,
+                            is_baseline             INTEGER DEFAULT 0,
+                            status                  TEXT NOT NULL DEFAULT 'candidate',
+                            parent_version          INTEGER,
+                            delta_description       TEXT,
+                            promoted_at             TEXT,
+                            promoted_eval_run_id    TEXT,
+                            rolled_back_at          TEXT,
+                            quarantined_until       TEXT,
+                            shadow_eval_metrics     TEXT,
+                            created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version "
+                        "ON prompt_modules (module_name, version)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status "
+                        "ON prompt_modules (module_name, status)"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (12,))
                 conn.commit()
             except Exception:
                 conn.rollback()

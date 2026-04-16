@@ -3,6 +3,14 @@
 When Nova gets corrected on a multi-step task, the correction handler can
 extract a skill: trigger pattern + tool sequence + answer template.
 Next time a matching query arrives, Nova follows the learned procedure.
+
+Matching is two-stage:
+  1. Regex — fast, exact, priority-sorted by pattern specificity.
+  2. Semantic — ChromaDB cosine similarity fallback when regex misses.
+
+Skills can be composed: a skill with composed_of = [id1, id2] expands
+those sub-skills' steps first, then appends its own. This allows
+multi-step patterns to be built from simpler learned primitives.
 """
 
 from __future__ import annotations
@@ -80,6 +88,16 @@ class SkillStore:
                 )
         return self._chroma_collection
 
+    # Keep backward-compat alias used by HEAD's _index_skill / refine_skill / toggle_skill
+    def _get_skills_collection(self):
+        """Alias for _get_skill_collection (backward compat)."""
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return None
+        try:
+            return self._get_skill_collection()
+        except Exception:
+            return None
+
     def _embed_skill(self, skill_id: int, name: str, trigger_pattern: str) -> None:
         """Add or update a skill's embedding in ChromaDB."""
         if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
@@ -105,7 +123,7 @@ class SkillStore:
         """Return an existing skill ID if trigger_pattern is semantically too close.
 
         Embeds the candidate trigger pattern and queries ChromaDB.  If the nearest
-        existing skill has similarity ≥ SKILL_SEMANTIC_THRESHOLD, the candidate
+        existing skill has similarity >= SKILL_SEMANTIC_THRESHOLD, the candidate
         would answer the same queries as that skill and is therefore a duplicate.
 
         Returns the duplicate skill's ID, or None if no duplicate found
@@ -136,7 +154,7 @@ class SkillStore:
             metadata = results["metadatas"][0][0]
             existing_id = int(metadata["skill_id"])
             existing_name = metadata.get("name", f"skill_{existing_id}")
-            # Exclude self-updates — same-name skills are handled by the name-dedup
+            # Exclude self-updates -- same-name skills are handled by the name-dedup
             # path that runs before this check; guard against edge-case order issues.
             existing_row = self._db.fetchone(
                 "SELECT name FROM skills WHERE id = ?", (existing_id,)
@@ -174,7 +192,7 @@ class SkillStore:
         try:
             collection = self._get_skill_collection()
         except Exception as e:
-            logger.warning("Skill embedding sync skipped — ChromaDB unavailable: %s", e)
+            logger.warning("Skill embedding sync skipped -- ChromaDB unavailable: %s", e)
             return 0
 
         rows = self._db.fetchall("SELECT id, name, trigger_pattern FROM skills WHERE enabled = 1")
@@ -199,9 +217,12 @@ class SkillStore:
     def get_matching_skill(self, query: str) -> Skill | None:
         """Find the best matching skill for a query.
 
-        1. Regex match (fast, exact trigger pattern check).
-        2. Semantic fallback via ChromaDB embedding similarity when no
-           regex match and ENABLE_SEMANTIC_SKILL_MATCHING is true.
+        Stage 1 -- Regex: checks all enabled skills, returns highest-specificity
+        match (longer pattern = more specific = higher priority).
+
+        Stage 2 -- Semantic: ChromaDB cosine similarity fallback when no regex
+        match is found and ENABLE_SEMANTIC_SKILL_MATCHING is true.
+        Uses SKILL_SEMANTIC_THRESHOLD to avoid false positives.
         """
         regex_hit = self._regex_match(query)
         if regex_hit:
@@ -229,19 +250,23 @@ class SkillStore:
                 if re.search(pattern, query, re.IGNORECASE):
                     matches.append(row)
             except re.error:
-                # Invalid regex — skip
                 logger.warning("Invalid skill trigger pattern: %s", row["trigger_pattern"])
                 continue
 
-        if not matches:
-            return None
+        if matches:
+            matches.sort(
+                key=lambda r: _pattern_specificity(r["trigger_pattern"]),
+                reverse=True,
+            )
+            return self._row_to_skill(matches[0])
 
-        # Sort by specificity: longer pattern first, then fewer wildcards (more specific)
-        matches.sort(
-            key=lambda r: _pattern_specificity(r["trigger_pattern"]),
-            reverse=True,
-        )
-        return self._row_to_skill(matches[0])
+        # Semantic fallback — finds skills whose natural-language descriptions
+        # are close to the query even when regex doesn't match exactly.
+        return self._semantic_match(query)
+
+    # ------------------------------------------------------------------
+    # CRUD
+    # ------------------------------------------------------------------
 
     def _semantic_match(self, query: str) -> Skill | None:
         """Embedding-similarity skill lookup (fallback when regex misses).
@@ -349,11 +374,27 @@ class SkillStore:
             (name,),
         )
         if existing_by_name:
-            old_trigger = existing_by_name["trigger_pattern"] if existing_by_name["trigger_pattern"] else "<unknown>"
-            self._db.execute(
-                "UPDATE skills SET trigger_pattern = ?, steps = ?, answer_template = ?, enabled = 1 WHERE id = ?",
-                (trigger_pattern, json.dumps(steps), answer_template, existing_by_name["id"]),
-            )
+            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>") or "<unknown>"
+            import sqlite3 as _sqlite3
+            try:
+                self._db.execute(
+                    "UPDATE skills SET trigger_pattern = ?, steps = ?, answer_template = ?, "
+                    "source = ?, composed_of = ?, enabled = 1 WHERE id = ?",
+                    (
+                        trigger_pattern,
+                        json.dumps(steps),
+                        answer_template,
+                        source,
+                        json.dumps(composed_of),
+                        existing_by_name["id"],
+                    ),
+                )
+            except _sqlite3.OperationalError:
+                self._db.execute(
+                    "UPDATE skills SET trigger_pattern = ?, steps = ?, answer_template = ?, "
+                    "enabled = 1 WHERE id = ?",
+                    (trigger_pattern, json.dumps(steps), answer_template, existing_by_name["id"]),
+                )
             logger.info(
                 "Skill updated: #%d '%s' trigger changed from '%s' to '%s'",
                 existing_by_name["id"], name, old_trigger[:60], trigger_pattern[:60],
@@ -361,21 +402,42 @@ class SkillStore:
             self._embed_skill(existing_by_name["id"], name, trigger_pattern)
             return existing_by_name["id"]
 
-        cursor = self._db.execute(
-            """INSERT INTO skills (name, trigger_pattern, steps, answer_template, learned_from, success_rate)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (
-                name,
-                trigger_pattern,
-                json.dumps(steps),
-                answer_template,
-                learned_from,
-                initial_success_rate,
-            ),
-        )
+        import sqlite3 as _sqlite3
+        try:
+            cursor = self._db.execute(
+                """INSERT INTO skills
+                   (name, trigger_pattern, steps, answer_template, learned_from,
+                    success_rate, source, composed_of)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    name,
+                    trigger_pattern,
+                    json.dumps(steps),
+                    answer_template,
+                    learned_from,
+                    initial_success_rate,
+                    source,
+                    json.dumps(composed_of),
+                ),
+            )
+        except _sqlite3.OperationalError:
+            cursor = self._db.execute(
+                """INSERT INTO skills
+                   (name, trigger_pattern, steps, answer_template, learned_from, success_rate)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    name,
+                    trigger_pattern,
+                    json.dumps(steps),
+                    answer_template,
+                    learned_from,
+                    initial_success_rate,
+                ),
+            )
         skill_id = cursor.lastrowid
         logger.info("Created skill #%d: '%s' (trigger: %s)", skill_id, name, trigger_pattern)
         self._embed_skill(skill_id, name, trigger_pattern)
+
         return skill_id
 
     def record_use(self, skill_id: int, success: bool) -> None:
@@ -508,12 +570,141 @@ class SkillStore:
         return cursor.rowcount > 0
 
     def delete_skill(self, skill_id: int) -> bool:
-        """Delete a skill."""
+        """Delete a skill and remove it from the vector index."""
         cursor = self._db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
         if cursor.rowcount > 0:
             self._unembed_skill(skill_id)
             return True
         return False
+
+    # ------------------------------------------------------------------
+    # Skill composition
+    # ------------------------------------------------------------------
+
+    def get_composed_steps(self, skill: Skill) -> list[dict]:
+        """Expand a composed skill into its full ordered step list.
+
+        Fetches each sub-skill by ID in order, concatenates their steps,
+        then appends the composing skill's own steps last. Cycles and
+        missing/disabled sub-skills are skipped silently.
+
+        Returns skill.steps unchanged if composed_of is empty.
+        """
+        if not skill.composed_of:
+            return skill.steps
+
+        seen: set[int] = {skill.id}
+        all_steps: list[dict] = []
+
+        for sub_id in skill.composed_of[:10]:  # cap at 10 to prevent runaway chains
+            if sub_id in seen:
+                logger.debug("Skill composition cycle detected at #%d, skipping", sub_id)
+                continue
+            seen.add(sub_id)
+            sub = self.get_skill(sub_id)
+            if sub and sub.enabled:
+                all_steps.extend(sub.steps)
+            else:
+                logger.debug("Composed sub-skill #%d unavailable, skipping", sub_id)
+
+        # Append the composing skill's own steps last (may be empty for pure compositions)
+        all_steps.extend(skill.steps)
+        return all_steps or skill.steps
+
+    # ------------------------------------------------------------------
+    # Metrics & maintenance
+    # ------------------------------------------------------------------
+
+    def get_skill_stats(self) -> dict:
+        """Return aggregate skill system metrics."""
+        rows = self._db.fetchall("SELECT * FROM skills")
+        if not rows:
+            return {
+                "total": 0, "enabled": 0, "disabled": 0,
+                "total_uses": 0, "avg_success_rate": 0.0,
+                "stale_count": 0, "top_skills": [],
+                "by_source": {},
+            }
+
+        total = len(rows)
+        enabled = sum(1 for r in rows if r["enabled"])
+        total_uses = sum(r["times_used"] for r in rows)
+        avg_rate = sum(r["success_rate"] for r in rows) / total
+
+        # Source breakdown
+        by_source: dict[str, int] = {}
+        for r in rows:
+            src = _safe_col(r, "source", "correction")
+            by_source[src] = by_source.get(src, 0) + 1
+
+        # Stale: not used in SKILL_STALE_DAYS days (NULL last_used_at = never used = stale)
+        stale_row = self._db.fetchone(
+            "SELECT COUNT(*) FROM skills WHERE "
+            "last_used_at IS NULL OR last_used_at < datetime('now', ?)",
+            (f"-{config.SKILL_STALE_DAYS} days",),
+        )
+        stale_count = stale_row[0] if stale_row else 0
+
+        top = self._db.fetchall(
+            "SELECT id, name, times_used, success_rate FROM skills WHERE enabled = 1 "
+            "ORDER BY times_used DESC LIMIT 5"
+        )
+
+        return {
+            "total": total,
+            "enabled": enabled,
+            "disabled": total - enabled,
+            "total_uses": total_uses,
+            "avg_success_rate": round(avg_rate, 3),
+            "stale_count": stale_count,
+            "by_source": by_source,
+            "top_skills": [
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "uses": r["times_used"],
+                    "success_rate": round(r["success_rate"], 3),
+                }
+                for r in top
+            ],
+        }
+
+    def decay_stale_skills(self) -> int:
+        """Reduce success_rate on skills unused for SKILL_STALE_DAYS days.
+
+        Each decay pass reduces success_rate by 5% (multiplicative).
+        Skills that cross below 0.3 after decay are auto-disabled.
+        Returns number of skills decayed.
+        """
+        rows = self._db.fetchall(
+            "SELECT id, name, success_rate FROM skills WHERE enabled = 1 AND "
+            "(last_used_at IS NULL OR last_used_at < datetime('now', ?))",
+            (f"-{config.SKILL_STALE_DAYS} days",),
+        )
+        if not rows:
+            return 0
+
+        decayed = 0
+        for row in rows:
+            new_rate = row["success_rate"] * 0.95
+            if new_rate < 0.3:
+                self._db.execute(
+                    "UPDATE skills SET success_rate = ?, enabled = 0 WHERE id = ?",
+                    (new_rate, row["id"]),
+                )
+                logger.info(
+                    "Disabled stale skill #%d '%s': success_rate decayed to %.2f",
+                    row["id"], row["name"], new_rate,
+                )
+            else:
+                self._db.execute(
+                    "UPDATE skills SET success_rate = ? WHERE id = ?",
+                    (new_rate, row["id"]),
+                )
+            decayed += 1
+
+        logger.info("Skill staleness decay: %d skills decayed", decayed)
+        return decayed
 
     async def refine_skill(self, skill_id: int, failure_context: str) -> bool:
         """Attempt to refine a failing skill instead of just degrading it.
@@ -559,7 +750,6 @@ class SkillStore:
 
             if action == "narrow" and obj.get("new_trigger"):
                 new_trigger = obj["new_trigger"]
-                # Validate: must be valid regex, not ReDoS-prone, and not too broad
                 try:
                     re.compile(new_trigger)
                 except re.error:
@@ -574,6 +764,10 @@ class SkillStore:
                     "UPDATE skills SET trigger_pattern = ? WHERE id = ?",
                     (new_trigger, skill_id),
                 )
+                # Re-index with updated description
+                updated = self.get_skill(skill_id)
+                if updated:
+                    self._embed_skill(skill_id, updated.name, new_trigger)
                 logger.info("Skill #%d refined: narrowed trigger to '%s'", skill_id, new_trigger)
                 return True
 
@@ -581,7 +775,6 @@ class SkillStore:
                 new_steps = obj["new_steps"]
                 if not isinstance(new_steps, list):
                     return False
-                # Validate tool names
                 valid_tools = _get_tool_names()
                 for step in new_steps:
                     if not isinstance(step, dict) or step.get("tool") not in valid_tools:
@@ -759,6 +952,39 @@ class SkillStore:
 
 
 # ---------------------------------------------------------------------------
+# ChromaDB index helpers (module-level, reused by SkillStore)
+# ---------------------------------------------------------------------------
+
+def _skill_embed_text(skill: Skill) -> str:
+    """Build a natural-language description of a skill for embedding.
+
+    Strips regex syntax noise so the embedder sees meaningful tokens.
+    """
+    pattern_hint = (
+        skill.trigger_pattern
+        .replace("(?i)", "")
+        .replace("(?:", "(")
+        .replace(r"\b", " ")
+        .replace(r"\s+", " ")
+        .replace(r"\w+", "word")
+        [:100]
+    )
+    return f"{skill.name}. Handles queries like: {pattern_hint}"
+
+
+def _index_skill(collection, skill: Skill) -> None:
+    """Upsert a skill into ChromaDB (idempotent)."""
+    try:
+        collection.upsert(
+            ids=[f"skill_{skill.id}"],
+            documents=[_skill_embed_text(skill)],
+            metadatas=[{"skill_id": skill.id, "name": skill.name}],
+        )
+    except Exception as e:
+        logger.debug("Skill index upsert failed for #%d: %s", skill.id, e)
+
+
+# ---------------------------------------------------------------------------
 # Guards — ported from old nova's hard-won lessons
 # ---------------------------------------------------------------------------
 
@@ -844,10 +1070,10 @@ def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template
         return True
 
     # Valid named bindings available to every args_template:
-    #   {query}          — always available (the user's raw query)
-    #   {capture_N}      — handled by the numeric check below; skip in named check
-    #   {output_key}     — each step's output_key is available to subsequent steps
-    #   (?P<name>…)      — named capture groups from the trigger pattern
+    #   {query}          -- always available (the user's raw query)
+    #   {capture_N}      -- handled by the numeric check below; skip in named check
+    #   {output_key}     -- each step's output_key is available to subsequent steps
+    #   (?P<name>...)    -- named capture groups from the trigger pattern
     output_keys: set[str] = set()
     for step in steps:
         ok = step.get("output_key", "")
@@ -921,15 +1147,21 @@ def _get_tool_names() -> set[str]:
 def _mentions_tool_procedure(text: str) -> bool:
     """Check if a correction message describes a tool-based procedure."""
     lower = text.lower()
-    # Check for explicit tool names
     if any(tool in lower for tool in _get_tool_names()):
         return True
-    # Check for procedural language about tools/searches/actions
     procedural = re.search(
         r"(?i)\b(?:search|look\s+up|fetch|calculate|check|use|try)\b.*\b(?:first|then|instead|always|next)\b",
         text,
     )
     return bool(procedural)
+
+
+def _safe_col(row, key: str, default):
+    """Safely read a column from a sqlite3.Row, returning default if absent."""
+    try:
+        return row[key]
+    except (IndexError, KeyError):
+        return default
 
 
 async def extract_skill_from_correction(
@@ -944,7 +1176,6 @@ async def extract_skill_from_correction(
     - The correction describes a tool-based procedure
     Returns skill dict or None.
     """
-    # Skip if there's no tool usage AND the correction doesn't describe a procedure
     if not tool_history and not _mentions_tool_procedure(correction_context):
         return None
 
@@ -994,7 +1225,6 @@ async def extract_skill_from_correction(
         if not obj or obj.get("skip") or not obj.get("name"):
             return None
 
-        # Validate trigger pattern is a valid regex
         pattern = obj.get("trigger_pattern", "")
         if pattern:
             try:
@@ -1003,7 +1233,6 @@ async def extract_skill_from_correction(
                 logger.warning("Skill extraction produced invalid regex: %s", pattern)
                 return None
 
-        # Validate steps reference real tools and have required structure
         steps = obj.get("steps", [])
         valid_tools = _get_tool_names()
         if steps:
@@ -1020,7 +1249,6 @@ async def extract_skill_from_correction(
 
         answer_template = obj.get("answer_template")
 
-        # Guard: capture group references must match actual groups in regex
         if _has_capture_group_mismatch(pattern, steps, answer_template):
             logger.warning("Skill extraction has capture group mismatch: %s", pattern)
             return None
@@ -1031,6 +1259,7 @@ async def extract_skill_from_correction(
             "steps": steps,
             "answer_template": answer_template,
             "learned_from": lesson_id,
+            "source": "correction",
         }
 
     except Exception as e:

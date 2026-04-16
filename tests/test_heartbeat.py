@@ -194,7 +194,6 @@ class TestMonitorStore:
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
         assert "Quality Eval Harness" in names
-        assert "Curiosity Research" in names
         assert "Hacker News Top Stories" in names
         assert "FOMC and Fed Watch" in names
 

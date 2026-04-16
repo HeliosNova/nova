@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from app.core.llm import GenerationResult, StreamChunk, ToolCall, _extract_tool_calls, _strip_think_tags
 from app.core.reflexion import ReflexionStore, Reflexion, assess_quality
 
 
@@ -293,19 +294,34 @@ class TestReflexionBrainIntegration:
         from app.core.brain import think
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Bitcoin is currently trading at $50,000."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            content = "Bitcoin is currently trading at $50,000."
+            result = GenerationResult(content=content, tool_calls=[], raw={})
 
             captured_messages = []
-            original_gen = mock_llm.generate_with_tools
 
             async def capture(msgs, tools, **kwargs):
                 captured_messages.extend(msgs)
-                return await original_gen(msgs, tools, **kwargs)
+                return result
 
             mock_llm.generate_with_tools = AsyncMock(side_effect=capture)
+
+            # stream_with_thinking also captures and yields the result
+            async def capture_stream(msgs, tools, **kwargs):
+                captured_messages.extend(msgs)
+                yield StreamChunk(content=content)
+
+            mock_llm.stream_with_thinking = MagicMock(side_effect=capture_stream)
+
+            mock_llm.get_provider = MagicMock(return_value=MagicMock(
+                capabilities=MagicMock(needs_emphatic_prompts=False),
+            ))
+            mock_llm._strip_think_tags = _strip_think_tags
+            mock_llm.extract_json_object = MagicMock(return_value=None)
+            mock_llm.invoke_nothink = AsyncMock(return_value="COMPLETE")
+            mock_llm._extract_tool_calls = _extract_tool_calls
+            mock_llm.GenerationResult = GenerationResult
+            mock_llm.ToolCall = ToolCall
+            mock_llm.StreamChunk = StreamChunk
 
             events = []
             async for event in think("What is the current bitcoin price?"):
@@ -315,7 +331,13 @@ class TestReflexionBrainIntegration:
         system_msgs = [m for m in captured_messages if m.get("role") == "system"]
         assert len(system_msgs) >= 1
         system_text = system_msgs[0]["content"]
-        assert "past mistakes" in system_text.lower() or "previous failure" in system_text.lower()
+        # The reflexion block uses summary format: "[failure]" label and
+        # "Lessons from Past Conversations" header, or legacy "Previous failure"
+        assert (
+            "past conversations" in system_text.lower()
+            or "previous failure" in system_text.lower()
+            or "[failure]" in system_text.lower()
+        )
 
     @pytest.mark.asyncio
     async def test_low_quality_triggers_reflexion(self, db):
@@ -332,11 +354,26 @@ class TestReflexionBrainIntegration:
         set_services(svc)
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
             # Simulate a bad answer: multiple hard failure indicators + short
-            mock_result.content = "I cannot do that. Failed to."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            content = "I cannot do that. Failed to."
+            result = GenerationResult(content=content, tool_calls=[], raw={})
+            mock_llm.generate_with_tools = AsyncMock(return_value=result)
+
+            async def _fake_stream(*args, **kwargs):
+                yield StreamChunk(content=content)
+
+            mock_llm.stream_with_thinking = MagicMock(side_effect=_fake_stream)
+
+            mock_llm.get_provider = MagicMock(return_value=MagicMock(
+                capabilities=MagicMock(needs_emphatic_prompts=False),
+            ))
+            mock_llm._strip_think_tags = _strip_think_tags
+            mock_llm.extract_json_object = MagicMock(return_value=None)
+            mock_llm.invoke_nothink = AsyncMock(return_value="COMPLETE")
+            mock_llm._extract_tool_calls = _extract_tool_calls
+            mock_llm.GenerationResult = GenerationResult
+            mock_llm.ToolCall = ToolCall
+            mock_llm.StreamChunk = StreamChunk
 
             async for _ in think("Tell me about quantum computing and its applications in modern cryptography"):
                 pass

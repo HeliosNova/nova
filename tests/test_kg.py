@@ -263,20 +263,23 @@ class TestKGBrainIntegration:
         from app.core.brain import think
         from app.schema import EventType
 
+        from app.core.llm import StreamChunk
+
         with patch("app.core.brain.llm") as mock_llm:
+            captured_messages = []
+
+            async def fake_stream(msgs, tools, **kwargs):
+                captured_messages.extend(msgs)
+                yield StreamChunk(content="Bitcoin is a cryptocurrency.", done=True)
+
+            mock_llm.stream_with_thinking = fake_stream
+            mock_llm._strip_think_tags = lambda x: x
+            # Also mock generate_with_tools for non-streaming fallback
             mock_result = AsyncMock()
             mock_result.content = "Bitcoin is a cryptocurrency."
             mock_result.tool_calls = []
+            mock_result.thinking = ""
             mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-
-            captured_messages = []
-            original_gen = mock_llm.generate_with_tools
-
-            async def capture(msgs, tools, **kwargs):
-                captured_messages.extend(msgs)
-                return await original_gen(msgs, tools, **kwargs)
-
-            mock_llm.generate_with_tools = AsyncMock(side_effect=capture)
 
             events = []
             async for event in think("Tell me about bitcoin cryptocurrency"):

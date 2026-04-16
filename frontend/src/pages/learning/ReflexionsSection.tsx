@@ -1,6 +1,6 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { GraduationCap } from "lucide-react";
-import { Card, EmptyState, Skeleton } from "../../components/ui";
+import { Button, Card, EmptyState, Skeleton } from "../../components/ui";
 import { formatDate } from "../../lib/utils";
 import type { ReflexionInfo } from "../../lib/types";
 
@@ -11,8 +11,13 @@ interface Props {
 
 type Filter = "all" | "success" | "failure";
 
+const PAGE_SIZE = 20;
+
 export default function ReflexionsSection({ reflexions, loading }: Props) {
   const [filter, setFilter] = useState<Filter>("all");
+  const [visible, setVisible] = useState(PAGE_SIZE);
+
+  useEffect(() => setVisible(PAGE_SIZE), [filter]);
 
   if (loading) {
     return <Skeleton lines={4} />;
@@ -50,7 +55,7 @@ export default function ReflexionsSection({ reflexions, loading }: Props) {
         ))}
       </div>
       <div className="space-y-3">
-      {filtered.map((r) => (
+      {filtered.slice(0, visible).map((r) => (
         <Card key={r.id}>
           <div className="mb-1 flex items-center justify-between">
             <div className="flex items-center gap-2">
@@ -87,6 +92,17 @@ export default function ReflexionsSection({ reflexions, loading }: Props) {
           )}
         </Card>
       ))}
+      {filtered.length > visible && (
+        <div className="mt-4 flex justify-center">
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={() => setVisible(v => v + PAGE_SIZE)}
+          >
+            Load More ({filtered.length - visible} remaining)
+          </Button>
+        </div>
+      )}
       </div>
     </section>
   );

@@ -10,6 +10,7 @@ import logging
 import os
 import time
 import uuid
+from datetime import datetime
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -41,6 +42,7 @@ from app.tools.knowledge import KnowledgeSearchTool
 from app.tools.memory_tool import MemorySearchTool
 from app.tools.browser import BrowserTool
 from app.tools.monitor_tool import MonitorTool
+from app.tools.active_memory import ActiveMemoryTool
 from app.tools.screenshot import ScreenshotTool
 from app.tools.shell_exec import ShellExecTool
 from app.tools.web_search import WebSearchTool
@@ -179,6 +181,10 @@ async def lifespan(app: FastAPI):
     if config.ENABLE_DELEGATION:
         _tool_instances.append(("DelegateTool", lambda: DelegateTool()))
 
+    # Context detail tool (lazy context retrieval — uses get_services() at call time)
+    from app.tools.context_detail import ContextDetailTool
+    _tool_instances.append(("ContextDetailTool", lambda: ContextDetailTool()))
+
     # Background task manager
     task_manager = TaskManager(
         max_concurrent=config.MAX_BACKGROUND_TASKS,
@@ -246,6 +252,19 @@ async def lifespan(app: FastAPI):
             logger.info("Custom tools enabled (0 loaded)")
 
     # Monitor store + monitor tool
+    # Active Memory Tool (AgeMem pattern — agent-managed memory)
+    registry.register(ActiveMemoryTool(db=db))
+
+    # Trust Manager (Sovereign-OS — earned trust with asymmetric scoring)
+    trust_manager = None
+    try:
+        from app.core.trust import TrustManager
+        trust_manager = TrustManager(db)
+        registry.trust_manager = trust_manager  # Attach to registry for tool gating
+        logger.info("Trust system initialized (score: %.0f)", trust_manager.get_score())
+    except Exception as e:
+        logger.warning("Trust system init failed: %s", e)
+
     monitor_store = None
     if config.ENABLE_HEARTBEAT:
         try:
@@ -324,6 +343,14 @@ async def lifespan(app: FastAPI):
             logger.info("Reindexed %d reflexions into ChromaDB", reindexed_r)
     except Exception as e:
         logger.warning("Reflexion reindex failed: %s", e)
+
+    # Reindex KG facts into ChromaDB for semantic search
+    try:
+        reindexed_kg = kg.reindex_kg_facts()
+        if reindexed_kg:
+            logger.info("Reindexed %d KG facts into ChromaDB", reindexed_kg)
+    except Exception as e:
+        logger.warning("KG reindex failed: %s", e)
 
     # Decay confidence on stale lessons
     try:
@@ -410,6 +437,21 @@ async def lifespan(app: FastAPI):
                 dtask = daily_digest.start()
                 dtask.add_done_callback(_on_bg_task_done)
                 logger.info("Daily digest started (hour=%d)", config.DIGEST_HOUR)
+
+            # Start daemon orchestrator
+            from app.monitors.daemon import DaemonOrchestrator
+            daemon_orch = DaemonOrchestrator(monitor_store._db)
+            daemon_orch.start()
+            logger.info("Daemon orchestrator started")
+
+            # Start event-driven trigger system
+            if config.ENABLE_EVENT_TRIGGERS:
+                from app.monitors.event_trigger import EventTrigger, set_event_trigger
+                event_trigger = EventTrigger(monitor_store, heartbeat_loop, db)
+                et_task = event_trigger.start()
+                et_task.add_done_callback(_on_bg_task_done)
+                set_event_trigger(event_trigger)
+                logger.info("Event trigger system started")
         except Exception as e:
             logger.warning("Heartbeat/proactive startup failed: %s", e)
 
@@ -566,6 +608,29 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RateLimitMiddleware, max_requests=config.RATE_LIMIT_RPM, window_seconds=60)
 
 
+class UserActivityMiddleware(BaseHTTPMiddleware):
+    """Track last user activity for idle detection (dream mode trigger)."""
+
+    async def dispatch(self, request: Request, call_next):
+        # Only track user-facing endpoints (chat, voice, actions)
+        path = request.url.path
+        if any(path.startswith(p) for p in ("/api/chat", "/api/voice", "/api/actions")):
+            from app.core.brain import get_services
+            try:
+                svc = get_services()
+                if svc.monitor_store:
+                    svc.monitor_store._db.execute(
+                        "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                        ("last_user_activity", datetime.utcnow().isoformat(), ),
+                    )
+            except Exception as e:
+                logger.warning("User activity tracking failed: %s", e)
+        return await call_next(request)
+
+
+app.add_middleware(UserActivityMiddleware)
+
+
 class SecurityHeadersMiddleware(BaseHTTPMiddleware):
     """Add security headers to all responses."""
 
@@ -613,6 +678,7 @@ from app.api.documents import router as documents_router
 from app.api.learning import router as learning_router
 from app.api.monitors import router as monitors_router
 from app.api.actions import router as actions_router
+from app.api.daemon import router as daemon_router
 
 app.include_router(system_router, prefix="/api")
 app.include_router(chat_router, prefix="/api")
@@ -620,6 +686,13 @@ app.include_router(documents_router, prefix="/api")
 app.include_router(learning_router, prefix="/api")
 app.include_router(monitors_router, prefix="/api")
 app.include_router(actions_router, prefix="/api")
+app.include_router(daemon_router, prefix="/api")
+
+from app.api.exports import router as exports_router
+app.include_router(exports_router, prefix="/api")
+
+from app.api.events import router as events_router
+app.include_router(events_router, prefix="/api")
 
 if config.ENABLE_VOICE:
     from app.api.voice import router as voice_router

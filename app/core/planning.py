@@ -84,19 +84,35 @@ def should_plan(query: str, intent: str) -> bool:
 # Plan creation (1 invoke_nothink call)
 # ---------------------------------------------------------------------------
 
-_PLAN_SYSTEM = """You are a query planner. Break the user's query into sequential steps.
-For each step, name the tool to use (or "none" for reasoning/synthesis).
+_PLAN_SYSTEM = """You are a precise query decomposition specialist. Break complex queries into the most effective execution plan.
+
+Think through this query before generating output:
+1. Count distinct questions/tasks in the query
+2. Identify step dependencies (which steps need prior results)
+3. Check if any sub-questions are INDEPENDENT (each answerable without the other's results)
+4. Assign the best tool to each step
 
 Available tools: {tools}
 
 Output JSON only:
-{{"steps": [{{"description": "what to do", "tool": "tool_name_or_none"}}], "complexity": "simple|multi_step"}}
+{{"steps": [{{"description": "concrete action under 20 words", "tool": "tool_name_or_none"}}],
+  "sub_questions": [{{"question": "exact sub-question text", "requires_tools": false}}],
+  "complexity": "simple|multi_step|decomposable",
+  "confidence": 0.1,
+  "key_risk": "main thing that could go wrong"}}
+
+complexity definitions:
+- simple: one question, direct answer, at most one tool
+- multi_step: steps depend on each other's outputs (sequential pipeline)
+- decomposable: 2+ INDEPENDENT sub-questions answerable separately then combined (ONLY when ALL require no tools)
+
+confidence: 0.1-1.0 — how certain you are this plan produces a correct, complete answer
+sub_questions: populate ONLY when complexity=decomposable
 
 Rules:
-- Max 5 steps
-- Use exact tool names from the list above
-- First step should gather information, last step should synthesize
-- Keep descriptions short (under 20 words)"""
+- Max 5 steps; use exact tool names from the list
+- First step gathers info, last step synthesizes
+- Only mark decomposable when sub-questions are truly independent and tool-free"""
 
 
 async def create_plan(
@@ -154,9 +170,36 @@ async def create_plan(
         if not validated:
             return None
 
+        # Extract and validate sub_questions (only meaningful for decomposable)
+        sub_questions: list[dict] = []
+        raw_sq = plan.get("sub_questions", [])
+        if isinstance(raw_sq, list):
+            for sq in raw_sq[:4]:  # cap at 4
+                if isinstance(sq, dict):
+                    q = str(sq.get("question", "")).strip()
+                    if q:
+                        sub_questions.append({
+                            "question": q,
+                            "requires_tools": bool(sq.get("requires_tools", False)),
+                        })
+
+        # Confidence: clamp to [0.1, 1.0]
+        raw_conf = plan.get("confidence", 0.8)
+        try:
+            confidence = max(0.1, min(1.0, float(raw_conf)))
+        except (TypeError, ValueError):
+            confidence = 0.8
+
+        complexity = plan.get("complexity", "multi_step")
+        if complexity not in ("simple", "multi_step", "decomposable"):
+            complexity = "multi_step"
+
         return {
             "steps": validated,
-            "complexity": plan.get("complexity", "multi_step"),
+            "sub_questions": sub_questions,
+            "complexity": complexity,
+            "confidence": round(confidence, 2),
+            "key_risk": str(plan.get("key_risk", "")).strip()[:200],
         }
     except Exception as e:
         logger.warning("Planning failed: %s", e)
@@ -173,6 +216,126 @@ def format_plan_for_prompt(plan: dict) -> str:
         tool_note = f" using {tool}" if tool != "none" else ""
         lines.append(f"{i}. {step['description']}{tool_note}")
     return "[PLAN]\n" + "\n".join(lines) + "\n[Follow this plan step by step.]"
+
+
+_DECOMPOSABLE_RE = re.compile(
+    r"\b(compare|contrast|analyze|evaluate|examine|assess)\b"
+    r".{0,150}"
+    r"\b(dimension|aspect|criterion|factor|angle|metric|perspective|front)\w*"
+    r"\s*[:：,]",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def is_decomposable(query: str) -> bool:
+    """Return True if the query enumerates 2+ explicit dimensions/aspects to analyze.
+
+    Detects patterns like "compare X vs Y across N dimensions: a, b, c" or
+    "analyze these aspects: latency, throughput, cost".
+    """
+    if not _DECOMPOSABLE_RE.search(query):
+        return False
+    colon_match = re.search(r"[:：]\s*(.+)", query, re.DOTALL)
+    if not colon_match:
+        return False
+    raw = colon_match.group(1)
+    items = [x.strip() for x in re.split(r",\s*|\s+and\s+", raw) if x.strip() and len(x.strip()) > 1]
+    return len(items) >= 2
+
+
+def _extract_sub_questions(query: str) -> list[str]:
+    """Parse an enumerated-dimension query into one sub-question per dimension."""
+    colon_match = re.search(r"[:：]\s*(.+)", query, re.DOTALL)
+    if not colon_match:
+        return []
+    raw = colon_match.group(1).strip()
+    items = [x.strip() for x in re.split(r",\s*|\s+and\s+", raw) if x.strip() and len(x.strip()) > 1]
+    if len(items) < 2:
+        return []
+    base = query[: colon_match.start()].strip().rstrip(":,").strip()
+    return [f"{base} — focus specifically on {item}" for item in items]
+
+
+async def solve_sub_questions(
+    sub_questions: list[dict],
+    user_facts: str = "",
+    kg_facts: str = "",
+    context: str = "",
+) -> str:
+    """Solve independent, tool-free sub-questions in parallel.
+
+    Called only for decomposable plans. Runs each sub-question through
+    invoke_nothink() concurrently and returns a context block with the
+    pre-computed answers for the main generation to synthesize.
+    """
+    if not sub_questions:
+        return ""
+
+    # Only solve questions that don't require tools
+    solvable = [q for q in sub_questions if not q.get("requires_tools", False)]
+    if len(solvable) < 2:
+        return ""
+    solvable = solvable[:4]  # cap to avoid token bloat
+
+    context_prefix_parts: list[str] = []
+    if user_facts:
+        context_prefix_parts.append(f"User facts: {user_facts[:300]}")
+    if kg_facts:
+        context_prefix_parts.append(f"Known facts: {kg_facts[:300]}")
+    if context:
+        context_prefix_parts.append(f"Context: {context[:500]}")
+    context_prefix = "\n".join(context_prefix_parts)
+
+    system = (
+        "Answer the specific question concisely and directly. "
+        "Use provided facts when available. Be precise, under 150 words."
+    )
+    if context_prefix:
+        system = context_prefix + "\n\n" + system
+
+    async def _solve_one(q: dict) -> tuple[str, str]:
+        question = q.get("question", "").strip()
+        if not question:
+            return "", ""
+        try:
+            answer = await asyncio.wait_for(
+                llm.invoke_nothink(
+                    [
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": question},
+                    ],
+                    max_tokens=200,
+                    temperature=0.2,
+                ),
+                timeout=config.INTERNAL_LLM_TIMEOUT,
+            )
+            return question, (answer or "").strip()
+        except Exception as e:
+            logger.debug("Sub-question solve failed ('%s'): %s", question[:50], e)
+            return question, ""
+
+    try:
+        results = await asyncio.gather(*[_solve_one(q) for q in solvable], return_exceptions=True)
+    except Exception as e:
+        logger.warning("Sub-question parallel solve failed: %s", e)
+        return ""
+
+    lines: list[str] = []
+    for item in results:
+        if isinstance(item, Exception):
+            continue
+        question, answer = item  # type: ignore[misc]
+        if question and answer:
+            lines.append(f"Q: {question}\nA: {answer}")
+
+    if not lines:
+        return ""
+
+    return (
+        "[PRE-ANALYZED SUB-QUESTIONS]\n"
+        + "\n\n".join(lines)
+        + "\n[Use these pre-computed answers when constructing your final response.]"
+    )
 
 
 def verify_plan_coverage(plan: dict, answer: str) -> list[str]:
