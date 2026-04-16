@@ -76,6 +76,12 @@ _MUTABLE_FIELDS = {
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
     "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
+    # Prompt self-modification
+    "ENABLE_PROMPT_SELF_MOD",
+    "PROMPT_MOD_MAX_PROPOSALS_PER_DAY", "PROMPT_MOD_MAX_PENDING",
+    "PROMPT_MOD_MAX_PROMOTIONS_PER_DAY", "PROMPT_MOD_MAX_DRIFT",
+    "PROMPT_MOD_MIN_IMPROVEMENT_PP", "PROMPT_MOD_REGRESSION_TOLERANCE_PP",
+    "PROMPT_MOD_STABILITY_RUNS", "PROMPT_MOD_LATENCY_OVERHEAD_MAX",
 }
 
 
@@ -266,6 +272,25 @@ class Config:
     REFLEXION_SUCCESS_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_SUCCESS_THRESHOLD", 0.8))
     KG_GRAPH_MAX_FRONTIER: int = field(default_factory=lambda: _env_int("KG_GRAPH_MAX_FRONTIER", 1000))
     AUTH_MAX_TRACKED_IPS: int = field(default_factory=lambda: _env_int("AUTH_MAX_TRACKED_IPS", 10000))
+
+    # Prompt self-modification (opt-in; default off for safety)
+    ENABLE_PROMPT_SELF_MOD: bool = field(default_factory=lambda: _env("ENABLE_PROMPT_SELF_MOD", "false").lower() == "true")
+    # Max candidate proposals per day per module
+    PROMPT_MOD_MAX_PROPOSALS_PER_DAY: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PROPOSALS_PER_DAY", 2))
+    # Max pending candidates per module before blocking new proposals
+    PROMPT_MOD_MAX_PENDING: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PENDING", 3))
+    # Max promotions system-wide per day
+    PROMPT_MOD_MAX_PROMOTIONS_PER_DAY: int = field(default_factory=lambda: _env_int("PROMPT_MOD_MAX_PROMOTIONS_PER_DAY", 2))
+    # Max word-overlap drift from baseline (0.0-1.0; 0.25 ≈ meaningful rephrasing limit)
+    PROMPT_MOD_MAX_DRIFT: float = field(default_factory=lambda: _env_float("PROMPT_MOD_MAX_DRIFT", 0.25))
+    # Minimum improvement (percentage points) required on target metric to promote
+    PROMPT_MOD_MIN_IMPROVEMENT_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_MIN_IMPROVEMENT_PP", 2.0))
+    # Max regression allowed (pp) in any non-target category before blocking
+    PROMPT_MOD_REGRESSION_TOLERANCE_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_REGRESSION_TOLERANCE_PP", 1.0))
+    # Number of consecutive shadow runs required (candidate must pass K out of this many)
+    PROMPT_MOD_STABILITY_RUNS: int = field(default_factory=lambda: _env_int("PROMPT_MOD_STABILITY_RUNS", 3))
+    # Max latency overhead before blocking (1.15 = 15% overhead allowed)
+    PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))
 
     # OpenAI token counting: use completion_tokens instead of total_tokens
     OPENAI_USE_COMPLETION_TOKENS: bool = field(default_factory=lambda: _env("OPENAI_USE_COMPLETION_TOKENS", "false").lower() == "true")
