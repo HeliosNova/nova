@@ -12,7 +12,7 @@ import json
 import logging
 import re
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from app.config import config
 from app.core import llm
@@ -33,6 +33,11 @@ class Skill:
     success_rate: float
     enabled: bool
     created_at: str | None
+    # Quality & lifecycle fields (added in migration 9)
+    last_used_at: str | None = None
+    consecutive_failures: int = 0
+    source: str = "correction"   # "correction" | "auto" | "manual"
+    composed_of: list[int] = field(default_factory=list)  # ordered sub-skill IDs
 
 
 def _pattern_specificity(pattern: str) -> tuple[int, int, int]:
@@ -284,8 +289,12 @@ class SkillStore:
         answer_template: str | None = None,
         learned_from: int | None = None,
         initial_success_rate: float = 0.7,
+        source: str = "correction",
+        composed_of: list[int] | None = None,
     ) -> int | None:
         """Create a new skill. Returns skill ID, or None if rejected by guards."""
+        composed_of = composed_of or []
+
         # Guard: reject ReDoS-prone patterns
         if _is_redos_risk(trigger_pattern):
             logger.warning("Skill '%s' rejected: ReDoS risk (%s)", name, trigger_pattern)
@@ -370,29 +379,77 @@ class SkillStore:
         return skill_id
 
     def record_use(self, skill_id: int, success: bool) -> None:
-        """Record a skill execution. Updates times_used and success_rate.
+        """Record a skill execution. Updates times_used, success_rate, and quality counters.
 
-        Auto-disables skills with success_rate < 0.3 after 5+ uses.
-        Uses atomic UPDATE to avoid read-then-write race.
+        Fast demotion: 3 consecutive failures disables the skill immediately
+        (in addition to the slow EMA-based auto-disable at success_rate < 0.3).
         """
         success_val = 1.0 if success else 0.0
         alpha = config.SKILL_EMA_ALPHA
-        self._db.execute(
-            "UPDATE skills SET times_used = times_used + 1, "
-            "success_rate = ? * ? + (1 - ?) * success_rate "
-            "WHERE id = ?",
-            (alpha, success_val, alpha, skill_id),
-        )
 
-        # Check for auto-disable (separate read after atomic update)
-        row = self._db.fetchone(
-            "SELECT name, times_used, success_rate FROM skills WHERE id = ?",
-            (skill_id,),
-        )
-        if row and row["times_used"] >= 5 and row["success_rate"] < 0.3:
-            self._db.execute(
-                "UPDATE skills SET enabled = 0 WHERE id = ?", (skill_id,)
+        import sqlite3 as _sqlite3
+        if success:
+            try:
+                self._db.execute(
+                    "UPDATE skills SET "
+                    "times_used = times_used + 1, "
+                    "success_rate = ? * ? + (1 - ?) * success_rate, "
+                    "consecutive_failures = 0, "
+                    "last_used_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (alpha, success_val, alpha, skill_id),
+                )
+            except _sqlite3.OperationalError:
+                self._db.execute(
+                    "UPDATE skills SET times_used = times_used + 1, "
+                    "success_rate = ? * ? + (1 - ?) * success_rate WHERE id = ?",
+                    (alpha, success_val, alpha, skill_id),
+                )
+        else:
+            try:
+                self._db.execute(
+                    "UPDATE skills SET "
+                    "times_used = times_used + 1, "
+                    "success_rate = ? * ? + (1 - ?) * success_rate, "
+                    "consecutive_failures = consecutive_failures + 1, "
+                    "last_used_at = CURRENT_TIMESTAMP "
+                    "WHERE id = ?",
+                    (alpha, success_val, alpha, skill_id),
+                )
+            except _sqlite3.OperationalError:
+                self._db.execute(
+                    "UPDATE skills SET times_used = times_used + 1, "
+                    "success_rate = ? * ? + (1 - ?) * success_rate WHERE id = ?",
+                    (alpha, success_val, alpha, skill_id),
+                )
+
+        # Check for auto-disable conditions (separate read after atomic update)
+        try:
+            row = self._db.fetchone(
+                "SELECT name, times_used, success_rate, consecutive_failures FROM skills WHERE id = ?",
+                (skill_id,),
             )
+        except _sqlite3.OperationalError:
+            row = self._db.fetchone(
+                "SELECT name, times_used, success_rate FROM skills WHERE id = ?",
+                (skill_id,),
+            )
+        if not row:
+            return
+
+        # Fast demotion: 3+ consecutive failures
+        consec = row["consecutive_failures"] if "consecutive_failures" in row.keys() else 0
+        if consec >= 3:
+            self._db.execute("UPDATE skills SET enabled = 0 WHERE id = ?", (skill_id,))
+            logger.warning(
+                "Fast-disabled skill #%d '%s': %d consecutive failures",
+                skill_id, row["name"], consec,
+            )
+            return
+
+        # Slow demotion: EMA success_rate below threshold after 5+ uses
+        if row["times_used"] >= 5 and row["success_rate"] < 0.3:
+            self._db.execute("UPDATE skills SET enabled = 0 WHERE id = ?", (skill_id,))
             logger.warning(
                 "Auto-disabled skill #%d '%s': success_rate=%.2f after %d uses",
                 skill_id, row["name"], row["success_rate"], row["times_used"],
@@ -403,12 +460,18 @@ class SkillStore:
         row = self._db.fetchone("SELECT * FROM skills WHERE id = ?", (skill_id,))
         return self._row_to_skill(row) if row else None
 
-    def get_all_skills(self, limit: int = 50) -> list[Skill]:
-        """Get all skills."""
-        rows = self._db.fetchall(
-            "SELECT * FROM skills ORDER BY times_used DESC, success_rate DESC, id ASC LIMIT ?",
-            (limit,),
-        )
+    def get_all_skills(self, limit: int = 50, include_disabled: bool = True) -> list[Skill]:
+        """Get all skills, optionally filtering to enabled only."""
+        if include_disabled:
+            rows = self._db.fetchall(
+                "SELECT * FROM skills ORDER BY times_used DESC, success_rate DESC, id ASC LIMIT ?",
+                (limit,),
+            )
+        else:
+            rows = self._db.fetchall(
+                "SELECT * FROM skills WHERE enabled = 1 ORDER BY times_used DESC, success_rate DESC, id ASC LIMIT ?",
+                (limit,),
+            )
         return [self._row_to_skill(r) for r in rows]
 
     def get_active_skills(self) -> list[Skill]:
@@ -421,10 +484,22 @@ class SkillStore:
     def toggle_skill(self, skill_id: int, enabled: bool) -> bool:
         """Enable or disable a skill. Re-enabling resets stats for a fresh start."""
         if enabled:
-            cursor = self._db.execute(
-                "UPDATE skills SET enabled = 1, times_used = 0, success_rate = 0.7 WHERE id = ?",
-                (skill_id,),
-            )
+            import sqlite3 as _sqlite3
+            try:
+                cursor = self._db.execute(
+                    "UPDATE skills SET enabled = 1, times_used = 0, success_rate = 0.7, "
+                    "consecutive_failures = 0 WHERE id = ?",
+                    (skill_id,),
+                )
+            except _sqlite3.OperationalError:
+                cursor = self._db.execute(
+                    "UPDATE skills SET enabled = 1, times_used = 0, success_rate = 0.7 WHERE id = ?",
+                    (skill_id,),
+                )
+            # Re-index in ChromaDB
+            skill = self.get_skill(skill_id)
+            if skill:
+                self._embed_skill(skill_id, skill.name, skill.trigger_pattern)
         else:
             cursor = self._db.execute(
                 "UPDATE skills SET enabled = 0 WHERE id = ?",
@@ -523,9 +598,148 @@ class SkillStore:
 
         return False
 
+    # ------------------------------------------------------------------
+    # Skill composition
+    # ------------------------------------------------------------------
+
+    def get_composed_steps(self, skill: Skill) -> list[dict]:
+        """Expand a composed skill into its full ordered step list.
+
+        Fetches each sub-skill by ID in order, concatenates their steps,
+        then appends the composing skill's own steps last. Cycles and
+        missing/disabled sub-skills are skipped silently.
+
+        Returns skill.steps unchanged if composed_of is empty.
+        """
+        if not skill.composed_of:
+            return skill.steps
+
+        seen: set[int] = {skill.id}
+        all_steps: list[dict] = []
+
+        for sub_id in skill.composed_of[:10]:  # cap at 10 to prevent runaway chains
+            if sub_id in seen:
+                logger.debug("Skill composition cycle detected at #%d, skipping", sub_id)
+                continue
+            seen.add(sub_id)
+            sub = self.get_skill(sub_id)
+            if sub and sub.enabled:
+                all_steps.extend(sub.steps)
+            else:
+                logger.debug("Composed sub-skill #%d unavailable, skipping", sub_id)
+
+        # Append the composing skill's own steps last (may be empty for pure compositions)
+        all_steps.extend(skill.steps)
+        return all_steps or skill.steps
+
+    # ------------------------------------------------------------------
+    # Metrics & maintenance
+    # ------------------------------------------------------------------
+
+    def get_skill_stats(self) -> dict:
+        """Return aggregate skill system metrics."""
+        rows = self._db.fetchall("SELECT * FROM skills")
+        if not rows:
+            return {
+                "total": 0, "enabled": 0, "disabled": 0,
+                "total_uses": 0, "avg_success_rate": 0.0,
+                "stale_count": 0, "top_skills": [],
+                "by_source": {},
+            }
+
+        total = len(rows)
+        enabled = sum(1 for r in rows if r["enabled"])
+        total_uses = sum(r["times_used"] for r in rows)
+        avg_rate = sum(r["success_rate"] for r in rows) / total
+
+        # Source breakdown
+        by_source: dict[str, int] = {}
+        for r in rows:
+            src = _safe_col(r, "source", "correction")
+            by_source[src] = by_source.get(src, 0) + 1
+
+        # Stale: not used in SKILL_STALE_DAYS days (NULL last_used_at = never used = stale)
+        stale_row = self._db.fetchone(
+            "SELECT COUNT(*) FROM skills WHERE "
+            "last_used_at IS NULL OR last_used_at < datetime('now', ?)",
+            (f"-{config.SKILL_STALE_DAYS} days",),
+        )
+        stale_count = stale_row[0] if stale_row else 0
+
+        top = self._db.fetchall(
+            "SELECT id, name, times_used, success_rate FROM skills WHERE enabled = 1 "
+            "ORDER BY times_used DESC LIMIT 5"
+        )
+
+        return {
+            "total": total,
+            "enabled": enabled,
+            "disabled": total - enabled,
+            "total_uses": total_uses,
+            "avg_success_rate": round(avg_rate, 3),
+            "stale_count": stale_count,
+            "by_source": by_source,
+            "top_skills": [
+                {
+                    "id": r["id"],
+                    "name": r["name"],
+                    "uses": r["times_used"],
+                    "success_rate": round(r["success_rate"], 3),
+                }
+                for r in top
+            ],
+        }
+
+    def decay_stale_skills(self) -> int:
+        """Reduce success_rate on skills unused for SKILL_STALE_DAYS days.
+
+        Each decay pass reduces success_rate by 5% (multiplicative).
+        Skills that cross below 0.3 after decay are auto-disabled.
+        Returns number of skills decayed.
+        """
+        rows = self._db.fetchall(
+            "SELECT id, name, success_rate FROM skills WHERE enabled = 1 AND "
+            "(last_used_at IS NULL OR last_used_at < datetime('now', ?))",
+            (f"-{config.SKILL_STALE_DAYS} days",),
+        )
+        if not rows:
+            return 0
+
+        decayed = 0
+        for row in rows:
+            new_rate = row["success_rate"] * 0.95
+            if new_rate < 0.3:
+                self._db.execute(
+                    "UPDATE skills SET success_rate = ?, enabled = 0 WHERE id = ?",
+                    (new_rate, row["id"]),
+                )
+                logger.info(
+                    "Disabled stale skill #%d '%s': success_rate decayed to %.2f",
+                    row["id"], row["name"], new_rate,
+                )
+            else:
+                self._db.execute(
+                    "UPDATE skills SET success_rate = ? WHERE id = ?",
+                    (new_rate, row["id"]),
+                )
+            decayed += 1
+
+        logger.info("Skill staleness decay: %d skills decayed", decayed)
+        return decayed
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _row_to_skill(self, row) -> Skill:
         """Convert a DB row to a Skill dataclass."""
         steps = json.loads(row["steps"]) if isinstance(row["steps"], str) else row["steps"]
+        row_keys = row.keys()
+        composed_raw = row["composed_of"] if "composed_of" in row_keys else "[]"
+        try:
+            composed_of = json.loads(composed_raw) if composed_raw else []
+        except (json.JSONDecodeError, TypeError):
+            composed_of = []
         return Skill(
             id=row["id"],
             name=row["name"],
@@ -537,6 +751,10 @@ class SkillStore:
             success_rate=row["success_rate"],
             enabled=bool(row["enabled"]),
             created_at=row["created_at"],
+            last_used_at=row["last_used_at"] if "last_used_at" in row_keys else None,
+            consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in row_keys else 0,
+            source=row["source"] if "source" in row_keys else "correction",
+            composed_of=composed_of,
         )
 
 
