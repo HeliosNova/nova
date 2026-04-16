@@ -655,15 +655,16 @@ class TestActionsAPI:
     def db(self):
         return _fresh_db()
 
-    def test_list_actions_empty(self, db):
+    @pytest.mark.asyncio
+    async def test_list_actions_empty(self, db):
+        from app.api.actions import list_actions
         with patch("app.api.actions.get_db", return_value=db):
-            import asyncio
-            from app.api.actions import list_actions
-            result = asyncio.run(list_actions())
+            result = await list_actions()
             assert result["count"] == 0
             assert result["actions"] == []
 
-    def test_list_actions_filtered(self, db):
+    @pytest.mark.asyncio
+    async def test_list_actions_filtered(self, db):
         db.execute(
             "INSERT INTO action_log (action_type, params, result, success) VALUES (?, ?, ?, ?)",
             ("email", '{}', "sent", 1),
@@ -672,20 +673,19 @@ class TestActionsAPI:
             "INSERT INTO action_log (action_type, params, result, success) VALUES (?, ?, ?, ?)",
             ("webhook", '{}', "called", 1),
         )
+        from app.api.actions import list_actions
         with patch("app.api.actions.get_db", return_value=db):
-            import asyncio
-            from app.api.actions import list_actions
-            result = asyncio.run(list_actions(action_type="email"))
+            result = await list_actions(action_type="email")
             assert result["count"] == 1
             assert result["actions"][0]["action_type"] == "email"
 
-    def test_get_action_not_found(self, db):
+    @pytest.mark.asyncio
+    async def test_get_action_not_found(self, db):
+        from app.api.actions import get_action
+        from fastapi import HTTPException
         with patch("app.api.actions.get_db", return_value=db):
-            import asyncio
-            from app.api.actions import get_action
-            from fastapi import HTTPException
             with pytest.raises(HTTPException) as exc_info:
-                asyncio.run(get_action(9999))
+                await get_action(9999)
             assert exc_info.value.status_code == 404
 
 

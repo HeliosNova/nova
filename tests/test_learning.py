@@ -707,7 +707,8 @@ class TestReflexionCritiqueFacts:
         assert "user_facts" in params
         assert "kg_facts" in params
 
-    def test_facts_in_prompt(self):
+    @pytest.mark.asyncio
+    async def test_facts_in_prompt(self):
         from app.core.reflexion import critique_response
         captured = []
 
@@ -717,15 +718,14 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.9, "critique": "good"}):
-                asyncio.run(
-                    critique_response("q", "a", [], user_facts="name: X", kg_facts="X works_at Y")
-                )
+                await critique_response("q", "a", [], user_facts="name: X", kg_facts="X works_at Y")
 
         assert captured
         assert "Owner facts" in captured[0]
         assert "Knowledge graph facts" in captured[0]
 
-    def test_empty_facts_no_section(self):
+    @pytest.mark.asyncio
+    async def test_empty_facts_no_section(self):
         from app.core.reflexion import critique_response
         captured = []
 
@@ -735,9 +735,7 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.8, "critique": "ok"}):
-                asyncio.run(
-                    critique_response("q", "a", [])
-                )
+                await critique_response("q", "a", [])
 
         assert "Owner facts" not in captured[0]
 

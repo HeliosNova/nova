@@ -235,11 +235,16 @@ class TestDesktopTool:
         mock_pyautogui.screenshot.return_value = mock_img
         mock_pyautogui.size.return_value = Size(1920, 1080)
 
+        # scrot doesn't exist on Windows — mock subprocess.run to simulate scrot failure
+        mock_scrot = MagicMock()
+        mock_scrot.returncode = 1  # scrot fails → fallback to pyautogui
+
         with patch("app.tools.desktop.config") as mock_config, \
              patch("app.tools.desktop._HAS_PYAUTOGUI", True), \
              patch("app.tools.desktop._HAS_DISPLAY", True), \
              patch("app.tools.desktop._tier", return_value="full"), \
-             patch("app.tools.desktop.pyautogui", mock_pyautogui):
+             patch("app.tools.desktop.pyautogui", mock_pyautogui), \
+             patch("subprocess.run", return_value=mock_scrot):
             mock_config.ENABLE_DESKTOP_AUTOMATION = True
             mock_config.DESKTOP_CLICK_DELAY = 0.0
             result = await tool.execute(action="screenshot")

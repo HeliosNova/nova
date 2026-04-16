@@ -208,8 +208,9 @@ class TestPromptBuilder:
         assert "revenue" in prompt
 
     def test_truncation_occurs(self):
-        # Huge context should be truncated
-        big_context = "x" * 20000
+        # Context must exceed the token budget to trigger truncation.
+        # MAX_SYSTEM_TOKENS=10000, identity ~1800 tokens, so remaining ~8200 tokens (~33K chars).
+        big_context = "x" * 50000
         prompt = build_system_prompt(retrieved_context=big_context)
         assert len(prompt) < 25000  # Must be truncated well below 20K+identity (conftest sets MAX_SYSTEM_TOKENS=6000)
         assert "truncated" in prompt.lower()
@@ -862,16 +863,15 @@ class TestCritiqueSources:
             m.invoke_nothink = AsyncMock(return_value='{"pass": true, "issues": []}')
             yield m
 
-    def test_critique_includes_user_facts(self, mock_llm):
+    @pytest.mark.asyncio
+    async def test_critique_includes_user_facts(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.run(
-            critique_answer(
-                "What is my name?",
-                "Your name is Marcus.",
-                sources="",
-                user_facts="- name: Marcus\n- employer: Acme Corp",
-            )
+        await critique_answer(
+            "What is my name?",
+            "Your name is Marcus.",
+            sources="",
+            user_facts="- name: Marcus\n- employer: Acme Corp",
         )
 
         call_args = mock_llm.invoke_nothink.call_args
@@ -880,16 +880,15 @@ class TestCritiqueSources:
         assert "Owner facts" in user_msg
         assert "Marcus" in user_msg
 
-    def test_critique_includes_kg_facts(self, mock_llm):
+    @pytest.mark.asyncio
+    async def test_critique_includes_kg_facts(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.run(
-            critique_answer(
-                "Tell me about bitcoin",
-                "Bitcoin is a cryptocurrency.",
-                sources="",
-                kg_facts="bitcoin is_a cryptocurrency (confidence: 0.9)",
-            )
+        await critique_answer(
+            "Tell me about bitcoin",
+            "Bitcoin is a cryptocurrency.",
+            sources="",
+            kg_facts="bitcoin is_a cryptocurrency (confidence: 0.9)",
         )
 
         call_args = mock_llm.invoke_nothink.call_args
@@ -898,17 +897,16 @@ class TestCritiqueSources:
         assert "Knowledge graph facts" in user_msg
         assert "bitcoin" in user_msg
 
-    def test_empty_facts_not_added(self, mock_llm):
+    @pytest.mark.asyncio
+    async def test_empty_facts_not_added(self, mock_llm):
         from app.core.critique import critique_answer
 
-        asyncio.run(
-            critique_answer(
-                "What is 2+2?",
-                "2+2 equals 4.",
-                sources="",
-                user_facts="",
-                kg_facts="",
-            )
+        await critique_answer(
+            "What is 2+2?",
+            "2+2 equals 4.",
+            sources="",
+            user_facts="",
+            kg_facts="",
         )
 
         call_args = mock_llm.invoke_nothink.call_args

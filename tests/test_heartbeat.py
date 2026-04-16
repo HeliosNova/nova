@@ -179,9 +179,17 @@ class TestMonitorStore:
         assert count == 54  # 52 original + Quality Eval Harness + Prompt Optimizer
         monitors = store.list_all()
         names = {m.name for m in monitors}
+        # Core monitors
         assert "Morning Check-in" in names
         assert "System Health" in names
         assert "World Awareness" in names
+        # Domain study monitors
+        assert "Domain Study: Science" in names
+        assert "Domain Study: Technology" in names
+        assert "Domain Study: Current Events" in names
+        assert "Domain Study: Finance" in names
+        # Teaching/self-improvement monitors
+        assert "Curiosity Research" in names
         assert "Fine-Tune Check" in names
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
