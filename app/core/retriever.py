@@ -5,8 +5,8 @@ Pipeline:
                              ├─ RRF(k=60) → merged candidates
   fts5_search  (top_k*2) ──┘
                              │
-                       score_rerank() → re-rank by composite score (when ENABLE_RERANKER)
-                             │
+                  _score_rerank() — composite (0.55·vec + 0.30·bm25 + 0.15·cov)
+                             │     (skipped when ENABLE_RERANKER=false)
                      entity_filter() → lexical guard
                              │
                         top_k Chunks
@@ -99,12 +99,12 @@ class Retriever:
         # Reciprocal Rank Fusion
         fused = _reciprocal_rank_fusion(vector_results, fts_results, k=config.RETRIEVAL_RRF_K)
 
-        # Score-level rerank: composite of vector_score + bm25_score + coverage
+        # Rerank: composite score (vec + bm25 + coverage) when enabled
         if config.ENABLE_RERANKER:
             try:
                 fused = _score_rerank(query, fused)
             except Exception as e:
-                logger.warning("Score reranker failed, using RRF order: %s", e)
+                logger.warning("Reranker (composite) failed, falling back to RRF order: %s", e)
 
         # Entity relevance guard — drop chunks where query entities don't appear
         fused = _entity_relevance_filter(query, fused[:top_k])
