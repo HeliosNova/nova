@@ -11,7 +11,11 @@ export function cn(...classes: (string | false | null | undefined)[]): string {
  * yesterday: "Yesterday 4:30 PM", older: "Mar 25, 4:30 PM"
  */
 export function formatDate(iso: string): string {
-  const date = new Date(iso);
+  // SQLite datetime('now') returns "YYYY-MM-DD HH:MM:SS" (UTC, no T, no Z).
+  // Normalize to proper ISO 8601 so JS parses it as UTC.
+  const normalized = iso.includes("T") ? iso : iso.replace(" ", "T") + "Z";
+  const date = new Date(normalized);
+  if (isNaN(date.getTime())) return iso; // fallback for unparseable strings
   const now = new Date();
   const diffMs = now.getTime() - date.getTime();
   const diffMin = Math.floor(diffMs / 60_000);

@@ -121,6 +121,8 @@ _ALLOWED_TABLES = frozenset({
 
 # Pre-built SQL queries — no f-string interpolation
 _TABLE_QUERIES = {t: f"SELECT COUNT(*) as c FROM {t}" for t in _ALLOWED_TABLES}
+# Count only enabled skills to match the default /api/learning/skills response
+_TABLE_QUERIES["skills"] = "SELECT COUNT(*) as c FROM skills WHERE enabled = 1"
 
 
 @router.get("/status", response_model=StatusResponse, dependencies=[Depends(require_auth)])
@@ -382,6 +384,92 @@ async def get_kg_facts(
             for f in fact_objects
         ]
     return facts
+
+
+@router.get("/kg/graph", dependencies=[Depends(require_auth)])
+async def get_kg_graph(
+    entity: str = "",
+    hops: int = Query(default=2, ge=1, le=4),
+    limit: int = Query(default=200, ge=1, le=5000),
+):
+    """Return KG data formatted as graph nodes and links for visualization."""
+    from app.core.brain import get_services
+    svc = get_services()
+    if not svc.kg:
+        return {"nodes": [], "links": []}
+
+    facts: list[dict] = []
+    if entity.strip():
+        facts = svc.kg.query(entity.strip(), hops=hops, max_results=limit)
+    else:
+        # For large limits, load all current facts directly (no BFS gaps)
+        if limit >= 1000:
+            all_facts = svc.kg.get_all_facts(limit=limit, offset=0)
+            facts = [
+                {"id": f.id, "subject": f.subject, "predicate": f.predicate,
+                 "object": f.object, "confidence": f.confidence, "source": f.source}
+                for f in all_facts if f.valid_to is None
+            ][:limit]
+        else:
+            # BFS from top entities for smaller, focused views
+            seed_count = max(10, limit // 15)
+            per_entity = max(20, limit // seed_count)
+            top = svc.kg.get_top_entities(limit=seed_count)
+            seen_ids: set[int] = set()
+            for ent in top:
+                for f in svc.kg.query(ent["subject"], hops=hops, max_results=per_entity):
+                    if f["id"] not in seen_ids:
+                        seen_ids.add(f["id"])
+                        facts.append(f)
+                        if len(facts) >= limit:
+                            break
+                if len(facts) >= limit:
+                    break
+
+    node_counts: dict[str, int] = {}
+    links = []
+    for f in facts:
+        s, o = f["subject"], f["object"]
+        node_counts[s] = node_counts.get(s, 0) + 1
+        node_counts[o] = node_counts.get(o, 0) + 1
+        links.append({
+            "source": s,
+            "target": o,
+            "label": f["predicate"],
+            "confidence": f.get("confidence", 0.5),
+        })
+
+    nodes = [
+        {"id": name, "label": name, "val": count}
+        for name, count in node_counts.items()
+    ]
+
+    return {"nodes": nodes, "links": links}
+
+
+@router.get("/kg/stats", dependencies=[Depends(require_auth)])
+async def get_kg_stats():
+    """Return KG statistics."""
+    from app.core.brain import get_services
+    svc = get_services()
+    if not svc.kg:
+        return {"total_facts": 0, "current_facts": 0, "superseded_facts": 0,
+                "unique_entities": 0, "unique_predicates": 0}
+    return svc.kg.get_stats()
+
+
+@router.delete("/kg/facts/{fact_id}", dependencies=[Depends(require_auth)])
+async def delete_kg_fact(fact_id: int):
+    """Delete a KG fact by ID."""
+    from app.core.brain import get_services
+    svc = get_services()
+    if not svc.kg:
+        raise HTTPException(404, "Knowledge graph not enabled")
+    row = svc.kg._db.fetchone("SELECT subject, predicate, object FROM kg_facts WHERE id = ?", (fact_id,))
+    if not row:
+        raise HTTPException(404, f"Fact {fact_id} not found")
+    svc.kg.delete_fact(row["subject"], row["predicate"], row["object"])
+    return {"status": "deleted", "fact_id": fact_id}
 
 
 # ---------------------------------------------------------------------------

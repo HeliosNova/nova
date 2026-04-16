@@ -132,6 +132,23 @@ def assess_quality(
         score -= 0.15 * hard_tool_failures
         reasons.append(f"{hard_tool_failures} tool(s) failed")
 
+    # Generation artifact detection — leaked planning/reasoning markers
+    _PLAN_ARTIFACTS = (
+        "[plan]", "step 1:", "step 2:", "step 3:", "[follow this plan",
+        "as planned,", "per the plan,", "according to the plan",
+    )
+    _META_MARKERS = (
+        "my previous answer", "my response above", "as i mentioned above",
+        "in my previous response", "as stated above", "this response will",
+        "[final response]", "[plan coverage", "[adversarial review",
+    )
+    if any(m in lower for m in _PLAN_ARTIFACTS):
+        score -= 0.4
+        reasons.append("Leaked planning/reasoning artifacts")
+    if any(m in lower for m in _META_MARKERS):
+        score -= 0.2
+        reasons.append("Contains meta-commentary about own response")
+
     score = max(0.0, min(1.0, score))
     reason = "; ".join(reasons) if reasons else ""
     return round(score, 2), reason
@@ -149,10 +166,18 @@ Answer: {answer}
 Tools used: {tools}
 {context_section}
 Check:
-1. Does it answer the question directly?
-2. Any missing context or incomplete information?
-3. Any unsupported claims or hallucinated details? Claims grounded in owner facts, knowledge graph facts, or the current date/year are NOT hallucinations — they are verified data. References to the current date above are from the real system clock.
+1. Does it answer the question directly and completely?
+2. Any missing context or incomplete information for a complex question?
+3. Any unsupported claims or hallucinated details? Claims grounded in owner facts, knowledge graph facts, or the current date/year are NOT hallucinations — they are verified data.
 4. Is it well-structured and clear?
+5. Does it contain leaked internal reasoning? Look for: "[PLAN]", "step 1/2/3", "as planned", meta-commentary about the response itself, fabricated prior turns, or self-analysis mid-sentence. These are CRITICAL failures.
+
+Score guidelines:
+- 0.9-1.0: Excellent — directly answers all parts, no issues
+- 0.7-0.8: Good — minor gaps or honest uncertainty
+- 0.5-0.6: Acceptable — generic or missing some parts
+- 0.3-0.4: Poor — significant gaps, hallucinations, or off-topic
+- 0.0-0.2: Broken — leaked reasoning, fabricated content, artifacts, or mid-sentence truncation
 
 Return JSON: {{"score": 0.0-1.0, "critique": "one sentence summary"}}"""
 
@@ -163,19 +188,17 @@ from app.core.quality import all_tools_clean as _all_tools_clean  # noqa: F401
 def should_use_llm_critique(intent: str, answer: str, tool_results: list[dict]) -> bool:
     """Decide whether to use LLM critique (expensive) vs heuristic (fast).
 
-    Use LLM critique for general queries that are complex enough, OR when
-    tools failed regardless of intent (tool failures need deeper review).
-    Skip when tools all succeeded — heuristic assess_quality() is sufficient.
+    Use LLM critique for general queries that are complex enough, or when
+    tools failed. The heuristic assess_quality() misses artifacts (leaked
+    planning text, meta-commentary) so LLM critique runs on substantial answers.
     """
-    # Always critique when tools failed, regardless of intent
-    if tool_results and not _all_tools_clean(tool_results):
-        return True
-    # Skip when tools all succeeded — heuristic is sufficient
-    if tool_results and _all_tools_clean(tool_results):
-        return False
     if intent == "correction":
         return False
-    # LLM-critique substantial, tool-less answers for all non-correction intents
+    # Always critique when tools failed — deeper review needed
+    if tool_results and not _all_tools_clean(tool_results):
+        return True
+    # LLM critique for substantial answers regardless of tool success.
+    # The heuristic starts at 1.0 and can't detect generation artifacts.
     return len(answer) > 200
 
 

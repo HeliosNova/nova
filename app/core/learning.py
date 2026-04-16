@@ -392,6 +392,13 @@ class LearningEngine:
         # Bound the lessons table
         self._prune_lessons()
 
+        # Emit event for event-driven triggers
+        try:
+            from app.monitors.event_trigger import emit_event
+            emit_event("internal:lesson_saved", {"lesson_id": lesson_id, "topic": topic})
+        except Exception:
+            pass
+
         return lesson_id
 
     def add_knowledge_lesson(
@@ -526,7 +533,22 @@ class LearningEngine:
         if not rrf_scores:
             return []
 
-        # Sort by RRF score descending, then filter by minimum relevance
+        # Blend RRF score with retrieval_score (Q-value) — MemRL pattern
+        # Normalize Q-value to same scale as RRF scores so 30% weight is real
+        if rrf_scores:
+            max_rrf = max(rrf_scores.values()) or 0.01
+            for lid in rrf_scores:
+                row = lesson_by_id.get(lid)
+                q_val = 0.5
+                if row:
+                    try:
+                        q_val = row["retrieval_score"] if "retrieval_score" in row.keys() else 0.5
+                    except Exception:
+                        pass
+                # Scale Q-value to match RRF magnitude, then blend 70/30
+                rrf_scores[lid] = rrf_scores[lid] * 0.7 + (q_val * max_rrf) * 0.3
+
+        # Sort by blended score descending, then filter by minimum relevance
         sorted_ids = sorted(rrf_scores, key=lambda lid: rrf_scores[lid], reverse=True)
         sorted_ids = [lid for lid in sorted_ids if rrf_scores[lid] >= config.MIN_RRF_SCORE]
 
@@ -572,14 +594,16 @@ class LearningEngine:
         delta = 0.05 / (1 + times)
         self._db.execute(
             "UPDATE lessons SET times_helpful = times_helpful + 1, "
-            "confidence = MIN(1.0, confidence + ?) WHERE id = ?",
+            "confidence = MIN(1.0, confidence + ?), "
+            "retrieval_score = MIN(1.0, COALESCE(retrieval_score, 0.5) + 0.1) WHERE id = ?",
             (delta, lesson_id),
         )
 
     def mark_lesson_unhelpful(self, lesson_id: int) -> None:
-        """Reduce confidence when a lesson was used but the answer was poor.
+        """Reduce confidence and retrieval score when a lesson was used but the answer was poor.
 
         Uses dampened adjustments — delta scales by 1/(1+times_helpful).
+        Retrieval score suppression is stronger (-0.15) so unhelpful lessons get ranked lower.
         """
         row = self._db.fetchone(
             "SELECT times_helpful FROM lessons WHERE id = ?", (lesson_id,),
@@ -587,7 +611,8 @@ class LearningEngine:
         times = row["times_helpful"] if row else 0
         delta = 0.05 / (1 + times)
         self._db.execute(
-            "UPDATE lessons SET confidence = MAX(0.1, confidence - ?) WHERE id = ?",
+            "UPDATE lessons SET confidence = MAX(0.1, confidence - ?), "
+            "retrieval_score = MAX(0.1, COALESCE(retrieval_score, 0.5) - 0.15) WHERE id = ?",
             (delta, lesson_id),
         )
 
@@ -635,6 +660,16 @@ class LearningEngine:
         # Quality gate — don't save garbage as training data
         if not _is_quality_content(good_answer):
             logger.warning("Skipping training pair: low-quality good_answer")
+            return
+        if len(good_answer.strip()) < 30:
+            logger.warning("Skipping training pair: chosen too short (%d chars)", len(good_answer.strip()))
+            return
+        if len(bad_answer.strip()) < 30:
+            logger.warning("Skipping training pair: rejected too short (%d chars)", len(bad_answer.strip()))
+            return
+        # Reject extreme length asymmetry — teaches "shorter=better" not "better content"
+        if len(good_answer) < len(bad_answer) * 0.2:
+            logger.warning("Skipping training pair: extreme asymmetry (chosen=%d, rejected=%d)", len(good_answer), len(bad_answer))
             return
 
         path = Path(config.TRAINING_DATA_PATH)

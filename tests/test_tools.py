@@ -730,8 +730,10 @@ class TestShellExecEdgeCases:
     async def test_shell_disabled(self, monkeypatch):
         from app.tools.shell_exec import ShellExecTool
         monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
-        from app.config import reset_config
+        from app.config import reset_config, get_config
         reset_config()
+        # Force-override in case /data/config_overrides.json re-enabled it
+        object.__setattr__(get_config(), "ENABLE_SHELL_EXEC", False)
         tool = ShellExecTool()
         result = await tool.execute(command="echo hello")
         assert not result.success

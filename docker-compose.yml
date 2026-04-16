@@ -63,6 +63,8 @@ services:
       DISPLAY: ":99"  # Xvfb virtual display for desktop automation
       XAUTHORITY: /tmp/.Xauthority
       ENABLE_DESKTOP_AUTOMATION: "true"
+      ENABLE_PLANNING: "true"
+      ENABLE_CRITIQUE: "true"
     volumes:
       - nova_data:/data
       - ./mcp:/data/mcp:ro

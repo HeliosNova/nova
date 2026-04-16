@@ -21,6 +21,8 @@ interface Props<T> {
   headerPrefix?: ReactNode;
   /** Optional header suffix (e.g. "Actions" label) */
   headerSuffix?: ReactNode;
+  /** Callback when a row is clicked */
+  onRowClick?: (row: T) => void;
 }
 
 export default function ResponsiveTable<T>({
@@ -32,6 +34,7 @@ export default function ResponsiveTable<T>({
   renderRowSuffix,
   headerPrefix,
   headerSuffix,
+  onRowClick,
 }: Props<T>) {
   const getCellValue = (row: T, col: Column<T>): ReactNode => {
     if (typeof col.accessor === "function") {
@@ -62,7 +65,8 @@ export default function ResponsiveTable<T>({
             {data.map((row, ri) => (
               <tr
                 key={keyFn(row, ri)}
-                className="border-b border-nova-border last:border-0 hover:bg-nova-surface/50"
+                className={`border-b border-nova-border last:border-0 hover:bg-nova-surface/50${onRowClick ? " cursor-pointer" : ""}`}
+                onClick={onRowClick ? () => onRowClick(row) : undefined}
               >
                 {renderRowPrefix && <td className="px-3 py-2">{renderRowPrefix(row)}</td>}
                 {columns.map((col, ci) => {
@@ -85,7 +89,8 @@ export default function ResponsiveTable<T>({
         {data.map((row, ri) => (
           <div
             key={keyFn(row, ri)}
-            className="rounded-lg border border-nova-border bg-nova-surface/30 p-3 space-y-1.5"
+            className={`rounded-lg border border-nova-border bg-nova-surface/30 p-3 space-y-1.5${onRowClick ? " cursor-pointer" : ""}`}
+            onClick={onRowClick ? () => onRowClick(row) : undefined}
           >
             <div className="flex items-center justify-between">
               {renderRowPrefix && <div>{renderRowPrefix(row)}</div>}

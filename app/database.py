@@ -194,6 +194,17 @@ CREATE TABLE IF NOT EXISTS auth_lockouts (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
+-- Capability gaps (detected when no skill/tool covers a query + low quality)
+CREATE TABLE IF NOT EXISTS capability_gaps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    query TEXT NOT NULL,
+    reason TEXT,
+    tools_tried TEXT DEFAULT '[]',
+    quality_score REAL,
+    reviewed INTEGER DEFAULT 0,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
 CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
@@ -400,6 +411,74 @@ class SafeDB:
                         )
                     """)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (8,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 9: skill quality + composition columns ---
+        if 9 not in applied:
+            conn.execute("BEGIN")
+            try:
+                skill_cols = {row[1] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+                if "last_used_at" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN last_used_at TIMESTAMP")
+                if "consecutive_failures" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+                if "source" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN source TEXT DEFAULT 'correction'")
+                if "composed_of" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN composed_of TEXT DEFAULT '[]'")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (9,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 10: re-apply skill columns for DBs where migration 9 ran empty ---
+        # Migration 9 was recorded before the ALTER TABLE statements were added to the code,
+        # so existing databases have version=9 but are missing the columns. This migration
+        # unconditionally ensures the columns exist.
+        if 10 not in applied:
+            conn.execute("BEGIN")
+            try:
+                skill_cols = {row[1] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
+                if "last_used_at" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN last_used_at TIMESTAMP")
+                if "consecutive_failures" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
+                if "source" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN source TEXT DEFAULT 'correction'")
+                if "composed_of" not in skill_cols:
+                    conn.execute("ALTER TABLE skills ADD COLUMN composed_of TEXT DEFAULT '[]'")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (10,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 11: capability_gaps table ---
+        if 11 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS capability_gaps (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        query TEXT NOT NULL,
+                        reason TEXT,
+                        tools_tried TEXT DEFAULT '[]',
+                        quality_score REAL,
+                        reviewed INTEGER DEFAULT 0,
+                        created_at TEXT DEFAULT (datetime('now'))
+                    )"""
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (11,))
                 conn.commit()
             except Exception:
                 conn.rollback()

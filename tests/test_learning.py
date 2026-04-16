@@ -136,9 +136,9 @@ class TestLearningEngine:
             mock_config.MAX_TRAINING_PAIRS = 10000
 
             await engine.save_training_pair(
-                query="What created Python?",
-                bad_answer="James Gosling",
-                good_answer="Guido van Rossum",
+                query="Who created the Python programming language?",
+                bad_answer="James Gosling created the Python programming language in the early 1990s.",
+                good_answer="Guido van Rossum created the Python programming language in 1991.",
             )
 
         # Read the JSONL file
@@ -146,9 +146,9 @@ class TestLearningEngine:
         assert path.exists()
         with open(path) as f:
             entry = json.loads(f.readline())
-        assert entry["query"] == "What created Python?"
-        assert entry["chosen"] == "Guido van Rossum"
-        assert entry["rejected"] == "James Gosling"
+        assert entry["query"] == "Who created the Python programming language?"
+        assert entry["chosen"] == "Guido van Rossum created the Python programming language in 1991."
+        assert entry["rejected"] == "James Gosling created the Python programming language in the early 1990s."
         assert "timestamp" in entry
 
     def test_get_all_lessons(self, engine):

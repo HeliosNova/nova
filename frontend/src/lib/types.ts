@@ -366,6 +366,7 @@ export interface ConfigSummary {
   ENABLE_AUTO_SKILL_CREATION: boolean;
   ENABLE_MODEL_ROUTING: boolean;
   ENABLE_EXTENDED_THINKING: boolean;
+  ENABLE_VOICE: boolean;
   TOOL_TIMEOUT: number;
   GENERATION_TIMEOUT: number;
   SYSTEM_ACCESS_LEVEL: string;
@@ -415,6 +416,80 @@ export interface KGFact {
   created_at: string;
   valid_from?: string;
   valid_to?: string | null;
+  provenance?: string;
+  superseded_by?: number | null;
+}
+
+// ── Knowledge Graph Visualization ──
+
+export interface KGGraphNode {
+  id: string;
+  label: string;
+  val: number;
+  group?: string;
+}
+
+export interface KGGraphLink {
+  source: string;
+  target: string;
+  label: string;
+  confidence: number;
+}
+
+export interface KGGraphData {
+  nodes: KGGraphNode[];
+  links: KGGraphLink[];
+}
+
+export interface KGStats {
+  total_facts: number;
+  current_facts: number;
+  unique_entities: number;
+  unique_predicates: number;
+}
+
+// ── Provider Health ──
+
+export interface ProviderHealthResult {
+  active: string;
+  providers: Record<string, string>;
+}
+
+// ── Daemon ──
+
+export interface DaemonStatus {
+  last_user_activity: string | null;
+  idle_minutes: number | null;
+  last_dream_at: string | null;
+  pending_events: number;
+  log_entries_24h: number;
+}
+
+export interface DaemonLogEntry {
+  id: number;
+  category: string;
+  content: string;
+  source: string;
+  created_at: string;
+}
+
+// ── Monitor Result Search ──
+
+export interface MonitorResultHit {
+  id: number;
+  monitor_name: string;
+  status: string;
+  content: string;
+  created_at: string;
+}
+
+export interface EventQueueItem {
+  id: number;
+  event_type: string;
+  payload: Record<string, unknown>;
+  priority: number;
+  status: string;
+  created_at: string;
 }
 
 // ── Custom Tool ──

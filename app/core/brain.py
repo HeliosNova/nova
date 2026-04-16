@@ -771,6 +771,21 @@ async def _build_messages(
                     messages.append({"role": "system", "content": plan_text})
                     was_planned = True
                     logger.info("Query planned: %d steps", len(plan["steps"]))
+                    # Solve decomposable sub-questions in parallel
+                    if plan.get("complexity") == "decomposable" and plan.get("sub_questions"):
+                        from app.core.planning import solve_sub_questions
+                        try:
+                            sub_context = await solve_sub_questions(
+                                plan["sub_questions"],
+                                user_facts=ctx.user_facts_text,
+                                kg_facts=ctx.kg_facts_text,
+                                context=ctx.retrieved_context,
+                            )
+                            if sub_context:
+                                logger.info("[DECOMPOSE] %d sub-questions solved", len(plan["sub_questions"]))
+                                messages.append({"role": "system", "content": sub_context})
+                        except Exception as e:
+                            logger.warning("Sub-question solving failed: %s", e)
             except Exception as e:
                 logger.warning("Planning failed: %s", e)
 
@@ -1038,6 +1053,12 @@ async def _run_generation_loop(
             _is_final_round = (tool_round >= config.MAX_TOOL_ROUNDS - 1)
             if round_succeeded:
                 if _is_final_round:
+                    if was_planned:
+                        messages = [
+                            m for m in messages
+                            if not (m.get("role") == "system" and m.get("content", "").startswith("[PLAN]"))
+                        ]
+                        logger.info("[FINAL_RESPONSE] Plan text stripped for final generation")
                     _synth = (
                         "Based on the real tool results above, provide your final answer. "
                         "Do NOT say you cannot use tools or add disclaimers."
@@ -1136,8 +1157,8 @@ async def _refine_response(
     # This preserves the already-streamed content and avoids UX jank.
     critique_passed = False
     if config.ENABLE_CRITIQUE and final_content and intent == "general":
-        from app.core.critique import should_critique, critique_answer, format_critique_for_regeneration
-        if should_critique(query, final_content, intent, tool_results, was_planned, kg_facts=kg_facts_text, user_facts=user_facts_text):
+        from app.core.critique import critique_answer, format_critique_for_regeneration
+        if len(final_content) >= 200:
             last_critique_issues: list[str] = []
             for critique_round in range(config.MAX_CRITIQUE_ROUNDS):
                 try:
@@ -1221,6 +1242,34 @@ async def _refine_response(
                     except Exception:
                         pass
 
+    # --- Adversarial critique (logic/factual error hunter) ---
+    if config.ENABLE_CRITIQUE and final_content and intent == "general" and len(final_content) >= 200:
+        from app.core.critique import adversarial_critique, format_adversarial_for_replan
+        try:
+            adv = await adversarial_critique(
+                query, final_content,
+                sources=retrieved_context,
+                user_facts=user_facts_text,
+                kg_facts=kg_facts_text,
+            )
+            if adv:
+                severity = adv.get("verdict", "pass")
+                flaws = adv.get("flaws", [])
+                logger.info("[ADVERSARIAL] Critique fired: severity=%s, flaws=%d", severity, len(flaws))
+                if adv.get("verdict") == "fail":
+                    adv_msg = format_adversarial_for_replan(adv)
+                    if adv_msg:
+                        messages.append({"role": "assistant", "content": final_content})
+                        messages.append({"role": "system", "content": adv_msg})
+                        try:
+                            retry_result = await llm.generate_with_tools(messages, tools)
+                            if retry_result.content and not retry_result.tool_calls:
+                                final_content = retry_result.content
+                        except Exception as e:
+                            logger.warning("Adversarial critique regeneration failed: %s", e)
+        except Exception as e:
+            logger.warning("Adversarial critique failed: %s", e)
+
     # --- Plan coverage check ---
     if was_planned and final_content and config.ENABLE_PLANNING:
         from app.core.planning import verify_plan_coverage
@@ -1266,6 +1315,9 @@ async def _refine_response(
             else:
                 reflexion_quality, reflexion_reason = assess_quality(final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query)
 
+            if reflexion_quality is not None:
+                logger.info("[QUALITY] score=%.2f reason=%s", reflexion_quality, reflexion_reason[:100])
+
             if reflexion_quality is not None and reflexion_quality < 0.3 and reflexion_reason and not critique_passed:
                 logger.info("Reflexion critique flagged (%.2f): %s", reflexion_quality, reflexion_reason)
                 # Generate a correction addendum instead of full re-generation
@@ -1293,6 +1345,47 @@ async def _refine_response(
             logger.debug("Reflexion pre-stream critique failed: %s", e)
 
     return final_content, reflexion_quality, reflexion_reason
+
+
+async def _detect_capability_gap(
+    svc: Services,
+    query: str,
+    matched_skill: object | None,
+    tool_results: list[dict],
+    reflexion_quality: float | None,
+) -> None:
+    """Log a capability gap when Nova demonstrably couldn't handle a query.
+
+    A gap is detected when all three conditions hold:
+    1. No skill was matched for the query
+    2. No tools were successfully used (empty tool_results = planner found nothing useful)
+    3. Response quality scored below 0.5
+
+    Gaps are stored in the capability_gaps table for periodic review by the
+    Capability Review monitor, which surfaces suggestions for new tools/skills.
+    """
+    if matched_skill is not None:
+        return
+    if tool_results:
+        return
+    if reflexion_quality is None or reflexion_quality >= 0.5:
+        return
+
+    try:
+        from app.database import get_db
+        db = get_db()
+        db.execute(
+            "INSERT INTO capability_gaps (query, reason, tools_tried, quality_score) VALUES (?, ?, ?, ?)",
+            (
+                query[:500],
+                f"No skill matched, no tools used, quality={reflexion_quality:.2f}",
+                "[]",
+                reflexion_quality,
+            ),
+        )
+        logger.info("[CAPABILITY_GAP] Logged gap: %s", query[:80])
+    except Exception as e:
+        logger.debug("Capability gap logging failed: %s", e)
 
 
 async def _run_post_processing(
@@ -1516,21 +1609,26 @@ async def _run_post_processing(
             logger.warning("Reflexion storage failed: %s", e)
 
     # --- Auto skill creation (background) ---
-    if (
+    # Fire for any tool interaction when: 2+ tools used, OR 1 tool + quality >= 0.7
+    # (quality check lets the reflexion system vouch for single-tool responses)
+    _auto_skill_quality = reflexion_quality if reflexion_quality is not None else 0.0
+    _auto_skill_eligible = (
         config.ENABLE_AUTO_SKILL_CREATION
         and svc.skills
-        and len(tool_results) >= 2
+        and len(tool_results) >= 1
         and intent == "general"
-    ):
+        and (len(tool_results) >= 2 or _auto_skill_quality >= 0.7)
+    )
+    if _auto_skill_eligible:
         from app.core.auto_skills import maybe_extract_skill
 
-        async def _safe_skill_extract(q, trs, content, skills):
+        async def _safe_skill_extract(q, trs, content, skills, qs):
             try:
-                await maybe_extract_skill(q, trs, content, skills)
+                await maybe_extract_skill(q, trs, content, skills, quality_score=qs)
             except Exception as e:
                 logger.warning("Auto-skill extraction failed: %s", e)
         _task = asyncio.create_task(
-            _safe_skill_extract(query, tool_results, final_content, svc.skills)
+            _safe_skill_extract(query, tool_results, final_content, svc.skills, _auto_skill_quality)
         )
         _background_tasks.add(_task)
         _task.add_done_callback(_background_tasks.discard)
@@ -1591,6 +1689,10 @@ async def _run_post_processing(
             await asyncio.to_thread(svc.topic_tracker.record_topic, query)
         except Exception as e:
             logger.debug("Topic tracking failed: %s", e)
+
+    # --- Capability gap detection ---
+    if intent == "general" and not is_error:
+        await _detect_capability_gap(svc, query, matched_skill, tool_results, reflexion_quality)
 
 
 # ---------------------------------------------------------------------------

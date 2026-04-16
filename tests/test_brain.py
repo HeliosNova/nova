@@ -11,7 +11,7 @@ import pytest
 
 from app.core.brain import Services, _classify_intent, get_services, set_services, think
 from app.core.critique import should_critique, critique_answer, format_critique_for_regeneration
-from app.core.llm import ToolCall
+from app.core.llm import GenerationResult, StreamChunk, ToolCall, _extract_tool_calls, _strip_think_tags
 from app.core.memory import ConversationStore, UserFactStore
 from app.core.prompt import (
     build_system_prompt,
@@ -19,6 +19,49 @@ from app.core.prompt import (
     format_skills_for_prompt,
 )
 from app.schema import EventType
+
+
+def _make_llm_mock(mock_llm, content: str, *, tool_calls=None, invoke_nothink_return="Title"):
+    """Configure a patched ``app.core.brain.llm`` MagicMock to behave like the real
+    llm module for both the streaming (``stream_with_thinking``) and non-streaming
+    (``generate_with_tools``) code paths.
+
+    This avoids "MagicMock can't be used in 'await' expression" errors caused by
+    the mock auto-creating regular MagicMock attributes where AsyncMock or async
+    generators are needed.
+    """
+    if tool_calls is None:
+        tool_calls = []
+
+    # --- generate_with_tools (used when ENABLE_EXTENDED_THINKING is False) ---
+    result = GenerationResult(content=content, tool_calls=tool_calls, raw={})
+    mock_llm.generate_with_tools = AsyncMock(return_value=result)
+
+    # --- stream_with_thinking (used when ENABLE_EXTENDED_THINKING is True) ---
+    # Yields a single StreamChunk with the full content, then done.
+    async def _fake_stream(*args, **kwargs):
+        yield StreamChunk(content=content, tool_call=tool_calls[0] if tool_calls else None)
+        # Yield remaining tool calls if any
+        for tc in tool_calls[1:]:
+            yield StreamChunk(tool_call=tc)
+
+    mock_llm.stream_with_thinking = MagicMock(side_effect=_fake_stream)
+
+    # --- _strip_think_tags (sync helper called in streaming path) ---
+    mock_llm._strip_think_tags = _strip_think_tags
+
+    # --- _extract_tool_calls (sync helper for text-based tool call parsing) ---
+    mock_llm._extract_tool_calls = _extract_tool_calls
+
+    # --- invoke_nothink (async — used for title generation, synthesis, etc.) ---
+    mock_llm.invoke_nothink = AsyncMock(return_value=invoke_nothink_return)
+
+    # --- GenerationResult class (used to construct results in streaming path) ---
+    mock_llm.GenerationResult = GenerationResult
+    mock_llm.ToolCall = ToolCall
+    mock_llm.StreamChunk = StreamChunk
+
+    return mock_llm
 
 
 # ===========================================================================
@@ -209,9 +252,11 @@ class TestPromptBuilder:
 
     def test_truncation_occurs(self):
         # Huge context should be truncated
-        big_context = "x" * 20000
+        big_context = "x" * 80000
         prompt = build_system_prompt(retrieved_context=big_context)
-        assert len(prompt) < 25000  # Must be truncated well below 20K+identity (MAX_SYSTEM_TOKENS=6000)
+        # MAX_SYSTEM_TOKENS=16000 → char budget ≈ 64000 (16000*4).
+        # Identity block alone is ~10K chars, so total must stay well under 80K+identity.
+        assert len(prompt) < 75000
         assert "truncated" in prompt.lower()
 
     def test_mandatory_blocks_never_truncated(self):
@@ -295,11 +340,7 @@ class TestBrain:
     async def test_think_yields_events(self, services):
         """think() should yield THINKING, TOKEN, and DONE events."""
         with patch("app.core.brain.llm") as mock_llm:
-            # Mock the LLM to return a simple response
-            mock_result = AsyncMock()
-            mock_result.content = "Hello! How can I help?"
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            _make_llm_mock(mock_llm, "Hello! How can I help?", invoke_nothink_return="Greeting")
 
             events = []
             async for event in think("Hello"):
@@ -319,11 +360,7 @@ class TestBrain:
     async def test_think_creates_conversation(self, services):
         """think() with no conversation_id should create one."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hi!"
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test Chat")
+            _make_llm_mock(mock_llm, "Hi!", invoke_nothink_return="Test Chat")
 
             done_event = None
             all_events = []
@@ -350,10 +387,7 @@ class TestBrain:
         conv_id = services.conversations.create_conversation("Existing Chat")
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Sure thing."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            _make_llm_mock(mock_llm, "Sure thing.", invoke_nothink_return="Title")
 
             done_event = None
             all_events = []
@@ -372,11 +406,7 @@ class TestBrain:
     async def test_think_saves_messages(self, services):
         """think() should save user and assistant messages."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "The answer is 42."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test Title")
+            _make_llm_mock(mock_llm, "The answer is 42.", invoke_nothink_return="Test Title")
 
             conv_id = None
             async for event in think("What is the meaning of life?"):
@@ -394,20 +424,31 @@ class TestBrain:
     async def test_think_tool_loop(self, services):
         """think() should handle tool calls."""
         with patch("app.core.brain.llm") as mock_llm:
-            # First call: tool call
-            tool_result = AsyncMock()
-            tool_result.content = '{"tool": "calculator", "args": {"expression": "2+2"}}'
-            tool_result.tool_calls = [ToolCall(tool="calculator", args={"expression": "2+2"})]
+            tc = ToolCall(tool="calculator", args={"expression": "2+2"})
 
-            # Second call: final answer
-            final_result = AsyncMock()
-            final_result.content = "2 + 2 = 4"
-            final_result.tool_calls = []
+            # Set up the helper for invoke_nothink + _strip_think_tags etc.
+            _make_llm_mock(mock_llm, "2 + 2 = 4", invoke_nothink_return="Math Question")
 
-            mock_llm.generate_with_tools = AsyncMock(
-                side_effect=[tool_result, final_result]
+            # Override stream_with_thinking to yield tool call first, then final answer
+            call_count = 0
+
+            async def _fake_stream_tool(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                if call_count == 1:
+                    yield StreamChunk(content='{"tool": "calculator", "args": {"expression": "2+2"}}', tool_call=tc)
+                else:
+                    yield StreamChunk(content="2 + 2 = 4")
+
+            mock_llm.stream_with_thinking = MagicMock(side_effect=_fake_stream_tool)
+
+            # Also override generate_with_tools for the non-streaming fallback
+            tool_result = GenerationResult(
+                content='{"tool": "calculator", "args": {"expression": "2+2"}}',
+                tool_calls=[tc], raw={},
             )
-            mock_llm.invoke_nothink = AsyncMock(return_value="Math Question")
+            final_result = GenerationResult(content="2 + 2 = 4", tool_calls=[], raw={})
+            mock_llm.generate_with_tools = AsyncMock(side_effect=[tool_result, final_result])
 
             events = []
             async for event in think("What is 2+2?"):
@@ -433,11 +474,8 @@ class TestBrain:
     async def test_think_streams_tokens(self, services):
         """think() should yield TOKEN events with text chunks."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hello world, this is a longer response for testing."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test")
+            _make_llm_mock(mock_llm, "Hello world, this is a longer response for testing.",
+                          invoke_nothink_return="Test")
 
             tokens = []
             async for event in think("Hello"):
@@ -451,10 +489,7 @@ class TestBrain:
     async def test_think_intent_in_done(self, services):
         """Done event should include the classified intent."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hello!"
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            _make_llm_mock(mock_llm, "Hello!", invoke_nothink_return="Greeting")
 
             done_event = None
             all_events = []
@@ -474,12 +509,11 @@ class TestBrain:
     async def test_think_vision_passes_image(self, services):
         """think() with image should include images in user message to LLM."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "I see a cat in the image."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            _make_llm_mock(mock_llm, "I see a cat in the image.", invoke_nothink_return="Vision Chat")
 
             captured_messages = []
+
+            # Vision disables streaming (image=True), so capture via generate_with_tools
             original_gen = mock_llm.generate_with_tools
 
             async def capture_messages(msgs, tools, **kwargs):
@@ -487,6 +521,16 @@ class TestBrain:
                 return await original_gen(msgs, tools, **kwargs)
 
             mock_llm.generate_with_tools = AsyncMock(side_effect=capture_messages)
+
+            # Also capture via stream_with_thinking in case streaming is used
+            original_stream = mock_llm.stream_with_thinking
+
+            async def capture_stream_messages(msgs, tools, **kwargs):
+                captured_messages.extend(msgs)
+                async for chunk in original_stream(msgs, tools, **kwargs):
+                    yield chunk
+
+            mock_llm.stream_with_thinking = MagicMock(side_effect=capture_stream_messages)
 
             events = []
             async for event in think("What is in this image?", image="base64data"):
@@ -502,19 +546,24 @@ class TestBrain:
     async def test_think_no_image_no_images_field(self, services):
         """think() without image should NOT include images field."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hi!"
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
+            _make_llm_mock(mock_llm, "Hi!", invoke_nothink_return="Greeting")
 
             captured_messages = []
-            original_gen = mock_llm.generate_with_tools
 
-            async def capture_messages(msgs, tools, **kwargs):
+            original_gen = mock_llm.generate_with_tools
+            original_stream = mock_llm.stream_with_thinking
+
+            async def capture_gen(msgs, tools, **kwargs):
                 captured_messages.extend(msgs)
                 return await original_gen(msgs, tools, **kwargs)
 
-            mock_llm.generate_with_tools = AsyncMock(side_effect=capture_messages)
+            async def capture_stream(msgs, tools, **kwargs):
+                captured_messages.extend(msgs)
+                async for chunk in original_stream(msgs, tools, **kwargs):
+                    yield chunk
+
+            mock_llm.generate_with_tools = AsyncMock(side_effect=capture_gen)
+            mock_llm.stream_with_thinking = MagicMock(side_effect=capture_stream)
 
             async for _ in think("Hello"):
                 pass
@@ -545,11 +594,7 @@ class TestChatAPI:
     def test_sync_chat(self, client):
         """POST /api/chat should return a full response."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hello! I'm Nova."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Greeting")
+            _make_llm_mock(mock_llm, "Hello! I'm Nova.", invoke_nothink_return="Greeting Chat")
 
             response = client.post("/api/chat", json={"query": "Hello"})
 
@@ -561,11 +606,7 @@ class TestChatAPI:
     def test_stream_chat(self, client):
         """POST /api/chat/stream should return SSE events."""
         with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Hello!"
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test")
+            _make_llm_mock(mock_llm, "Hello!", invoke_nothink_return="Test")
 
             response = client.post(
                 "/api/chat/stream",

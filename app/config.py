@@ -67,7 +67,8 @@ _MUTABLE_FIELDS = {
     "TEMPERATURE_DEFAULT", "TEMPERATURE_INTERNAL", "TEMPERATURE_REFLEXION",
     "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
-    "SKILL_EMA_ALPHA", "INJECTION_SUSPICIOUS_THRESHOLD",
+    "SKILL_EMA_ALPHA", "SKILL_SEMANTIC_THRESHOLD", "SKILL_STALE_DAYS",
+    "INJECTION_SUSPICIOUS_THRESHOLD",
     "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
@@ -141,6 +142,7 @@ class Config:
     ENABLE_HEARTBEAT: bool = field(default_factory=lambda: _env("ENABLE_HEARTBEAT", "true").lower() == "true")
     HEARTBEAT_INTERVAL: int = field(default_factory=lambda: _env_int("HEARTBEAT_INTERVAL", 60))
     ENABLE_PROACTIVE: bool = field(default_factory=lambda: _env("ENABLE_PROACTIVE", "true").lower() == "true")
+    ENABLE_EVENT_TRIGGERS: bool = field(default_factory=lambda: _env("ENABLE_EVENT_TRIGGERS", "false").lower() == "true")
     MIN_MONITOR_SCHEDULE_SECONDS: int = field(default_factory=lambda: _env_int("MIN_MONITOR_SCHEDULE_SECONDS", 60))
     DIGEST_HOUR: int = field(default_factory=lambda: _env_int("DIGEST_HOUR", 21))
     USER_TIMEZONE: str = field(default_factory=lambda: _env("USER_TIMEZONE", "UTC"))
@@ -233,6 +235,10 @@ class Config:
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
+    # Cosine distance threshold for semantic skill matching (lower = stricter, 0.35 ≈ 0.65 similarity)
+    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.35))
+    # Days without use before a skill is considered stale for decay/pruning
+    SKILL_STALE_DAYS: int = field(default_factory=lambda: _env_int("SKILL_STALE_DAYS", 30))
     INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
     FACT_INJECTION_SKIP_THRESHOLD: float = field(default_factory=lambda: _env_float("FACT_INJECTION_SKIP_THRESHOLD", 0.3))
     FACT_CONFIDENCE_EXTRACTED: float = field(default_factory=lambda: _env_float("FACT_CONFIDENCE_EXTRACTED", 0.65))

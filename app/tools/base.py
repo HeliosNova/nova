@@ -172,6 +172,21 @@ class ToolRegistry:
             msg = format_tool_error(name, f"Tool not found. Available: {', '.join(self._tools)}")
             return msg, ToolResult(output="", success=False, error="Tool not found", error_category=ErrorCategory.NOT_FOUND)
 
+        # Tool whitelist gating — check if isolation mode allows this tool
+        from app.core.access_tiers import is_tool_allowed
+        if not is_tool_allowed(name):
+            msg = format_tool_error(name, "Tool not available in current isolation mode", category=ErrorCategory.PERMISSION)
+            return msg, ToolResult(output="", success=False, error="Tool blocked by isolation whitelist",
+                                   error_category=ErrorCategory.PERMISSION)
+
+        # Trust gating — check if current trust level allows this tool
+        trust_mgr = getattr(self, "trust_manager", None)
+        if trust_mgr is not None and not trust_mgr.can_use(name):
+            score = trust_mgr.get_score()
+            msg = format_tool_error(name, f"Trust level too low ({score:.0f})", category=ErrorCategory.PERMISSION)
+            return msg, ToolResult(output="", success=False, error="Trust level insufficient",
+                                   error_category=ErrorCategory.PERMISSION)
+
         for hook in self._hooks:
             try:
                 await hook.pre_execute(name, args)
@@ -183,6 +198,21 @@ class ToolRegistry:
             for hook in self._hooks:
                 try:
                     await hook.post_execute(name, args, result)
+                except Exception:
+                    pass
+            # Record trust outcome — only for infrastructure failures, not bad model input
+            # 404/403 from hallucinated URLs is the model's fault, not the tool's
+            if trust_mgr is not None:
+                try:
+                    is_infrastructure_failure = (
+                        not result.success
+                        and result.error_category not in (ErrorCategory.NOT_FOUND, ErrorCategory.VALIDATION)
+                    )
+                    trust_mgr.record_outcome(
+                        name,
+                        result.success or not is_infrastructure_failure,
+                        action=str(args)[:100],
+                    )
                 except Exception:
                     pass
             if result.success:
