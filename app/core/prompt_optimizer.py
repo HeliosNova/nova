@@ -744,7 +744,7 @@ META_PROMPT: str = (
     "Given the current prompt and observed performance failures, propose a targeted improvement.\n\n"
     "RULES:\n"
     "- Make the smallest change that addresses the specific failure pattern observed.\n"
-    "- Do NOT change the JSON output format contract (any {key: value} structure must stay identical).\n"
+    "- Do NOT change the JSON output format contract (any {{key: value}} structure must stay identical).\n"
     "- Do NOT add instructions that reference internal system details (tool names, DB tables, etc.).\n"
     "- Do NOT relax safety-related language or grounding requirements.\n"
     "- Keep the revised prompt within 20% of the original length.\n\n"

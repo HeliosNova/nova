@@ -185,6 +185,23 @@ class TestMetaPromptHashStability:
         assert "{failures}" in META_PROMPT
         assert "{current_prompt}" in META_PROMPT
 
+    def test_meta_prompt_format_does_not_raise(self):
+        """META_PROMPT.format() must not crash when substituting realistic content.
+
+        Regression test: literal {key: value} in META_PROMPT caused KeyError
+        because Python .format() interpreted it as a template variable.
+        """
+        # Use a critique prompt with curly braces (like the real baseline)
+        sample_prompt = (
+            'Rate this response.\nReturn JSON: {{"score": 0.0-1.0, "critique": "summary"}}'
+        )
+        result = META_PROMPT.format(
+            failures="reflexion_mean declined -5pp",
+            current_prompt=sample_prompt,
+        )
+        assert "Rate this response" in result
+        assert "reflexion_mean declined" in result
+
 
 # ---------------------------------------------------------------------------
 # Safety cap enforcement
