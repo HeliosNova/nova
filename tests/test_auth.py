@@ -407,6 +407,126 @@ class TestRateLimiting:
 
 
 # ---------------------------------------------------------------------------
+# Auth failure dict eviction (bounded growth)
+# ---------------------------------------------------------------------------
+
+class TestAuthFailureEviction:
+    """Verify auth failure tracking dicts are bounded and evict properly."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_auth_state(self):
+        """Reset auth state between tests."""
+        import app.auth as auth_mod
+        auth_mod._auth_failures.clear()
+        auth_mod._lockouts.clear()
+        yield
+        auth_mod._auth_failures.clear()
+        auth_mod._lockouts.clear()
+
+    def test_failures_dict_is_regular_dict(self):
+        """_auth_failures must be a regular dict, not defaultdict."""
+        import app.auth as auth_mod
+        from collections import defaultdict
+        assert type(auth_mod._auth_failures) is dict
+        assert not isinstance(auth_mod._auth_failures, defaultdict)
+
+    def test_check_rate_limit_no_phantom_entries(self):
+        """_check_rate_limit should not create entries for IPs with no failures."""
+        import app.auth as auth_mod
+        auth_mod._check_rate_limit("192.168.1.100")
+        # IP with no failures should not appear in the dict
+        assert "192.168.1.100" not in auth_mod._auth_failures
+
+    def test_record_failure_creates_entry(self):
+        """_record_failure should create an entry for the IP."""
+        import app.auth as auth_mod
+        auth_mod._record_failure("10.0.0.1")
+        assert "10.0.0.1" in auth_mod._auth_failures
+
+    def test_eviction_under_max_cap(self):
+        """When dict exceeds max IPs, oldest entries are evicted."""
+        import app.auth as auth_mod
+        import time
+
+        max_ips = 5
+        now = time.time()
+
+        # Fill with max_ips + 3 entries
+        for i in range(max_ips + 3):
+            ip = f"10.0.0.{i}"
+            auth_mod._auth_failures[ip] = [now]
+
+        assert len(auth_mod._auth_failures) == max_ips + 3
+
+        # Eviction should trim to max_ips
+        auth_mod._evict_oldest(auth_mod._auth_failures, max_ips)
+        assert len(auth_mod._auth_failures) <= max_ips
+
+        # The oldest entries (lowest IPs) should have been evicted
+        assert "10.0.0.0" not in auth_mod._auth_failures
+        assert "10.0.0.1" not in auth_mod._auth_failures
+        assert "10.0.0.2" not in auth_mod._auth_failures
+
+    def test_eviction_runs_on_every_auth_check(self):
+        """_check_rate_limit calls _evict_oldest to cap dict size."""
+        import app.auth as auth_mod
+        import time
+
+        now = time.time()
+        # Add many entries, simulating many failing IPs
+        for i in range(20):
+            auth_mod._auth_failures[f"10.0.0.{i}"] = [now]
+
+        # Temporarily lower the cap by patching the config module in auth
+        with patch("app.auth.config") as mock_cfg:
+            mock_cfg.AUTH_MAX_TRACKED_IPS = 10
+            mock_cfg.AUTH_LOCKOUT_SECONDS = 300
+            auth_mod._check_rate_limit("192.168.1.1")
+
+        assert len(auth_mod._auth_failures) <= 10
+
+    def test_lockouts_dict_also_evicted(self):
+        """Lockout dict is also bounded by _evict_oldest."""
+        import app.auth as auth_mod
+        import time
+
+        now = time.time()
+        for i in range(15):
+            auth_mod._lockouts[f"10.0.0.{i}"] = now + 600  # locked for 10 min
+
+        auth_mod._evict_oldest(auth_mod._lockouts, 5)
+        assert len(auth_mod._lockouts) <= 5
+
+    def test_expired_entries_cleaned_up(self):
+        """_cleanup_expired_entries removes stale failure entries."""
+        import app.auth as auth_mod
+        import time
+
+        old = time.time() - 1000  # Way past the lockout window
+        auth_mod._auth_failures["stale_ip"] = [old]
+        auth_mod._lockouts["expired_ip"] = old  # Already expired
+
+        auth_mod._cleanup_expired_entries()
+
+        assert "stale_ip" not in auth_mod._auth_failures
+        assert "expired_ip" not in auth_mod._lockouts
+
+    def test_record_failure_triggers_lockout(self):
+        """After enough failures, IP gets locked out and failures cleared."""
+        import app.auth as auth_mod
+        from app.config import config as app_config
+
+        max_failures = app_config.AUTH_MAX_FAILURES
+        for _ in range(max_failures):
+            auth_mod._record_failure("attacker")
+
+        # Should be locked out
+        assert "attacker" in auth_mod._lockouts
+        # Failures should be cleared (not in dict anymore)
+        assert "attacker" not in auth_mod._auth_failures
+
+
+# ---------------------------------------------------------------------------
 # Access Tiers (from test_access_tiers)
 # ---------------------------------------------------------------------------
 

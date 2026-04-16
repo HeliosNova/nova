@@ -1,4 +1,8 @@
-"""Authentication middleware — Bearer token validation with rate-limiting."""
+"""Authentication middleware — Bearer token validation with rate-limiting.
+
+Failure tracking dicts are bounded: max AUTH_MAX_TRACKED_IPS entries (default 10k),
+evicted on every auth check and every recorded failure.
+"""
 
 from __future__ import annotations
 
@@ -6,7 +10,6 @@ import hmac
 import json
 import logging
 import time
-from collections import defaultdict
 
 from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -18,10 +21,11 @@ logger = logging.getLogger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 
 # Per-IP auth failure tracking: ip -> list of failure timestamps (wall clock)
-_auth_failures: dict[str, list[float]] = defaultdict(list)
+# Regular dict (NOT defaultdict) — prevents unbounded growth from auto-creating
+# entries on every auth check.  Entries are only created on actual failures.
+_auth_failures: dict[str, list[float]] = {}
 _AUTH_WINDOW = 60        # sliding window in seconds
 _lockouts: dict[str, float] = {}
-_MAX_TRACKED_IPS = None  # Use config.AUTH_MAX_TRACKED_IPS
 
 # Lazy DB handle for lockout persistence
 _lockout_db = None
@@ -158,8 +162,14 @@ def _check_rate_limit(ip: str) -> None:
     """Raise 429 if IP has exceeded auth failure limit."""
     now = time.time()
 
-    # Periodic cleanup of expired entries
+    # Periodic cleanup of expired entries (removes stale IPs)
     _cleanup_expired_entries()
+
+    # Hard cap: evict oldest if either dict exceeds max tracked IPs.
+    # This runs on every auth check, not just on failure recording.
+    max_ips = config.AUTH_MAX_TRACKED_IPS
+    _evict_oldest(_auth_failures, max_ips)
+    _evict_oldest(_lockouts, max_ips)
 
     # Check if currently locked out
     if ip in _lockouts:
@@ -172,14 +182,25 @@ def _check_rate_limit(ip: str) -> None:
             del _lockouts[ip]
             _sync_to_db(ip)
 
-    # Prune old failures outside the window
-    cutoff = now - _AUTH_WINDOW
-    _auth_failures[ip] = [t for t in _auth_failures[ip] if t > cutoff]
+    # Prune old failures outside the window — only if this IP has entries.
+    # Using .get() avoids creating empty entries for IPs that never failed.
+    existing = _auth_failures.get(ip)
+    if existing:
+        cutoff = now - _AUTH_WINDOW
+        pruned = [t for t in existing if t > cutoff]
+        if pruned:
+            _auth_failures[ip] = pruned
+        else:
+            del _auth_failures[ip]
 
 
 def _record_failure(ip: str) -> None:
     """Record an auth failure and lock out if threshold exceeded."""
     now = time.time()
+
+    # Explicit entry creation (no defaultdict auto-creation)
+    if ip not in _auth_failures:
+        _auth_failures[ip] = []
     _auth_failures[ip].append(now)
 
     # Evict oldest entries if tracking dicts grow too large
@@ -187,9 +208,10 @@ def _record_failure(ip: str) -> None:
     _evict_oldest(_auth_failures, max_ips)
     _evict_oldest(_lockouts, max_ips)
 
-    if len(_auth_failures[ip]) >= config.AUTH_MAX_FAILURES:
+    failures = _auth_failures.get(ip, [])
+    if len(failures) >= config.AUTH_MAX_FAILURES:
         _lockouts[ip] = now + config.AUTH_LOCKOUT_SECONDS
-        _auth_failures[ip].clear()
+        _auth_failures.pop(ip, None)  # Clear failures for this IP
 
     # Persist to DB on every failure and lockout event
     _sync_to_db(ip)
