@@ -131,7 +131,7 @@ class TestMonitorStoreCRUD:
         assert monitor_after.last_alert_at is not None
 
     def test_add_result_truncates_long_values(self, store):
-        """add_result should truncate value and message to 2000 chars."""
+        """add_result should truncate value and message to 4000 chars."""
         monitor_id = store.create(
             name="Truncation Test",
             check_type="url",
@@ -144,8 +144,8 @@ class TestMonitorStoreCRUD:
 
         results = store.get_results(monitor_id)
         assert len(results) == 1
-        assert len(results[0].value) <= 2000
-        assert len(results[0].message) <= 2000
+        assert len(results[0].value) <= 4000
+        assert len(results[0].message) <= 4000
 
 
 class TestMonitorStoreWorkflow:

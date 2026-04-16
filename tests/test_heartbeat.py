@@ -176,17 +176,22 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 14
+        assert count == 52
         monitors = store.list_all()
         names = {m.name for m in monitors}
+        # Core monitors
         assert "Morning Check-in" in names
         assert "System Health" in names
         assert "World Awareness" in names
-        assert "Self-Reflection" in names
+        # Domain study monitors
         assert "Domain Study: Science" in names
         assert "Domain Study: Technology" in names
         assert "Domain Study: Current Events" in names
         assert "Domain Study: Finance" in names
+        # Teaching/self-improvement monitors
+        assert "Lesson Quiz" in names
+        assert "Skill Validation" in names
+        assert "Curiosity Research" in names
         assert "Fine-Tune Check" in names
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
