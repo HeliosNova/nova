@@ -1143,9 +1143,9 @@ class TestHeartbeatSeedCount:
         assert monitor.schedule_seconds == 86400
 
     def test_seed_count_includes_eval(self, db):
-        """Total seeded monitors now equals 53 (was 52, +1 for eval harness)."""
+        """Total seeded monitors now equals 54 (was 52, +1 for eval harness, +1 for Prompt Optimizer)."""
         from app.monitors.heartbeat import MonitorStore
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 53
+        assert len(all_monitors) == 54

@@ -176,7 +176,7 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 53  # 52 original + Quality Eval Harness
+        assert count == 54  # 52 original + Quality Eval Harness + Prompt Optimizer
         monitors = store.list_all()
         names = {m.name for m in monitors}
         assert "Morning Check-in" in names

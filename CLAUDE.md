@@ -385,6 +385,81 @@ In-process `asyncio.create_task` system for long-running work that shouldn't blo
 - `BackgroundTaskTool` (`app/tools/background_task.py`): 4 actions — submit, status, list, cancel
 - Submit spawns ephemeral `brain.think()` calls for parallel research
 
+## Prompt Self-Modification (`app/core/prompt_optimizer.py`)
+
+Conservative, eval-gated prompt optimization. Modifies instruction strings only — NOT model weights (Ollama GGUF is static).
+
+### How to Enable
+
+```bash
+ENABLE_PROMPT_SELF_MOD=true  # default false — opt-in required
+```
+
+The "Prompt Optimizer" heartbeat monitor (`check_type="prompt_analyzer"`, daily) is seeded disabled. Enable it alongside the flag:
+
+```sql
+UPDATE monitors SET enabled=1 WHERE name='Prompt Optimizer';
+```
+
+### Tunable Modules (6 total, hard allow-list)
+
+| Module | Source constant | Tuned when |
+|--------|-----------------|------------|
+| `critique_prompt` | `reflexion._CRITIQUE_PROMPT` | reflexion calibration drifts |
+| `extraction_prompt` | `learning._EXTRACTION_PROMPT` | reasoning/tool-use pass_rate drifts |
+| `skill_extraction_prompt` | `skills.py` inline | skill-match hit_rate drifts |
+| `merge_instruction_parallel` | `decomposer.py` inline | multi-agent pass_rate drifts |
+| `merge_instruction_sequential` | `decomposer.py` inline | multi-agent pass_rate drifts |
+| `kg_extraction_prompt` | `brain.py` inline | semantic-match recall drifts |
+
+Everything else (`IDENTITY_AND_REASONING`, harness prompts, safety instructions, `META_PROMPT`) is **hardcoded and unmodifiable by design**.
+
+### Firewall Guarantees
+
+- **Allow-list**: `get_active_module()` returns `None` for any name not in `_SELF_MOD_ALLOWED_MODULES`.
+- **Harness internal block**: `quiz_gen/quiz_answer/quiz_grade` are double-blocked by `_HARNESS_INTERNAL_MODULES`.
+- **Baseline immutability**: `is_baseline=1` rows are never overwritten; the optimizer only adds new versions.
+- **META_PROMPT**: Hardcoded constant, SHA-256 hash verified in `tests/test_prompt_optimizer.py::TestMetaPromptHashStability`.
+- **Kill switch**: All writes and promotions check `ENABLE_PROMPT_SELF_MOD` at entry.
+
+### Safety Caps (all configurable)
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `PROMPT_MOD_MAX_PROPOSALS_PER_DAY` | `2` | Per-module write cap |
+| `PROMPT_MOD_MAX_PENDING` | `3` | Max pending candidates per module |
+| `PROMPT_MOD_MAX_PROMOTIONS_PER_DAY` | `2` | System-wide daily promotion cap |
+| `PROMPT_MOD_MAX_DRIFT` | `0.25` | Jaccard distance from baseline (0=identical, 1=disjoint) |
+| `PROMPT_MOD_MIN_IMPROVEMENT_PP` | `2.0` | Min improvement (pp) needed to pass shadow eval |
+| `PROMPT_MOD_REGRESSION_TOLERANCE_PP` | `1.0` | Max allowed drop in non-target categories |
+| `PROMPT_MOD_LATENCY_OVERHEAD_MAX` | `1.15` | Latency P95 overhead limit (1.15 = +15%) |
+
+### Goodhart Firewall (critique_prompt candidates)
+
+When shadow-testing a `critique_prompt` candidate, `_SCORING_OVERRIDES` pins the **baseline** critique for the reflexion scoring path. The candidate can only improve generation quality — it cannot inflate its own scores.
+
+Calibration check: if `reflexion_p90 > 0.93` or `reflexion_mean > 0.80` during shadow eval, the run is marked `calibration_ok=False` and the candidate is rejected.
+
+### Manual Rollback
+
+```python
+from app.database import get_db
+from app.core.prompt_optimizer import PromptModuleStore
+store = PromptModuleStore(db=get_db())
+# Find the active promoted module id:
+active = store.get_active("critique_prompt")
+store.rollback(active.id)
+```
+
+### Troubleshooting
+
+| Symptom | Likely cause | Fix |
+|---------|--------------|-----|
+| `PromptOptimizer: no new candidates` | Not enough eval history (< 3 runs) | Let eval harness run nightly for 3+ days |
+| `drift too high` in logs | Candidate text too different from baseline | Reduce `PROMPT_MOD_MAX_DRIFT` or let LLM draft a smaller change |
+| `calibration_ok=False` | Candidate inflates reflexion scores | Baseline scorer detected Goodhart loop — reject and quarantine expected |
+| Module stuck in `quarantined` | Expiry defaults to 24h | Wait or manually `UPDATE prompt_modules SET status='candidate', quarantined_until=NULL WHERE id=?` |
+
 ## Hybrid Retrieval Config
 
 | Variable | Default | Meaning |
