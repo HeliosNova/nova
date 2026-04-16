@@ -42,7 +42,8 @@ _MUTABLE_FIELDS = {
     "EMBEDDING_MODEL", "RETRIEVAL_TOP_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
     "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT", "MAX_SKILLS_CHECK",
     "MAX_CONTEXT_TOKENS", "RECENT_MESSAGES_KEEP",
-    "CODE_EXEC_TIMEOUT", "MAX_TOOL_ROUNDS", "SHELL_EXEC_TIMEOUT",
+    "CODE_EXEC_TIMEOUT", "MAX_TOOL_ROUNDS", "MAX_SAME_TOOL_CALLS", "MAX_TOOL_CALLS_PER_QUERY",
+    "SHELL_EXEC_TIMEOUT",
     "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
     "ENABLE_PLANNING", "ENABLE_CRITIQUE", "ENABLE_CUSTOM_TOOLS",
     "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
@@ -123,6 +124,8 @@ class Config:
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
     CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 10))
     MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 10))
+    MAX_SAME_TOOL_CALLS: int = field(default_factory=lambda: _env_int("MAX_SAME_TOOL_CALLS", 3))
+    MAX_TOOL_CALLS_PER_QUERY: int = field(default_factory=lambda: _env_int("MAX_TOOL_CALLS_PER_QUERY", 15))
     SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 30))
     BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 30))
     BROWSER_CDP_URL: str = field(default_factory=lambda: _env("BROWSER_CDP_URL", ""))  # http:// CDP URL to connect to host browser

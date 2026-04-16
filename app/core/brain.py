@@ -847,6 +847,13 @@ async def _run_generation_loop(
     # Skip caching for tools with side effects (uses module-level _SIDE_EFFECT_TOOLS)
     _tool_cache: dict[tuple, str] = {}
 
+    # --- Circuit breaker state ---
+    # Track (tool_name, args_hash) call counts to detect loops
+    _call_counts: dict[str, int] = {}     # tool_name -> call count
+    _pair_counts: dict[tuple, int] = {}   # (tool_name, args_hash) -> call count
+    _total_tool_calls: int = 0            # total tool executions across all rounds
+    _last_tool_outputs: dict[str, str] = {}  # tool_name -> last output (for browser dedup)
+
     _any_round_succeeded = False  # Track cumulative success across tool rounds
 
     try:
@@ -921,6 +928,65 @@ async def _run_generation_loop(
                 gen.final_content = result.content
                 break
 
+            # --- Circuit breaker: loop detection ---
+            _circuit_broken = False
+            _filtered_calls = []
+            for tc in tool_calls:
+                try:
+                    _args_hash = json.dumps(tc.args, sort_keys=True, default=str)
+                except (TypeError, ValueError):
+                    _args_hash = str(tc.args)
+                _pair_key = (tc.tool, _args_hash)
+
+                # Per-tool-name cap
+                _call_counts[tc.tool] = _call_counts.get(tc.tool, 0) + 1
+                if _call_counts[tc.tool] > config.MAX_SAME_TOOL_CALLS:
+                    logger.warning(
+                        "Circuit breaker: tool '%s' called %d times (max %d) — skipping",
+                        tc.tool, _call_counts[tc.tool], config.MAX_SAME_TOOL_CALLS,
+                    )
+                    continue
+
+                # Same (tool, args) dedup
+                _pair_counts[_pair_key] = _pair_counts.get(_pair_key, 0) + 1
+                if _pair_counts[_pair_key] > 2:
+                    logger.warning(
+                        "Circuit breaker: identical call '%s(%s)' repeated %d times — skipping",
+                        tc.tool, _args_hash[:80], _pair_counts[_pair_key],
+                    )
+                    continue
+
+                # Total call cap
+                _total_tool_calls += 1
+                if _total_tool_calls > config.MAX_TOOL_CALLS_PER_QUERY:
+                    logger.warning(
+                        "Circuit breaker: total tool calls (%d) exceeded max (%d) — stopping",
+                        _total_tool_calls, config.MAX_TOOL_CALLS_PER_QUERY,
+                    )
+                    _circuit_broken = True
+                    break
+
+                _filtered_calls.append(tc)
+
+            if not _filtered_calls:
+                # All calls were filtered out by circuit breaker
+                logger.warning("Circuit breaker: all tool calls in round %d filtered — synthesizing", tool_round + 1)
+                if gen.tool_results:
+                    gen.final_content = result.content or ""
+                else:
+                    gen.final_content = (
+                        result.content or
+                        "I attempted to use tools but kept getting the same result. "
+                        "Let me answer with what I know instead."
+                    )
+                break
+
+            tool_calls = _filtered_calls
+
+            if _circuit_broken:
+                # Force this to be the final round
+                pass
+
             logger.info(
                 "Tool calls [round %d]: %s",
                 tool_round + 1,
@@ -969,6 +1035,29 @@ async def _run_generation_loop(
                 return tc, output, tool_result
 
             results = await asyncio.gather(*[_run_tool(tc) for tc in tool_calls])
+
+            # --- Browser-specific dedup: detect identical outputs ---
+            _deduped_results = []
+            for tc, tool_output, tool_result_obj in results:
+                if tc.tool in ("browser", "web_search", "http_fetch"):
+                    _prev = _last_tool_outputs.get(tc.tool)
+                    _output_hash = hash(tool_output[:2000]) if tool_output else 0
+                    if _prev is not None and _prev == _output_hash:
+                        logger.warning(
+                            "Circuit breaker: '%s' returned identical output — suppressing repeat",
+                            tc.tool,
+                        )
+                        # Bump the per-tool count to accelerate circuit-break
+                        _call_counts[tc.tool] = _call_counts.get(tc.tool, 0) + 1
+                        # Still include the result but mark it so the LLM doesn't retry
+                        tool_output = (
+                            tool_output[:500] +
+                            "\n\n[NOTE: This tool returned the same result as the previous call. "
+                            "Do not call it again with the same arguments. Synthesize from existing results.]"
+                        )
+                    _last_tool_outputs[tc.tool] = _output_hash
+                _deduped_results.append((tc, tool_output, tool_result_obj))
+            results = _deduped_results
 
             assistant_content = result.content or f'[Calling tool: {tool_calls[0].tool}]'
 
@@ -1034,8 +1123,8 @@ async def _run_generation_loop(
 
             # User-role synthesis trigger with result evaluation
             # On intermediate rounds, encourage the model to assess and potentially
-            # use more tools. On the final round, just synthesize.
-            _is_final_round = (tool_round >= config.MAX_TOOL_ROUNDS - 1)
+            # use more tools. On the final round (or circuit breaker hit), just synthesize.
+            _is_final_round = (tool_round >= config.MAX_TOOL_ROUNDS - 1) or _circuit_broken
             if round_succeeded:
                 if _is_final_round:
                     _synth = (
