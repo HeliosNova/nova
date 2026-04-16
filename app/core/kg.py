@@ -668,7 +668,7 @@ class KnowledgeGraph:
             max_results: Maximum number of results.
             include_superseded: If False (default), only return current facts.
         """
-        entity = entity.strip().lower()
+        entity = normalize_entity(entity)
         if not entity:
             return []
 
@@ -887,7 +887,7 @@ class KnowledgeGraph:
         Returns:
             List of fact dicts valid at the given time.
         """
-        entity = entity.strip().lower()
+        entity = normalize_entity(entity)
         if not entity:
             return []
 
@@ -925,7 +925,7 @@ class KnowledgeGraph:
         Returns:
             List of fact dicts ordered by valid_from DESC (most recent first).
         """
-        subject = subject.strip().lower()
+        subject = normalize_entity(subject)
         predicate = normalize_predicate(predicate)
 
         rows = self._db.fetchall(
