@@ -418,3 +418,114 @@ tasks:
       - type: reflexion_in_range
         min: 0.1
         max: 0.9
+
+  # =========================================================================
+  # Category: multi-agent  (3 tasks)
+  # Tests structural decomposition.  Two tasks should trigger decomposition
+  # (parallel-decomposable, sequential-decomposable); one should NOT.
+  #
+  # The decomposition_fired / decomposition_not_fired assertion types check
+  # the DONE event's `decomposed` field, which is set by _run_multi_agent_path.
+  # Regression probe: set MULTI_AGENT_TRIGGER_THRESHOLD=1 → everything fires →
+  # non-decomposable task fails decomposition_not_fired → decomposition_rate
+  # drifts away from baseline → regression flagged automatically.
+  # =========================================================================
+
+  - id: multi_agent_parallel_compare
+    category: multi-agent
+    query: "Compare Python and JavaScript: how are they different in terms of typing system, execution model, and primary use cases? Give me a detailed comparison of both."
+    timeout: 120
+    tags: [parallel-decomposable]
+    assertions:
+      - type: response_not_empty
+      - type: decomposition_fired
+      - type: answer_matches
+        value: "\\b(?:Python|JavaScript|typing|static|dynamic|execution)\\b"
+
+  - id: multi_agent_sequential_research
+    category: multi-agent
+    query: "First search for the current Python version, then based on that result calculate how many years have passed since Python 1.0 was released in 1994 and how many major versions there have been."
+    timeout: 150
+    tags: [sequential-decomposable]
+    assertions:
+      - type: response_not_empty
+      - type: decomposition_fired
+      - type: tool_invoked
+        value: web_search
+
+  - id: multi_agent_no_decompose
+    category: multi-agent
+    query: "What is 2 plus 2?"
+    timeout: 45
+    tags: [should-not-decompose]
+    assertions:
+      - type: answer_contains
+        value: "4"
+      - type: decomposition_not_fired
+
+  # =========================================================================
+  # Category: retrieval  (3 tasks)
+  # Tests: BM25 exact-keyword recall, semantic paraphrase recall, adversarial
+  # confounder probe. Corpus: subset of the 300-doc adversarial eval corpus in
+  # scripts/eval_retrieval.py (50 core docs + 250 confounders, 10 domains).
+  # Task 3 exercises the composite reranker against a same-keyword confounder;
+  # it catches regressions if ENABLE_RERANKER is disabled.
+  # =========================================================================
+
+  - id: retrieval_exact_keyword
+    category: retrieval
+    query: "eval-retrieval: What is Merkle tree cryptographic hash structure?"
+    timeout: 60
+    tags: [bm25-dominant]
+    seed_document:
+      title: "Merkle Trees in Cryptography"
+      source: "eval-seed"
+      text: |
+        A Merkle tree is a tree data structure in which every leaf node is labelled
+        with the cryptographic hash of a data block, and every non-leaf node is
+        labelled with the cryptographic hash of its child nodes. Merkle trees allow
+        efficient and secure verification of the contents of large data structures.
+        They are used in Bitcoin, Ethereum, and other distributed systems to
+        verify block integrity without downloading the full blockchain.
+    assertions:
+      - type: retrieval_recall
+        value: "Merkle"
+
+  - id: retrieval_semantic_paraphrase
+    category: retrieval
+    query: "eval-retrieval: How does gradient descent minimize loss in training?"
+    timeout: 60
+    tags: [vector-dominant]
+    seed_document:
+      title: "Backpropagation and Optimization"
+      source: "eval-seed"
+      text: |
+        Optimization algorithms iteratively adjust model parameters to reduce
+        the error function. The most widely used approach computes partial
+        derivatives of the cost function with respect to each weight and moves
+        in the direction that decreases the objective. This iterative parameter
+        update process converges toward a local minimum of the error surface,
+        enabling neural networks to fit training data accurately.
+    assertions:
+      - type: retrieval_recall
+        value: "parameter"
+
+  - id: retrieval_reranker_regression_probe
+    category: retrieval
+    query: "eval-retrieval: MVCC snapshot isolation readers writers PostgreSQL VACUUM dead tuples"
+    timeout: 60
+    tags: [reranker-probe, adversarial-confounder]
+    seed_document:
+      title: "PostgreSQL MVCC and Concurrency"
+      source: "eval-seed"
+      text: |
+        PostgreSQL uses Multi-Version Concurrency Control (MVCC) to allow readers
+        and writers to operate concurrently without blocking each other. Each
+        transaction sees a snapshot of the database as it existed at the start of
+        the transaction. Old row versions (dead tuples) accumulate as rows are
+        updated or deleted; the VACUUM process reclaims this space. Snapshot
+        isolation prevents dirty reads and non-repeatable reads, making PostgreSQL
+        well-suited for OLTP workloads with mixed read/write concurrency.
+    assertions:
+      - type: retrieval_recall
+        value: "MVCC"

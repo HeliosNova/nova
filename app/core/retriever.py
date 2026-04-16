@@ -1,7 +1,15 @@
 """Hybrid retrieval — ChromaDB vector search + SQLite FTS5 BM25 + RRF fusion.
 
-Simple and effective: two signals, reciprocal rank fusion, done.
-No reranker until we have evidence retrieval quality is bad.
+Pipeline:
+  vector_search (top_k*2) ──┐
+                             ├─ RRF(k=60) → merged candidates
+  fts5_search  (top_k*2) ──┘
+                             │
+                  _score_rerank() — composite (0.55·vec + 0.30·bm25 + 0.15·cov)
+                             │     (skipped when ENABLE_RERANKER=false)
+                     entity_filter() → lexical guard
+                             │
+                        top_k Chunks
 """
 
 from __future__ import annotations
@@ -24,9 +32,11 @@ class Chunk:
     chunk_id: str
     document_id: str
     content: str
-    score: float = 0.0
+    score: float = 0.0        # composite score (post-rerank) or RRF score
     source: str = ""
     title: str = ""
+    vector_score: float = 0.0  # raw ChromaDB cosine similarity (0-1)
+    bm25_score: float = 0.0    # raw FTS5 BM25 normalized score (0-1)
 
 
 class Retriever:
@@ -87,7 +97,14 @@ class Retriever:
             return []
 
         # Reciprocal Rank Fusion
-        fused = _reciprocal_rank_fusion(vector_results, fts_results, k=config.RRF_K)
+        fused = _reciprocal_rank_fusion(vector_results, fts_results, k=config.RETRIEVAL_RRF_K)
+
+        # Rerank: composite score (vec + bm25 + coverage) when enabled
+        if config.ENABLE_RERANKER:
+            try:
+                fused = _score_rerank(query, fused)
+            except Exception as e:
+                logger.warning("Reranker (composite) failed, falling back to RRF order: %s", e)
 
         # Entity relevance guard — drop chunks where query entities don't appear
         fused = _entity_relevance_filter(query, fused[:top_k])
@@ -122,6 +139,7 @@ class Retriever:
                         score=score,
                         source=metadata.get("source", ""),
                         title=metadata.get("title", ""),
+                        vector_score=score,
                     ))
             return chunks
 
@@ -157,6 +175,7 @@ class Retriever:
                     document_id=row["document_id"],
                     content=row["content"],
                     score=score,
+                    bm25_score=score,
                 ))
             return chunks
 
@@ -275,26 +294,72 @@ def _reciprocal_rank_fusion(
 
     RRF score = sum(1 / (k + rank_i)) for each list the doc appears in.
     k=60 is the standard constant from the original RRF paper.
+
+    Preserves vector_score and bm25_score from source lists so the downstream
+    score-level reranker can restore magnitude signal that RRF discards.
     """
-    scores: dict[str, float] = {}
+    rrf_scores: dict[str, float] = {}
     chunk_map: dict[str, Chunk] = {}
 
     for results in result_lists:
         for rank, chunk in enumerate(results):
-            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0) + 1.0 / (k + rank + 1)
+            rrf_scores[chunk.chunk_id] = rrf_scores.get(chunk.chunk_id, 0) + 1.0 / (k + rank + 1)
             if chunk.chunk_id not in chunk_map:
                 chunk_map[chunk.chunk_id] = chunk
+            else:
+                # Accumulate per-source scores so both vector_score and bm25_score
+                # end up on the merged chunk regardless of which list saw it first.
+                existing = chunk_map[chunk.chunk_id]
+                if chunk.vector_score > 0:
+                    existing.vector_score = chunk.vector_score
+                if chunk.bm25_score > 0:
+                    existing.bm25_score = chunk.bm25_score
 
     # Sort by fused score descending
-    sorted_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)
+    sorted_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)
 
     result = []
     for cid in sorted_ids:
         chunk = chunk_map[cid]
-        chunk.score = scores[cid]
+        chunk.score = rrf_scores[cid]
         result.append(chunk)
 
     return result
+
+
+def _score_rerank(query: str, chunks: list[Chunk]) -> list[Chunk]:
+    """Re-score RRF candidates using weighted combination of signals.
+
+    composite = 0.55 * vector_score + 0.30 * bm25_score + 0.15 * coverage_score
+
+    Why better than pure RRF:
+    RRF only uses ranks (1/(k+rank)). It treats rank-1 from a 0.99-cosine result
+    the same as rank-1 from a 0.51-cosine result. Score-level fusion restores
+    magnitude signal — a chunk at 0.95 vector + 0.8 BM25 legitimately outranks
+    one at 0.52 vector + 0.1 BM25 even if both ranked #1 in their source lists.
+
+    Coverage score: |query_content_words ∩ chunk_content_words| / |query_content_words|
+    Latency: O(k) pure Python, ~1-3ms at k=10. Always on.
+    """
+    if not chunks:
+        return chunks
+
+    query_words = _content_words(query)
+
+    for chunk in chunks:
+        if query_words:
+            chunk_words = _content_words(chunk.content)
+            coverage = len(query_words & chunk_words) / len(query_words)
+        else:
+            coverage = 0.0
+
+        chunk.score = (
+            0.55 * chunk.vector_score
+            + 0.30 * chunk.bm25_score
+            + 0.15 * coverage
+        )
+
+    return sorted(chunks, key=lambda c: c.score, reverse=True)
 
 
 def _recursive_split(text: str, chunk_size: int, overlap: int) -> list[str]:
