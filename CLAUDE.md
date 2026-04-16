@@ -385,6 +385,17 @@ In-process `asyncio.create_task` system for long-running work that shouldn't blo
 - `BackgroundTaskTool` (`app/tools/background_task.py`): 4 actions — submit, status, list, cancel
 - Submit spawns ephemeral `brain.think()` calls for parallel research
 
+## Hybrid Retrieval Config
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `ENABLE_RERANKER` | `true` | Apply composite score reranker after RRF fusion |
+| `RETRIEVAL_RRF_K` | `60` | RRF smoothing constant (alias `RRF_K`) |
+
+Reranker: composite heuristic `0.55·vec + 0.30·bm25 + 0.15·coverage`. No external model required.
+A cross-encoder path (sentence-transformers) was evaluated empirically on a 300-doc adversarial corpus
+and gave 0pp gain over composite on Recall@5/P@1/MRR — deleted (see commit for 4×4 table).
+
 ## New Config Fields (Deep Audit)
 - `MAX_QUERY_LENGTH` (50000) — query length validation in brain.think()
 - `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL` — provider base URLs
