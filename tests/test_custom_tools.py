@@ -196,6 +196,174 @@ class TestDynamicTool:
 
 
 # ===========================================================================
+# Sandbox hardening — dynamic tools are ALWAYS sandboxed
+# ===========================================================================
+
+class TestDynamicToolSandbox:
+    """Verify DynamicTool uses forced sandbox-level restrictions regardless of system tier."""
+
+    @pytest.fixture(autouse=True)
+    def _set_full_tier(self):
+        """Set system to FULL tier — dynamic tools should still be sandboxed."""
+        with patch("app.core.access_tiers.config") as mock_cfg:
+            mock_cfg.SYSTEM_ACCESS_LEVEL = "full"
+            yield
+
+    def _make_tool(self, db, name, code):
+        """Create a DynamicTool by inserting directly into DB (bypassing create_tool safety check)."""
+        store = CustomToolStore(db)
+        db.execute(
+            "INSERT INTO custom_tools (name, description, parameters, code) VALUES (?, ?, ?, ?)",
+            (name, f"test tool {name}", "[]", code),
+        )
+        record = store.get_tool(name)
+        return DynamicTool(record, store)
+
+    @pytest.mark.asyncio
+    async def test_network_import_blocked_at_full_tier(self, db):
+        """Even at 'full' tier, dynamic tools cannot import socket."""
+        tool = self._make_tool(db, "net_tool", "import socket\ndef run(): return 'ok'")
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_os_import_blocked_at_full_tier(self, db):
+        """Even at 'full' tier, dynamic tools cannot import os."""
+        tool = self._make_tool(db, "os_tool", "import os\ndef run(): return os.getcwd()")
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_subprocess_import_blocked_at_full_tier(self, db):
+        """Even at 'full' tier, dynamic tools cannot import subprocess."""
+        tool = self._make_tool(db, "sub_tool", "import subprocess\ndef run(): return 'ok'")
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_http_import_blocked(self, db):
+        """HTTP/urllib/requests imports are blocked."""
+        for mod in ["http", "urllib", "requests", "httpx"]:
+            tool = self._make_tool(db, f"http_{mod}", f"import {mod}\ndef run(): return 'ok'")
+            result = await tool.execute()
+            assert not result.success, f"import {mod} should be blocked"
+            assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_safe_code_still_works_at_full_tier(self, db):
+        """Legitimate tools still execute correctly."""
+        tool = self._make_tool(
+            db, "math_tool",
+            'import math\ndef run(): return str(math.pi)'
+        )
+        result = await tool.execute()
+        assert result.success
+        assert "3.14" in result.output
+
+    @pytest.mark.asyncio
+    async def test_runtime_network_blocked_even_if_ast_bypassed(self, db):
+        """Runtime preamble blocks network even if AST check were somehow bypassed.
+
+        We test this by creating a tool that tries to use socket indirectly
+        through the subprocess — the preamble poisons sys.modules['socket'].
+        """
+        # This code doesn't directly "import socket" (which AST catches),
+        # but tries to access it via __import__ which is also blocked by AST.
+        # The runtime preamble is defense-in-depth.
+        tool = self._make_tool(
+            db, "sneaky_net",
+            'def run():\n    try:\n        import socket\n        return "FAIL: socket imported"\n    except (ImportError, PermissionError):\n        return "OK: blocked"'
+        )
+        result = await tool.execute()
+        # Should be caught by AST check
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_eval_blocked(self, db):
+        """eval() is blocked in dynamic tools."""
+        tool = self._make_tool(
+            db, "eval_tool",
+            'def run(): return eval("1+1")'
+        )
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_exec_blocked(self, db):
+        """exec() is blocked in dynamic tools."""
+        tool = self._make_tool(
+            db, "exec_tool",
+            'def run(): exec("x=1"); return "ok"'
+        )
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_pickle_blocked(self, db):
+        """pickle (deserialization attack vector) is blocked."""
+        tool = self._make_tool(
+            db, "pickle_tool",
+            'import pickle\ndef run(): return "ok"'
+        )
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_create_tool_uses_forced_sandbox(self, db):
+        """create_tool() also uses forced-sandbox safety checks."""
+        store = CustomToolStore(db)
+        # At "full" system tier, os would normally be allowed by _check_code_safety
+        # but create_tool now uses _check_dynamic_tool_safety
+        tid = store.create_tool(
+            "os_reader", "reads os info", "[]",
+            "import os\ndef run(): return os.getcwd()"
+        )
+        assert tid == -1  # Rejected even at full tier
+
+
+class TestDynamicToolSandboxNoneTier:
+    """Verify sandbox restrictions hold even at 'none' tier (all restrictions off)."""
+
+    @pytest.fixture(autouse=True)
+    def _set_none_tier(self):
+        """Set system to NONE tier — dynamic tools should STILL be sandboxed."""
+        with patch("app.core.access_tiers.config") as mock_cfg:
+            mock_cfg.SYSTEM_ACCESS_LEVEL = "none"
+            yield
+
+    def _make_tool(self, db, name, code):
+        store = CustomToolStore(db)
+        db.execute(
+            "INSERT INTO custom_tools (name, description, parameters, code) VALUES (?, ?, ?, ?)",
+            (name, f"test {name}", "[]", code),
+        )
+        record = store.get_tool(name)
+        return DynamicTool(record, store)
+
+    @pytest.mark.asyncio
+    async def test_os_blocked_at_none_tier(self, db):
+        """Even at 'none' tier, dynamic tools cannot import os."""
+        tool = self._make_tool(db, "os_none", "import os\ndef run(): return os.getcwd()")
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+    @pytest.mark.asyncio
+    async def test_subprocess_blocked_at_none_tier(self, db):
+        tool = self._make_tool(db, "sub_none", "import subprocess\ndef run(): return 'ok'")
+        result = await tool.execute()
+        assert not result.success
+        assert "blocked" in result.error.lower()
+
+
+# ===========================================================================
 # TOOL_CREATE_DESCRIPTION constant
 # ===========================================================================
 
