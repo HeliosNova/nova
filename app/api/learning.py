@@ -103,12 +103,15 @@ async def bulk_delete_lessons(body: BulkDeleteRequest):
 
 
 @router.get("/skills")
-async def list_skills(limit: int = Query(default=50, ge=1, le=500)):
-    """List all learned skills."""
+async def list_skills(
+    limit: int = Query(default=500, ge=1, le=1000),
+    include_disabled: bool = Query(default=False),
+):
+    """List learned skills. By default returns only enabled skills; pass ?include_disabled=true for all."""
     svc = get_services()
     if not svc.skills:
         return []
-    skills = svc.skills.get_all_skills(limit=limit)
+    skills = svc.skills.get_all_skills(limit=limit, include_disabled=include_disabled)
     return [
         {
             "id": s.id,
@@ -120,9 +123,23 @@ async def list_skills(limit: int = Query(default=50, ge=1, le=500)):
             "success_rate": round(s.success_rate, 3),
             "enabled": s.enabled,
             "created_at": s.created_at,
+            "last_used_at": s.last_used_at,
+            "consecutive_failures": s.consecutive_failures,
+            "source": s.source,
+            "composed_of": s.composed_of,
         }
         for s in skills
     ]
+
+
+@router.get("/skills/stats")
+async def skill_stats():
+    """Aggregate skill system metrics: hit rates, quality, staleness, top skills."""
+    svc = get_services()
+    if not svc.skills:
+        return {"total": 0, "enabled": 0, "disabled": 0, "total_uses": 0,
+                "avg_success_rate": 0.0, "stale_count": 0, "by_source": {}, "top_skills": []}
+    return svc.skills.get_skill_stats()
 
 
 @router.post("/skills/{skill_id}/toggle")

@@ -28,6 +28,12 @@ import type {
   FullConfig,
   ConfigUpdateResponse,
   KGFact,
+  KGGraphData,
+  KGStats,
+  ProviderHealthResult,
+  DaemonStatus,
+  DaemonLogEntry,
+  EventQueueItem,
   CustomToolInfo,
   CuriosityItem,
   FinetuneTriggerResponse,
@@ -273,6 +279,11 @@ export async function getMonitorDetail(id: number): Promise<MonitorDetail> {
   return request(`/api/monitors/${id}`);
 }
 
+export async function searchMonitorResults(query: string, limit = 8): Promise<import("./types").MonitorResultHit[]> {
+  const res = await request(`/api/monitors/results/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+  return ensureArray<import("./types").MonitorResultHit>(res);
+}
+
 export async function rateMonitorResult(resultId: number, rating: -1 | 0 | 1): Promise<void> {
   await request(`/api/monitors/results/${resultId}/rate`, {
     method: "POST",
@@ -379,6 +390,95 @@ export async function getKGFacts(limit = 50, offset = 0, search = ""): Promise<K
   if (search) params.set("search", search);
   const res = await request(`/api/kg/facts?${params}`);
   return ensureArray<KGFact>(res, "facts");
+}
+
+export async function getKGGraph(entity?: string, hops = 2, limit = 200): Promise<KGGraphData> {
+  const params = new URLSearchParams({ hops: String(hops), limit: String(limit) });
+  if (entity) params.set("entity", entity);
+  return request(`/api/kg/graph?${params}`);
+}
+
+export async function getKGStats(): Promise<KGStats> {
+  return request("/api/kg/stats");
+}
+
+export async function deleteKGFact(id: number): Promise<void> {
+  await request(`/api/kg/facts/${id}`, { method: "DELETE" });
+}
+
+// ── Provider Health ──
+
+export async function getProviderHealth(): Promise<ProviderHealthResult> {
+  return request("/api/providers/health");
+}
+
+// ── Daemon ──
+
+export async function getDaemonStatus(): Promise<DaemonStatus> {
+  return request("/api/daemon/status");
+}
+
+export async function getDaemonLog(hours = 24, category?: string, limit = 100): Promise<DaemonLogEntry[]> {
+  const params = new URLSearchParams({ hours: String(hours), limit: String(limit) });
+  if (category) params.set("category", category);
+  const res = await request(`/api/daemon/log?${params}`);
+  return ensureArray<DaemonLogEntry>(res, "entries");
+}
+
+export async function getDaemonEvents(status = "pending", limit = 50): Promise<EventQueueItem[]> {
+  const res = await request(`/api/daemon/events?status=${status}&limit=${limit}`);
+  return ensureArray<EventQueueItem>(res, "events");
+}
+
+export async function triggerDream(force = false): Promise<{ status: string; digest?: string; reason?: string }> {
+  return request("/api/daemon/dream", {
+    method: "POST",
+    body: JSON.stringify({ force }),
+  });
+}
+
+// ── Events ──
+
+export async function getPendingEvents(limit = 20): Promise<EventQueueItem[]> {
+  const res = await request(`/api/events/pending?limit=${limit}`);
+  return ensureArray<EventQueueItem>(res, "events");
+}
+
+export async function getRecentEvents(limit = 50): Promise<EventQueueItem[]> {
+  const res = await request(`/api/events/recent?limit=${limit}`);
+  return ensureArray<EventQueueItem>(res, "events");
+}
+
+// ── Exports ──
+
+export async function exportLessons(): Promise<Blob> {
+  const res = await fetch(`${getBaseUrl()}/api/exports/lessons`, {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  return res.blob();
+}
+
+export async function exportKGFacts(): Promise<Blob> {
+  const res = await fetch(`${getBaseUrl()}/api/exports/kg-facts`, {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  return res.blob();
+}
+
+export async function exportBundle(): Promise<Blob> {
+  const res = await fetch(`${getBaseUrl()}/api/exports/bundle`, {
+    method: "POST",
+    headers: getHeaders(),
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) throw new Error(`Export failed: ${res.status}`);
+  return res.blob();
 }
 
 // ── Custom Tools ──

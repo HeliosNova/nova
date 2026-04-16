@@ -12,27 +12,74 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from app.core.brain import Services, set_services, think
+from app.core.llm import GenerationResult, StreamChunk, ToolCall, _extract_tool_calls, _strip_think_tags
 from app.core.memory import ConversationStore, UserFactStore
 from app.schema import EventType
 
 
-def _mock_llm_simple(mock_llm, content="Hello!", invoke_nothink_return="Test Title"):
-    """Helper to configure a mock LLM for simple (no-tool) responses."""
-    mock_llm.generate_with_tools = AsyncMock(return_value=MagicMock(
-        content=content,
-        tool_calls=[],
-        raw={},
-        thinking="",
-        usage=None,
-    ))
+def _mock_llm_simple(mock_llm, content="Hello!", invoke_nothink_return="COMPLETE"):
+    """Helper to configure a mock LLM for simple (no-tool) responses.
+
+    Supports both code paths: generate_with_tools (ENABLE_EXTENDED_THINKING=false)
+    and stream_with_thinking (ENABLE_EXTENDED_THINKING=true).
+
+    Default invoke_nothink_return is "COMPLETE" so the self-check step (9b) in
+    brain.think() does not append extra text to the final content.
+    """
+    # --- generate_with_tools (non-streaming path) ---
+    result = GenerationResult(content=content, tool_calls=[], raw={})
+    mock_llm.generate_with_tools = AsyncMock(return_value=result)
+
+    # --- stream_with_thinking (streaming path) ---
+    async def _fake_stream(*args, **kwargs):
+        yield StreamChunk(content=content)
+
+    mock_llm.stream_with_thinking = MagicMock(side_effect=_fake_stream)
+
     mock_llm.get_provider = MagicMock(return_value=MagicMock(
         capabilities=MagicMock(needs_emphatic_prompts=False),
     ))
-    mock_llm._strip_think_tags = lambda x: x
+    mock_llm._strip_think_tags = _strip_think_tags
     mock_llm.extract_json_object = MagicMock(return_value=None)
     mock_llm.invoke_nothink = AsyncMock(return_value=invoke_nothink_return)
-    mock_llm._extract_tool_calls = MagicMock(return_value=[])
-    mock_llm.GenerationResult = MagicMock
+    mock_llm._extract_tool_calls = _extract_tool_calls
+    mock_llm.GenerationResult = GenerationResult
+    mock_llm.ToolCall = ToolCall
+    mock_llm.StreamChunk = StreamChunk
+
+
+def _mock_llm_multistep(mock_llm, generate_fn, invoke_nothink_return="COMPLETE"):
+    """Configure a mock LLM that uses a custom generate_fn for multi-step tool flows.
+
+    ``generate_fn`` is an async callable(messages, tools, **kwargs) -> GenerationResult.
+    Both generate_with_tools and stream_with_thinking are wired to it so the test
+    works regardless of ENABLE_EXTENDED_THINKING.
+
+    Default invoke_nothink_return is "COMPLETE" so the self-check step (9b) in
+    brain.think() does not append extra text to the final content.
+    """
+    mock_llm.generate_with_tools = generate_fn
+
+    # stream_with_thinking calls the same generate_fn and yields the result as chunks
+    async def _fake_stream(messages, tools, **kwargs):
+        result = await generate_fn(messages, tools, **kwargs)
+        tc = result.tool_calls[0] if result.tool_calls else None
+        yield StreamChunk(content=result.content, tool_call=tc)
+        for extra_tc in result.tool_calls[1:]:
+            yield StreamChunk(tool_call=extra_tc)
+
+    mock_llm.stream_with_thinking = MagicMock(side_effect=_fake_stream)
+
+    mock_llm.get_provider = MagicMock(return_value=MagicMock(
+        capabilities=MagicMock(needs_emphatic_prompts=False),
+    ))
+    mock_llm._strip_think_tags = _strip_think_tags
+    mock_llm.extract_json_object = MagicMock(return_value=None)
+    mock_llm.invoke_nothink = AsyncMock(return_value=invoke_nothink_return)
+    mock_llm._extract_tool_calls = _extract_tool_calls
+    mock_llm.GenerationResult = GenerationResult
+    mock_llm.ToolCall = ToolCall
+    mock_llm.StreamChunk = StreamChunk
 
 
 def _make_tool_registry(services, tools=None, execute_map=None):
@@ -100,8 +147,6 @@ class TestBrainThinkPipeline:
     @pytest.mark.asyncio
     async def test_tool_call_then_final_answer(self, services):
         """LLM returns a tool call, tool executes, then final answer."""
-        from app.core.llm import ToolCall, GenerationResult
-
         # First call returns a tool call, second returns final answer
         call_count = 0
 
@@ -121,28 +166,12 @@ class TestBrainThinkPipeline:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test Title")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate)
 
-            # Mock tool registry
             from app.tools.base import ToolResult
-            mock_registry = MagicMock()
-            mock_registry.get_descriptions.return_value = "calculator(expression: str) — Evaluate math."
-            mock_registry.get_tool_list.return_value = [{"name": "calculator"}]
-            mock_registry.get.return_value = MagicMock(trim_output=lambda x: x[:500])
-
-            async def mock_execute_full(name, args):
-                return "4", ToolResult(output="4", success=True)
-
-            mock_registry.execute_full = mock_execute_full
-            services.tool_registry = mock_registry
+            _make_tool_registry(services, tools=[{"name": "calculator"}], execute_map={
+                "calculator": ("4", ToolResult(output="4", success=True)),
+            })
 
             events = []
             async for event in think("What is 2+2?"):
@@ -231,7 +260,6 @@ class TestToolRoundTrip:
     @pytest.mark.asyncio
     async def test_tool_round_trip_verifies_output_content(self, services):
         """Tool call -> execution -> final answer includes the tool output in the response."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -252,15 +280,7 @@ class TestToolRoundTrip:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Python Release")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate, invoke_nothink_return="Python Release")
 
             _make_tool_registry(services, tools=[{"name": "web_search"}], execute_map={
                 "web_search": (
@@ -291,7 +311,6 @@ class TestToolRoundTrip:
     @pytest.mark.asyncio
     async def test_tool_round_trip_tool_result_saved_to_db(self, services):
         """Tool results are saved as tool-role messages in the conversation history."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -312,15 +331,7 @@ class TestToolRoundTrip:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Math")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate, invoke_nothink_return="Math")
 
             _make_tool_registry(services, execute_map={
                 "calculator": ("50", ToolResult(output="50", success=True)),
@@ -501,7 +512,6 @@ class TestMultipleToolRounds:
     @pytest.mark.asyncio
     async def test_two_consecutive_tool_rounds(self, services):
         """LLM calls tool in round 1, then another tool in round 2, then final answer."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -528,15 +538,7 @@ class TestMultipleToolRounds:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Stock Price")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate, invoke_nothink_return="Stock Price")
 
             _make_tool_registry(
                 services,
@@ -564,7 +566,6 @@ class TestMultipleToolRounds:
     @pytest.mark.asyncio
     async def test_multiple_tools_in_single_round(self, services):
         """LLM returns two tool calls in a single round, both execute concurrently."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -588,15 +589,7 @@ class TestMultipleToolRounds:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Weather Compare")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate, invoke_nothink_return="Weather Compare")
 
             _make_tool_registry(services, tools=[{"name": "web_search"}], execute_map={
                 "web_search": ("Weather: sunny, 72F", ToolResult(output="Weather: sunny, 72F", success=True)),
@@ -689,7 +682,6 @@ class TestErrorRecoveryDuringTools:
     @pytest.mark.asyncio
     async def test_tool_failure_still_produces_final_answer(self, services):
         """If a tool fails, the LLM should still produce a final answer."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -710,15 +702,7 @@ class TestErrorRecoveryDuringTools:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate)
 
             _make_tool_registry(services, tools=[{"name": "web_search"}], execute_map={
                 "web_search": (
@@ -748,14 +732,24 @@ class TestErrorRecoveryDuringTools:
             mock_llm.generate_with_tools = AsyncMock(
                 side_effect=LLMUnavailableError("Connection refused")
             )
+
+            # stream_with_thinking must also raise the error for the streaming path
+            async def _raise_stream(*args, **kwargs):
+                raise LLMUnavailableError("Connection refused")
+                yield  # noqa: unreachable — makes this an async generator
+
+            mock_llm.stream_with_thinking = MagicMock(side_effect=_raise_stream)
+
             mock_llm.get_provider = MagicMock(return_value=MagicMock(
                 capabilities=MagicMock(needs_emphatic_prompts=False),
             ))
-            mock_llm._strip_think_tags = lambda x: x
+            mock_llm._strip_think_tags = _strip_think_tags
             mock_llm.extract_json_object = MagicMock(return_value=None)
             mock_llm.invoke_nothink = AsyncMock(return_value="Test")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = MagicMock
+            mock_llm._extract_tool_calls = _extract_tool_calls
+            mock_llm.GenerationResult = GenerationResult
+            mock_llm.ToolCall = ToolCall
+            mock_llm.StreamChunk = StreamChunk
 
             events = []
             async for event in think("What is the weather?"):
@@ -770,7 +764,6 @@ class TestErrorRecoveryDuringTools:
     @pytest.mark.asyncio
     async def test_tool_timeout_still_completes(self, services):
         """A tool that times out should not crash the pipeline; the LLM gets the error."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -791,15 +784,7 @@ class TestErrorRecoveryDuringTools:
             )
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Test")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate)
 
             # Simulate a timeout by returning an error result
             _make_tool_registry(services, tools=[{"name": "web_search"}], execute_map={
@@ -851,7 +836,6 @@ class TestDoneEventMetadata:
     @pytest.mark.asyncio
     async def test_done_event_tool_results_count(self, services):
         """DONE event should report tool_results_count when tools were used."""
-        from app.core.llm import ToolCall, GenerationResult
         from app.tools.base import ToolResult
 
         call_count = 0
@@ -868,15 +852,7 @@ class TestDoneEventMetadata:
             return GenerationResult(content="2", tool_calls=[], raw={})
 
         with patch("app.core.brain.llm") as mock_llm:
-            mock_llm.generate_with_tools = mock_generate
-            mock_llm.get_provider = MagicMock(return_value=MagicMock(
-                capabilities=MagicMock(needs_emphatic_prompts=False),
-            ))
-            mock_llm._strip_think_tags = lambda x: x
-            mock_llm.extract_json_object = MagicMock(return_value=None)
-            mock_llm.invoke_nothink = AsyncMock(return_value="Math")
-            mock_llm._extract_tool_calls = MagicMock(return_value=[])
-            mock_llm.GenerationResult = GenerationResult
+            _mock_llm_multistep(mock_llm, mock_generate, invoke_nothink_return="Math")
 
             _make_tool_registry(services, execute_map={
                 "calculator": ("2", ToolResult(output="2", success=True)),

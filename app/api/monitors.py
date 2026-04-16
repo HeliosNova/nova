@@ -208,6 +208,34 @@ async def recent_results(hours: int = Query(default=24, ge=1, le=720), limit: in
     }
 
 
+@router.get("/monitors/results/search")
+async def search_results(
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=8, ge=1, le=50),
+):
+    """Search monitor results by text content."""
+    store = _get_store()
+    db = store.db
+    rows = db.fetchall(
+        "SELECT mr.id, mr.monitor_id, m.name as monitor_name, mr.status, "
+        "mr.message, mr.value, mr.created_at "
+        "FROM monitor_results mr JOIN monitors m ON m.id = mr.monitor_id "
+        "WHERE mr.message LIKE ? OR mr.value LIKE ? "
+        "ORDER BY mr.created_at DESC LIMIT ?",
+        (f"%{q}%", f"%{q}%", limit),
+    )
+    return [
+        {
+            "id": r["id"],
+            "monitor_name": r["monitor_name"],
+            "status": r["status"],
+            "content": (r["message"] or r["value"] or "")[:500],
+            "created_at": r["created_at"],
+        }
+        for r in rows
+    ]
+
+
 @router.get("/monitors/{monitor_id}")
 async def get_monitor(monitor_id: int):
     store = _get_store()

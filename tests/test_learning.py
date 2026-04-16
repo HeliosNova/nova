@@ -136,9 +136,9 @@ class TestLearningEngine:
             mock_config.MAX_TRAINING_PAIRS = 10000
 
             await engine.save_training_pair(
-                query="What created Python?",
-                bad_answer="James Gosling",
-                good_answer="Guido van Rossum",
+                query="Who created the Python programming language?",
+                bad_answer="James Gosling created the Python programming language in the early 1990s.",
+                good_answer="Guido van Rossum created the Python programming language in 1991.",
             )
 
         # Read the JSONL file
@@ -146,9 +146,9 @@ class TestLearningEngine:
         assert path.exists()
         with open(path) as f:
             entry = json.loads(f.readline())
-        assert entry["query"] == "What created Python?"
-        assert entry["chosen"] == "Guido van Rossum"
-        assert entry["rejected"] == "James Gosling"
+        assert entry["query"] == "Who created the Python programming language?"
+        assert entry["chosen"] == "Guido van Rossum created the Python programming language in 1991."
+        assert entry["rejected"] == "James Gosling created the Python programming language in the early 1990s."
         assert "timestamp" in entry
 
     def test_get_all_lessons(self, engine):
@@ -370,8 +370,7 @@ class TestSkillStore:
     def test_create_skill(self, store):
         skill_id = store.create_skill(
             name="crypto_price",
-            # Named capture group so {entity} in args_template is a valid binding.
-            trigger_pattern=r"(?i)price of (?P<entity>\w+)",
+            trigger_pattern=r"(?i)price of \w+",
             steps=[{"tool": "web_search", "args_template": {"query": "current price of {entity}"}}],
             answer_template="The current price is {result}.",
         )
@@ -449,10 +448,9 @@ class TestSkillStore:
         assert "active2" not in names
 
     def test_skill_steps_stored_as_json(self, store):
-        # Test is about JSON round-trip; use {query} (always exempt) and literal values.
         steps = [
-            {"tool": "web_search", "args_template": {"query": "{query}"}},
-            {"tool": "calculator", "args_template": {"expression": "42 * 100"}},
+            {"tool": "web_search", "args_template": {"query": "price of {entity}"}},
+            {"tool": "calculator", "args_template": {"expression": "{price} * 100"}},
         ]
         skill_id = store.create_skill("multi_step", r"test", steps)
         skill = store.get_skill(skill_id)
@@ -717,7 +715,7 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.9, "critique": "good"}):
-                asyncio.run(
+                asyncio.get_event_loop().run_until_complete(
                     critique_response("q", "a", [], user_facts="name: X", kg_facts="X works_at Y")
                 )
 
@@ -735,7 +733,7 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.8, "critique": "ok"}):
-                asyncio.run(
+                asyncio.get_event_loop().run_until_complete(
                     critique_response("q", "a", [])
                 )
 

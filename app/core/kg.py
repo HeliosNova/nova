@@ -270,6 +270,88 @@ class KnowledgeGraph:
         self._inserts_since_prune = 0
         # Lock for concurrent supersession safety
         self._write_lock = asyncio.Lock()
+        # ChromaDB collection for semantic search (lazy init)
+        self._collection = None
+
+    # --- ChromaDB vector collection for semantic KG search ---
+
+    def _get_collection(self):
+        """Lazy-init ChromaDB collection for semantic KG fact search."""
+        if self._collection is None:
+            try:
+                import chromadb
+                from ..config import config
+                client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
+                self._collection = client.get_or_create_collection(
+                    name="kg_facts",
+                    metadata={"hnsw:space": "cosine"},
+                )
+            except Exception as e:
+                logger.warning("Failed to init kg_facts ChromaDB collection: %s", e)
+                return None
+        return self._collection
+
+    def reindex_kg_facts(self) -> int:
+        """One-time backfill of existing KG facts into ChromaDB. Returns count indexed."""
+        collection = self._get_collection()
+        if collection is None:
+            return 0
+        if collection.count() > 0:
+            logger.info("KG facts collection already has %d entries, skipping reindex", collection.count())
+            return 0
+
+        all_rows = self._db.fetchall(
+            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL LIMIT 1000"
+        )
+        if not all_rows:
+            return 0
+
+        ids, documents, metadatas = [], [], []
+        for row in all_rows:
+            searchable = f"{row['subject']} {row['predicate'].replace('_', ' ')} {row['object']}"
+            ids.append(str(row["id"]))
+            documents.append(searchable)
+            metadatas.append({"subject": row["subject"], "predicate": row["predicate"]})
+
+        if ids:
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info("Reindexed %d KG facts into ChromaDB", len(ids))
+        return len(ids)
+
+    def _add_to_vector(self, fact_id: int, subject: str, predicate: str, object_: str) -> None:
+        """Add a single fact to the vector collection."""
+        collection = self._get_collection()
+        if collection is None:
+            return
+        try:
+            searchable = f"{subject} {predicate.replace('_', ' ')} {object_}"
+            collection.upsert(
+                ids=[str(fact_id)],
+                documents=[searchable],
+                metadatas=[{"subject": subject, "predicate": predicate}],
+            )
+        except Exception as e:
+            logger.debug("Failed to add KG fact %d to vector store: %s", fact_id, e)
+
+    def _remove_from_vector(self, fact_id: int) -> None:
+        """Remove a fact from the vector collection (on supersession/deletion)."""
+        collection = self._get_collection()
+        if collection is None:
+            return
+        try:
+            collection.delete(ids=[str(fact_id)])
+        except Exception:
+            pass
+
+    @staticmethod
+    def _rrf_fuse(keyword_ids: list[int], vector_ids: list[int], k: int = 60) -> list[int]:
+        """Reciprocal Rank Fusion of two ranked ID lists."""
+        scores: dict[int, float] = {}
+        for rank, rid in enumerate(keyword_ids):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        for rank, rid in enumerate(vector_ids):
+            scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        return sorted(scores, key=lambda x: scores[x], reverse=True)
 
     # --- Core operations ---
 
@@ -406,10 +488,24 @@ class KnowledgeGraph:
                     len(conflicts), subject, predicate, object_,
                 )
 
+            # Add new fact to vector store for semantic search
+            if new_id is not None:
+                self._add_to_vector(new_id, subject, predicate, object_)
+            # Remove superseded facts from vector store
+            for conflict in conflicts:
+                self._remove_from_vector(conflict["id"])
+
             self._inserts_since_prune += 1
             if self._inserts_since_prune >= _PRUNE_BATCH_SIZE:
                 self._prune()
                 self._inserts_since_prune = 0
+
+        # Emit event for event-driven triggers
+        try:
+            from app.monitors.event_trigger import emit_event
+            emit_event("internal:kg_fact_added", {"subject": subject, "predicate": predicate, "object": object_})
+        except Exception:
+            pass
 
         return True
 
@@ -749,9 +845,9 @@ class KnowledgeGraph:
         return results
 
     def get_relevant_facts(self, query: str, limit: int = 8) -> list[Fact]:
-        """Get facts relevant to a query by keyword overlap.
+        """Get facts relevant to a query by hybrid keyword + semantic search.
 
-        Same scoring pattern as LearningEngine.get_relevant_lessons().
+        Uses RRF fusion of keyword overlap and ChromaDB vector similarity.
         Only returns current facts (valid_to IS NULL).
         """
         all_facts = self._db.fetchall(
@@ -761,54 +857,89 @@ class KnowledgeGraph:
         if not all_facts:
             return []
 
+        rows_by_id = {row["id"]: row for row in all_facts}
+
+        # --- Keyword search (existing approach) ---
         query_words = _normalize_words(query)
-        if not query_words:
+        keyword_ids: list[int] = []
+        if query_words:
+            scored: list[tuple[int, int]] = []
+            for row in all_facts:
+                fact_words = (
+                    _normalize_words(row["subject"])
+                    | _normalize_words(row["predicate"].replace("_", " "))
+                    | _normalize_words(row["object"])
+                )
+                overlap = len(query_words & fact_words)
+                if overlap >= 2:
+                    scored.append((overlap, row["id"]))
+            scored.sort(key=lambda x: -x[0])
+            keyword_ids = [rid for _, rid in scored[:limit * 3]]
+
+        # --- Vector search (semantic similarity via ChromaDB) ---
+        vector_ids: list[int] = []
+        collection = self._get_collection()
+        if collection is not None and collection.count() > 0:
+            try:
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=min(limit * 3, collection.count()),
+                    include=["distances"],
+                )
+                if results and results["ids"] and results["ids"][0]:
+                    # Filter by cosine distance threshold (0 = identical, 2 = opposite).
+                    # Only keep results with distance < 0.8 (similarity > 0.6).
+                    _MAX_DISTANCE = 0.8
+                    distances = results.get("distances", [[]])[0]
+                    for rid_str, dist in zip(results["ids"][0], distances):
+                        rid = int(rid_str)
+                        if rid in rows_by_id and dist < _MAX_DISTANCE:
+                            vector_ids.append(rid)
+            except Exception as e:
+                logger.debug("KG vector search failed: %s", e)
+
+        # --- RRF fusion ---
+        # Require keyword matches for fusion — vector-only matches are too noisy
+        # in small KGs where ChromaDB returns whatever it has regardless of relevance.
+        if keyword_ids:
+            fused_ids = self._rrf_fuse(keyword_ids, vector_ids)
+            # Filter to valid IDs and take top limit
+            top_ids = [rid for rid in fused_ids if rid in rows_by_id][:limit]
+        elif query_words:
+            # No keyword matches with overlap >= 2 and no vector boost.
+            # Do NOT fall back to overlap >= 1 — single-word matches are too noisy.
+            top_ids = []
+        else:
             return []
 
-        scored: list[tuple[int, dict]] = []
-
-        for row in all_facts:
-            fact_words = (
-                _normalize_words(row["subject"])
-                | _normalize_words(row["predicate"].replace("_", " "))
-                | _normalize_words(row["object"])
-            )
-            overlap = len(query_words & fact_words)
-            if overlap >= 2:
-                scored.append((overlap, row))
-
-        scored.sort(key=lambda x: (-x[0], -x[1]["confidence"]))
-
-        top = scored[:limit]
-
-        # Batch increment retrieval counts and update last_retrieved_at
-        if top:
-            retrieved_ids = [row["id"] for _, row in top]
-            placeholders = ",".join("?" for _ in retrieved_ids)
+        # Batch increment retrieval counts
+        if top_ids:
+            placeholders = ",".join("?" for _ in top_ids)
             try:
                 self._db.execute(
                     f"UPDATE kg_facts SET times_retrieved = times_retrieved + 1, "
                     f"last_retrieved_at = datetime('now') WHERE id IN ({placeholders})",
-                    tuple(retrieved_ids),
+                    tuple(top_ids),
                 )
             except Exception:
-                pass  # backward compat if column missing
+                pass
 
         return [
             Fact(
-                id=row["id"],
-                subject=row["subject"],
-                predicate=row["predicate"],
-                object=row["object"],
-                confidence=row["confidence"],
-                source=row["source"],
-                created_at=row["created_at"],
-                valid_from=row["valid_from"] if "valid_from" in row.keys() else None,
-                valid_to=row["valid_to"] if "valid_to" in row.keys() else None,
-                provenance=row["provenance"] if "provenance" in row.keys() else "",
-                superseded_by=row["superseded_by"] if "superseded_by" in row.keys() else None,
+                id=rows_by_id[rid]["id"],
+                subject=rows_by_id[rid]["subject"],
+                predicate=rows_by_id[rid]["predicate"],
+                object=rows_by_id[rid]["object"],
+                confidence=rows_by_id[rid]["confidence"],
+                source=rows_by_id[rid]["source"],
+                created_at=rows_by_id[rid]["created_at"],
+                valid_from=rows_by_id[rid]["valid_from"] if "valid_from" in rows_by_id[rid].keys() else None,
+                valid_to=rows_by_id[rid]["valid_to"] if "valid_to" in rows_by_id[rid].keys() else None,
+                provenance=rows_by_id[rid]["provenance"] if "provenance" in rows_by_id[rid].keys() else "",
+                superseded_by=rows_by_id[rid]["superseded_by"] if "superseded_by" in rows_by_id[rid].keys() else None,
             )
-            for _, row in top
+            for rid in top_ids
+            if rid in rows_by_id
         ]
 
     # --- Temporal query methods ---
@@ -929,6 +1060,24 @@ class KnowledgeGraph:
                 f"- {new_tag}{label} {f.subject} {pred} {f.object} "
                 f"[confidence: {conf:.2f}]"
             )
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_summary_for_prompt(facts: list[Fact]) -> str:
+        """Format facts as compact one-line summaries with IDs for lazy retrieval.
+
+        Each line includes the fact ID so the LLM can call
+        context_detail(category='kg_fact', item_id=N) for full details.
+        """
+        if not facts:
+            return ""
+        lines = []
+        for f in facts:
+            if f.superseded_by is not None or f.valid_to is not None:
+                continue
+            pred = f.predicate.replace("_", " ")
+            conf = f.confidence if f.confidence is not None else 0
+            lines.append(f"- [K{f.id}] {f.subject} —{pred}→ {f.object} ({conf:.1f})")
         return "\n".join(lines)
 
     # --- Management ---

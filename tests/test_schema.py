@@ -249,8 +249,7 @@ class TestSSEFormatting:
     def test_event_type_values(self):
         from app.schema import EventType
         expected = {"thinking", "token", "tool_use", "sources",
-                    "lesson_used", "lesson_learned", "warning", "done", "error",
-                    "agent_meta", "agent_start", "agent_done", "agent_merge"}
+                    "lesson_used", "lesson_learned", "warning", "done", "error"}
         actual = {e.value for e in EventType}
         assert expected == actual
 

@@ -28,7 +28,7 @@ from pathlib import Path
 
 # Paths
 NOVA_DIR = Path(__file__).resolve().parent.parent
-DATA_DIR = Path(os.getenv("NOVA_DATA_DIR", "C:/data"))
+DATA_DIR = Path(os.getenv("NOVA_DATA_DIR", "/data"))  # Container path for docker cp
 FINETUNE_DIR = DATA_DIR / "finetune"
 ADAPTER_DIR = FINETUNE_DIR / "adapter"
 MERGED_DIR = FINETUNE_DIR / "merged"
@@ -76,8 +76,10 @@ def detect_next_version() -> str:
 def run(cmd, **kwargs):
     """Run a command and return output."""
     print(f"  $ {' '.join(cmd) if isinstance(cmd, list) else cmd}")
-    result = subprocess.run(cmd, capture_output=True, text=True, timeout=kwargs.get("timeout", 600), **{k: v for k, v in kwargs.items() if k != "timeout"})
-    if result.returncode != 0 and not kwargs.get("ignore_errors"):
+    ignore_errors = kwargs.pop("ignore_errors", False)
+    timeout = kwargs.pop("timeout", 600)
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    if result.returncode != 0 and not ignore_errors:
         print(f"  ERROR: {result.stderr[:500]}")
     return result
 
@@ -101,7 +103,7 @@ def check_readiness():
         print("No training data found.")
         return False, 0
 
-    with open(LOCAL_TRAINING_DATA) as f:
+    with open(LOCAL_TRAINING_DATA, encoding="utf-8") as f:
         lines = [l.strip() for l in f if l.strip()]
 
     valid = 0
@@ -121,7 +123,7 @@ def step_1_copy_data():
     """Copy training data from Docker volume to host."""
     print("\n=== Step 1: Copy training data ===")
     run(["docker", "cp", f"nova-app:{DATA_DIR}/training_data.jsonl", str(LOCAL_TRAINING_DATA)])
-    with open(LOCAL_TRAINING_DATA) as f:
+    with open(LOCAL_TRAINING_DATA, encoding="utf-8") as f:
         count = sum(1 for l in f if l.strip())
     print(f"  {count} training pairs copied")
     return count
@@ -151,7 +153,7 @@ def step_3_train():
         "--data", str(LOCAL_TRAINING_DATA),
         "--model", BASE_MODEL,
         "--epochs", str(EPOCHS),
-    ], timeout=3600)
+    ], timeout=172800)  # 48 hours — training takes ~26h on RTX 3090
 
     if result.returncode != 0:
         print("  Training failed!")
@@ -244,8 +246,8 @@ def step_5_register_ollama():
         "RENDERER qwen3.5\n"
         "PARSER qwen3.5\n"
         "PARAMETER temperature 0.7\n"
-        "PARAMETER num_predict 2000\n"
-        "PARAMETER num_ctx 4096\n"
+        "PARAMETER num_predict 4000\n"
+        "PARAMETER num_ctx 32768\n"
     )
 
     # Write modelfile inside container

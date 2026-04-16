@@ -135,26 +135,9 @@ class LLMProvider(Protocol):
 # ---------------------------------------------------------------------------
 
 def create_provider(cfg=None) -> LLMProvider:
-    """Create the LLM provider based on config. Called at startup."""
-    cfg = cfg or config
-
-    match cfg.LLM_PROVIDER:
-        case "ollama":
-            from app.core.providers.ollama import OllamaProvider
-            return OllamaProvider()
-        case "openai":
-            from app.core.providers.openai import OpenAIProvider
-            return OpenAIProvider(cfg.OPENAI_API_KEY, cfg.OPENAI_MODEL)
-        case "anthropic":
-            from app.core.providers.anthropic import AnthropicProvider
-            return AnthropicProvider(cfg.ANTHROPIC_API_KEY, cfg.ANTHROPIC_MODEL)
-        case "google":
-            from app.core.providers.google import GoogleProvider
-            return GoogleProvider(cfg.GOOGLE_API_KEY, cfg.GOOGLE_MODEL)
-        case _:
-            logger.warning("Unknown LLM_PROVIDER '%s', falling back to Ollama", cfg.LLM_PROVIDER)
-            from app.core.providers.ollama import OllamaProvider
-            return OllamaProvider()
+    """Create the LLM provider. Ollama only — Nova runs on your hardware."""
+    from app.core.providers.ollama import OllamaProvider
+    return OllamaProvider()
 
 
 # ---------------------------------------------------------------------------

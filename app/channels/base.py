@@ -26,7 +26,19 @@ class BaseChannel:
         Returns:
             The assistant's response text.
         """
-        from app.core.brain import think
+        from app.core.brain import think, get_services
+
+        # Track user activity for idle detection (dream mode)
+        try:
+            from datetime import datetime
+            svc = get_services()
+            if svc.monitor_store:
+                svc.monitor_store.db.execute(
+                    "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
+                    ("last_user_activity", datetime.utcnow().isoformat()),
+                )
+        except Exception as e:
+            logger.warning("Channel activity tracking failed: %s", e)
 
         try:
             tokens = []

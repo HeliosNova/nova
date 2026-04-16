@@ -42,6 +42,39 @@ _ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD"}
 
 _MAX_RESPONSE_SIZE = 50_000  # 50KB (up from 10KB)
 
+# Minimum visible text ratio to detect JS-rendered pages
+_MIN_TEXT_RATIO = 0.05  # If <5% of HTML is visible text, likely needs JS rendering
+_MIN_READABLE_CHARS = 200  # Minimum readable chars to consider content useful
+
+# Regex-based HTML text extraction (no external dependencies)
+_SCRIPT_STYLE_RE = re.compile(r'<(script|style|noscript)[^>]*>.*?</\1>', re.DOTALL | re.IGNORECASE)
+_TAG_RE = re.compile(r'<[^>]+>')
+_WHITESPACE_RE = re.compile(r'\s+')
+
+
+def _extract_readable_text(html: str) -> str:
+    """Extract visible text from HTML. Flags JS-only pages."""
+    original_len = len(html)
+    # Strip scripts, styles, noscript blocks
+    clean = _SCRIPT_STYLE_RE.sub(' ', html)
+    # Strip all remaining tags
+    clean = _TAG_RE.sub(' ', clean)
+    # Decode common HTML entities
+    for entity, char in [("&amp;", "&"), ("&lt;", "<"), ("&gt;", ">"),
+                         ("&quot;", '"'), ("&#39;", "'"), ("&nbsp;", " ")]:
+        clean = clean.replace(entity, char)
+    # Normalize whitespace
+    clean = _WHITESPACE_RE.sub(' ', clean).strip()
+
+    # Detect JS-only pages: very little readable text relative to HTML size
+    if original_len > 500 and len(clean) < _MIN_READABLE_CHARS:
+        return (
+            f"[Page returned minimal readable content ({len(clean)} chars from {original_len} chars of HTML). "
+            f"This site likely requires JavaScript rendering — use the browser tool to load it.]\n\n{clean}"
+        )
+
+    return clean
+
 
 def _is_private_ip(host: str) -> bool:
     """Check if a hostname resolves to a private/reserved IP (IPv4 + IPv6)."""
@@ -424,6 +457,11 @@ class HttpFetchTool(BaseTool):
                     retriable=resp.status_code in (429, 500, 502, 503),
                     error_category=_cat,
                 )
+
+            # Extract readable text from HTML (strip scripts, styles, tags)
+            content_type = resp.headers.get("content-type", "")
+            if "html" in content_type.lower():
+                text = _extract_readable_text(text)
 
             if config.ENABLE_INJECTION_DETECTION:
                 from app.core.injection import sanitize_content

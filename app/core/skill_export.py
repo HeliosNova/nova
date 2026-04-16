@@ -2,12 +2,12 @@
 
 Exports skills to portable JSON dicts, optionally signed.
 Imports skills with signature verification and deduplication.
+
+Signing primitives are delegated to app.core.data_export (shared module).
 """
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import logging
 from datetime import datetime, timezone
@@ -15,42 +15,33 @@ from pathlib import Path
 
 from app.config import config
 from app.core.skills import SkillStore
+from app.core.data_export import (
+    load_key as _load_key,
+    canonical_json as _canonical_json,
+    sign_data,
+    verify_data,
+    SignatureError,
+)
 
 logger = logging.getLogger(__name__)
 
 
-class SkillSignatureError(Exception):
-    """Raised when skill signature verification fails."""
+# Backward-compatible alias
+SkillSignatureError = SignatureError
 
 
 # ---------------------------------------------------------------------------
-# Signing utilities
+# Signing utilities (delegate to shared primitives)
 # ---------------------------------------------------------------------------
-
-def _load_key(path: str | Path) -> bytes:
-    """Load a hex-encoded signing key from a file."""
-    raw = Path(path).read_text(encoding="utf-8").strip()
-    return bytes.fromhex(raw)
-
-
-def _canonical_json(data: dict) -> bytes:
-    """Canonical JSON: sorted keys, no whitespace, UTF-8."""
-    return json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
-
 
 def sign_skill(skill_data: dict, key: bytes) -> str:
-    """Create HMAC-SHA256 signature of canonical skill JSON.
-
-    The 'signature' field is excluded from the signed payload.
-    """
-    payload = {k: v for k, v in skill_data.items() if k != "signature"}
-    return hmac.new(key, _canonical_json(payload), hashlib.sha256).hexdigest()
+    """Create HMAC-SHA256 signature of canonical skill JSON."""
+    return sign_data(skill_data, key)
 
 
 def verify_skill(skill_data: dict, signature: str, key: bytes) -> bool:
     """Verify HMAC-SHA256 signature of a skill dict."""
-    expected = sign_skill(skill_data, key)
-    return hmac.compare_digest(expected, signature)
+    return verify_data(skill_data, signature, key)
 
 
 # ---------------------------------------------------------------------------

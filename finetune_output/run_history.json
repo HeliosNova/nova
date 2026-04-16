@@ -12,5 +12,14 @@
     "holdout_queries": 3,
     "reason": "Training failed: cannot import name 'AttrsDescriptor' from 'triton.compiler.compiler' (C:\\Users\\sysadmin\\Desktop\\Helios Project\\nova_\\finetune_env\\Lib\\site-packages\\triton\\compiler\\compiler.py)",
     "completed_at": "2026-03-22T14:16:23.059643"
+  },
+  {
+    "started_at": "2026-04-02T08:54:16.720992+00:00",
+    "status": "error",
+    "base_model": "Qwen/Qwen3.5-9B",
+    "ft_model": "nova-ft-v7",
+    "total_pairs": 356,
+    "epochs": 3,
+    "error": "Command '['C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\finetune_env\\\\Scripts\\\\python.exe', 'C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\scripts\\\\finetune.py', '--data', 'C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\training_data.jsonl', '--model', 'Qwen/Qwen3.5-9B', '--epochs', '3']' timed out after 3600 seconds"
   }
 ]

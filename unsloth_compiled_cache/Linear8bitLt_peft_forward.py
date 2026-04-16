@@ -44,18 +44,16 @@ from peft.tuners.lora.bnb import (VARIANT_KWARG_KEYS, torch)
 
 torch_addmm = torch.addmm
 torch_add   = torch.add
+torch_float16 = torch.float16
 # @torch.compile(fullgraph = False, dynamic = True, options = torch_compile_options)
 def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
-    # Use result.dtype (bfloat16 from base layer) since x may have been cast to float32
-    # by _cast_input_dtype when autocast is disabled
-    target_dtype = result.dtype
-    xA = dropout(x).to(target_dtype) @ lora_A.weight.to(target_dtype).t()
+    xA = dropout(x.to(torch_float16)) @ lora_A.weight.to(torch_float16).t()
     # output = result + scaling * xA @ lora_B.weight.t()
     shape = result.shape
     output = torch_addmm(
-        result.view(-1, shape[-1]),
+        result.view(-1, shape[-1]).to(torch_float16),
         xA.view(-1, xA.shape[-1]),
-        lora_B.weight.to(target_dtype).t(),
+        lora_B.weight.to(torch_float16).t(),
         alpha = scaling,
         beta = 1,
     ).view(shape)
@@ -64,7 +62,7 @@ def lora_forward(result, lora_A, lora_B, dropout, x, scaling):
     if bias is not None:
         output = torch_add(
             output,
-            bias.to(target_dtype),
+            bias.to(torch_float16),
             alpha = scaling,
         )
     return output
@@ -96,7 +94,7 @@ def unsloth_forward(self, x: torch.Tensor, *args, **kwargs) -> torch.Tensor:
             requires_conversion = not torch.is_autocast_enabled()
             if requires_conversion:
                 expected_dtype = result.dtype
-                x = self._cast_input_dtype(x, lora_A.weight.dtype)
+                
 
             if active_adapter not in self.lora_variant:  # vanilla LoRA
                 return lora_forward(result, lora_A, lora_B, dropout, x, scaling).to(result.dtype)

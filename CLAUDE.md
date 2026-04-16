@@ -2,10 +2,10 @@
 
 ## What This Is
 
-Nova is a sovereign personal AI assistant with multi-provider LLM support (Ollama, OpenAI, Anthropic, Google).
+Nova is a sovereign personal AI assistant. Ollama only — runs entirely on your hardware.
 Default: FastAPI backend + Ollama (Qwen3.5:27b) on RTX 3090. Supports MCP (Model Context Protocol) for external tools.
-It learns from corrections, remembers user facts, uses tools, and generates DPO training data for fine-tuning.
-~79 files, not 238. Learning is the product.
+It learns from corrections, remembers user facts, uses tools, and generates training data for SimPO fine-tuning.
+~89 files. Learning is the product.
 
 ## Architecture (Single Pipeline, No Framework)
 
@@ -15,7 +15,7 @@ User query -> brain.think()
   -> classify intent (regex, no LLM)
   -> retrieve documents if needed (ChromaDB + FTS5 + RRF)
   -> build system prompt (8 prioritized blocks)
-  -> generate response (LLM provider: Ollama, OpenAI, Anthropic, or Google)
+  -> generate response (Ollama — local inference)
   -> tool loop if tool call detected (max 5 rounds)
   -> stream tokens via SSE
   -> post-response: corrections, fact extraction, skill creation
@@ -29,7 +29,7 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 |------|---------|
 | `app/core/brain.py` | THE core: `think()` generator -- the entire pipeline |
 | `app/core/llm.py` | Provider-agnostic LLM interface: `invoke_nothink()`, `generate_with_tools()`, JSON extraction |
-| `app/core/providers/` | LLM backends: `ollama.py`, `openai.py`, `anthropic.py`, `google.py` |
+| `app/core/providers/` | LLM backend: `ollama.py` |
 | `app/tools/mcp.py` | MCP client: discovers external MCP tools, wraps as BaseTool |
 | `app/mcp_server.py` | MCP server: exposes Nova as MCP server (memory, KG, lessons, docs) |
 | `app/core/prompt.py` | System prompt builder (8 blocks with truncation priority) |
@@ -68,8 +68,6 @@ Main responses use `generate_with_tools()` (thinking suppressed for speed) or `s
 - Use `extract_json_object()` as fallback parser (balanced brace matching)
 
 ### Tool Calling (Hybrid: Native + Text)
-Cloud providers (OpenAI, Anthropic, Google) use native structured tool calls returned in `result.tool_call`.
-Tools are now passed through `stream_with_thinking()` for all cloud providers, enabling streaming tool calls.
 Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as fallback:
 ```
 {"tool": "tool_name", "args": {"param": "value"}}
@@ -78,12 +76,9 @@ Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as f
 
 ### Provider-Aware Prompt Building
 `build_system_prompt()` accepts `provider` and `registered_tool_names` params:
-- **Date block**: Full emphatic repetition for Ollama (date confusion workaround), condensed for cloud providers
-- **Self-attribution**: Emphatic "REAL, live results" framing for Ollama, neutral for cloud
 - **Tool examples**: Filtered to only registered tools (no phantom examples)
 
 ### Provider Base URLs
-All cloud provider base URLs are configurable via config: `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL`, `ANTHROPIC_API_VERSION`. Supports self-hosted endpoints and proxy setups.
 
 ### Correction Detection (2-stage)
 1. **Regex pre-filter** -- `is_likely_correction()` in `learning.py` is the single source of truth
@@ -99,7 +94,7 @@ In `brain.py` step 13, the correction handler must **skip 1 assistant message** 
 [NEVER TRUNCATE] Block 1: Identity + Reasoning Methodology
 [NEVER TRUNCATE] Block 2: User Facts
 [NEVER TRUNCATE] Block 3: Learned Lessons
-[NEVER TRUNCATE] Block 8: Date/Time (provider-aware: full for Ollama, condensed for cloud)
+[NEVER TRUNCATE] Block 8: Date/Time (date emphasis for local models)
 [TRUNCATE LAST]  Block 4: Tool Descriptions + Examples (filtered to registered tools only)
 [TRUNCATE MID]   Block 5: Skills / Retrieved Context
 [TRUNCATE FIRST] Block 7: Conversation Summary
@@ -130,7 +125,7 @@ Register `/path/literal` routes BEFORE `/path/{param}` in FastAPI to avoid path 
 ### Monitor System (`app/monitors/heartbeat.py`)
 Background loop checks monitors on schedule, detects changes, sends alerts via Discord/Telegram/WhatsApp/Signal.
 
-**52 default monitors** (seeded on first startup):
+**50 default monitors** (seeded on first startup):
 - **Operational** (5): Morning Check-in (daily), System Health (2h), System Maintenance (daily), Fine-Tune Check (weekly), Auto-Monitor Detector (daily)
 - **Self-Improvement** (3): Lesson Quiz (6h), Skill Validation (12h), Curiosity Research (1h)
 - **Financial Intelligence** (10): Finance (12h), Crypto & Web3 (6h), DeFi & Protocols (8h), Whale Watch (6h), Top Trades (8h), Commodities & Forex (6h), Earnings (8h), FOMC & Fed Watch (24h), SEC Insider Trading (12h), Economics & Markets (12h)
@@ -169,13 +164,13 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 
 ## Rules
 1. Never add features without asking. The rebuild is lean by design.
-2. Never add config flags without approval. ~45 settings, not 281.
+2. Never add config flags without approval. Settings are managed in config.py.
 3. Never rate quality without evidence (test output, logs, actual behavior).
 4. If unsure whether something is broken, TEST IT before changing it.
 5. Port patterns from nova/ when they're battle-tested. Don't reinvent.
 6. No duplicate correction patterns. `learning.py` is the single source of truth.
 7. Lessons must have all fields: `topic`, `correct_answer`, `wrong_answer`, `lesson_text`.
-8. DPO training pairs: query=original question, chosen=correct, rejected=wrong.
+8. Training pairs: query=original question, chosen=correct, rejected=wrong. Used for SimPO (default) or DPO fine-tuning.
 9. Facts are extracted, not hallucinated. Only extract from explicit user statements.
 10. Context budget: 6000 tokens max (MAX_SYSTEM_TOKENS in prompt.py). Summarize older messages, keep 6 recent.
 
@@ -183,7 +178,6 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 
 - **Runtime**: FastAPI, uvicorn, httpx, chromadb, sympy, pydantic
 - **LLM (default)**: Ollama 0.17.5+ with qwen3.5:27b (17GB VRAM)
-- **LLM (cloud, optional)**: OpenAI (gpt-4o), Anthropic (claude-sonnet), Google (gemini-2.0-flash)
 - **MCP (optional)**: `mcp` package for Model Context Protocol tool integration
 - **Embedding**: nomic-embed-text-v2-moe (0.5GB VRAM)
 - **Fine-tuning** (separate venv): unsloth, trl, torch (see `scripts/requirements-finetune.txt`)
@@ -269,83 +263,6 @@ KG facts now track change over time:
 - `get_fact_history(subject, predicate)` — all versions of a fact over time
 - `get_changes_since(since)` — what changed recently
 
-## Multi-Agent Structural Decomposition
-
-Structural decomposition is a separate path from `DelegateTool`. `DelegateTool` is LLM-driven, tool-call-based delegation. Structural decomposition fires heuristically before the LLM generates, based on query signals.
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `app/core/decomposer.py` | Signal scoring, gate logic (`should_decompose`), strategy selection, task extraction (`decompose_query`) |
-| `app/core/agent_spawner.py` | `AgentSpawner`: executes `DecompositionPlan` via parallel/sequential/map-reduce `think()` sub-agents; `merge_agent_results()` |
-
-### Config Flags
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `ENABLE_MULTI_AGENT` | `true` | Enable/disable structural decomposition entirely |
-| `MULTI_AGENT_TRIGGER_THRESHOLD` | `4` | Minimum signal score to fire decomposition |
-| `MAX_AGENT_COUNT` | `5` | Maximum sub-agents per decomposition |
-| `AGENT_TASK_TIMEOUT` | `90` | Per-sub-agent timeout in seconds |
-
-### Signal Scoring (threshold = 4)
-
-| Signal | Points |
-|--------|--------|
-| Parallel markers (`compare`, `versus`, `side by side`, …) | +2 |
-| Delegation words (`run in parallel agents`, `break this down`, …) | +2 |
-| ≥ 3 distinct proper-noun candidates | +1 |
-| Multiple question marks in query | +1 |
-| Query length > 200 chars AND ≥ 2 tool-type keywords | +1 |
-| Query was planned (`was_planned=True`) | +1 |
-
-### Safety Gates (in `should_decompose`)
-
-1. `ENABLE_MULTI_AGENT=false` → never fires
-2. `_structural_depth.get() > 0` → sub-agents cannot themselves decompose (max depth = 1)
-3. `intent in ("greeting", "correction")` → always skip
-4. `score < MULTI_AGENT_TRIGGER_THRESHOLD` → skip
-
-`ephemeral=True` is NOT a gate — the eval harness runs `think(ephemeral=True)` and must be able to test the decomposition path.
-
-### Execution Strategies
-
-- **parallel** (default): all sub-agents run concurrently under `asyncio.Semaphore(max_parallel=3)`
-- **sequential**: sub-agents run in order; each receives prior results in `shared_findings`
-- **map-reduce**: all-but-last tasks run in parallel; last task receives all map results
-
-### SSE Events Emitted
-
-```
-AGENT_META    — decomposition plan summary (strategy, task count)
-AGENT_START   — fired once per sub-agent at start
-AGENT_DONE    — fired once per sub-agent when complete
-AGENT_MERGE   — fired before merge LLM call
-TOKEN         — merged response tokens (streamed)
-TOOL_USE      — re-emitted for each unique tool used by sub-agents
-DONE          — includes decomposed=True, agent_count=N
-```
-
-### _structural_depth ContextVar
-
-Lives in `agent_spawner.py`, distinct from `DelegateTool`'s `_delegation_depth` in `delegate.py`.
-
-- Set to `depth+1` before each `think()` sub-agent call via `token = _structural_depth.set(...)`
-- Restored via `_structural_depth.reset(token)` in `finally` — correct even on exception/timeout
-- `asyncio.gather()` copies the context to each Task at creation time, so parallel sub-agents are naturally isolated
-- Sequential sub-agents must explicitly reset because they run in the same coroutine
-
-### Eval Regression Probe
-
-Three multi-agent tasks in `evals/suite.yaml` (category `multi-agent`):
-
-1. `multi_agent_parallel_compare` — compare query, asserts `decomposition_fired`
-2. `multi_agent_sequential_research` — search+calculate, asserts `decomposition_fired` + `tool_invoked: web_search`
-3. `multi_agent_no_decompose` — "What is 2 plus 2?", asserts `answer_contains: 4` + `decomposition_not_fired`
-
-**Regression detection**: `decomposition_rate` metric in the `multi-agent` category. Setting `MULTI_AGENT_TRIGGER_THRESHOLD=1` makes everything decompose → `multi_agent_no_decompose` fails `decomposition_not_fired` → `decomposition_rate` drifts from baseline → regression flagged.
-
 ## Security
 
 ### Prompt Injection Detection (`app/core/injection.py`)
@@ -385,21 +302,8 @@ In-process `asyncio.create_task` system for long-running work that shouldn't blo
 - `BackgroundTaskTool` (`app/tools/background_task.py`): 4 actions — submit, status, list, cancel
 - Submit spawns ephemeral `brain.think()` calls for parallel research
 
-## Hybrid Retrieval Config
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `ENABLE_RERANKER` | `true` | Apply composite score reranker after RRF fusion |
-| `RETRIEVAL_RRF_K` | `60` | RRF smoothing constant (alias `RRF_K`) |
-
-Reranker: composite heuristic `0.55·vec + 0.30·bm25 + 0.15·coverage`. No external model required.
-A cross-encoder path (sentence-transformers) was evaluated empirically on a 300-doc adversarial corpus
-and gave 0pp gain over composite on Recall@5/P@1/MRR — deleted (see commit for 4×4 table).
-
 ## New Config Fields (Deep Audit)
 - `MAX_QUERY_LENGTH` (50000) — query length validation in brain.think()
-- `OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `GOOGLE_BASE_URL` — provider base URLs
-- `ANTHROPIC_API_VERSION` — Anthropic API version header
 - `TRUSTED_PROXY` — enable X-Forwarded-For only when set
 
 ## Version Source of Truth
@@ -426,108 +330,3 @@ Local Whisper STT (speech-to-text). Gated by `ENABLE_VOICE`.
 - Model size via `WHISPER_MODEL_SIZE` (default "base"), max duration via `VOICE_MAX_DURATION` (300s)
 - 25MB file size limit, audio extension validation
 - GPU auto-unloaded on shutdown
-
-## Automated Eval Harness (`app/monitors/eval_harness.py`)
-
-Self-testing pipeline that runs a curated task suite through the real brain,
-computes quality metrics, and flags regressions.  Runs as a nightly heartbeat
-monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
-
-### Files
-
-| File | Purpose |
-|------|---------|
-| `evals/suite.yaml` | 30 evaluation tasks across 6 categories |
-| `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
-| `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
-| `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
-| `/data/eval_reports/eval_history.jsonl` | Time-series log — one line per run, appended |
-| `/data/eval_reports/eval_baseline.json` | Regression baseline (written on first run) |
-
-### Categories
-
-| Category | Tasks | What it tests |
-|----------|-------|---------------|
-| `reasoning` | 5 | Arithmetic, logic, definitions — no tools, high reflexion expected |
-| `tool-use` | 6 | calculator, code_exec, web_search invocation + answer correctness |
-| `skill-match` | 6 | Seeded "Eval: *" skills matched by exact regex (eval-probe: prefix) |
-| `semantic-match` | 5 | Paraphrase queries that must hit same skill via ChromaDB at threshold 0.65 |
-| `autonomous-tool` | 4 | Multi-step queries; metric = fraction using ≥2 tools |
-| `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
-
-### Metrics
-
-- **Per-category**: pass_rate, latency P50/P95, reflexion mean/std/P10/P90
-- **skill-match**: hit_rate (fraction of queries that matched any skill)
-- **semantic-match**: recall_at_threshold (paraphrases matching at 0.65)
-- **autonomous-tool**: multi_tool_rate (fraction using ≥2 tools)
-- **Regression flags**: any metric dropping >EVAL_REGRESSION_TOLERANCE (10%) from baseline
-
-### How to add a task
-
-Add an entry to `evals/suite.yaml`:
-
-```yaml
-- id: my_task_001          # unique snake_case id
-  category: reasoning       # one of the 6 categories above
-  query: "What is 2+2?"
-  timeout: 45               # seconds (default 60)
-  assertions:
-    - type: answer_contains
-      value: "4"
-    - type: reflexion_above
-      value: 0.5
-```
-
-For a skill-match task with a seeded skill:
-
-```yaml
-- id: skill_match_myskill
-  category: skill-match
-  query: "eval-probe: do my thing"
-  seed_skill:
-    name: "Eval: My Skill"
-    trigger_pattern: "(?i)\\beval-probe[:\\s]+.*do\\s+my\\s+thing\\b"
-    steps:
-      - tool: web_search
-        args_template: {q: "{query}"}
-        output_key: result
-  assertions:
-    - type: skill_matched
-```
-
-### How to interpret a drift flag
-
-A `RegressionFlag` in the report JSON means a metric dropped more than
-`EVAL_REGRESSION_TOLERANCE` (default 0.10 = 10 percentage points) below the
-stored baseline.  Common causes:
-
-- **skill-match.hit_rate drops** — skill patterns broken or SkillStore corrupted
-- **semantic-match.recall_at_threshold drops** — `SKILL_SEMANTIC_THRESHOLD` too high
-  (was the regression we proved empirically: raising to 0.99 drops recall to 0%)
-- **tool-use.pass_rate drops** — tool registry broken or tool unreachable
-- **reflexion_mean drifts upward** — score inflation (quality heuristic too lenient)
-
-To update the baseline after intentional improvements:
-
-```python
-from app.monitors.eval_harness import EvalHarness
-harness = EvalHarness()
-# Load any recent report JSON as the new baseline
-import json
-with open("/data/eval_reports/eval_<ts>.json") as f:
-    data = json.load(f)
-# Then write it as baseline directly
-import shutil
-shutil.copy("/data/eval_reports/eval_<ts>.json",
-            "/data/eval_reports/eval_baseline.json")
-```
-
-### Config flags
-
-| Variable | Default | Meaning |
-|----------|---------|---------|
-| `ENABLE_EVAL_HARNESS` | `true` | Enable/disable the harness monitor |
-| `EVAL_SUITE_PATH` | `evals/suite.yaml` | Path to task suite YAML |
-| `EVAL_REPORT_PATH` | `/data/eval_reports` | Output directory for reports |
-| `EVAL_REGRESSION_TOLERANCE` | `0.10` | Allowed metric drop before flagging |

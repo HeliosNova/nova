@@ -36,6 +36,11 @@ class BackgroundTaskTool(BaseTool):
                 "type": "string",
                 "description": "Task ID (required for status and cancel actions).",
             },
+            "isolation_mode": {
+                "type": "string",
+                "enum": ["full", "maintenance", "curiosity", "none"],
+                "description": "Isolation level. 'maintenance' restricts to read-only memory tools. 'curiosity' adds web_search/http_fetch. Default: 'full' (all tools).",
+            },
         },
         "required": ["action"],
     }
@@ -46,6 +51,7 @@ class BackgroundTaskTool(BaseTool):
         action: str = "",
         task: str = "",
         task_id: str = "",
+        isolation_mode: str = "full",
         **kwargs,
     ) -> ToolResult:
         if not action:
@@ -65,7 +71,7 @@ class BackgroundTaskTool(BaseTool):
         action = action.lower().strip()
 
         if action == "submit":
-            return await self._submit(tm, task)
+            return await self._submit(tm, task, isolation_mode)
         elif action == "status":
             return self._status(tm, task_id)
         elif action == "list":
@@ -75,7 +81,7 @@ class BackgroundTaskTool(BaseTool):
         else:
             return ToolResult(output="", success=False, error=f"Unknown action '{action}'. Use: submit, status, list, cancel", error_category=ErrorCategory.VALIDATION)
 
-    async def _submit(self, tm, task: str) -> ToolResult:
+    async def _submit(self, tm, task: str, isolation_mode: str = "full") -> ToolResult:
         if not task:
             return ToolResult(output="", success=False, error="No task provided for submit", error_category=ErrorCategory.VALIDATION)
 
@@ -85,18 +91,35 @@ class BackgroundTaskTool(BaseTool):
         # Shared list for partial result capture on failure
         partial_collector: list[str] = []
 
+        # Resolve isolation whitelist
+        _whitelist = None
+        if isolation_mode == "maintenance":
+            from app.core.access_tiers import MAINTENANCE_TOOLS
+            _whitelist = MAINTENANCE_TOOLS
+        elif isolation_mode == "curiosity":
+            from app.core.access_tiers import CURIOSITY_TOOLS
+            _whitelist = CURIOSITY_TOOLS
+        # "full" and "none" = no whitelist restriction
+
         async def _run_think() -> str:
-            """Run an ephemeral think() call and collect the output."""
-            async for event in think(
-                query=task,
-                conversation_id=None,
-                ephemeral=True,
-            ):
-                if event.type == EventType.TOKEN:
-                    text = event.data.get("text", "")
-                    partial_collector.append(text)
-                elif event.type == EventType.ERROR:
-                    raise RuntimeError(event.data.get("message", "unknown error"))
+            """Run an ephemeral think() call with optional tool isolation."""
+            from app.core.access_tiers import set_tool_whitelist
+            if _whitelist is not None:
+                set_tool_whitelist(_whitelist)
+            try:
+                async for event in think(
+                    query=task,
+                    conversation_id=None,
+                    ephemeral=True,
+                ):
+                    if event.type == EventType.TOKEN:
+                        text = event.data.get("text", "")
+                        partial_collector.append(text)
+                    elif event.type == EventType.ERROR:
+                        raise RuntimeError(event.data.get("message", "unknown error"))
+            finally:
+                if _whitelist is not None:
+                    set_tool_whitelist(None)
 
             result = "".join(partial_collector)
             if not result.strip():

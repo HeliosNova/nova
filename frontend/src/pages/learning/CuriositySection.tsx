@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { Search } from "lucide-react";
 import { Card, EmptyState, Skeleton } from "../../components/ui";
 import { formatDate } from "../../lib/utils";
@@ -9,6 +10,8 @@ interface Props {
 }
 
 export default function CuriositySection({ items, loading }: Props) {
+  const [filter, setFilter] = useState<"all" | "pending" | "researched" | "completed">("all");
+
   if (loading) {
     return <Skeleton lines={4} />;
   }
@@ -23,9 +26,28 @@ export default function CuriositySection({ items, loading }: Props) {
     );
   }
 
+  const filtered = filter === "all" ? items : items.filter(i => i.status === filter);
+  const pendingCount = items.filter(i => i.status === "pending").length;
+  const researchedCount = items.filter(i => i.status === "researched" || i.status === "completed").length;
+
   return (
     <section className="space-y-2">
-      {items.map((item) => (
+      <div className="mb-3 flex gap-1.5">
+        {([["all", `All (${items.length})`], ["pending", `Pending (${pendingCount})`], ["researched", `Done (${researchedCount})`]] as const).map(([key, label]) => (
+          <button
+            key={key}
+            onClick={() => setFilter(key)}
+            className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
+              filter === key
+                ? "bg-nova-accent/15 text-nova-accent border border-nova-accent/30"
+                : "text-nova-text-dim hover:text-nova-text hover:bg-nova-border/40 border border-transparent"
+            }`}
+          >
+            {label}
+          </button>
+        ))}
+      </div>
+      {filtered.map((item) => (
         <Card key={item.id}>
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0 flex-1">

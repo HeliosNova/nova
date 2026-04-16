@@ -27,12 +27,16 @@ import {
   EmptyState,
   Skeleton,
 } from "../components/ui";
+import DaemonSection from "./monitors/DaemonSection";
+
+type PageTab = "monitors" | "system";
 
 function configTarget(cfg: Record<string, unknown>): string {
   return String(cfg?.url || cfg?.query || cfg?.command || cfg?.target || "—");
 }
 
 export default function MonitorsPage() {
+  const [pageTab, setPageTab] = useState<PageTab>("monitors");
   const [monitors, setMonitors] = useState<MonitorInfo[]>([]);
   const [results, setResults] = useState<MonitorResult[]>([]);
   const [loading, setLoading] = useState(true);
@@ -47,6 +51,8 @@ export default function MonitorsPage() {
   const [formType, setFormType] = useState("url");
   const [formTarget, setFormTarget] = useState("");
   const [formSchedule, setFormSchedule] = useState(3600);
+  const [formCooldown, setFormCooldown] = useState(60);
+  const [formNotifyCondition, setFormNotifyCondition] = useState("on_change");
   const [saving, setSaving] = useState(false);
 
   // MED-6: Form validation
@@ -80,6 +86,8 @@ export default function MonitorsPage() {
     setFormType("url");
     setFormTarget("");
     setFormSchedule(3600);
+    setFormCooldown(60);
+    setFormNotifyCondition("on_change");
     setEditingId(null);
     setShowForm(false);
     setFormTouched({});
@@ -122,7 +130,7 @@ export default function MonitorsPage() {
     try {
       const result = await triggerMonitor(id);
       const status = result?.status || "ok";
-      const value = result?.value || "";
+      const value = String(result?.result || "");
       if (status === "error") {
         toast.error(`Monitor failed: ${value.slice(0, 100)}`);
       } else {
@@ -164,6 +172,8 @@ export default function MonitorsPage() {
     setFormType(m.check_type);
     setFormTarget(configTarget(m.check_config));
     setFormSchedule(m.schedule_seconds);
+    setFormCooldown(m.cooldown_minutes || 60);
+    setFormNotifyCondition(m.notify_condition || "on_change");
     setShowForm(true);
   };
 
@@ -184,6 +194,8 @@ export default function MonitorsPage() {
           check_type: formType,
           check_config: config,
           schedule_seconds: formSchedule,
+          cooldown_minutes: formCooldown,
+          notify_condition: formNotifyCondition,
         });
         toast.success("Monitor updated");
       } else {
@@ -192,6 +204,8 @@ export default function MonitorsPage() {
           check_type: formType,
           check_config: config,
           schedule_seconds: formSchedule,
+          cooldown_minutes: formCooldown,
+          notify_condition: formNotifyCondition,
         });
         toast.success("Monitor created");
       }
@@ -223,23 +237,45 @@ export default function MonitorsPage() {
           icon={<Activity size={22} />}
           title="Monitors"
           actions={
-            <Button
-              onClick={() => {
-                if (showForm) {
-                  resetForm();
-                } else {
-                  setEditingId(null);
-                  setShowForm(true);
-                }
-              }}
-              icon={showForm ? undefined : <Plus size={16} />}
-              variant={showForm ? "secondary" : "primary"}
-            >
-              {showForm ? "Cancel" : "New Monitor"}
-            </Button>
+            pageTab === "monitors" ? (
+              <Button
+                onClick={() => {
+                  if (showForm) {
+                    resetForm();
+                  } else {
+                    setEditingId(null);
+                    setShowForm(true);
+                  }
+                }}
+                icon={showForm ? undefined : <Plus size={16} />}
+                variant={showForm ? "secondary" : "primary"}
+              >
+                {showForm ? "Cancel" : "New Monitor"}
+              </Button>
+            ) : undefined
           }
         />
 
+        {/* Page tabs */}
+        <div className="mb-6 flex gap-1.5">
+          {([["monitors", "Monitors"], ["system", "System"]] as const).map(([key, label]) => (
+            <button
+              key={key}
+              onClick={() => setPageTab(key)}
+              className={`rounded-lg px-3 py-1.5 text-xs font-medium transition-all ${
+                pageTab === key
+                  ? "bg-nova-accent/15 text-nova-accent border border-nova-accent/30"
+                  : "text-nova-text-dim hover:text-nova-text hover:bg-nova-border/40 border border-transparent"
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        {pageTab === "system" && <DaemonSection />}
+
+        {pageTab === "monitors" && <>
         {/* Create/Edit form */}
         {showForm && (
           <Card className="mb-6">
@@ -301,7 +337,34 @@ export default function MonitorsPage() {
                     error={scheduleError}
                   />
                 )}
+                {scheduleHint && (
+                  <span className="text-xs text-nova-text-dim">{scheduleHint}</span>
+                )}
               </div>
+              <FormSelect
+                label="Cooldown"
+                value={String(formCooldown)}
+                onChange={(e) => setFormCooldown(Number(e.target.value))}
+                options={[
+                  { value: "15", label: "15 minutes" },
+                  { value: "30", label: "30 minutes" },
+                  { value: "60", label: "1 hour" },
+                  { value: "120", label: "2 hours" },
+                  { value: "360", label: "6 hours" },
+                  { value: "1440", label: "24 hours" },
+                ]}
+              />
+              <FormSelect
+                label="Notify Condition"
+                value={formNotifyCondition}
+                onChange={(e) => setFormNotifyCondition(e.target.value)}
+                options={[
+                  { value: "on_change", label: "On Change" },
+                  { value: "always", label: "Always" },
+                  { value: "on_error", label: "On Error" },
+                  { value: "on_threshold", label: "On Threshold" },
+                ]}
+              />
             </div>
             <div className="mt-3 flex gap-2">
               <Button
@@ -463,7 +526,7 @@ export default function MonitorsPage() {
                         key={r.id}
                         className="border-b border-nova-border last:border-0 hover:bg-nova-surface/50"
                       >
-                        <td className="px-3 py-2 font-medium">#{r.monitor_id}</td>
+                        <td className="px-3 py-2 font-medium">{monitors.find(m => m.id === r.monitor_id)?.name || `#${r.monitor_id}`}</td>
                         <td className="px-3 py-2">
                           <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
                             r.status === "ok" || r.status === "success" || r.status === "changed"
@@ -523,6 +586,7 @@ export default function MonitorsPage() {
 
         {/* Heartbeat Instructions */}
         <HeartbeatInstructions />
+        </>}
 
         {/* Monitor Detail Modal */}
         <Modal

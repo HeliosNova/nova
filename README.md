@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1%2C689%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-1%2C540%20passing-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
@@ -80,7 +80,7 @@ User query -> brain.think()
   -> classify intent (regex, no LLM call)
   -> retrieve documents (ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)
   -> build system prompt (8 prioritized blocks with truncation budget)
-  -> generate response (Ollama / OpenAI / Anthropic / Google)
+  -> generate response (Ollama — local inference)
   -> tool loop if needed (max 5 rounds, 20 built-in tools)
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
@@ -201,9 +201,6 @@ Switch providers with one env var:
 | Provider | Config | Default Model |
 |----------|--------|---------------|
 | **Ollama** (default) | `LLM_PROVIDER=ollama` | qwen3.5:27b |
-| **OpenAI** | `LLM_PROVIDER=openai` + key | gpt-4o |
-| **Anthropic** | `LLM_PROVIDER=anthropic` + key | claude-sonnet |
-| **Google** | `LLM_PROVIDER=google` + key | gemini-2.0-flash |
 
 Model routing *(experimental)*: configurable fast model for greetings, heavy model for complex reasoning, vision model for images. Set via `FAST_MODEL`, `HEAVY_MODEL`, `VISION_MODEL` env vars.
 
@@ -236,7 +233,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-1,689 tests across 64 files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
+1,540 tests across 74 files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
 
 ## Hardware Requirements
 
@@ -257,14 +254,9 @@ Nova's LLM layer is provider-agnostic — you don't need a 3090.
 | **Quantized local** | 16GB | `qwen3.5:27b-q4_K_M` — set `LLM_MODEL=qwen3.5:27b-q4_K_M` in `.env` |
 | **Smaller model** | 8GB | `qwen3.5:9b` — set `LLM_MODEL=qwen3.5:9b` in `.env` |
 | **Tiny model** | 4GB | `qwen3.5:4b` — set `LLM_MODEL=qwen3.5:4b` in `.env` |
-| **Cloud inference** | 0GB | Set `LLM_PROVIDER=openai` (or `anthropic`/`google`) + API key |
-| **Mixed** | 0GB | Cloud for inference, local for everything else |
 
-All options keep your data fully local — memory, knowledge graph, lessons, training pairs, and conversations never leave your machine. Cloud mode only sends the current query + context to the LLM provider.
 
 ```bash
-# Cloud mode — no GPU needed
-docker compose -f docker-compose.cloud.yml up -d
 
 # Quantized — fits in 16GB VRAM
 # Just change LLM_MODEL in .env, then:

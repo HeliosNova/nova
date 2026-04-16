@@ -53,11 +53,6 @@ class EventType(str, Enum):
     WARNING = "warning"
     DONE = "done"
     ERROR = "error"
-    # Multi-agent structural decomposition events
-    AGENT_META = "agent_meta"
-    AGENT_START = "agent_start"
-    AGENT_DONE = "agent_done"
-    AGENT_MERGE = "agent_merge"
 
 
 class StreamEvent(BaseModel):
