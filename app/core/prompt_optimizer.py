@@ -614,6 +614,26 @@ async def run_shadow_eval(
     if cat_metrics:
         candidate_metric = getattr(cat_metrics, target_metric, 0.0) or 0.0
 
+    # Guard: if no baseline exists, skip regression detection on first shadow run.
+    # _load_baseline_metric() returns 0.0 when the file is missing — any candidate
+    # with score > MIN_IMPROVEMENT_PP would pass, causing premature promotion.
+    if not _baseline_file_exists():
+        logger.info(
+            "prompt_optimizer: no eval baseline found — "
+            "deferring promotion until baseline is established (run_id=%s)", run_id,
+        )
+        return ShadowEvalResult(
+            run_id=run_id,
+            candidate_id=candidate_id,
+            module_name=module_name,
+            passed=False,
+            target_category=target_category,
+            baseline_metric=0.0,
+            candidate_metric=candidate_metric,
+            delta_pp=0.0,
+            reason="no baseline — first shadow run establishes baseline",
+        )
+
     # Load baseline metric from stored eval history
     baseline_metric = _load_baseline_metric(target_category, target_metric)
     delta_pp = (candidate_metric - baseline_metric) * 100
@@ -680,6 +700,12 @@ async def run_shadow_eval(
         calibration_ok=calibration_ok,
         reason=reason,
     )
+
+
+def _baseline_file_exists() -> bool:
+    """Return True if eval_baseline.json is present.  Extracted for testability."""
+    import pathlib
+    return (pathlib.Path(config.EVAL_REPORT_PATH) / "eval_baseline.json").exists()
 
 
 def _load_baseline_metric(category: str, metric_key: str) -> float:

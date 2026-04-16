@@ -30,6 +30,9 @@ from app.core.prompt_optimizer import (
     with_module_overrides,
 )
 
+# Convenience alias: patch target for the baseline-file guard in run_shadow_eval()
+_BASELINE_EXISTS = "app.core.prompt_optimizer._baseline_file_exists"
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -373,6 +376,7 @@ class TestFavorablePath:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch("app.core.prompt_optimizer._load_baseline_metric", return_value=0.85),
             patch("app.core.prompt_optimizer._load_baseline_latency", return_value=1.0),
         ):
@@ -437,6 +441,7 @@ class TestRejectionPath:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch(
                 "app.core.prompt_optimizer._load_baseline_metric",
                 side_effect=lambda cat, _m: 0.85,
@@ -482,6 +487,49 @@ class TestRejectionPath:
         assert active.version == 1
         assert active.is_baseline is True
 
+    async def test_shadow_eval_not_passed_when_no_baseline(self, db, tmp_path, monkeypatch):
+        """When eval_baseline.json is absent, run_shadow_eval must return passed=False.
+
+        Without this guard, _load_baseline_metric() returns 0.0 — any candidate with
+        score > MIN_IMPROVEMENT_PP (2pp) would appear to improve and get promoted
+        prematurely.  The guard prevents promotion until a real baseline exists.
+        """
+        monkeypatch.setenv("ENABLE_PROMPT_SELF_MOD", "true")
+        monkeypatch.setenv("PROMPT_MOD_MAX_DRIFT", "1.0")
+        monkeypatch.setenv("PROMPT_MOD_MIN_IMPROVEMENT_PP", "2.0")
+        monkeypatch.setenv("EVAL_REPORT_PATH", str(tmp_path))  # no baseline.json here
+        from app.config import reset_config; reset_config()
+        _seed_module(db, "critique_prompt")
+        store = PromptModuleStore(db=db)
+        cand_id = store.write_candidate("critique_prompt", _CANDIDATE_TEXT, "test")
+        assert cand_id is not None
+
+        # A report that would trivially pass 2pp bar if baseline were 0.0
+        good_report = _make_eval_report({
+            "reflexion-calibration": _make_category_metrics(
+                "reflexion-calibration",
+                pass_rate=0.90,
+                reflexion_mean=0.74,
+                reflexion_p10=0.60,
+                reflexion_p90=0.87,
+            ),
+        })
+
+        with patch("app.monitors.eval_harness.EvalHarness") as MockHarness:
+            mock_harness_inst = MagicMock()
+            mock_harness_inst.run_all = AsyncMock(return_value=good_report)
+            MockHarness.return_value = mock_harness_inst
+
+            result = await run_shadow_eval(cand_id, "reflexion-calibration", store=store)
+
+        assert result.passed is False
+        assert "no baseline" in result.reason.lower()
+        assert result.delta_pp == 0.0
+        # Active module must still be v1 — no premature promotion
+        active = store.get_active("critique_prompt")
+        assert active.version == 1
+        assert active.is_baseline is True
+
     async def test_shadow_eval_no_auto_promote_on_failure(self, db, monkeypatch):
         """A failed shadow eval must NOT automatically promote the candidate."""
         monkeypatch.setenv("ENABLE_PROMPT_SELF_MOD", "true")
@@ -501,6 +549,7 @@ class TestRejectionPath:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch("app.core.prompt_optimizer._load_baseline_metric", return_value=0.85),
             patch("app.core.prompt_optimizer._load_baseline_latency", return_value=1.0),
         ):
@@ -641,6 +690,7 @@ class TestGoodhartDefense:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch("app.core.prompt_optimizer._load_baseline_metric", return_value=0.80),
             patch("app.core.prompt_optimizer._load_baseline_latency", return_value=1.0),
         ):
@@ -686,6 +736,7 @@ class TestGoodhartDefense:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch("app.core.prompt_optimizer._load_baseline_metric", return_value=0.85),
             patch("app.core.prompt_optimizer._load_baseline_latency", return_value=1.0),
         ):
@@ -725,6 +776,7 @@ class TestGoodhartDefense:
 
         with (
             patch("app.monitors.eval_harness.EvalHarness") as MockHarness,
+            patch(_BASELINE_EXISTS, return_value=True),
             patch("app.core.prompt_optimizer._load_baseline_metric", return_value=0.85),
             patch("app.core.prompt_optimizer._load_baseline_latency", return_value=1.0),
         ):
