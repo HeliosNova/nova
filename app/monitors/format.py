@@ -2,10 +2,17 @@
 
 Standardizes all monitor outputs for consistent, readable Discord messages.
 Handles Discord's 2000-char limit with smart truncation.
+
+Also provides the unified one-line monitor result format:
+    <status emoji> <summary> │ <key>: <value> │ <key>: <value>
+
+Used by both LLM-driven and native-handler monitors so Discord/Telegram output
+is consistent and free of tool-call JSON leakage.
 """
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timezone
 
 
@@ -19,7 +26,100 @@ _STATUS_EMOJI = {
     "error": "\u274c",     # ❌
     "critical": "\u274c",
     "unknown": "\u2753",   # ❓
+    "skip": "\U0001f4a4",  # 💤
+    "skipped": "\U0001f4a4",
+    "info": "\U0001f4ca",  # 📊
+    "stats": "\U0001f4ca",
 }
+
+# ---------------------------------------------------------------------------
+# Unified one-line format
+# ---------------------------------------------------------------------------
+
+# Pipe separator (with non-breaking spaces so Discord/Telegram render it cleanly)
+_SEP = " \u2502 "   # " │ "
+_MAX_SUMMARY = 80
+_MAX_LINE = 400  # total budget before we bail and truncate
+
+
+# Defensive patterns for stripping tool-call artifacts from LLM output.
+# These fire when a monitor query got the model to emit raw tool-call
+# syntax instead of executing the tool — we strip the leaked JSON so it
+# doesn't show up in Discord/Telegram.
+_TOOLCALL_JSON_RE = re.compile(
+    r'\{\s*"tool"\s*:\s*"[^"]+"\s*,\s*"(?:args|arguments|parameters)"\s*:\s*\{.*?\}\s*\}',
+    re.DOTALL,
+)
+_TOOLCALL_TAG_RE = re.compile(r'</?tool_call\s*/?>', re.IGNORECASE)
+_TOOLCALL_XML_WRAP_RE = re.compile(
+    r'<tool_call>.*?</tool_call>',
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def strip_tool_call_artifacts(text: str) -> str:
+    """Remove raw tool-call JSON and XML tags that leaked from LLM output.
+
+    When a monitor's LLM tool loop fails (no tool registry, no parse, etc.)
+    the model's intended tool call can be stringified into the final result.
+    This scrubs those artifacts defensively before rendering to Discord.
+    """
+    if not text:
+        return text
+    cleaned = _TOOLCALL_XML_WRAP_RE.sub("", text)
+    cleaned = _TOOLCALL_JSON_RE.sub("", cleaned)
+    cleaned = _TOOLCALL_TAG_RE.sub("", cleaned)
+    # Collapse whitespace left behind
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned).strip()
+    return cleaned
+
+
+def _truncate_summary(summary: str, *, limit: int = _MAX_SUMMARY) -> str:
+    summary = " ".join(summary.split())  # collapse newlines/tabs
+    if len(summary) <= limit:
+        return summary
+    return summary[: limit - 1].rstrip() + "\u2026"  # single-char ellipsis
+
+
+def format_monitor_result(
+    name: str,
+    status: str,
+    summary: str,
+    fields: dict[str, str | int | float] | None = None,
+) -> str:
+    """Build the unified one-line monitor result string.
+
+    Format: "<emoji> <summary> │ <key>: <value> │ <key>: <value>"
+
+    Args:
+        name: monitor name (not rendered in the line itself — heartbeat loop
+            prepends "[<name>] " when sending). Reserved for future use.
+        status: one of ok / warn / warning / err / error / skip / skipped /
+            info / stats. Unknown statuses fall back to "❓".
+        summary: short prose summary (truncated to 80 chars).
+        fields: optional key-value pairs rendered after the summary.
+
+    The returned string never contains tool-call JSON or `</tool_call>`
+    artifacts — leaked syntax from the LLM is stripped defensively.
+    """
+    del name  # reserved; heartbeat loop prepends the name prefix
+    emoji = _STATUS_EMOJI.get((status or "").lower(), _STATUS_EMOJI["unknown"])
+    clean_summary = strip_tool_call_artifacts(summary or "")
+    clean_summary = _truncate_summary(clean_summary) or "(no summary)"
+
+    parts = [f"{emoji} {clean_summary}"]
+    if fields:
+        for k, v in fields.items():
+            if v is None or v == "":
+                continue
+            # Fields are short — no per-field truncation beyond overall budget
+            parts.append(f"{k}: {v}")
+
+    line = _SEP.join(parts)
+    # Hard cap to keep single-line output readable in Discord/Telegram
+    if len(line) > _MAX_LINE:
+        line = line[: _MAX_LINE - 1].rstrip() + "\u2026"
+    return line
 
 DISCORD_LIMIT = 2000
 # Reserve space for header/footer

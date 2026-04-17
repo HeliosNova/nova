@@ -15,6 +15,10 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from app.config import config
+from app.monitors.format import (
+    format_monitor_result,
+    strip_tool_call_artifacts,
+)
 from app.monitors.monitor_store import (
     Monitor,
     MonitorResult,  # noqa: F401 — available for callers
@@ -179,6 +183,10 @@ class HeartbeatLoop:
 
         # Execute the check
         new_value = await self._execute_check(monitor)
+        # Defensive: strip any tool-call artifacts the LLM may have emitted
+        # instead of executing the tool. Keeps Discord/Telegram output clean.
+        if new_value:
+            new_value = strip_tool_call_artifacts(new_value)
 
         # Categorize the result BEFORE recording
         _lower = (new_value or "").lower()
@@ -606,12 +614,30 @@ class HeartbeatLoop:
             "Do NOT report old news. Include specific dates in your findings."
         )
 
+        # Strict output contract — stops the LLM from offering suggestions,
+        # asking clarifying questions, or emitting raw tool-call JSON in the
+        # final answer. Tool calls themselves still fire normally during the
+        # tool loop (they're not final output).
+        output_contract = (
+            "=== OUTPUT CONTRACT ===\n"
+            "This is a monitor report, NOT a conversation. Produce a snapshot, "
+            "not a suggestion.\n"
+            "- Do NOT ask the user questions.\n"
+            "- Do NOT offer to set up, continue, or expand monitoring.\n"
+            "- Do NOT narrate your reasoning.\n"
+            "- Do NOT include raw tool-call JSON or </tool_call> in the answer.\n"
+            "- If nothing notable changed, reply exactly: "
+            "'no change | last: <UTC timestamp>'.\n"
+            "- Otherwise produce 2-3 compact bullets with specific facts and dates.\n"
+            "=== END CONTRACT ===\n\n"
+        )
+
         # Prepend context to query
         if ctx_lines:
             context_block = "=== System Context ===\n" + "\n".join(ctx_lines) + "\n=== End Context ===\n\n"
-            enriched_query = context_block + query
+            enriched_query = context_block + output_contract + query
         else:
-            enriched_query = query
+            enriched_query = output_contract + query
 
         tokens = []
         try:
@@ -630,6 +656,7 @@ class HeartbeatLoop:
 
         result = "".join(tokens).strip()
         result = _strip_deliberation(result)
+        result = strip_tool_call_artifacts(result)
         return result
 
     async def _execute_instruction(self, inst) -> None:
@@ -1364,9 +1391,9 @@ class HeartbeatLoop:
                 elapsed_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - last).total_seconds() / 3600
                 min_hours = float(cfg.get("min_hours_between", 1.0))
                 if elapsed_hours < min_hours:
-                    return (
-                        f"[Dream Consolidation skipped — last run {elapsed_hours:.1f}h ago "
-                        f"(min {min_hours}h between cycles)]"
+                    return format_monitor_result(
+                        "Dream Consolidation", "skip", "cooldown",
+                        {"cooldown": f"{elapsed_hours:.1f}h/{min_hours}h"},
                     )
         except Exception:
             pass  # If we can't check, proceed
@@ -1376,10 +1403,15 @@ class HeartbeatLoop:
             async_db = AsyncSafeDB(db) if isinstance(db, SafeDB) else db
             consolidator = DreamConsolidator(async_db)
             digest = await consolidator.run()
-            return f"DREAM CONSOLIDATION COMPLETE | {digest}"
+            return format_monitor_result(
+                "Dream Consolidation", "ok", "consolidation complete",
+                {"digest": str(digest)[:120]},
+            )
         except Exception as e:
             logger.error("[Heartbeat] Dream consolidation failed: %s", e)
-            return f"[Dream consolidation failed: {e}]"
+            return format_monitor_result(
+                "Dream Consolidation", "error", f"dream failed: {e}",
+            )
 
     async def _execute_capability_review(self, cfg: dict) -> str:
         """Review accumulated capability gaps and suggest new tools/skills.
@@ -1638,32 +1670,42 @@ class HeartbeatLoop:
         from app.database import get_db
         import os
 
-        parts = []
+        fields: dict[str, str | int | float] = {}
+        summary = "db healthy"
+        status = "info"
 
         try:
             db_path = config.DB_PATH if hasattr(config, "DB_PATH") else "/data/nova.db"
             if os.path.exists(db_path):
-                size_bytes = os.path.getsize(db_path)
-                size_mb = size_bytes / (1024 * 1024)
-                parts.append(f"DB size: {size_mb:.1f} MB")
+                size_mb = os.path.getsize(db_path) / (1024 * 1024)
+                fields["size"] = f"{size_mb:.1f}MB"
                 wal_path = db_path + "-wal"
                 if os.path.exists(wal_path):
                     wal_mb = os.path.getsize(wal_path) / (1024 * 1024)
-                    parts.append(f"WAL: {wal_mb:.1f} MB")
+                    fields["wal"] = f"{wal_mb:.1f}MB"
+                if size_mb > 500:
+                    status = "warning"
+                    summary = f"db size elevated ({size_mb:.1f}MB)"
+                else:
+                    summary = f"db {size_mb:.1f}MB"
             else:
-                parts.append(f"DB not found: {db_path}")
+                status = "error"
+                summary = f"db missing: {db_path}"
         except Exception as e:
-            parts.append(f"DB size error: {e}")
+            return format_monitor_result(
+                "DB Size Monitor", "error", f"db size error: {e}",
+            )
 
         db = get_db()
-        for table in ("conversations", "messages", "lessons", "reflexions", "skills", "kg_facts", "monitors"):
+        for table in ("conversations", "messages", "lessons", "reflexions",
+                      "skills", "kg_facts", "monitors"):
             try:
                 row = db.fetchone(f"SELECT count(*) as c FROM {table}")
-                parts.append(f"{table}: {row['c']} rows")
+                fields[table] = row["c"]
             except Exception:
                 pass
 
-        return " | ".join(parts)
+        return format_monitor_result("DB Size Monitor", status, summary, fields)
 
     async def _execute_ollama_latency_check(self) -> str:
         """Measure Ollama response latency with a trivial prompt."""
@@ -1674,12 +1716,22 @@ class HeartbeatLoop:
             start = time.monotonic()
             healthy = await provider.check_health()
             elapsed_ms = (time.monotonic() - start) * 1000
-            if healthy:
-                return f"Ollama latency: {elapsed_ms:.0f}ms (healthy)"
+            if not healthy:
+                status, summary = "error", f"ollama unhealthy ({elapsed_ms:.0f}ms)"
+            elif elapsed_ms > 5000:
+                status, summary = "error", f"ollama very slow ({elapsed_ms:.0f}ms)"
+            elif elapsed_ms > 2000:
+                status, summary = "warning", f"ollama slow ({elapsed_ms:.0f}ms)"
             else:
-                return f"Ollama latency: {elapsed_ms:.0f}ms (UNHEALTHY)"
+                status, summary = "ok", f"ollama healthy ({elapsed_ms:.0f}ms)"
+            return format_monitor_result(
+                "Ollama Latency Monitor", status, summary,
+                {"latency": f"{elapsed_ms:.0f}ms"},
+            )
         except Exception as e:
-            return f"Ollama latency: error ({e})"
+            return format_monitor_result(
+                "Ollama Latency Monitor", "error", f"ollama error: {e}",
+            )
 
     async def _execute_skill_quality_check(self) -> str:
         """Check skill corpus quality: success rates, disabled skills, dedup guard rate."""
@@ -1687,7 +1739,9 @@ class HeartbeatLoop:
 
         svc = get_services()
         if not svc.skills:
-            return "Skill store not available"
+            return format_monitor_result(
+                "Skill Quality Monitor", "error", "skill store unavailable",
+            )
 
         try:
             db = svc.skills._db
@@ -1699,16 +1753,26 @@ class HeartbeatLoop:
             degrading = db.fetchone(
                 "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
             )["c"]
-            parts = [
-                f"Total: {total}",
-                f"Enabled: {enabled}",
-                f"Disabled: {disabled}",
-                f"Avg success rate: {avg_sr:.2f}",
-                f"Degrading: {degrading}",
-            ]
-            return " | ".join(parts)
+            if degrading > 5 or avg_sr < 0.4:
+                status = "warning"
+                summary = f"{degrading} degrading, avg {avg_sr:.2f}"
+            else:
+                status = "info"
+                summary = f"{enabled}/{total} skills healthy"
+            return format_monitor_result(
+                "Skill Quality Monitor", status, summary,
+                {
+                    "total": total,
+                    "enabled": enabled,
+                    "disabled": disabled,
+                    "avg_sr": f"{avg_sr:.2f}",
+                    "degrading": degrading,
+                },
+            )
         except Exception as e:
-            return f"Skill quality error: {e}"
+            return format_monitor_result(
+                "Skill Quality Monitor", "error", f"skill quality error: {e}",
+            )
 
     async def _execute_chromadb_integrity_check(self) -> str:
         """Check ChromaDB collection health: doc count, collection status."""
@@ -1716,26 +1780,30 @@ class HeartbeatLoop:
         from app.database import get_db
 
         svc = get_services()
-        parts = []
-
+        fields: dict[str, str | int | float] = {}
+        status = "info"
+        summary = "chromadb healthy"
         if svc.retriever:
             try:
                 collection = svc.retriever._get_collection()
                 doc_count = collection.count()
-                parts.append(f"ChromaDB docs: {doc_count}")
+                fields["docs"] = doc_count
+                summary = f"{doc_count} docs indexed"
             except Exception as e:
-                parts.append(f"ChromaDB error: {e}")
+                status = "error"
+                summary = f"chromadb error: {e}"
         else:
-            parts.append("Retriever not available")
+            status = "error"
+            summary = "retriever unavailable"
 
         try:
             db = get_db()
             fts_row = db.fetchone("SELECT count(*) as c FROM chunks_fts")
-            parts.append(f"FTS5 chunks: {fts_row['c']}")
+            fields["fts5"] = fts_row["c"]
         except Exception:
             pass
 
-        return " | ".join(parts)
+        return format_monitor_result("ChromaDB Integrity", status, summary, fields)
 
     async def _execute_kg_health_check(self) -> str:
         """Check Knowledge Graph health: node count, edge count, fragmentation."""
@@ -1743,21 +1811,21 @@ class HeartbeatLoop:
 
         svc = get_services()
         if not svc.kg:
-            return "KG not available"
+            return format_monitor_result("KG Health Monitor", "error", "kg unavailable")
 
         try:
             stats = svc.kg.get_stats()
-            parts = [
-                f"Facts: {stats.get('total_facts', 0)}",
-                f"Active: {stats.get('current_facts', 0)}",
-                f"Superseded: {stats.get('superseded_facts', 0)}",
-            ]
+            fields: dict[str, str | int | float] = {
+                "facts": stats.get("total_facts", 0),
+                "active": stats.get("current_facts", 0),
+                "superseded": stats.get("superseded_facts", 0),
+            }
             db = svc.kg._db
             entities_row = db.fetchone(
                 "SELECT count(DISTINCT subject) + count(DISTINCT object) as c FROM kg_facts WHERE valid_to IS NULL"
             )
             if entities_row:
-                parts.append(f"Unique entities: {entities_row['c']}")
+                fields["entities"] = entities_row["c"]
             orphans_row = db.fetchone("""
                 SELECT count(*) as c FROM (
                     SELECT subject as entity FROM kg_facts WHERE valid_to IS NULL
@@ -1767,10 +1835,16 @@ class HeartbeatLoop:
                 )
             """)
             if orphans_row:
-                parts.append(f"Orphans: {orphans_row['c']}")
-            return " | ".join(parts)
+                fields["orphans"] = orphans_row["c"]
+            active = fields.get("active", 0)
+            orphans = fields.get("orphans", 0)
+            status = "warning" if isinstance(active, int) and active and isinstance(orphans, int) and orphans / max(active, 1) > 0.6 else "info"
+            summary = f"{active} active facts"
+            return format_monitor_result("KG Health Monitor", status, summary, fields)
         except Exception as e:
-            return f"KG health error: {e}"
+            return format_monitor_result(
+                "KG Health Monitor", "error", f"kg health error: {e}",
+            )
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""
