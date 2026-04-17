@@ -405,6 +405,62 @@ class TestRateLimiting:
             resp = client.get("/api/health")
             assert resp.status_code == 200
 
+    def test_ratelimit_headers_present_on_normal_request(self, client):
+        """Normal requests must include X-RateLimit-Limit/Remaining/Reset headers."""
+        resp = client.get("/api/status")
+        assert "X-RateLimit-Limit" in resp.headers
+        assert "X-RateLimit-Remaining" in resp.headers
+        assert "X-RateLimit-Reset" in resp.headers
+        assert int(resp.headers["X-RateLimit-Limit"]) >= 1
+
+    def test_ratelimit_headers_present_on_429(self, client):
+        """429 response must also carry rate-limit headers with Remaining=0."""
+        resp = None
+        for _ in range(65):
+            resp = client.get("/api/status")
+            if resp.status_code == 429:
+                break
+        assert resp is not None and resp.status_code == 429
+        assert resp.headers.get("X-RateLimit-Remaining") == "0"
+        assert "X-RateLimit-Limit" in resp.headers
+        assert "X-RateLimit-Reset" in resp.headers
+
+    def test_remaining_decrements(self, client):
+        """X-RateLimit-Remaining should decrease with each request."""
+        remaining_values = []
+        for _ in range(3):
+            r = client.get("/api/status")
+            if r.status_code == 200:
+                remaining_values.append(int(r.headers.get("X-RateLimit-Remaining", -1)))
+        assert len(remaining_values) >= 2
+        assert remaining_values[0] > remaining_values[-1]
+
+    def test_custom_limit_respected(self, db, monkeypatch):
+        """RATE_LIMIT_RPM config drives the effective per-IP limit."""
+        monkeypatch.setenv("RATE_LIMIT_RPM", "3")
+        import importlib, app.config, app.auth
+        importlib.reload(app.config)
+        importlib.reload(app.auth)
+
+        from fastapi.testclient import TestClient
+        from app.main import app, _rate_limit_requests
+        _rate_limit_requests.clear()
+
+        from app.core.brain import Services, set_services
+        from app.core.memory import ConversationStore, UserFactStore
+        svc = Services(conversations=ConversationStore(db), user_facts=UserFactStore(db))
+        set_services(svc)
+
+        with patch("app.main.config") as mock_cfg:
+            mock_cfg.RATE_LIMIT_RPM = 3
+            mock_cfg.API_KEY = ""
+            mock_cfg.REQUIRE_AUTH = False
+            mock_cfg.TRUSTED_PROXY = None
+            client_low = TestClient(app)
+            statuses = [client_low.get("/api/status").status_code for _ in range(6)]
+
+        assert 429 in statuses, "Low limit (3 rpm) should trigger 429 within 6 requests"
+
 
 # ---------------------------------------------------------------------------
 # Auth failure dict eviction (bounded growth)
@@ -680,3 +736,69 @@ class TestAccessTierConfigValidation:
             blocked = get_blocked_shell_commands()
             # Falls back to sandboxed, which blocks interpreters
             assert "python" in blocked
+
+
+# ---------------------------------------------------------------------------
+# Finding #10: Config orphan cleanup / unimplemented-provider warning
+# ---------------------------------------------------------------------------
+
+class TestConfigOrphansAndValidation:
+    """Verify removed orphan fields are gone and validate() catches silent failures."""
+
+    def test_temperature_internal_removed(self):
+        """TEMPERATURE_INTERNAL was unused (llm.py hard-codes defaults) — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "TEMPERATURE_INTERNAL"), (
+            "TEMPERATURE_INTERNAL is an orphan — llm.py never reads it. Remove from Config."
+        )
+
+    def test_temperature_reflexion_removed(self):
+        """TEMPERATURE_REFLEXION was unused — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "TEMPERATURE_REFLEXION")
+
+    def test_openai_use_completion_tokens_removed(self):
+        """OPENAI_USE_COMPLETION_TOKENS has no reader in app code — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "OPENAI_USE_COMPLETION_TOKENS")
+
+    def test_anthropic_api_version_removed(self):
+        """ANTHROPIC_API_VERSION has no reader in app code — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "ANTHROPIC_API_VERSION")
+
+    def test_anthropic_beta_header_removed(self):
+        """ANTHROPIC_BETA_HEADER has no reader in app code — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "ANTHROPIC_BETA_HEADER")
+
+    def test_validate_warns_on_unimplemented_provider_anthropic(self):
+        """validate() must warn when LLM_PROVIDER=anthropic but the module doesn't exist."""
+        from app.config import Config
+        cfg = Config(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="sk-fake")
+        warnings = cfg.validate()
+        assert any("anthropic" in w.lower() and "not exist" in w.lower() for w in warnings), (
+            f"Expected warning about missing anthropic module. Got: {warnings}"
+        )
+
+    def test_validate_warns_on_unimplemented_provider_openai(self):
+        """validate() must warn when LLM_PROVIDER=openai but the module doesn't exist."""
+        from app.config import Config
+        cfg = Config(LLM_PROVIDER="openai", OPENAI_API_KEY="sk-fake")
+        warnings = cfg.validate()
+        assert any("openai" in w.lower() and "not exist" in w.lower() for w in warnings)
+
+    def test_validate_no_warning_for_ollama(self):
+        """validate() must NOT warn about provider when LLM_PROVIDER=ollama (implemented)."""
+        from app.config import Config
+        cfg = Config(LLM_PROVIDER="ollama")
+        warnings = cfg.validate()
+        assert not any("not exist" in w.lower() for w in warnings)
+
+    def test_base_urls_still_present(self):
+        """Provider base URLs must be kept — they'll be needed when providers are implemented."""
+        from app.config import Config
+        cfg = Config()
+        assert hasattr(cfg, "OPENAI_BASE_URL")
+        assert hasattr(cfg, "ANTHROPIC_BASE_URL")
+        assert hasattr(cfg, "GOOGLE_BASE_URL")
