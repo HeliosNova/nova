@@ -146,7 +146,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     last_check_at TEXT,
     last_alert_at TEXT,
     last_result TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    -- category: 'system' = internal/health (telegram only);
+    --          'content' = news/domain feeds (all channels).
+    -- See app/monitors/monitor_store.classify_category.
+    category TEXT DEFAULT 'content'
 );
 
 CREATE TABLE IF NOT EXISTS monitor_results (
@@ -555,6 +559,21 @@ class SafeDB:
                         "ON prompt_modules (module_name, status)"
                     )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (12,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 13: monitors.category column for channel routing ---
+        if 13 not in applied:
+            conn.execute("BEGIN")
+            try:
+                mcols = {row[1] for row in conn.execute("PRAGMA table_info(monitors)").fetchall()}
+                if "category" not in mcols:
+                    conn.execute(
+                        "ALTER TABLE monitors ADD COLUMN category TEXT DEFAULT 'content'"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (13,))
                 conn.commit()
             except Exception:
                 conn.rollback()

@@ -1563,12 +1563,23 @@ class HeartbeatLoop:
             return f"Monitor '{monitor.name}' update: {new_value[:200]}"
 
     async def _send_alert(self, monitor: Monitor, message: str) -> None:
-        """Send an alert via available channel bots."""
+        """Send an alert via available channel bots.
+
+        Channel routing by category:
+        - system : Telegram ONLY. Internal health/meta output (DB size,
+                   ollama latency, consolidation, eval harness, etc.). Discord
+                   has users who get confused by this output so it stays
+                   behind the operator channel.
+        - content: Discord + Telegram + WhatsApp + Signal (all configured).
+                   News feeds, domain studies, public-facing monitor results.
+        """
         prefix = f"[{monitor.name}] "
         full_message = prefix + message
 
+        is_system = monitor.category == "system"
+
         sent = False
-        if self._discord:
+        if self._discord and not is_system:
             try:
                 await self._discord.send_alert(full_message)
                 sent = True
@@ -1582,14 +1593,14 @@ class HeartbeatLoop:
             except Exception as e:
                 logger.error("[Heartbeat] Telegram alert failed: %s", e)
 
-        if self._whatsapp:
+        if self._whatsapp and not is_system:
             try:
                 await self._whatsapp.send_alert(full_message)
                 sent = True
             except Exception as e:
                 logger.error("[Heartbeat] WhatsApp alert failed: %s", e)
 
-        if self._signal:
+        if self._signal and not is_system:
             try:
                 await self._signal.send_alert(full_message)
                 sent = True
@@ -1597,12 +1608,20 @@ class HeartbeatLoop:
                 logger.error("[Heartbeat] Signal alert failed: %s", e)
 
         if sent:
-            logger.info("[Heartbeat] Alert sent for '%s'", monitor.name)
+            logger.info(
+                "[Heartbeat] Alert sent for '%s' (category=%s)",
+                monitor.name, monitor.category,
+            )
             try:
                 from app.tools.action_logging import log_action
                 log_action("alert", {"monitor": monitor.name}, message[:500], True)
             except Exception:
                 pass
+        elif is_system and not self._telegram:
+            logger.warning(
+                "[Heartbeat] system-category monitor '%s' has no Telegram channel — suppressed",
+                monitor.name,
+            )
         elif self._discord or self._telegram or self._whatsapp or self._signal:
             logger.error("[Heartbeat] ALL notification channels failed for '%s'", monitor.name)
         else:

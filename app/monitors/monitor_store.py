@@ -41,6 +41,64 @@ class Monitor:
     last_alert_at: str | None
     last_result: str | None
     created_at: str
+    category: str = "content"  # 'system' (telegram-only, internal health) or
+                               # 'content' (domain/news feeds, all channels)
+
+
+# Monitors whose output is about Nova itself (health, meta, internal state).
+# These route to Telegram only — Discord has confused users who don't want
+# internal telemetry.  Matched by monitor name OR by check_type so new
+# health-style monitors are classified correctly by default.
+_SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
+    "DB Size Monitor",
+    "Ollama Latency Monitor",
+    "Skill Quality Monitor",
+    "ChromaDB Integrity",
+    "KG Health Monitor",
+    "Dream Consolidation",
+    "Capability Review",
+    "Quality Eval Harness",
+    "Prompt Optimizer",
+    "System Health",
+    "System Maintenance",
+    "Fine-Tune Check",
+    "Skill Validation",
+    "Lesson Quiz",
+    "Auto-Monitor Detector",
+    "Training Job Watch",
+    "KG Growth Rate",
+    "Ollama Model Loaded",
+})
+
+_SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
+    "system_health",
+    "db_size",
+    "ollama_latency",
+    "skill_quality",
+    "chromadb_integrity",
+    "kg_health",
+    "maintenance",
+    "finetune",
+    "consolidation",
+    "capability_review",
+    "eval",
+    "prompt_analyzer",
+    "quiz",
+    "skill_test",
+    "auto_monitor",
+    "training_job",
+    "kg_growth",
+    "ollama_model",
+})
+
+
+def classify_category(name: str, check_type: str) -> str:
+    """Classify a monitor into 'system' or 'content' for channel routing."""
+    if name in _SYSTEM_CATEGORY_NAMES:
+        return "system"
+    if check_type in _SYSTEM_CATEGORY_CHECK_TYPES:
+        return "system"
+    return "content"
 
 
 @dataclass
@@ -85,15 +143,18 @@ class MonitorStore:
         schedule_seconds: int = 300,
         cooldown_minutes: int = 60,
         notify_condition: str = "on_change",
+        category: str | None = None,
+        enabled: bool = True,
     ) -> int:
         """Create a monitor. Returns its ID, or -1 if name exists."""
+        cat = category or classify_category(name, check_type)
         try:
             cursor = self._db.execute(
                 """INSERT INTO monitors (name, check_type, check_config, schedule_seconds,
-                   cooldown_minutes, notify_condition)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   cooldown_minutes, notify_condition, category, enabled)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (name, check_type, json.dumps(check_config), schedule_seconds,
-                 cooldown_minutes, notify_condition),
+                 cooldown_minutes, notify_condition, cat, 1 if enabled else 0),
             )
             return cursor.lastrowid
         except Exception as e:
@@ -114,7 +175,8 @@ class MonitorStore:
 
     def update(self, monitor_id: int, **kwargs) -> bool:
         allowed = {"name", "check_type", "check_config", "schedule_seconds",
-                    "enabled", "cooldown_minutes", "notify_condition", "last_check_at"}
+                    "enabled", "cooldown_minutes", "notify_condition", "last_check_at",
+                    "category"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -194,6 +256,13 @@ class MonitorStore:
             parsed = json.loads(cfg) if isinstance(cfg, str) else cfg
         except (json.JSONDecodeError, TypeError):
             parsed = {}
+        # category column may not exist on databases predating migration 13
+        try:
+            category = row["category"] if "category" in row.keys() else None
+        except (KeyError, TypeError):
+            category = None
+        if not category:
+            category = classify_category(row["name"], row["check_type"])
         return Monitor(
             id=row["id"],
             name=row["name"],
@@ -207,6 +276,7 @@ class MonitorStore:
             last_alert_at=row["last_alert_at"],
             last_result=row["last_result"],
             created_at=row["created_at"],
+            category=category,
         )
 
     def _row_to_result(self, row) -> MonitorResult:
@@ -586,6 +656,15 @@ class MonitorStore:
 
     def _migrate_existing_monitors(self) -> None:
         """Update existing domain study queries to multi-topic format and fix check_types."""
+        # Back-populate category on existing rows where it's empty/NULL.
+        # Safe: classify_category is deterministic from (name, check_type).
+        try:
+            for m in self.list_all():
+                if not m.category:
+                    self.update(m.id, category=classify_category(m.name, m.check_type))
+        except Exception as e:
+            logger.warning("[MonitorStore] Category back-fill failed: %s", e)
+
         # Check if migration already applied
         _MIGRATION_VERSION = 3
         self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
