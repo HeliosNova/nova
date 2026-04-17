@@ -703,3 +703,75 @@ class TestEmpiricalCorpus:
         recall = self._recall_at_k(seeded_retriever, k=3, rerank=True)
         # At k=3 in a well-designed corpus, ≥50% expected
         assert recall >= 0.50, f"Reranker Recall@3 too low: {recall:.0%}"
+
+
+# ===========================================================================
+# FTS5 Backfill — reconcile FTS5 with ChromaDB
+# ===========================================================================
+
+class TestFTS5Backfill:
+    """backfill_fts5() re-inserts ChromaDB chunks that are missing from FTS5."""
+
+    @pytest.fixture
+    def fake_collection(self):
+        """Stub ChromaDB collection with get(offset, limit) + count()."""
+        chunks = [
+            ("doc1_chunk_0", "alpha beta gamma", {"document_id": "doc1"}),
+            ("doc1_chunk_1", "delta epsilon zeta", {"document_id": "doc1"}),
+            ("doc2_chunk_0", "Project Helios is a sovereign AI", {"document_id": "doc2"}),
+            ("doc3_chunk_0", "knowledge graph stores temporal facts", {"document_id": "doc3"}),
+        ]
+
+        class _Coll:
+            def count(self):
+                return len(chunks)
+
+            def get(self, limit=None, offset=0, include=None):
+                sub = chunks[offset : (offset + limit) if limit else None]
+                return {
+                    "ids": [c[0] for c in sub],
+                    "documents": [c[1] for c in sub],
+                    "metadatas": [c[2] for c in sub],
+                }
+
+        return _Coll()
+
+    def test_backfill_inserts_missing_chunks(self, db, fake_collection):
+        retriever = Retriever(db=db, chroma_collection=fake_collection)
+        # Seed one chunk already in FTS5 — simulates partial population
+        db.execute(
+            "INSERT INTO chunks_fts (chunk_id, document_id, content) VALUES (?, ?, ?)",
+            ("doc1_chunk_0", "doc1", "alpha beta gamma"),
+        )
+
+        report = retriever.backfill_fts5(batch_size=2)
+        assert report["chromadb_chunks"] == 4
+        assert report["fts5_before"] == 1
+        assert report["fts5_after"] == 4
+        assert report["inserted"] == 3
+        assert report["skipped"] == 1
+
+    def test_backfill_is_idempotent(self, db, fake_collection):
+        retriever = Retriever(db=db, chroma_collection=fake_collection)
+        retriever.backfill_fts5()
+        report = retriever.backfill_fts5()
+        assert report["inserted"] == 0
+        assert report["fts5_after"] == 4
+
+    def test_backfill_enables_fts5_search(self, db, fake_collection):
+        """Sanity: after backfill, FTS5 BM25 search returns non-zero results."""
+        retriever = Retriever(db=db, chroma_collection=fake_collection)
+        # Before backfill — BM25 is empty
+        assert retriever._fts5_search("Project Helios", 5) == []
+        assert retriever._fts5_search("knowledge graph", 5) == []
+
+        retriever.backfill_fts5()
+
+        helios = retriever._fts5_search("Project Helios", 5)
+        assert len(helios) >= 1
+        assert helios[0].bm25_score > 0
+        assert "Helios" in helios[0].content
+
+        kg = retriever._fts5_search("knowledge graph", 5)
+        assert len(kg) >= 1
+        assert kg[0].bm25_score > 0

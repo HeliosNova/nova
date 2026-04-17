@@ -242,7 +242,96 @@ class Retriever:
         except Exception as e:
             logger.error("ChromaDB ingest failed: %s", e)
 
+        # Post-write verification: both stores must have the same chunk count.
+        # Catches silent drift (future regressions in either write path) so we
+        # don't end up with a half-populated FTS5 index that kills BM25 recall.
+        try:
+            fts_count_row = self._db.fetchone(
+                "SELECT count(*) AS c FROM chunks_fts WHERE document_id = ?", (doc_id,)
+            )
+            fts_n = int(fts_count_row["c"]) if fts_count_row else 0
+            if fts_n != len(chunks):
+                logger.error(
+                    "Ingest verification failed: doc %s expected %d FTS5 chunks, got %d",
+                    doc_id, len(chunks), fts_n,
+                )
+        except Exception as e:
+            logger.debug("Ingest verification skipped: %s", e)
+
         return doc_id, len(chunks)
+
+    def backfill_fts5(self, *, batch_size: int = 500) -> dict:
+        """Reconcile FTS5 with ChromaDB — re-insert any chunks missing from FTS5.
+
+        Used as a one-off fixer when FTS5 drifted out of sync with ChromaDB
+        (e.g. after a prior ingest bug or manual ChromaDB edits). Idempotent.
+
+        Returns {"chromadb_chunks": N, "fts5_before": N, "fts5_after": N,
+                 "inserted": N, "skipped": N}.
+        """
+        try:
+            collection = self._get_collection()
+        except Exception as e:
+            logger.error("backfill_fts5: ChromaDB unavailable: %s", e)
+            return {"error": f"ChromaDB unavailable: {e}"}
+
+        total = collection.count()
+        before = self._db.fetchone("SELECT count(*) AS c FROM chunks_fts")
+        before_n = int(before["c"]) if before else 0
+
+        inserted = 0
+        skipped = 0
+        offset = 0
+        while offset < total:
+            got = collection.get(
+                limit=batch_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            ids = got.get("ids") or []
+            docs = got.get("documents") or []
+            metas = got.get("metadatas") or []
+            if not ids:
+                break
+
+            existing_rows = self._db.fetchall(
+                "SELECT chunk_id FROM chunks_fts WHERE chunk_id IN ({})".format(
+                    ",".join("?" * len(ids))
+                ),
+                tuple(ids),
+            )
+            existing = {r["chunk_id"] for r in existing_rows}
+
+            rows_to_insert = []
+            for chunk_id, content, meta in zip(ids, docs, metas):
+                if chunk_id in existing:
+                    skipped += 1
+                    continue
+                if not content:
+                    skipped += 1
+                    continue
+                doc_id = (meta or {}).get("document_id") or chunk_id.rsplit("_chunk_", 1)[0]
+                rows_to_insert.append((chunk_id, doc_id, content))
+
+            if rows_to_insert:
+                with self._db.transaction() as tx:
+                    tx.executemany(
+                        "INSERT INTO chunks_fts (chunk_id, document_id, content) VALUES (?, ?, ?)",
+                        rows_to_insert,
+                    )
+                inserted += len(rows_to_insert)
+
+            offset += len(ids)
+
+        after = self._db.fetchone("SELECT count(*) AS c FROM chunks_fts")
+        after_n = int(after["c"]) if after else 0
+        return {
+            "chromadb_chunks": total,
+            "fts5_before": before_n,
+            "fts5_after": after_n,
+            "inserted": inserted,
+            "skipped": skipped,
+        }
 
     def get_document(self, doc_id: str) -> dict | None:
         """Get document metadata."""
