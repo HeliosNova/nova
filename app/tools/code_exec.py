@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import asyncio
 import logging
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -145,23 +146,24 @@ class CodeExecTool(BaseTool):
         if safety_error:
             return ToolResult(output="", success=False, error=safety_error, error_category=ErrorCategory.PERMISSION)
 
+        sandbox_dir = None
         script_path = None
         try:
-            # Write code to temp file
-            with tempfile.NamedTemporaryFile(
-                mode="w", suffix=".py", delete=False
-            ) as f:
+            # Per-request isolated sandbox directory — prevents cross-request file leakage.
+            # Everything created by user code lands here and is wiped in finally.
+            sandbox_dir = tempfile.mkdtemp(prefix="nova_code_")
+            script_path = str(Path(sandbox_dir) / "_script.py")
+            with open(script_path, "w") as f:
                 f.write(code)
-                script_path = f.name
 
             # Execute in subprocess with timeout and minimal env (no token leakage)
             result = await asyncio.to_thread(
                 subprocess.run,
-                [sys.executable, script_path],
+                [sys.executable, "-I", script_path],
                 capture_output=True,
                 text=True,
                 timeout=config.CODE_EXEC_TIMEOUT,
-                cwd=tempfile.gettempdir(),
+                cwd=sandbox_dir,
                 env=get_safe_env(),
             )
 
@@ -203,8 +205,8 @@ class CodeExecTool(BaseTool):
         except Exception as e:
             return ToolResult(output="", success=False, error=f"Execution failed: {e}", error_category=ErrorCategory.INTERNAL)
         finally:
-            if script_path:
+            if sandbox_dir:
                 try:
-                    Path(script_path).unlink()
+                    shutil.rmtree(sandbox_dir, ignore_errors=True)
                 except OSError:
                     pass
