@@ -42,8 +42,6 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("RESPONSE_TOKEN_BUDGET", "600")
     monkeypatch.setenv("RETRIEVAL_RELEVANCE_THRESHOLD", "0.15")
     monkeypatch.setenv("TEMPERATURE_DEFAULT", "0.7")
-    monkeypatch.setenv("TEMPERATURE_INTERNAL", "0.3")
-    monkeypatch.setenv("TEMPERATURE_REFLEXION", "0.4")
     monkeypatch.setenv("MIN_RRF_SCORE", "0.015")
     monkeypatch.setenv("DEDUP_JACCARD_THRESHOLD", "0.85")
     monkeypatch.setenv("REFLEXION_DECAY_DAYS", "90")

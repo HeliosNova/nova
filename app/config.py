@@ -66,7 +66,7 @@ _MUTABLE_FIELDS = {
     "MAX_CRITIQUE_ROUNDS", "DIGEST_HOUR", "USER_TIMEZONE",
     # Tuning parameters
     "RESPONSE_TOKEN_BUDGET", "RETRIEVAL_RELEVANCE_THRESHOLD",
-    "TEMPERATURE_DEFAULT", "TEMPERATURE_INTERNAL", "TEMPERATURE_REFLEXION",
+    "TEMPERATURE_DEFAULT",
     "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
@@ -260,8 +260,6 @@ class Config:
     RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 600))
     RETRIEVAL_RELEVANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("RETRIEVAL_RELEVANCE_THRESHOLD", 0.15))
     TEMPERATURE_DEFAULT: float = field(default_factory=lambda: _env_float("TEMPERATURE_DEFAULT", 0.7))
-    TEMPERATURE_INTERNAL: float = field(default_factory=lambda: _env_float("TEMPERATURE_INTERNAL", 0.3))
-    TEMPERATURE_REFLEXION: float = field(default_factory=lambda: _env_float("TEMPERATURE_REFLEXION", 0.4))
     MIN_RRF_SCORE: float = field(default_factory=lambda: _env_float("MIN_RRF_SCORE", 0.015))
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
@@ -301,15 +299,10 @@ class Config:
     # Max latency overhead before blocking (1.15 = 15% overhead allowed)
     PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))
 
-    # OpenAI token counting: use completion_tokens instead of total_tokens
-    OPENAI_USE_COMPLETION_TOKENS: bool = field(default_factory=lambda: _env("OPENAI_USE_COMPLETION_TOKENS", "false").lower() == "true")
-
-    # Provider base URLs (for self-hosted / proxy setups)
+    # Provider base URLs (for self-hosted / proxy setups — used when provider modules are implemented)
     OPENAI_BASE_URL: str = field(default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com"))
     ANTHROPIC_BASE_URL: str = field(default_factory=lambda: _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
     GOOGLE_BASE_URL: str = field(default_factory=lambda: _env("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com"))
-    ANTHROPIC_API_VERSION: str = field(default_factory=lambda: _env("ANTHROPIC_API_VERSION", "2024-10-22"))
-    ANTHROPIC_BETA_HEADER: str = field(default_factory=lambda: _env("ANTHROPIC_BETA_HEADER", "interleaved-thinking-2025-05-14"))
 
     # System access tiers (sandboxed | standard | full | none)
     SYSTEM_ACCESS_LEVEL: str = field(default_factory=lambda: _env("SYSTEM_ACCESS_LEVEL", "sandboxed"))
@@ -488,6 +481,18 @@ class Config:
         if self.LLM_PROVIDER in provider_keys and not provider_keys[self.LLM_PROVIDER]:
             key_name = f"{self.LLM_PROVIDER.upper()}_API_KEY"
             warnings.append(f"{key_name} is required when LLM_PROVIDER={self.LLM_PROVIDER}")
+
+        # Warn when a non-Ollama provider is configured but its module isn't implemented yet
+        _unimplemented = {"openai", "anthropic", "google"}
+        if self.LLM_PROVIDER in _unimplemented:
+            import importlib.util
+            module_name = f"app.core.providers.{self.LLM_PROVIDER}"
+            if importlib.util.find_spec(module_name) is None:
+                warnings.append(
+                    f"LLM_PROVIDER={self.LLM_PROVIDER} is configured but "
+                    f"'app/core/providers/{self.LLM_PROVIDER}.py' does not exist — "
+                    f"requests will fail at runtime. Only 'ollama' is currently implemented."
+                )
 
         if not self.OLLAMA_URL.startswith(("http://", "https://")):
             warnings.append(f"OLLAMA_URL must start with http:// or https://, got: {self.OLLAMA_URL}")
