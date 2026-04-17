@@ -443,6 +443,18 @@ _META_PATTERNS = [
     # Defense-in-depth: strip leaked tool-call placeholders that sometimes
     # survive when the model imitates its own assistant history.
     re.compile(r"^\s*\[Calling tool:\s*[\w.\-]+\]\s*$", re.MULTILINE),
+    # Qwen / Hermes-style tool call blocks — `<tool_call>{…}</tool_call>`.
+    # When the extractor can't resolve the call (unknown tool name, circuit-
+    # broken round, or final round emits another call instead of prose) the
+    # raw block slips into the final answer. Strip both the tagged variant
+    # and a bare JSON-object variant that starts with `"name":`/`"tool":`.
+    re.compile(r"<tool_call>\s*\{.*?\}\s*</tool_call>", re.DOTALL | re.IGNORECASE),
+    re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL | re.IGNORECASE),
+    re.compile(
+        r'^\s*\{\s*"(?:name|tool|function)"\s*:\s*"[\w.\-]+"\s*,'
+        r'\s*"(?:arguments|args|parameters)"\s*:\s*\{.*?\}\s*\}\s*$',
+        re.DOTALL | re.MULTILINE,
+    ),
     # Date confusion disclaimers (Qwen calls 2026 a "simulated future date")
     re.compile(r"\b(?:simulated|hypothetical)\s+(?:future\s+)?date\b[^.]*\.?", re.IGNORECASE),
     re.compile(r"\b(?:since|as)\s+(?:my\s+)?training\s+(?:data\s+)?cut-?off\b[^.]*\.?", re.IGNORECASE),

@@ -767,6 +767,69 @@ class TestAnswerSanitizer:
         assert "Line 1." in result
         assert "Line 2." in result
 
+    def test_strips_tool_call_wrapped_json(self):
+        """Regression: Q3 runtime-eval ("What have I said about Project Helios
+        before?") returned raw <tool_call>{…}</tool_call> instead of prose."""
+        from app.core.brain import _sanitize_answer
+        text = (
+            'Here is what I found:\n'
+            '<tool_call>{"name":"document_search","arguments":'
+            '{"query":"Project Helios"}}</tool_call>\n'
+            'That is all.'
+        )
+        result = _sanitize_answer(text)
+        assert "<tool_call>" not in result
+        assert "</tool_call>" not in result
+        assert '"name"' not in result
+        assert '"arguments"' not in result
+        assert "Here is what I found" in result
+        assert "That is all." in result
+
+    def test_strips_tool_call_only_response(self):
+        """Final answer that is ONLY a tool_call block should collapse to empty."""
+        from app.core.brain import _sanitize_answer
+        text = (
+            '<tool_call>{"name":"nova_memory_query","arguments":'
+            '{"query":"Project Helios"}}</tool_call>'
+        )
+        result = _sanitize_answer(text)
+        assert "<tool_call>" not in result
+        assert "nova_memory_query" not in result
+        assert result.strip() == ""
+
+    def test_strips_bare_tool_call_json_line(self):
+        """Model sometimes emits the raw JSON alone on a line (no tags)."""
+        from app.core.brain import _sanitize_answer
+        text = (
+            'Short summary.\n'
+            '{"name":"document_search","arguments":{"query":"Helios"}}\n'
+            'End.'
+        )
+        result = _sanitize_answer(text)
+        assert '"name"' not in result
+        assert "document_search" not in result
+        assert "Short summary." in result
+        assert "End." in result
+
+    def test_strips_multiline_tool_call_block(self):
+        """Tool call with newlines inside should still be stripped."""
+        from app.core.brain import _sanitize_answer
+        text = (
+            'Here we go.\n'
+            '<tool_call>\n'
+            '{\n'
+            '  "name": "document_search",\n'
+            '  "arguments": {"query": "Project Helios"}\n'
+            '}\n'
+            '</tool_call>\n'
+            'Done.'
+        )
+        result = _sanitize_answer(text)
+        assert "<tool_call>" not in result
+        assert "document_search" not in result
+        assert "Here we go." in result
+        assert "Done." in result
+
 
 # ===========================================================================
 # Failure-Context Lesson Detection (prompt.py)
