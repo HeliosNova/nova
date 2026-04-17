@@ -172,7 +172,7 @@ async def chat_sync(request: ChatRequest):
 async def list_conversations(limit: int = Query(default=50, ge=1, le=500)):
     """List recent conversations."""
     svc = get_services()
-    return svc.conversations.list_conversations(limit=limit)
+    return await asyncio.to_thread(svc.conversations.list_conversations, limit)
 
 
 @router.get("/chat/conversations/search")
@@ -181,7 +181,7 @@ async def search_conversations(q: str = Query(max_length=1_000), limit: int = Qu
     svc = get_services()
     if not q.strip():
         return []
-    return svc.conversations.search_conversations(q, limit=limit)
+    return await asyncio.to_thread(lambda: svc.conversations.search_conversations(q, limit=limit))
 
 
 @router.get("/chat/messages/search")
@@ -190,18 +190,18 @@ async def search_messages(q: str = Query(max_length=1_000), limit: int = Query(d
     svc = get_services()
     if not q.strip():
         return []
-    return svc.conversations.search_messages(q, limit=limit)
+    return await asyncio.to_thread(lambda: svc.conversations.search_messages(q, limit=limit))
 
 
 @router.get("/chat/conversations/{conv_id}")
 async def get_conversation(conv_id: str):
     """Get a conversation with its messages."""
     svc = get_services()
-    conv = svc.conversations.get_conversation(conv_id)
+    conv = await asyncio.to_thread(svc.conversations.get_conversation, conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
 
-    messages = svc.conversations.get_history(conv_id, limit=100)
+    messages = await asyncio.to_thread(svc.conversations.get_history, conv_id, 100)
     return {
         **conv,
         "messages": [
@@ -223,11 +223,11 @@ async def get_conversation(conv_id: str):
 async def rename_conversation(conv_id: str, body: RenameRequest):
     """Rename a conversation."""
     svc = get_services()
-    conv = svc.conversations.get_conversation(conv_id)
+    conv = await asyncio.to_thread(svc.conversations.get_conversation, conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
     title = body.title.strip()
-    svc.conversations.update_title(conv_id, title)
+    await asyncio.to_thread(svc.conversations.update_title, conv_id, title)
     return {"status": "ok", "conversation_id": conv_id, "title": title}
 
 
@@ -235,10 +235,10 @@ async def rename_conversation(conv_id: str, body: RenameRequest):
 async def delete_conversation(conv_id: str):
     """Delete a conversation and all its messages."""
     svc = get_services()
-    conv = svc.conversations.get_conversation(conv_id)
+    conv = await asyncio.to_thread(svc.conversations.get_conversation, conv_id)
     if conv is None:
         raise HTTPException(status_code=404, detail="Conversation not found")
-    svc.conversations.delete_conversation(conv_id)
+    await asyncio.to_thread(svc.conversations.delete_conversation, conv_id)
     return {"status": "deleted", "conversation_id": conv_id}
 
 
@@ -250,7 +250,7 @@ async def delete_conversation(conv_id: str):
 async def list_facts():
     """List all user facts."""
     svc = get_services()
-    facts = svc.user_facts.get_all()
+    facts = await asyncio.to_thread(svc.user_facts.get_all)
     return [
         {"id": f.id, "key": f.key, "value": f.value, "source": f.source, "confidence": f.confidence, "category": f.category}
         for f in facts
@@ -261,7 +261,7 @@ async def list_facts():
 async def create_fact(fact: UserFactCreate):
     """Create or update a user fact."""
     svc = get_services()
-    svc.user_facts.set(fact.key, fact.value, source=fact.source, category=fact.category)
+    await asyncio.to_thread(lambda: svc.user_facts.set(fact.key, fact.value, source=fact.source, category=fact.category))
     return {"status": "ok", "key": fact.key}
 
 
@@ -269,7 +269,7 @@ async def create_fact(fact: UserFactCreate):
 async def delete_fact(key: str):
     """Delete a user fact."""
     svc = get_services()
-    deleted = svc.user_facts.delete(key)
+    deleted = await asyncio.to_thread(svc.user_facts.delete, key)
     if not deleted:
         raise HTTPException(status_code=404, detail=f"Fact '{key}' not found")
     return {"status": "deleted", "key": key}

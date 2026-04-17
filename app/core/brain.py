@@ -1473,7 +1473,8 @@ async def _detect_capability_gap(
     try:
         from app.database import get_db
         db = get_db()
-        db.execute(
+        await asyncio.to_thread(
+            db.execute,
             "INSERT INTO capability_gaps (query, reason, tools_tried, quality_score) VALUES (?, ?, ?, ?)",
             (
                 query[:500],

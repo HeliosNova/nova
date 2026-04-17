@@ -619,10 +619,13 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
             try:
                 svc = get_services()
                 if svc.monitor_store:
-                    svc.monitor_store._db.execute(
+                    ts = datetime.now(timezone.utc).isoformat()
+                    db = svc.monitor_store._db
+                    asyncio.create_task(asyncio.to_thread(
+                        db.execute,
                         "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-                        ("last_user_activity", datetime.now(timezone.utc).isoformat(), ),
-                    )
+                        ("last_user_activity", ts),
+                    ))
             except Exception as e:
                 logger.warning("User activity tracking failed: %s", e)
         return await call_next(request)
