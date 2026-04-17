@@ -176,26 +176,60 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        assert count == 59  # 52 original + 2 (eval+prompt_analyzer) + 5 system health monitors
+        # 59 pre-cull monitors. New 3 ("Training Job Watch", "KG Growth Rate",
+        # "Ollama Model Loaded") are added in a separate commit; this test
+        # locks the count and is updated together with that change.
+        assert count == 59
         monitors = store.list_all()
         names = {m.name for m in monitors}
-        # Core monitors
+        # Core monitors (enabled by default)
         assert "Morning Check-in" in names
         assert "System Health" in names
         assert "World Awareness" in names
-        # Domain study monitors
+        # Niche domain studies still in catalog but seeded disabled
         assert "Domain Study: Science" in names
         assert "Domain Study: Technology" in names
         assert "Domain Study: Current Events" in names
         assert "Domain Study: Finance" in names
+        assert "Hacker News Top Stories" in names
+        assert "FOMC and Fed Watch" in names
         # Teaching/self-improvement monitors
         assert "Curiosity Research" in names
         assert "Fine-Tune Check" in names
         assert "Lesson Quiz" in names
         assert "Skill Validation" in names
         assert "Quality Eval Harness" in names
-        assert "Hacker News Top Stories" in names
-        assert "FOMC and Fed Watch" in names
+
+    def test_core_monitors_enabled_by_default(self, store):
+        """Culling: only the ~13 core monitors should be enabled on first seed.
+
+        Everything else (48+ niche domain studies) is seeded disabled so R
+        can flip on what he actually wants without losing the catalog.
+        """
+        store.seed_defaults()
+        monitors = store.list_all()
+        enabled = [m for m in monitors if m.enabled]
+        enabled_names = {m.name for m in enabled}
+        # Should be ~13 core monitors, not 59
+        assert 10 <= len(enabled) <= 18, (
+            f"expected ~13 core monitors enabled, got {len(enabled)}: "
+            f"{sorted(enabled_names)}"
+        )
+        # Core set checked explicitly
+        for core in (
+            "DB Size Monitor", "Ollama Latency Monitor", "KG Health Monitor",
+            "Morning Check-in", "World Awareness", "Curiosity Research",
+            "Dream Consolidation", "Quality Eval Harness",
+        ):
+            assert core in enabled_names, f"core monitor '{core}' should be enabled"
+        # Niche domains should NOT be enabled by default
+        for niche in (
+            "Domain Study: Quantum Computing", "Domain Study: Semiconductors",
+            "Domain Study: Whale Watch", "Hacker News Top Stories",
+        ):
+            assert niche not in enabled_names, (
+                f"niche monitor '{niche}' should be disabled by default"
+            )
 
     def test_quiz_and_skill_seeded_on_change(self, store):
         """Quiz and Skill Validation should seed with notify_condition='on_change'."""

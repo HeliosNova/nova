@@ -345,6 +345,30 @@ class MonitorStore:
 
     # --- Seed monitors ---
 
+    # Core monitors enabled out-of-the-box. Everything else in the seed list
+    # below is created with enabled=False so users can flip on what they
+    # actually want without losing the catalog. Reversible via:
+    #   UPDATE monitors SET enabled=1 WHERE name='Domain Study: AI and ML';
+    _CORE_ENABLED: frozenset[str] = frozenset({
+        # System health (telegram-only)
+        "DB Size Monitor",
+        "Ollama Latency Monitor",
+        "Skill Quality Monitor",
+        "ChromaDB Integrity",
+        "KG Health Monitor",
+        "System Health",
+        # Meta / self-improvement (telegram-only)
+        "Dream Consolidation",
+        "Capability Review",
+        "Quality Eval Harness",
+        # Content (Discord + others)
+        "Morning Check-in",
+        "World Awareness",
+        "Curiosity Research",
+        # Background loops
+        "System Maintenance",
+    })
+
     def seed_defaults(self) -> int:
         """Create default seed monitors, skipping any that already exist by name."""
         existing_names = {m.name for m in self.list_all()}
@@ -634,6 +658,9 @@ class MonitorStore:
         for seed in seeds:
             if seed["name"] in existing_names:
                 continue
+            # Only enable core monitors by default. Everything else is seeded
+            # disabled and reversible — user flips on what they want.
+            seed["enabled"] = seed["name"] in self._CORE_ENABLED
             mid = self.create(**seed)
             if mid > 0:
                 count += 1
