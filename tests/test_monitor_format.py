@@ -176,3 +176,239 @@ class TestNewMonitorSeeds:
         fast_types = {"db_size", "ollama_latency", "skill_quality", "chromadb_integrity", "kg_health"}
         health_monitors = [m for m in monitors if m.check_type in fast_types]
         assert len(health_monitors) == 5
+
+
+# ===========================================================================
+# Unified format_monitor_result() — one-liner contract
+# ===========================================================================
+
+
+class TestFormatMonitorResult:
+    """Validate the unified one-line monitor result format."""
+
+    def test_basic_shape(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result("X", "ok", "all healthy", {"docs": 110})
+        assert out.startswith("\u2705 all healthy")  # ✅
+        assert "\u2502" in out                       # │
+        assert "docs: 110" in out
+
+    def test_status_emojis(self):
+        from app.monitors.format import format_monitor_result
+
+        assert format_monitor_result("X", "ok", "good").startswith("\u2705")
+        assert format_monitor_result("X", "warning", "wobbly").startswith("\u26a0")
+        assert format_monitor_result("X", "error", "boom").startswith("\u274c")
+        assert format_monitor_result("X", "skip", "nope").startswith("\U0001f4a4")
+        assert format_monitor_result("X", "info", "data").startswith("\U0001f4ca")
+
+    def test_unknown_status_falls_back(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result("X", "nonsense", "hi")
+        assert out.startswith("\u2753")  # ❓
+
+    def test_summary_truncation_80_chars(self):
+        from app.monitors.format import format_monitor_result
+
+        long = "a" * 200
+        out = format_monitor_result("X", "ok", long)
+        # Strip emoji + space, then check summary length
+        summary = out.split(" ", 1)[1].split(" \u2502 ")[0]
+        assert len(summary) <= 80
+
+    def test_empty_summary_placeholder(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result("X", "ok", "")
+        assert "no summary" in out
+
+    def test_field_ordering_preserved(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result(
+            "X", "ok", "ok", {"first": 1, "second": 2, "third": 3},
+        )
+        i1 = out.index("first: 1")
+        i2 = out.index("second: 2")
+        i3 = out.index("third: 3")
+        assert i1 < i2 < i3
+
+    def test_none_empty_fields_dropped(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result(
+            "X", "ok", "ok", {"a": 1, "b": None, "c": ""},
+        )
+        assert "a: 1" in out
+        assert "b:" not in out
+        assert "c:" not in out
+
+    def test_collapses_newlines_in_summary(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result("X", "ok", "line one\n\nline two\ttab")
+        assert "\n" not in out
+        assert "\t" not in out
+
+
+class TestStripToolCallArtifacts:
+    """Defensive scrubbing of leaked LLM tool-call syntax."""
+
+    def test_strips_args_variant(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        leaked = 'hello {"tool": "web_search", "args": {"query": "x"}}</tool_call> world'
+        out = strip_tool_call_artifacts(leaked)
+        assert "tool" not in out
+        assert "</tool_call>" not in out
+        assert "hello" in out and "world" in out
+
+    def test_strips_arguments_variant(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        leaked = '{"tool": "web_search", "arguments": {"query": "y"}}</tool_call>'
+        out = strip_tool_call_artifacts(leaked)
+        assert out == ""
+
+    def test_strips_xml_wrapped(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        leaked = 'prose <tool_call>{"tool":"x","args":{}}</tool_call> more prose'
+        out = strip_tool_call_artifacts(leaked)
+        assert "<tool_call>" not in out
+        assert "</tool_call>" not in out
+        assert "prose" in out
+
+    def test_strips_orphan_close_tag(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        out = strip_tool_call_artifacts("hi there </tool_call>")
+        assert "</tool_call>" not in out
+        assert "hi there" in out
+
+    def test_noop_on_clean_text(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        clean = "BTC at $67,500 — up 3.2% over 24h."
+        assert strip_tool_call_artifacts(clean) == clean
+
+    def test_empty_string(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        assert strip_tool_call_artifacts("") == ""
+
+    def test_collapses_excess_blank_lines(self):
+        from app.monitors.format import strip_tool_call_artifacts
+
+        out = strip_tool_call_artifacts("line1\n\n\n\n\nline2")
+        assert out == "line1\n\nline2"
+
+
+class TestDreamConsolidationSkipFormat:
+    """Dream Consolidation skip message should be the concise unified line."""
+
+    def test_skip_format_is_short(self):
+        from app.monitors.format import format_monitor_result
+
+        out = format_monitor_result(
+            "Dream Consolidation", "skip", "cooldown",
+            {"cooldown": "0.5h/6.0h"},
+        )
+        # Compact: under 80 chars, emoji + summary + fields separator
+        assert len(out) < 100
+        assert "\U0001f4a4" in out       # 💤
+        assert "0.5h/6.0h" in out
+        # Not the old 60-word paragraph
+        assert "minimum" not in out.lower()
+        assert "skipped because" not in out.lower()
+
+
+class TestMonitorRouting:
+    """System-category monitors must never reach Discord."""
+
+    @pytest.fixture
+    def store(self, tmp_path):
+        from app.database import SafeDB
+        from app.monitors.heartbeat import MonitorStore
+        db = SafeDB(str(tmp_path / "test.db"))
+        db.init_schema()
+        return MonitorStore(db)
+
+    @pytest.mark.asyncio
+    async def test_system_monitor_skips_discord(self, store):
+        """A system-category monitor result should NOT reach the Discord bot."""
+        from unittest.mock import AsyncMock
+        from app.monitors.heartbeat import HeartbeatLoop
+        from app.monitors.monitor_store import Monitor
+
+        mid = store.create("DB Size Monitor", "db_size", {})
+        m = store.get(mid)
+        assert m.category == "system"
+
+        discord_bot = AsyncMock()
+        telegram_bot = AsyncMock()
+        whatsapp_bot = AsyncMock()
+        signal_bot = AsyncMock()
+
+        loop = HeartbeatLoop(
+            store,
+            discord_bot=discord_bot,
+            telegram_bot=telegram_bot,
+            whatsapp_bot=whatsapp_bot,
+            signal_bot=signal_bot,
+        )
+        await loop._send_alert(m, "db healthy")
+
+        discord_bot.send_alert.assert_not_called()
+        whatsapp_bot.send_alert.assert_not_called()
+        signal_bot.send_alert.assert_not_called()
+        telegram_bot.send_alert.assert_called_once()
+        # Must carry the name prefix so Telegram users still see which monitor
+        sent_msg = telegram_bot.send_alert.call_args[0][0]
+        assert sent_msg.startswith("[DB Size Monitor]")
+
+    @pytest.mark.asyncio
+    async def test_content_monitor_hits_all_channels(self, store):
+        """A content-category monitor broadcasts to all configured channels."""
+        from unittest.mock import AsyncMock
+        from app.monitors.heartbeat import HeartbeatLoop
+
+        mid = store.create("World Awareness", "query", {"query": "news"})
+        m = store.get(mid)
+        assert m.category == "content"
+
+        discord_bot = AsyncMock()
+        telegram_bot = AsyncMock()
+        whatsapp_bot = AsyncMock()
+        signal_bot = AsyncMock()
+
+        loop = HeartbeatLoop(
+            store,
+            discord_bot=discord_bot,
+            telegram_bot=telegram_bot,
+            whatsapp_bot=whatsapp_bot,
+            signal_bot=signal_bot,
+        )
+        await loop._send_alert(m, "major news")
+
+        discord_bot.send_alert.assert_called_once()
+        telegram_bot.send_alert.assert_called_once()
+        whatsapp_bot.send_alert.assert_called_once()
+        signal_bot.send_alert.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_system_monitor_without_telegram_is_suppressed(self, store):
+        """System monitor with no Telegram channel should not fall through to Discord."""
+        from unittest.mock import AsyncMock
+        from app.monitors.heartbeat import HeartbeatLoop
+
+        mid = store.create("DB Size Monitor", "db_size", {})
+        m = store.get(mid)
+
+        discord_bot = AsyncMock()
+        loop = HeartbeatLoop(store, discord_bot=discord_bot, telegram_bot=None)
+        await loop._send_alert(m, "stats")
+
+        discord_bot.send_alert.assert_not_called()

@@ -55,9 +55,9 @@ class TestDbSizeCheck:
             mock_cfg.DB_PATH = str(db_file)
             result = await loop._execute_db_size_check()
 
-        assert "DB size:" in result
+        assert "size:" in result
         assert "MB" in result
-        assert "rows" in result
+        assert "conversations:" in result
 
     @pytest.mark.asyncio
     async def test_missing_db_file_reports_not_found(self, loop, tmp_path, monkeypatch):
@@ -71,7 +71,7 @@ class TestDbSizeCheck:
             mock_cfg.DB_PATH = missing
             result = await loop._execute_db_size_check()
 
-        assert "DB not found" in result or "DB size:" in result  # file absent → not-found msg
+        assert "missing" in result.lower() or "size:" in result
 
     @pytest.mark.asyncio
     async def test_table_error_is_swallowed(self, loop, tmp_path):
@@ -103,7 +103,7 @@ class TestDbSizeCheck:
             mock_cfg.DB_PATH = str(db_file)
             result = await loop._execute_db_size_check()
 
-        assert "WAL:" in result
+        assert "wal:" in result.lower()
 
 
 # ---------------------------------------------------------------------------
@@ -134,7 +134,7 @@ class TestOllamaLatencyCheck:
         with patch("app.core.llm.get_provider", return_value=mock_provider):
             result = await loop._execute_ollama_latency_check()
 
-        assert "UNHEALTHY" in result
+        assert "unhealthy" in result.lower()
         assert "ms" in result
 
     @pytest.mark.asyncio
@@ -173,11 +173,11 @@ class TestSkillQualityCheck:
         with patch("app.core.brain.get_services", return_value=mock_svc):
             result = await loop._execute_skill_quality_check()
 
-        assert "Total: 10" in result
-        assert "Enabled: 8" in result
-        assert "Disabled: 2" in result
+        assert "total: 10" in result
+        assert "enabled: 8" in result
+        assert "disabled: 2" in result
         assert "0.75" in result
-        assert "Degrading: 1" in result
+        assert "degrading: 1" in result
 
     @pytest.mark.asyncio
     async def test_no_skills_service(self, loop):
@@ -188,7 +188,7 @@ class TestSkillQualityCheck:
         with patch("app.core.brain.get_services", return_value=mock_svc):
             result = await loop._execute_skill_quality_check()
 
-        assert "not available" in result.lower()
+        assert "unavailable" in result.lower() or "not available" in result.lower()
 
     @pytest.mark.asyncio
     async def test_db_error_returns_error_string(self, loop):
@@ -255,8 +255,8 @@ class TestChromaDbIntegrityCheck:
              patch("app.database.get_db", return_value=mock_db):
             result = await loop._execute_chromadb_integrity_check()
 
-        assert "ChromaDB docs: 150" in result
-        assert "FTS5 chunks: 300" in result
+        assert "docs: 150" in result
+        assert "fts5: 300" in result
 
     @pytest.mark.asyncio
     async def test_chromadb_collection_error_reported(self, loop):
@@ -274,7 +274,7 @@ class TestChromaDbIntegrityCheck:
              patch("app.database.get_db", return_value=mock_db):
             result = await loop._execute_chromadb_integrity_check()
 
-        assert "ChromaDB error" in result
+        assert "chromadb error" in result.lower()
         assert "collection missing" in result
 
     @pytest.mark.asyncio
@@ -290,7 +290,7 @@ class TestChromaDbIntegrityCheck:
              patch("app.database.get_db", return_value=mock_db):
             result = await loop._execute_chromadb_integrity_check()
 
-        assert "Retriever not available" in result
+        assert "retriever" in result.lower() and "unavailable" in result.lower()
 
     @pytest.mark.asyncio
     async def test_fts5_error_is_swallowed(self, loop):
@@ -311,9 +311,9 @@ class TestChromaDbIntegrityCheck:
              patch("app.database.get_db", return_value=mock_db):
             result = await loop._execute_chromadb_integrity_check()
 
-        assert "ChromaDB docs: 42" in result
-        # FTS error swallowed — no crash, no "FTS5 chunks" line
-        assert "FTS5" not in result
+        assert "docs: 42" in result
+        # FTS error swallowed — no crash, no fts5 field
+        assert "fts5:" not in result
 
 
 # ---------------------------------------------------------------------------
@@ -347,11 +347,11 @@ class TestKgHealthCheck:
         with patch("app.core.brain.get_services", return_value=mock_svc):
             result = await loop._execute_kg_health_check()
 
-        assert "Facts: 100" in result
-        assert "Active: 80" in result       # uses current_facts key (bug was active_facts)
-        assert "Superseded: 20" in result
-        assert "Unique entities:" in result
-        assert "Orphans:" in result
+        assert "facts: 100" in result
+        assert "active: 80" in result       # uses current_facts key (bug was active_facts)
+        assert "superseded: 20" in result
+        assert "entities:" in result
+        assert "orphans:" in result
 
     @pytest.mark.asyncio
     async def test_no_kg_returns_unavailable(self, loop):
@@ -362,7 +362,7 @@ class TestKgHealthCheck:
         with patch("app.core.brain.get_services", return_value=mock_svc):
             result = await loop._execute_kg_health_check()
 
-        assert "not available" in result.lower()
+        assert "unavailable" in result.lower() or "not available" in result.lower()
 
     @pytest.mark.asyncio
     async def test_kg_stats_exception_caught(self, loop):
@@ -398,8 +398,9 @@ class TestKgHealthCheck:
             result = await loop._execute_kg_health_check()
 
         # Active must show 40, NOT 0 (which would happen with the wrong 'active_facts' key)
-        assert "Active: 40" in result
-        assert "Active: 0" not in result
+        assert "active: 40" in result
+        assert "active: 0 " not in result
+        assert "active: 0\u2502" not in result
 
 
 # ---------------------------------------------------------------------------
