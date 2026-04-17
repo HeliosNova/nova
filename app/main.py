@@ -10,7 +10,7 @@ import logging
 import os
 import time
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import defaultdict
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -621,7 +621,7 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
                 if svc.monitor_store:
                     svc.monitor_store._db.execute(
                         "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
-                        ("last_user_activity", datetime.utcnow().isoformat(), ),
+                        ("last_user_activity", datetime.now(timezone.utc).isoformat(), ),
                     )
             except Exception as e:
                 logger.warning("User activity tracking failed: %s", e)

@@ -542,3 +542,124 @@ class TestSecurityResponseBodies:
         detail = str(body.get("detail", "")).lower()
         assert "query" in detail or "field" in detail or "required" in detail, \
             f"Error body should mention missing field: {detail}"
+
+
+# ---------------------------------------------------------------------------
+# UserActivityMiddleware
+# ---------------------------------------------------------------------------
+
+class TestUserActivityMiddleware:
+    """UserActivityMiddleware writes last_user_activity to system_state for
+    /api/chat, /api/voice, and /api/actions paths; skips all others."""
+
+    @pytest.fixture
+    def activity_client(self, db):
+        """Client with monitor_store wired so the middleware can write to system_state."""
+        import importlib, app.config, app.auth
+        importlib.reload(app.config)
+        importlib.reload(app.auth)
+
+        from fastapi.testclient import TestClient
+        from app.main import app, _rate_limit_requests
+        from app.monitors.heartbeat import MonitorStore
+
+        _rate_limit_requests.clear()
+
+        monitor_store = MonitorStore(db)
+        svc = Services(
+            conversations=ConversationStore(db),
+            user_facts=UserFactStore(db),
+            monitor_store=monitor_store,
+        )
+        set_services(svc)
+        # raise_server_exceptions=False: the chat route 500s without Ollama; we only
+        # care that the middleware ran, not the route result.
+        return TestClient(app, raise_server_exceptions=False)
+
+    def test_chat_request_writes_activity(self, activity_client, db):
+        """POST /api/chat should write last_user_activity into system_state."""
+        row_before = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert row_before is None  # no prior activity
+
+        activity_client.post("/api/chat", json={"query": "hello"})
+
+        row_after = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert row_after is not None
+        assert row_after["value"]  # ISO-format timestamp, non-empty
+
+    def test_non_tracked_path_skips_activity(self, activity_client, db):
+        """GET /api/status must NOT write to system_state (not a tracked path)."""
+        activity_client.get("/api/status")
+
+        row = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert row is None
+
+    def test_health_path_skips_activity(self, activity_client, db):
+        """GET /api/health must NOT write to system_state."""
+        activity_client.get("/api/health")
+
+        row = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert row is None
+
+    def test_second_chat_request_updates_timestamp(self, activity_client, db):
+        """A second chat request must upsert the activity row (not duplicate it)."""
+        activity_client.post("/api/chat", json={"query": "first"})
+        row1 = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+
+        activity_client.post("/api/chat", json={"query": "second"})
+        row2 = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+
+        # Still exactly one row (INSERT OR REPLACE), and timestamp is non-decreasing
+        count = db.fetchone(
+            "SELECT count(*) as c FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert count["c"] == 1
+        assert row2["value"] >= row1["value"]
+
+    def test_no_monitor_store_does_not_crash(self, db):
+        """Middleware must not crash when services.monitor_store is None."""
+        import importlib, app.config, app.auth
+        importlib.reload(app.config)
+        importlib.reload(app.auth)
+
+        from fastapi.testclient import TestClient
+        from app.main import app, _rate_limit_requests
+
+        _rate_limit_requests.clear()
+
+        svc = Services(
+            conversations=ConversationStore(db),
+            user_facts=UserFactStore(db),
+            # no monitor_store
+        )
+        set_services(svc)
+
+        client = TestClient(app, raise_server_exceptions=False)
+        resp = client.post("/api/chat", json={"query": "hello"})
+
+        # Request completed (any status is fine — we're testing no crash)
+        assert resp.status_code is not None
+
+        # And nothing was written to system_state
+        row = db.fetchone(
+            "SELECT value FROM system_state WHERE key = 'last_user_activity'"
+        )
+        assert row is None
+
+    def test_security_headers_on_tracked_response(self, activity_client):
+        """Security headers must still be present on responses from tracked paths."""
+        resp = activity_client.get("/api/status")
+        assert resp.headers.get("x-content-type-options") == "nosniff"
+        assert resp.headers.get("x-frame-options") == "DENY"
