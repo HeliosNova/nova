@@ -9,6 +9,7 @@ References: AgeMem (arXiv 2601.01885), Letta/MemGPT memory blocks
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -102,17 +103,17 @@ class ActiveMemoryTool(BaseTool):
                               error_category=ErrorCategory.INTERNAL)
 
         if action == "add":
-            return self._add(kwargs)
+            return await asyncio.to_thread(self._add, kwargs)
         elif action == "search":
-            return self._search(kwargs)
+            return await asyncio.to_thread(self._search, kwargs)
         elif action == "update":
-            return self._update(kwargs)
+            return await asyncio.to_thread(self._update, kwargs)
         elif action == "delete":
-            return self._delete(kwargs)
+            return await asyncio.to_thread(self._delete, kwargs)
         elif action == "list":
-            return self._list(kwargs)
+            return await asyncio.to_thread(self._list, kwargs)
         elif action == "summarize":
-            return self._summarize(kwargs)
+            return await asyncio.to_thread(self._summarize, kwargs)
         else:
             return ToolResult(
                 output="",
