@@ -440,6 +440,9 @@ _META_PATTERNS = [
     re.compile(r"^I've (?:noted|recorded|saved|updated|stored) (?:your|that|this) correction.*$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"^Thank you for (?:the )?correction.*$", re.IGNORECASE | re.MULTILINE),
     re.compile(r"<think>.*</think>", re.DOTALL),
+    # Defense-in-depth: strip leaked tool-call placeholders that sometimes
+    # survive when the model imitates its own assistant history.
+    re.compile(r"^\s*\[Calling tool:\s*[\w.\-]+\]\s*$", re.MULTILINE),
     # Date confusion disclaimers (Qwen calls 2026 a "simulated future date")
     re.compile(r"\b(?:simulated|hypothetical)\s+(?:future\s+)?date\b[^.]*\.?", re.IGNORECASE),
     re.compile(r"\b(?:since|as)\s+(?:my\s+)?training\s+(?:data\s+)?cut-?off\b[^.]*\.?", re.IGNORECASE),
@@ -1074,7 +1077,12 @@ async def _run_generation_loop(
                 _deduped_results.append((tc, tool_output, tool_result_obj))
             results = _deduped_results
 
-            assistant_content = result.content or f'[Calling tool: {tool_calls[0].tool}]'
+            # Use empty content when the LLM emits tool calls without narrative.
+            # Prior code used "[Calling tool: X]" as a placeholder, which leaked
+            # into assistant-role history and caused the model to imitate the
+            # pattern as its final synthesis output (producing monitor results
+            # that were just accumulated "[Calling tool: X]" lines with no answer).
+            assistant_content = result.content or ""
 
             tool_result_parts = []
             for i, (tc, tool_output, tool_result_obj) in enumerate(results, 1):
