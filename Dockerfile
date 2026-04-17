@@ -27,6 +27,7 @@ RUN playwright install chromium
 # Application code
 COPY app/ app/
 COPY tests/ tests/
+COPY evals/ evals/
 COPY pytest.ini .
 
 # Data directory + non-root user
