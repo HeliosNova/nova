@@ -176,16 +176,19 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        # 59 pre-cull monitors. New 3 ("Training Job Watch", "KG Growth Rate",
-        # "Ollama Model Loaded") are added in a separate commit; this test
-        # locks the count and is updated together with that change.
-        assert count == 59
+        # 61 pre-cull + 3 new system monitors (Training Job Watch,
+        # KG Growth Rate, Ollama Model Loaded) = 64.
+        assert count == 64
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)
         assert "Morning Check-in" in names
         assert "System Health" in names
         assert "World Awareness" in names
+        # New system monitors
+        assert "Training Job Watch" in names
+        assert "KG Growth Rate" in names
+        assert "Ollama Model Loaded" in names
         # Niche domain studies still in catalog but seeded disabled
         assert "Domain Study: Science" in names
         assert "Domain Study: Technology" in names

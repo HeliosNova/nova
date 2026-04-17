@@ -417,6 +417,15 @@ class HeartbeatLoop:
         elif monitor.check_type == "kg_health":
             return await self._execute_kg_health_check()
 
+        elif monitor.check_type == "training_job":
+            return await self._execute_training_job_check()
+
+        elif monitor.check_type == "kg_growth":
+            return await self._execute_kg_growth_check(monitor)
+
+        elif monitor.check_type == "ollama_model":
+            return await self._execute_ollama_model_check()
+
         return f"[Unknown check_type: {monitor.check_type}]"
 
     async def _execute_system_health(self) -> str:
@@ -1864,6 +1873,137 @@ class HeartbeatLoop:
             return format_monitor_result(
                 "KG Health Monitor", "error", f"kg health error: {e}",
             )
+
+    async def _execute_training_job_check(self) -> str:
+        """Detect a failed or stale fine-tune run.
+
+        Reads the last entry from scripts/run_history.json (written by
+        finetune_auto.py). Flags runs with status='failed' or 'rejected'.
+        """
+        import json as _json
+        from pathlib import Path
+
+        history_path = Path(config.FINETUNE_OUTPUT_DIR) / "run_history.json"
+        if not history_path.exists():
+            return format_monitor_result(
+                "Training Job Watch", "info", "no training history yet",
+            )
+
+        try:
+            with open(history_path, encoding="utf-8") as f:
+                history = _json.load(f)
+        except Exception as e:
+            return format_monitor_result(
+                "Training Job Watch", "error", f"history unreadable: {e}",
+            )
+
+        if not history:
+            return format_monitor_result(
+                "Training Job Watch", "info", "no training runs",
+            )
+
+        last = history[-1]
+        status_field = (last.get("status") or "").lower()
+        started = last.get("started_at") or last.get("timestamp") or ""
+        pairs = last.get("training_pairs", 0)
+        fields = {"last_run": started[:19], "pairs": pairs}
+
+        if status_field in ("failed", "error"):
+            return format_monitor_result(
+                "Training Job Watch", "error",
+                f"last fine-tune failed ({last.get('reason', 'unknown')})",
+                fields,
+            )
+        if status_field in ("rejected",):
+            return format_monitor_result(
+                "Training Job Watch", "warning",
+                "candidate rejected by A/B eval", fields,
+            )
+        return format_monitor_result(
+            "Training Job Watch", "ok",
+            f"last run {status_field or 'ok'}", fields,
+        )
+
+    async def _execute_kg_growth_check(self, monitor: Monitor) -> str:
+        """Detect unusual spikes in KG growth over the last 6 hours."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        if not svc.kg:
+            return format_monitor_result(
+                "KG Growth Rate", "error", "kg unavailable",
+            )
+
+        db = svc.kg._db
+        try:
+            last_6h = db.fetchone(
+                "SELECT count(*) as c FROM kg_facts WHERE created_at > datetime('now', '-6 hours')"
+            )
+            prev_6h = db.fetchone(
+                "SELECT count(*) as c FROM kg_facts "
+                "WHERE created_at > datetime('now', '-12 hours') "
+                "AND created_at <= datetime('now', '-6 hours')"
+            )
+        except Exception as e:
+            return format_monitor_result(
+                "KG Growth Rate", "error", f"kg query failed: {e}",
+            )
+
+        now_count = last_6h["c"] if last_6h else 0
+        prev_count = prev_6h["c"] if prev_6h else 0
+        threshold = float(monitor.check_config.get("spike_threshold_pct", 25.0))
+
+        if prev_count == 0:
+            pct = 0.0
+        else:
+            pct = ((now_count - prev_count) / prev_count) * 100.0
+
+        fields = {
+            "last_6h": now_count,
+            "prev_6h": prev_count,
+            "delta_pct": f"{pct:+.1f}%",
+        }
+        if abs(pct) >= threshold and prev_count >= 10:
+            direction = "spike" if pct > 0 else "drop"
+            return format_monitor_result(
+                "KG Growth Rate", "warning",
+                f"kg growth {direction} ({pct:+.1f}% over prev 6h)",
+                fields,
+            )
+        return format_monitor_result(
+            "KG Growth Rate", "info",
+            f"kg growth normal ({pct:+.1f}%)", fields,
+        )
+
+    async def _execute_ollama_model_check(self) -> str:
+        """Verify the configured LLM model is actually loaded in Ollama."""
+        import httpx
+
+        model_name = getattr(config, "LLM_MODEL", None) or "qwen3.5:27b"
+        ollama_url = getattr(config, "OLLAMA_URL", None) or "http://localhost:11434"
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{ollama_url}/api/tags")
+                resp.raise_for_status()
+                payload = resp.json()
+        except Exception as e:
+            return format_monitor_result(
+                "Ollama Model Loaded", "error", f"ollama unreachable: {e}",
+            )
+
+        names = {m.get("name", "") for m in payload.get("models", [])}
+        base = model_name.split(":")[0]
+        found = any(n == model_name or n.startswith(base + ":") for n in names)
+        fields = {"expected": model_name, "total_models": len(names)}
+        if not found:
+            return format_monitor_result(
+                "Ollama Model Loaded", "error",
+                f"model {model_name} not loaded", fields,
+            )
+        return format_monitor_result(
+            "Ollama Model Loaded", "ok",
+            f"model {model_name} loaded", fields,
+        )
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""

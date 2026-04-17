@@ -357,6 +357,9 @@ class MonitorStore:
         "ChromaDB Integrity",
         "KG Health Monitor",
         "System Health",
+        "Ollama Model Loaded",
+        "Training Job Watch",
+        "KG Growth Rate",
         # Meta / self-improvement (telegram-only)
         "Dream Consolidation",
         "Capability Review",
@@ -650,6 +653,33 @@ class MonitorStore:
                 "check_config": {},
                 "schedule_seconds": 90000,   # 25h -- runs after Quality Eval Harness
                 "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            # --- System health monitors added alongside the cull ---
+            # Detect failed fine-tune runs, unusual KG growth, and
+            # whether the expected Ollama model is actually loaded.
+            {
+                "name": "Training Job Watch",
+                "check_type": "training_job",
+                "check_config": {},
+                "schedule_seconds": 3600,   # hourly
+                "cooldown_minutes": 55,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "KG Growth Rate",
+                "check_type": "kg_growth",
+                "check_config": {"spike_threshold_pct": 25.0},
+                "schedule_seconds": 21600,  # every 6h
+                "cooldown_minutes": 300,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Ollama Model Loaded",
+                "check_type": "ollama_model",
+                "check_config": {},
+                "schedule_seconds": 7200,   # every 2h
+                "cooldown_minutes": 120,
                 "notify_condition": "on_change",
             },
         ]
