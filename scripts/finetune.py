@@ -87,8 +87,15 @@ DEFAULT_LORA_RANK = 16
 DEFAULT_EPOCHS = 3
 DEFAULT_BATCH_SIZE = 1
 DEFAULT_GRAD_ACCUM = 2
-DEFAULT_LR = 5e-7  # SimPO: reference-free, uses lower LR (paper: 5e-7)
-DEFAULT_LOSS_TYPE = "simpo"  # SimPO (reference-free) or "sigmoid" (standard DPO)
+DEFAULT_LR = 5e-7  # Low LR; safe across loss types (SimPO paper: 5e-7)
+# trl 0.24.0 DPOTrainer/DPOConfig does NOT accept loss_type="simpo" — it raises
+# `ValueError: Unknown loss type: ['simpo']. Should be one of [...]`. SimPO
+# lives in CPOTrainer/CPOConfig (not DPO) as of trl 0.17+. To keep this
+# pipeline working with stock DPOTrainer we default to "sigmoid" (the original
+# DPO loss). Capability difference: standard DPO needs a reference model in
+# VRAM (or precomputed log-probs — we do the latter). SimPO is reference-free
+# and ~40% cheaper in VRAM — if we want that back, switch train() to CPOTrainer.
+DEFAULT_LOSS_TYPE = "sigmoid"
 MIN_TRAINING_PAIRS = 10  # Minimum pairs before training is worthwhile
 
 
@@ -174,11 +181,12 @@ def train(
     learning_rate: float = DEFAULT_LR,
     loss_type: str = DEFAULT_LOSS_TYPE,
 ) -> str:
-    """Run SimPO fine-tuning with QLoRA (reference-free, no ref model in VRAM).
+    """Run DPO fine-tuning with QLoRA.
 
-    Uses CPOTrainer with loss_type="simpo" — outperforms DPO by 6.4 pts,
-    uses ~40% less VRAM (no reference model at all). Same data format.
-    Returns path to the saved adapter.
+    Uses DPOTrainer with a precomputed reference log-probs pass to fit in
+    24GB VRAM. Default loss="sigmoid" (original DPO). SimPO is not supported
+    by DPOTrainer in trl 0.24+ — it lives in CPOTrainer. Returns path to the
+    saved adapter.
     """
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
@@ -228,19 +236,13 @@ def train(
     dataset = Dataset.from_list(data)
 
     # --- Step 4: DPO Training ---
-    _method = "SimPO" if _is_simpo else "DPO"
-    logger.info("Starting %s training...", _method)
-    logger.info(
-        "  Method: %s, Epochs: %d, Batch: %d, Grad accum: %d, LR: %s, Beta: %s",
-        _method, epochs, batch_size, grad_accum, learning_rate, training_args.beta,
-    )
-
-    _is_simpo = loss_type == "simpo"
-    _dpo_kwargs = {}
-    if not _is_simpo:
-        # Standard DPO needs ref model — precompute to fit in 24GB
-        _dpo_kwargs["precompute_ref_log_probs"] = True
-        _dpo_kwargs["precompute_ref_batch_size"] = 1
+    # Standard DPO: needs a reference model. Precompute log-probs so we can
+    # fit in 24GB VRAM (otherwise the ref model has to be resident alongside
+    # the policy model during training).
+    _dpo_kwargs = {
+        "precompute_ref_log_probs": True,
+        "precompute_ref_batch_size": 1,
+    }
 
     training_args = DPOConfig(
         output_dir=adapter_dir,
@@ -254,13 +256,18 @@ def train(
         save_strategy="epoch",
         max_length=max_seq_length,
         loss_type=loss_type,
-        beta=2.5 if _is_simpo else 0.1,
-        **({"gamma_beta_ratio": 0.5} if _is_simpo else {}),
+        beta=0.1,
         remove_unused_columns=False,
         bf16=True,
         report_to="none",
         gradient_checkpointing=True,
         **_dpo_kwargs,
+    )
+
+    logger.info("Starting DPO training...")
+    logger.info(
+        "  Loss: %s, Epochs: %d, Batch: %d, Grad accum: %d, LR: %s, Beta: %s",
+        loss_type, epochs, batch_size, grad_accum, learning_rate, training_args.beta,
     )
 
     # Patch for TRL + Qwen3.5 compatibility
@@ -402,8 +409,13 @@ def main():
         help=f"Learning rate (default: {DEFAULT_LR})",
     )
     parser.add_argument(
-        "--loss-type", default=DEFAULT_LOSS_TYPE, choices=["simpo", "sigmoid"],
-        help=f"Training method: simpo (reference-free) or sigmoid (standard DPO) (default: {DEFAULT_LOSS_TYPE})",
+        "--loss-type", default=DEFAULT_LOSS_TYPE,
+        choices=["sigmoid", "hinge", "ipo", "robust"],
+        help=(
+            f"DPO loss type (default: {DEFAULT_LOSS_TYPE}). "
+            "Note: 'simpo' is NOT a valid DPOTrainer loss in trl 0.24+ — "
+            "use CPOTrainer instead if SimPO is needed."
+        ),
     )
     parser.add_argument(
         "--export-gguf", action="store_true",
