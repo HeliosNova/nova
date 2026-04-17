@@ -447,6 +447,17 @@ class MonitorStore:
                 "cooldown_minutes": 60,
                 "notify_condition": "on_change",
             },
+            # --- System Health Monitors ---
+            {"name": "DB Size Monitor", "check_type": "db_size", "schedule_seconds": 14400, "cooldown_minutes": 240, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 20}},
+            {"name": "Ollama Latency Monitor", "check_type": "ollama_latency", "schedule_seconds": 7200, "cooldown_minutes": 120, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 50}},
+            {"name": "Skill Quality Monitor", "check_type": "skill_quality", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "ChromaDB Integrity", "check_type": "chromadb_integrity", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "KG Health Monitor", "check_type": "kg_health", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 3 notable AI/ML developments from TODAY or the past 24-48 hours: new model releases, research breakthroughs, benchmark results, or major company announcements. For each: what happened, who did it, the date, and why it matters.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},

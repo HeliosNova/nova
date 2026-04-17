@@ -394,6 +394,21 @@ class HeartbeatLoop:
         elif monitor.check_type == "prompt_analyzer":
             return await self._execute_prompt_analyzer(cfg)
 
+        elif monitor.check_type == "db_size":
+            return await self._execute_db_size_check()
+
+        elif monitor.check_type == "ollama_latency":
+            return await self._execute_ollama_latency_check()
+
+        elif monitor.check_type == "skill_quality":
+            return await self._execute_skill_quality_check()
+
+        elif monitor.check_type == "chromadb_integrity":
+            return await self._execute_chromadb_integrity_check()
+
+        elif monitor.check_type == "kg_health":
+            return await self._execute_kg_health_check()
+
         return f"[Unknown check_type: {monitor.check_type}]"
 
     async def _execute_system_health(self) -> str:
@@ -1617,6 +1632,145 @@ class HeartbeatLoop:
         except Exception as e:
             logger.error("[Heartbeat] Prompt analyzer failed: %s", e, exc_info=True)
             return f"[Prompt analyzer failed: {e}]"
+
+    async def _execute_db_size_check(self) -> str:
+        """Check SQLite database file size and table row counts."""
+        from app.database import get_db
+        import os
+
+        parts = []
+
+        try:
+            db_path = config.DB_PATH if hasattr(config, "DB_PATH") else "/data/nova.db"
+            if os.path.exists(db_path):
+                size_bytes = os.path.getsize(db_path)
+                size_mb = size_bytes / (1024 * 1024)
+                parts.append(f"DB size: {size_mb:.1f} MB")
+                wal_path = db_path + "-wal"
+                if os.path.exists(wal_path):
+                    wal_mb = os.path.getsize(wal_path) / (1024 * 1024)
+                    parts.append(f"WAL: {wal_mb:.1f} MB")
+            else:
+                parts.append(f"DB not found: {db_path}")
+        except Exception as e:
+            parts.append(f"DB size error: {e}")
+
+        db = get_db()
+        for table in ("conversations", "messages", "lessons", "reflexions", "skills", "kg_facts", "monitors"):
+            try:
+                row = db.fetchone(f"SELECT count(*) as c FROM {table}")
+                parts.append(f"{table}: {row['c']} rows")
+            except Exception:
+                pass
+
+        return " | ".join(parts)
+
+    async def _execute_ollama_latency_check(self) -> str:
+        """Measure Ollama response latency with a trivial prompt."""
+        import time
+        try:
+            from app.core import llm
+            provider = llm.get_provider()
+            start = time.monotonic()
+            healthy = await provider.check_health()
+            elapsed_ms = (time.monotonic() - start) * 1000
+            if healthy:
+                return f"Ollama latency: {elapsed_ms:.0f}ms (healthy)"
+            else:
+                return f"Ollama latency: {elapsed_ms:.0f}ms (UNHEALTHY)"
+        except Exception as e:
+            return f"Ollama latency: error ({e})"
+
+    async def _execute_skill_quality_check(self) -> str:
+        """Check skill corpus quality: success rates, disabled skills, dedup guard rate."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        if not svc.skills:
+            return "Skill store not available"
+
+        try:
+            db = svc.skills._db
+            total = db.fetchone("SELECT count(*) as c FROM skills")["c"]
+            enabled = db.fetchone("SELECT count(*) as c FROM skills WHERE enabled = 1")["c"]
+            disabled = total - enabled
+            avg_row = db.fetchone("SELECT avg(success_rate) as avg_sr FROM skills WHERE enabled = 1")
+            avg_sr = avg_row["avg_sr"] if avg_row and avg_row["avg_sr"] is not None else 0.0
+            degrading = db.fetchone(
+                "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
+            )["c"]
+            parts = [
+                f"Total: {total}",
+                f"Enabled: {enabled}",
+                f"Disabled: {disabled}",
+                f"Avg success rate: {avg_sr:.2f}",
+                f"Degrading: {degrading}",
+            ]
+            return " | ".join(parts)
+        except Exception as e:
+            return f"Skill quality error: {e}"
+
+    async def _execute_chromadb_integrity_check(self) -> str:
+        """Check ChromaDB collection health: doc count, collection status."""
+        from app.core.brain import get_services
+        from app.database import get_db
+
+        svc = get_services()
+        parts = []
+
+        if svc.retriever:
+            try:
+                collection = svc.retriever._get_collection()
+                doc_count = collection.count()
+                parts.append(f"ChromaDB docs: {doc_count}")
+            except Exception as e:
+                parts.append(f"ChromaDB error: {e}")
+        else:
+            parts.append("Retriever not available")
+
+        try:
+            db = get_db()
+            fts_row = db.fetchone("SELECT count(*) as c FROM chunks_fts")
+            parts.append(f"FTS5 chunks: {fts_row['c']}")
+        except Exception:
+            pass
+
+        return " | ".join(parts)
+
+    async def _execute_kg_health_check(self) -> str:
+        """Check Knowledge Graph health: node count, edge count, fragmentation."""
+        from app.core.brain import get_services
+
+        svc = get_services()
+        if not svc.kg:
+            return "KG not available"
+
+        try:
+            stats = svc.kg.get_stats()
+            parts = [
+                f"Facts: {stats.get('total_facts', 0)}",
+                f"Active: {stats.get('current_facts', 0)}",
+                f"Superseded: {stats.get('superseded_facts', 0)}",
+            ]
+            db = svc.kg._db
+            entities_row = db.fetchone(
+                "SELECT count(DISTINCT subject) + count(DISTINCT object) as c FROM kg_facts WHERE valid_to IS NULL"
+            )
+            if entities_row:
+                parts.append(f"Unique entities: {entities_row['c']}")
+            orphans_row = db.fetchone("""
+                SELECT count(*) as c FROM (
+                    SELECT subject as entity FROM kg_facts WHERE valid_to IS NULL
+                    GROUP BY subject HAVING count(*) = 1
+                    EXCEPT
+                    SELECT object as entity FROM kg_facts WHERE valid_to IS NULL
+                )
+            """)
+            if orphans_row:
+                parts.append(f"Orphans: {orphans_row['c']}")
+            return " | ".join(parts)
+        except Exception as e:
+            return f"KG health error: {e}"
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""

@@ -54,15 +54,15 @@ class TestSkillExtractionThreshold:
             mock_llm.invoke_nothink.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_skips_with_one_tool_result(self, db, monkeypatch):
-        """No extraction when only 1 tool result."""
+    async def test_single_tool_result_with_failure_marker_skips(self, db, monkeypatch):
+        """No extraction when single tool result AND answer contains failure marker."""
         monkeypatch.setenv("ENABLE_AUTO_SKILL_CREATION", "true")
         from app.config import reset_config
         reset_config()
 
         skills = SkillStore(db)
         with patch("app.core.auto_skills.llm") as mock_llm:
-            await maybe_extract_skill("hello", _make_tool_results(1), "answer", skills)
+            await maybe_extract_skill("hello", _make_tool_results(1), "i couldn't find that", skills)
             mock_llm.invoke_nothink.assert_not_called()
 
     @pytest.mark.asyncio
