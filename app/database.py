@@ -579,6 +579,121 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 14: daemon_log + event_queue tables ---
+        # These tables are referenced throughout app/monitors/daemon.py,
+        # app/api/daemon.py, app/api/events.py, app/core/dream.py, and
+        # app/monitors/event_trigger.py, but were never created by any prior
+        # schema step — so the DaemonOrchestrator would silently swallow
+        # "no such table" errors on every tick. Phase-0 bootstrap fix.
+        if 14 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "daemon_log" not in tables:
+                    conn.execute("""
+                        CREATE TABLE daemon_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            category TEXT NOT NULL,
+                            content TEXT NOT NULL DEFAULT '',
+                            source TEXT DEFAULT '',
+                            created_at TEXT DEFAULT (datetime('now'))
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_daemon_log_created "
+                        "ON daemon_log (created_at)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_daemon_log_category "
+                        "ON daemon_log (category, created_at)"
+                    )
+                if "event_queue" not in tables:
+                    conn.execute("""
+                        CREATE TABLE event_queue (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_type TEXT NOT NULL,
+                            payload TEXT DEFAULT '',
+                            priority REAL DEFAULT 0.5,
+                            status TEXT DEFAULT 'pending',
+                            created_at TEXT DEFAULT (datetime('now')),
+                            processed_at TEXT
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_event_queue_status "
+                        "ON event_queue (status, priority DESC, created_at ASC)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_event_queue_type "
+                        "ON event_queue (event_type, status)"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (14,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 15: goals table + Phase-0 bootstrap seed ---
+        # Minimal will-module scaffold so Nova has somewhere to read its
+        # intended next action from. The schema is intentionally bare —
+        # the bootstrap goal's purpose is to write app/core/goals.py with
+        # a proper GoalStore, which will then own this table.
+        if 15 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "goals" not in tables:
+                    conn.execute("""
+                        CREATE TABLE goals (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            goal TEXT NOT NULL,
+                            priority REAL DEFAULT 0.5,
+                            status TEXT DEFAULT 'pending',
+                            source TEXT DEFAULT 'user',
+                            context TEXT DEFAULT '{}',
+                            created_at TEXT DEFAULT (datetime('now')),
+                            updated_at TEXT DEFAULT (datetime('now')),
+                            completed_at TEXT
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_goals_status_priority "
+                        "ON goals (status, priority DESC, created_at ASC)"
+                    )
+
+                # Seed Phase-0 bootstrap goal exactly once. Idempotent on
+                # (source='phase_0_bootstrap') so this migration is safe to
+                # re-run on DBs that already contain it.
+                seed_text = (
+                    "write app/core/goals.py with GoalStore, "
+                    "derive_goals_from_state(), and execute_goal(); "
+                    "wire pursue_goal into DaemonOrchestrator._decide"
+                )
+                existing = conn.execute(
+                    "SELECT id FROM goals WHERE source='phase_0_bootstrap' LIMIT 1"
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO goals (goal, priority, status, source, context) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            seed_text,
+                            1.0,                    # priority high
+                            "pending",
+                            "phase_0_bootstrap",
+                            '{"phase": 0, "seeded_by": "phase-0-bootstrap migration"}',
+                        ),
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (15,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
         with self._lock:
             conn = self._get_conn()

@@ -370,6 +370,18 @@ class MonitorStore:
         "Curiosity Research",
         # Background loops
         "System Maintenance",
+        # Phase-0 ambient restoration (low-cost, broad-signal, proven-stable).
+        # Four are internal-state-only (no network). The fifth is a single
+        # cheap web_search against a curated high-signal source. Collectively
+        # they exercise learning, validate skills, propose new monitors, pulse
+        # training readiness, and give ambient "what's happening" awareness.
+        # See _migrate_existing_monitors V4 for the one-shot re-enable on
+        # existing DBs where these were previously culled.
+        "Lesson Quiz",
+        "Skill Validation",
+        "Auto-Monitor Detector",
+        "Fine-Tune Check",
+        "Hacker News Top Stories",
     })
 
     def seed_defaults(self) -> int:
@@ -723,10 +735,11 @@ class MonitorStore:
             logger.warning("[MonitorStore] Category back-fill failed: %s", e)
 
         # Check if migration already applied
-        _MIGRATION_VERSION = 3
+        _MIGRATION_VERSION = 4
         self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         row = self._db.fetchone("SELECT value FROM meta WHERE key = 'monitor_migration_version'")
-        if row and int(row["value"]) >= _MIGRATION_VERSION:
+        current_version = int(row["value"]) if row else 0
+        if current_version >= _MIGRATION_VERSION:
             return
 
         # V3: Update ALL query-type monitor prompts for temporal freshness
@@ -796,6 +809,26 @@ class MonitorStore:
                 if not CuriosityQueue._is_valid_topic(topic):
                     self.delete(m.id)
                     logger.info("[MonitorStore] Deleted garbage auto-monitor: %s", m.name)
+
+        # V4: Phase-0 ambient restoration — re-enable 5 low-cost, broad-signal
+        # monitors that were previously culled. Idempotent: only flips rows that
+        # exist AND are currently disabled. User may disable again at will; this
+        # migration will not flip them back on subsequent startups.
+        if current_version < 4:
+            _phase_0_restore = (
+                "Lesson Quiz",
+                "Skill Validation",
+                "Auto-Monitor Detector",
+                "Fine-Tune Check",
+                "Hacker News Top Stories",
+            )
+            for name in _phase_0_restore:
+                m = self.get_by_name(name)
+                if m and not m.enabled:
+                    self.update(m.id, enabled=True)
+                    logger.info(
+                        "[MonitorStore] V4 Phase-0 restore: re-enabled '%s'", name
+                    )
 
         # Mark migration as applied
         self._db.execute(
