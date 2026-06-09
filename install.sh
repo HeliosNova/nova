@@ -63,7 +63,7 @@ if [ "$HAS_GPU" = true ]; then
     echo ""
     echo "  Pulling models (this may take a few minutes)..."
     docker exec nova-ollama ollama pull qwen3.5:27b
-    docker exec nova-ollama ollama pull nomic-embed-text-v2-moe
+    docker exec nova-ollama ollama pull bge-m3
 else
     echo ""
     echo "  No GPU — using cloud LLM mode."

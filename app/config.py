@@ -56,7 +56,7 @@ _MUTABLE_FIELDS = {
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
     "WEB_SEARCH_TIMEOUT", "WEB_SEARCH_ENGINES", "WEB_SEARCH_MAX_RESULTS",
     "ALLOWED_ORIGINS",
-    "MAX_SYSTEM_TOKENS", "MAX_USER_FACTS", "MAX_KG_FACTS",
+    "MAX_SYSTEM_TOKENS", "MAX_USER_FACTS", "MAX_KG_FACTS", "MAX_LESSON_CANDIDATES",
     "MAX_CURIOSITY_PENDING", "MAX_CURIOSITY_ATTEMPTS", "MAX_CURIOSITY_QUEUE_SIZE",
     "MAX_CUSTOM_TOOL_CODE_LENGTH", "MAX_CUSTOM_TOOLS", "RATE_LIMIT_RPM",
     "MAX_KG_FACTS_IN_PROMPT", "MAX_REFLEXIONS_IN_PROMPT", "MAX_SUCCESS_PATTERNS_IN_PROMPT",
@@ -66,7 +66,7 @@ _MUTABLE_FIELDS = {
     # Tuning parameters
     "RESPONSE_TOKEN_BUDGET", "RETRIEVAL_RELEVANCE_THRESHOLD",
     "TEMPERATURE_DEFAULT",
-    "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
+    "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "KG_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
     "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
@@ -128,7 +128,12 @@ class Config:
     RECENT_MESSAGES_KEEP: int = field(default_factory=lambda: _env_int("RECENT_MESSAGES_KEEP", 12))
 
     # Retrieval
-    EMBEDDING_MODEL: str = field(default_factory=lambda: _env("EMBEDDING_MODEL", "nomic-embed-text-v2-moe"))
+    # Embedder for all ChromaDB collections. Resolved by app/core/embedding.py:
+    # a reachable Ollama embedder is used; otherwise falls back to ChromaDB's
+    # bundled all-MiniLM-L6-v2. bge-m3 won a 2026 paraphrase-retrieval bake-off
+    # (r@3=1.00 vs MiniLM 0.95); see embedding.py. Set to "default" to force
+    # MiniLM (zero GPU/network cost) on modest hardware.
+    EMBEDDING_MODEL: str = field(default_factory=lambda: _env("EMBEDDING_MODEL", "bge-m3"))
     RETRIEVAL_TOP_K: int = field(default_factory=lambda: _env_int("RETRIEVAL_TOP_K", 5))
     CHUNK_SIZE: int = field(default_factory=lambda: _env_int("CHUNK_SIZE", 512))
     CHUNK_OVERLAP: int = field(default_factory=lambda: _env_int("CHUNK_OVERLAP", 50))
@@ -322,6 +327,7 @@ class Config:
     MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 18000))
     MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
     MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 5000))
+    MAX_LESSON_CANDIDATES: int = field(default_factory=lambda: _env_int("MAX_LESSON_CANDIDATES", 5000))
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
     MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
     MAX_CURIOSITY_QUEUE_SIZE: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_QUEUE_SIZE", 100))
@@ -364,6 +370,7 @@ class Config:
     # surface the relevant lesson — the WS2A "semantic-first" change. The RRF
     # fusion, MIN_RRF_SCORE floor, and 0.40 confidence floor remain as backstops.
     LESSON_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_MAX_DISTANCE", 0.9))
+    KG_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("KG_VECTOR_MAX_DISTANCE", 0.8))
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))

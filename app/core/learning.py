@@ -189,11 +189,13 @@ class LearningEngine:
         if self._lessons_collection is None:
             try:
                 import chromadb
+                from .embedding import get_embedding_function
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._lessons_collection = client.get_or_create_collection(
-                    name="lessons",
-                    metadata={"hnsw:space": "cosine"},
-                )
+                _kw = {"name": "lessons", "metadata": {"hnsw:space": "cosine"}}
+                _ef = get_embedding_function()
+                if _ef is not None:
+                    _kw["embedding_function"] = _ef
+                self._lessons_collection = client.get_or_create_collection(**_kw)
             except Exception as e:
                 logger.warning("Failed to init lessons ChromaDB collection: %s", e)
                 return None
@@ -473,8 +475,13 @@ class LearningEngine:
         """Get lessons relevant to a query using hybrid retrieval (vector + keyword + RRF)."""
         limit = limit or config.MAX_LESSONS_IN_PROMPT
 
+        # Candidate cap mirrors KG's MAX_KG_FACTS fix: a hardcoded LIMIT 500
+        # silently drops candidates once lessons exceed it, so the vector/keyword
+        # arms can never surface a relevant lesson outside the top-500-by-helpful.
+        _cand = int(getattr(config, "MAX_LESSON_CANDIDATES", 5000))
         all_lessons = self._db.fetchall(
-            "SELECT * FROM lessons ORDER BY times_helpful DESC, confidence DESC LIMIT 500"
+            "SELECT * FROM lessons ORDER BY times_helpful DESC, confidence DESC LIMIT ?",
+            (_cand,),
         )
 
         if not all_lessons:

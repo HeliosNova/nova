@@ -34,13 +34,20 @@ files in `app/`. Learning is the product.
   (2) `ENABLE_EXTENDED_THINKING=false` in the override — nova-ft (9B) burned its budget in `<think>`
   and returned EMPTY answers / web-searched fictional facts instead of reading the injected lesson.
   Reasoning category is neutral (6/7 both ways; thinking-on also produced an empty there). Remaining
-  miss is paraphrase **retrieval** — the lessons ChromaDB collection uses the default MiniLM embedder.
-  A naive swap to `nomic-embed-text-v2-moe` was tried 2026-05-30 and **REVERTED**: it regressed the
-  eval 0.83→0.17 (even direct tasks broke). nomic's cosine-distance scale mismatches the MiniLM-tuned
-  `LESSON_VECTOR_MAX_DISTANCE=0.9` gate, and the startup reindex contended with query-time embeds. A
-  real embedding upgrade needs per-embedder gate calibration + an isolated/throttled reindex — not a
-  drop-in. The lesson vector *gate* itself was disproven for MiniLM (0.7==0.95). Consider conditional
-  thinking (on for complex, off for recall) as a separate refinement.
+  miss is paraphrase **retrieval**.
+- **EMBEDDER UPGRADE — done properly + measured (2026-06-09):** The earlier (2026-05-30) `nomic`
+  swap was reverted because it was a *half-wired* hack (the `EMBEDDING_MODEL` config was dead — every
+  collection silently used ChromaDB's 2020-era MiniLM-L6 default; no Ollama embedder was ever called).
+  Fixed for real: a 2026 offline bake-off over 80 paraphrase→fact queries measured MiniLM **last** of
+  five (`app/core/embedding.py` has the table); **bge-m3** won the deployable slot (symmetric, so it
+  drops into ChromaDB's EF; r@3=1.00 vs MiniLM 0.95). Wired a gated `OllamaEmbeddingFunction`
+  (`app/core/embedding.py`, falls back to MiniLM if the embedder isn't reachable → giveaway-safe),
+  set `EMBEDDING_MODEL=bge-m3`, calibrated `KG_VECTOR_MAX_DISTANCE` from the measured distribution
+  (correct matches at cosine 0.08–0.42), and did a clean full reindex (`_reindex_embeddings.py`) that
+  also dropped ~3,400 stale/superseded KG vectors (chroma 5,916 → 2,490 active). **Result: kg-retrieval
+  causal_fix 0.83 → 1.0** (every paraphrase resolves); lessons retrieval ranks the hardest keyword-free
+  paraphrase **#1** (dist 0.386). The lesson vector *gate* was disproven for MiniLM (0.7==0.95).
+  Consider conditional thinking (on for complex, off for recall) as a separate refinement.
 - **ROOT CAUSE of the memory loop's fragility, found + fixed (2026-05-30):** `MIN_RRF_SCORE=0.015` was
   filtering out **keyword-only** lesson matches — a single keyword hit blends to ~0.0139 (`0.85 × 1/61`)
   < 0.015 — so lesson retrieval depended ENTIRELY on the ChromaDB vector index, which was found **empty**
@@ -242,7 +249,8 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 - **Runtime**: FastAPI, uvicorn, httpx, chromadb, sympy, pydantic
 - **LLM (default)**: Ollama 0.17.5+ with qwen3.5:27b (17GB VRAM)
 - **MCP (optional)**: `mcp` package for Model Context Protocol tool integration
-- **Embedding**: nomic-embed-text-v2-moe (0.5GB VRAM)
+- **Embedding**: bge-m3 (1024-dim, ~1.2GB VRAM) via a gated Ollama EmbeddingFunction; falls back to
+  ChromaDB's bundled all-MiniLM-L6-v2 if unreachable. Won a 2026 paraphrase-retrieval bake-off.
 - **Fine-tuning** (separate venv): unsloth, trl, torch (see `scripts/requirements-finetune.txt`)
 
 ## Docker

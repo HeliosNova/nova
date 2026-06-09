@@ -408,11 +408,13 @@ class KnowledgeGraph:
             try:
                 import chromadb
                 from ..config import config
+                from .embedding import get_embedding_function
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._collection = client.get_or_create_collection(
-                    name="kg_facts",
-                    metadata={"hnsw:space": "cosine"},
-                )
+                _kw = {"name": "kg_facts", "metadata": {"hnsw:space": "cosine"}}
+                _ef = get_embedding_function()
+                if _ef is not None:
+                    _kw["embedding_function"] = _ef
+                self._collection = client.get_or_create_collection(**_kw)
             except Exception as e:
                 logger.warning("Failed to init kg_facts ChromaDB collection: %s", e)
                 return None
@@ -428,7 +430,7 @@ class KnowledgeGraph:
             return 0
 
         all_rows = self._db.fetchall(
-            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL LIMIT 1000"
+            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
         )
         if not all_rows:
             return 0
@@ -1080,8 +1082,10 @@ class KnowledgeGraph:
                 )
                 if results and results["ids"] and results["ids"][0]:
                     # Filter by cosine distance threshold (0 = identical, 2 = opposite).
-                    # Only keep results with distance < 0.8 (similarity > 0.6).
-                    _MAX_DISTANCE = 0.8
+                    # Default 0.8 (sim > 0.6) suits MiniLM; configurable because
+                    # modern embedders (bge-m3) place relevant pairs at different
+                    # distances. RRF fusion is the real ranker; this is a coarse gate.
+                    _MAX_DISTANCE = float(getattr(_config, "KG_VECTOR_MAX_DISTANCE", 0.8))
                     distances = results.get("distances", [[]])[0]
                     for rid_str, dist in zip(results["ids"][0], distances):
                         rid = int(rid_str)

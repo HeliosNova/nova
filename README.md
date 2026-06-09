@@ -62,7 +62,7 @@ docker compose up -d
 
 # Pull models (one-time)
 docker exec nova-ollama ollama pull qwen3.5:27b            # Main model
-docker exec nova-ollama ollama pull nomic-embed-text-v2-moe # Embeddings
+docker exec nova-ollama ollama pull bge-m3                 # Embeddings (won a paraphrase-retrieval bake-off)
 ```
 
 Open `http://localhost:5173` — that's it.

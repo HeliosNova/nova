@@ -56,11 +56,13 @@ class Retriever:
             if self._collection is None:
                 try:
                     import chromadb
+                    from .embedding import get_embedding_function
                     self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                    self._collection = self._chroma_client.get_or_create_collection(
-                        name="documents",
-                        metadata={"hnsw:space": "cosine"},
-                    )
+                    _kw = {"name": "documents", "metadata": {"hnsw:space": "cosine"}}
+                    _ef = get_embedding_function()
+                    if _ef is not None:
+                        _kw["embedding_function"] = _ef
+                    self._collection = self._chroma_client.get_or_create_collection(**_kw)
                 except Exception as e:
                     logger.error("Failed to init ChromaDB: %s", e)
                     raise

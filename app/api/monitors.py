@@ -407,6 +407,40 @@ async def trigger_monitor(monitor_id: int):
     return result
 
 
+@router.post("/eval/run")
+async def run_eval_categories(categories: str = Query("memory-learning,kg-retrieval")):
+    """Run selected eval categories on demand, in-process (full service fidelity).
+
+    Faster than triggering the full Quality Eval Harness monitor when you only
+    need the causal-fix categories. Returns per-category causal_fix_rate plus
+    per-task before/after correctness.
+    """
+    from app.monitors.eval_harness import EvalHarness
+    cats = {c.strip() for c in categories.split(",") if c.strip()}
+    harness = EvalHarness()
+    tasks = [t for t in harness.load_suite() if t.category in cats]
+    if not tasks:
+        raise HTTPException(status_code=400, detail=f"No tasks for categories {cats}")
+    report = await harness.run_all(tasks)
+    return {
+        "categories": {
+            cat: {
+                "pass_rate": cm.pass_rate,
+                "causal_fix_rate": cm.memory_causal_fix_rate,
+                "testable": cm.memory_testable,
+                "total": cm.total,
+            }
+            for cat, cm in (report.categories or {}).items()
+        },
+        "tasks": [
+            {"id": r.task_id, "passed": r.passed,
+             "before_correct": r.memory_before_correct,
+             "after_correct": r.memory_after_correct}
+            for r in report.task_results
+        ],
+    }
+
+
 class InstructionCreate(BaseModel):
     instruction: str = Field(min_length=1, max_length=5_000)
     schedule_seconds: int = Field(3600, ge=60, le=604_800)
