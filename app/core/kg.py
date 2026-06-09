@@ -135,23 +135,23 @@ def _normalize_words(text: str) -> set[str]:
 
 
 def normalize_entity(name: str) -> str:
-    """Normalize an entity name for consistent storage.
+    """Light cleanup only — strip and collapse whitespace. Casing is PRESERVED.
 
-    Strategy: strip whitespace, collapse internal whitespace, title-case for
-    readability.  Keeps acronyms (ALL-CAPS words ≤5 chars) uppercase.
+    The old implementation title-cased every word, which mangled the extractor's
+    correct casing (BlackRock->Blackrock, OpenAI->Openai, iPhone->Iphone) and
+    diverged on acronyms ("AMD" kept but "amd"->"Amd"), fragmenting entities into
+    casing-only variants. Cross-variant consistency is now handled by
+    KnowledgeGraph._canonical_entity (a kg_entity_aliases registry), which maps
+    every casing variant to one canonical form chosen by casing richness.
     """
-    name = " ".join(name.split())  # collapse whitespace
-    if not name:
-        return name
-    words = name.split()
-    normalized = []
-    for w in words:
-        # Keep short all-caps words (acronyms: AI, ML, US, EU, GDP)
-        if w.isupper() and len(w) <= 5:
-            normalized.append(w)
-        else:
-            normalized.append(w.capitalize())
-    return " ".join(normalized)
+    return " ".join(name.split()) if name else name
+
+
+def _casing_score(s: str) -> int:
+    """Rank casing 'intentionality' for choosing a canonical form. Counts
+    uppercase letters: BlackRock=2 > Blackrock=1; AMD=3 > Amd=1; OpenAI=3 >
+    Openai=1. Naive .capitalize() artifacts (one leading capital) score lowest."""
+    return sum(1 for c in s if c.isupper())
 
 
 # ---------------------------------------------------------------------------
@@ -335,6 +335,10 @@ class KnowledgeGraph:
     );
     CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_facts(subject);
     CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_facts(object);
+    CREATE TABLE IF NOT EXISTS kg_entity_aliases (
+        alias_lower TEXT PRIMARY KEY,
+        canonical TEXT NOT NULL
+    );
     """
 
     def __init__(self, db):
@@ -496,6 +500,57 @@ class KnowledgeGraph:
                 scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores, key=lambda x: scores[x], reverse=True)
 
+    # --- Entity canonicalization ---
+
+    def _canonical_entity(self, name: str, register: bool = False) -> str:
+        """Map an entity to its one canonical casing via the kg_entity_aliases
+        registry, so casing variants ("AMD"/"amd", "BlackRock"/"Blackrock") never
+        fragment into separate graph nodes or duplicate facts.
+
+        Lookup is case-insensitive (keyed on lower(name)). On a write path pass
+        register=True: an unseen entity registers its (whitespace-cleaned) form as
+        the canonical; a richer-cased form upgrades the canonical AND rewrites the
+        entity's existing facts so storage stays consistent. Query paths pass
+        register=False (lookup only — never pollute the registry with query casing).
+        """
+        clean = normalize_entity(name)
+        if not clean:
+            return clean
+        low = clean.lower()
+        row = self._db.fetchone(
+            "SELECT canonical FROM kg_entity_aliases WHERE alias_lower = ?", (low,)
+        )
+        if row is not None:
+            current = row["canonical"]
+            if register and _casing_score(clean) > _casing_score(current):
+                # A better-cased form arrived — upgrade canonical + rewrite facts.
+                try:
+                    self._db.execute(
+                        "UPDATE kg_entity_aliases SET canonical = ? WHERE alias_lower = ?",
+                        (clean, low),
+                    )
+                    self._db.execute(
+                        "UPDATE kg_facts SET subject = ? WHERE LOWER(subject) = ?",
+                        (clean, low),
+                    )
+                    self._db.execute(
+                        "UPDATE kg_facts SET object = ? WHERE LOWER(object) = ?",
+                        (clean, low),
+                    )
+                except Exception as e:
+                    logger.debug("canonical upgrade failed for %r: %s", clean, e)
+                return clean
+            return current
+        if register:
+            try:
+                self._db.execute(
+                    "INSERT OR IGNORE INTO kg_entity_aliases (alias_lower, canonical) "
+                    "VALUES (?, ?)", (low, clean),
+                )
+            except Exception as e:
+                logger.debug("alias register failed for %r: %s", clean, e)
+        return clean
+
     # --- Core operations ---
 
     async def add_fact(
@@ -544,6 +599,10 @@ class KnowledgeGraph:
         fact_valid_from, valid_to, provenance, now,
     ) -> bool:
         """Sync helper for add_fact — all DB operations happen here (off event loop)."""
+        # Canonicalize entities (under the write lock) so casing variants collapse
+        # to one form before storage — no fragmented graph nodes or dup facts.
+        subject = self._canonical_entity(subject, register=True)
+        object_ = self._canonical_entity(object_, register=True)
         # Check for exact duplicate
         existing = self._db.fetchone(
             "SELECT id, confidence FROM kg_facts "
@@ -914,7 +973,7 @@ class KnowledgeGraph:
             max_results: Maximum number of results.
             include_superseded: If False (default), only return current facts.
         """
-        entity = normalize_entity(entity)
+        entity = self._canonical_entity(entity)
         if not entity:
             return []
 
@@ -1208,7 +1267,7 @@ class KnowledgeGraph:
         Returns:
             List of fact dicts valid at the given time.
         """
-        entity = normalize_entity(entity)
+        entity = self._canonical_entity(entity)
         if not entity:
             return []
 
@@ -1271,7 +1330,7 @@ class KnowledgeGraph:
         Returns rows we had in the DB on that date and hadn't superseded yet,
         regardless of whether those records were later overturned.
         """
-        entity = normalize_entity(entity)
+        entity = self._canonical_entity(entity)
         if not entity:
             return []
 
@@ -1325,7 +1384,7 @@ class KnowledgeGraph:
         Returns:
             List of fact dicts ordered by valid_from DESC (most recent first).
         """
-        subject = normalize_entity(subject)
+        subject = self._canonical_entity(subject)
         predicate = normalize_predicate(predicate)
 
         rows = self._db.fetchall(
