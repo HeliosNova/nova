@@ -2663,6 +2663,29 @@ async def _run_post_processing(
                     else:
                         lesson_id = await asyncio.to_thread(svc.learning.save_lesson, correction)
 
+                        # ACE harmful-attribution (strongest signal): the user just
+                        # CORRECTED an answer, so the lessons that were in-context for
+                        # it were collectively unhelpful. Re-retrieve the lessons
+                        # relevant to the original question (~= those injected for the
+                        # wrong answer) and demote them — excluding the correction we
+                        # just saved. mark_lesson_unhelpful is dampened, so a lesson
+                        # only incidentally present self-corrects over time.
+                        try:
+                            _prior_lessons = await asyncio.to_thread(
+                                svc.learning.get_relevant_lessons, original_query or query)
+                            _demoted = 0
+                            for _les in (_prior_lessons or []):
+                                _lid = getattr(_les, "id", None)
+                                if _lid and _lid != lesson_id:
+                                    await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, _lid)
+                                    _demoted += 1
+                            if _demoted:
+                                logger.info(
+                                    "[ACE] correction-attribution: demoted %d in-context "
+                                    "lesson(s) that preceded a user correction", _demoted)
+                        except Exception as _e:
+                            logger.debug("correction-attribution penalty failed: %s", _e)
+
                         dpo_query = original_query or query
                         dpo_rejected = (prev_answer or "")[:1000]
                         dpo_chosen = (correction.correct_answer or correction.lesson_text or "")[:1000]
