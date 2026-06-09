@@ -207,6 +207,19 @@ _INHERENTLY_UNCERTAIN_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Query EXPLICITLY asks Nova to use a tool ("write and run code", "use the
+# calculator"). As the memory loop teaches the model to compute, it tends to
+# self-answer correctly but skip the requested tool — fine for implicit math
+# ("what is 15% of 840"), but it should honor an *explicit* tool request. This
+# fires narrowly so it never forces a tool on a query that didn't ask for one.
+_EXPLICIT_TOOL_REQUEST_RE = re.compile(
+    r"\b(run|execute)\b[^.?!\n]{0,25}\b(code|python|script)\b"
+    r"|\bwrite\b[^.?!\n]{0,20}\b(and|&)\b[^.?!\n]{0,10}\brun\b"
+    r"|\buse\b[^.?!\n]{0,12}\b(the\s+)?calculator\b"
+    r"|\bcode[_ ]exec\b",
+    re.IGNORECASE,
+)
+
 # Time-sensitive queries (current price, latest news, today's weather) must
 # never serve from workspace cache or stale lessons — the "fact" they cached
 # yesterday is wrong today. Used to:
@@ -928,6 +941,16 @@ async def _build_messages(
     if image:
         user_msg["images"] = [image]
     messages.append(user_msg)
+
+    # Honor EXPLICIT tool requests: if the user asked to run code / use the
+    # calculator, the answer must come from the tool's output, not from memory.
+    # (Narrowly gated — implicit math like "what is 15% of 840" is unaffected.)
+    if _EXPLICIT_TOOL_REQUEST_RE.search(query):
+        messages.append({"role": "system", "content": (
+            "[EXPLICIT TOOL REQUEST] The user explicitly asked you to use a tool "
+            "(run code and/or use the calculator). You MUST invoke the appropriate "
+            "tool (code_exec or calculator) and base your answer on its actual "
+            "output — do not compute or recall the result from memory instead.")})
 
     # Query Planning
     was_planned = False
