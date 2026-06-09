@@ -1961,6 +1961,27 @@ async def _extract_workspace_facts(query: str, answer: str) -> dict[str, str]:
         return {}
 
 
+_UNVERIFIED_CAVEAT = (
+    "\n\n_(unverified: I couldn't confirm some specifics above against my "
+    "sources — treat precise details like dates, figures, and names with caution.)_"
+)
+
+
+def _maybe_unverified_caveat(final_content: str, flagged_text: str | None) -> str:
+    """Append an honest unverified-claims caveat IFF the exact critique-flagged
+    answer is still what's shipping — i.e. no accepted rewrite, regeneration, or
+    confidence footer changed `final_content` since critique flagged it. The
+    strict `==` makes this under-fire (never double-signal) rather than over-fire:
+    any later modification suppresses the caveat. Idempotent."""
+    if (
+        flagged_text is not None
+        and final_content == flagged_text
+        and "couldn't confirm some specifics" not in final_content
+    ):
+        return final_content.rstrip() + _UNVERIFIED_CAVEAT
+    return final_content
+
+
 async def _refine_response(
     messages: list[dict],
     tools: list[dict],
@@ -1988,6 +2009,12 @@ async def _refine_response(
     # substantive AND no longer than 1.5x the original (guard against
     # over-explanation), otherwise keep original.
     critique_passed = False
+    # Grounding-honesty: if critique flags unsupported claims and we never produce
+    # an accepted rewrite, the flagged answer would otherwise ship as confident
+    # fact. Capture the exact flagged text; at return we append an honest caveat
+    # ONLY if that exact text survived unmodified (any later regeneration changes
+    # final_content and auto-suppresses the note — it under-fires, never over-fires).
+    _flagged_unverified: str | None = None
     if config.ENABLE_CRITIQUE and final_content and intent == "general":
         from app.core.critique import critique_answer, format_critique_for_regeneration
         if len(final_content) >= 200:
@@ -2005,6 +2032,7 @@ async def _refine_response(
                     last_critique_issues = critique.get("issues", [])
                     logger.info("Critique flagged issues: %s", last_critique_issues)
                     issues_list = critique.get("issues", [])
+                    _flagged_unverified = final_content  # ground-truth: this exact text was flagged
                     rewrite_prompt = (
                         "Your previous answer had these issues:\n"
                         + "\n".join(f"- {issue}" for issue in issues_list)
@@ -2472,6 +2500,15 @@ async def _refine_response(
                 )
     except Exception as e:
         logger.debug("Confidence footer logic failed: %s", e)
+
+    # Grounding-honesty caveat (anti-illusion): if critique flagged unsupported
+    # claims and the EXACT flagged text is still shipping (no accepted rewrite,
+    # regeneration, or confidence footer changed it — any of those make the `==`
+    # in the helper False, so this never double-signals), say so.
+    _caveated = _maybe_unverified_caveat(final_content, _flagged_unverified)
+    if _caveated != final_content:
+        final_content = _caveated
+        logger.info("[GROUNDING] appended unverified-claims caveat (critique flagged, unfixed)")
 
     return final_content, reflexion_quality, reflexion_reason
 
