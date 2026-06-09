@@ -191,7 +191,13 @@ class Config:
     WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "bing,startpage,ecosia,yandex,yahoo"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
     CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 15))
-    MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 10))
+    # Worst-case bound on agentic tool-use rounds per query. A 2026 latency/depth
+    # study (7-query mix, cap 10 vs 5) found chat uses <=3 rounds (even a fictional
+    # "find the codename" query self-limited to 3), so 10 was dead headroom and the
+    # cap is NOT a latency lever (latency is dominated by per-round 9B+browser cost,
+    # not round count). 6 keeps comfortable headroom for chat + monitor research
+    # while halving the worst-case spin ceiling. Insurance, not an optimization.
+    MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 6))
     MAX_SAME_TOOL_CALLS: int = field(default_factory=lambda: _env_int("MAX_SAME_TOOL_CALLS", 3))
     MAX_TOOL_CALLS_PER_QUERY: int = field(default_factory=lambda: _env_int("MAX_TOOL_CALLS_PER_QUERY", 15))
     SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 45))
