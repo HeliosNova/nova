@@ -180,6 +180,8 @@ class OllamaProvider:
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
+                # repeat_penalty 1.1 — see streaming path comment.
+                "repeat_penalty": 1.1,
             },
         }
         # Pass tools for native tool calling (Ollama 0.17+)
@@ -285,6 +287,13 @@ class OllamaProvider:
                             "options": {
                                 "num_predict": max_tokens,
                                 "temperature": temperature,
+                                # repeat_penalty 1.1 stops Qwen3.5 from falling
+                                # into degenerate token-loops on complex math /
+                                # LaTeX (verified case 2026-05-04: "0.1+0.2 in
+                                # IEEE 754" produced 4000 chars where the same
+                                # block repeated 6 times). 1.1 is mild — doesn't
+                                # damage normal text. Higher values mangle JSON.
+                                "repeat_penalty": 1.1,
                             },
                         }
                     if ollama_tools and self.capabilities.supports_native_tools:

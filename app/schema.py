@@ -16,6 +16,7 @@ class ChatRequest(BaseModel):
     query: str = Field(min_length=1, max_length=50_000)
     conversation_id: str | None = Field(None, max_length=100)
     image_base64: str | None = Field(None, max_length=10_000_000)
+    ephemeral: bool = False
 
     @field_validator("conversation_id")
     @classmethod

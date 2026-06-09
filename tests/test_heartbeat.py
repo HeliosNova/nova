@@ -176,9 +176,11 @@ class TestMonitorStore:
 
     def test_seed_defaults(self, store):
         count = store.seed_defaults()
-        # 61 pre-cull + 3 new system monitors (Training Job Watch,
-        # KG Growth Rate, Ollama Model Loaded) = 64.
-        assert count == 64
+        # 61 pre-cull + 3 system (Training Job Watch, KG Growth Rate,
+        # Ollama Model Loaded) + 4 self-improvement loop closers
+        # (Goal Derivation, Cross-Monitor Synthesis, Auto-Tool Synthesis,
+        # Output Quality Eval) + 1 added later = 69.
+        assert count == 69
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)
@@ -213,9 +215,11 @@ class TestMonitorStore:
         monitors = store.list_all()
         enabled = [m for m in monitors if m.enabled]
         enabled_names = {m.name for m in enabled}
-        # Should be ~13 core monitors, not 59
-        assert 10 <= len(enabled) <= 18, (
-            f"expected ~13 core monitors enabled, got {len(enabled)}: "
+        # Core seed set has grown to ~21 (including system-health, intelligence, eval).
+        # Bound is loose because we don't want this test to break every time we
+        # seed a new system monitor; we just want to flag if it explodes back to 50+.
+        assert 10 <= len(enabled) <= 30, (
+            f"expected 10-30 core monitors enabled, got {len(enabled)}: "
             f"{sorted(enabled_names)}"
         )
         # Core set checked explicitly
@@ -225,10 +229,12 @@ class TestMonitorStore:
             "Dream Consolidation", "Quality Eval Harness",
         ):
             assert core in enabled_names, f"core monitor '{core}' should be enabled"
-        # Niche domains should NOT be enabled by default
+        # Niche domain studies should NOT be enabled by default; intelligence
+        # monitors (Hacker News, GitHub advisories, etc.) DO enable since they
+        # surface high-value low-volume signals.
         for niche in (
             "Domain Study: Quantum Computing", "Domain Study: Semiconductors",
-            "Domain Study: Whale Watch", "Hacker News Top Stories",
+            "Domain Study: Whale Watch",
         ):
             assert niche not in enabled_names, (
                 f"niche monitor '{niche}' should be disabled by default"

@@ -54,6 +54,90 @@ def _strip_deliberation(text: str) -> str:
     return text.strip()
 
 
+_CITATION_RE = re.compile(r"(?i)\bsource\s*[:–]\s*\S")
+_URL_RE = re.compile(r"https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(?:/[^\s)]*)?")
+_DATE_RE_GATE = re.compile(
+    r"\b("
+    r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
+    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}"
+    r"|"
+    r"\d{4}-\d{2}-\d{2}"
+    r")\b"
+)
+# Hedging patterns that violate the no-hedging rule
+_HEDGE_RE = re.compile(
+    r"(?i)("
+    r"\bapr[/\-]may\b|\bmay[/\-]apr\b|"
+    r"\bapril[–\-]+may\b|\bmay[–\-]+april\b|"
+    r"\b~\s*[a-z]+\b|"
+    r"\b(?:approximately|around|circa|roughly)\s+(?:apr|april|may|jun|june)\b|"
+    r"\b(?:early|mid|late)[\s\-](?:april|may|june)\b|"
+    r"\b\d+[–\-]+\d+\s*days?\s*ago\b|"
+    r"\b\d+\s*days?\s*ago\b"
+    r")"
+)
+
+
+def _domain_study_passes_citation_gate(result: str) -> bool:
+    """A Domain Study output is acceptable if it either:
+      - contains >= 2 'Source:' citations AND >= 2 well-formed dates within the
+        last 48h AND >= 2 well-formed URLs AND no hedging-language matches, OR
+      - is the explicit 'No significant ... in the past 48 hours' fallback,
+      - OR is empty/error (those bypass since we can't fix them by re-rolling).
+    """
+    if not result:
+        return True
+    low = result.lower()
+    if "no significant" in low and "past 48 hours" in low:
+        return True
+    if low.startswith("[query failed") or low.startswith("[query timed out"):
+        return True
+
+    # Hard rejects
+    if _HEDGE_RE.search(result):
+        logger.info("[Heartbeat] citation gate FAIL: hedging language detected")
+        return False
+
+    citations = len(_CITATION_RE.findall(result))
+    if citations < 2:
+        logger.info("[Heartbeat] citation gate FAIL: only %d Source: citations", citations)
+        return False
+
+    urls = [u for u in _URL_RE.findall(result) if "." in u]
+    if len(urls) < 2:
+        logger.info("[Heartbeat] citation gate FAIL: only %d well-formed URLs", len(urls))
+        return False
+
+    # Parse dates and require at least 2 within the last 48h
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = _dt.utcnow() - _td(hours=48)
+    fresh_count = 0
+    stale_count = 0
+    for m in _DATE_RE_GATE.finditer(result):
+        raw = m.group(1)
+        parsed = None
+        for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%Y-%m-%d"):
+            try:
+                parsed = _dt.strptime(raw.strip().rstrip("."), fmt)
+                break
+            except ValueError:
+                continue
+        if not parsed:
+            continue
+        if parsed >= cutoff:
+            fresh_count += 1
+        else:
+            stale_count += 1
+    if fresh_count < 2:
+        logger.info(
+            "[Heartbeat] citation gate FAIL: %d fresh dates, %d stale (need ≥2 fresh)",
+            fresh_count, stale_count,
+        )
+        return False
+
+    return True
+
+
 # ---------------------------------------------------------------------------
 # HeartbeatLoop — the background engine
 # ---------------------------------------------------------------------------
@@ -77,6 +161,10 @@ class HeartbeatLoop:
         self._signal = signal_bot
         self._task: asyncio.Task | None = None
         self._running = False
+        # Strong-ref set for fire-and-forget background tasks (KG extraction)
+        # so the GC can't cancel them mid-flight; the done_callback discards
+        # the entry and surfaces any exception at WARNING.
+        self._kg_bg_tasks: set[asyncio.Task] = set()
 
     def start(self) -> asyncio.Task:
         """Start the heartbeat loop as a background task."""
@@ -188,6 +276,24 @@ class HeartbeatLoop:
         if new_value:
             new_value = strip_tool_call_artifacts(new_value)
 
+        # Empty-result gate: query-type monitors that come back with <50 chars of
+        # actual content (after artifact strip) are treated as soft failures —
+        # log as info, don't alert, don't update last_check_at so we retry on
+        # the next schedule. Without this gate, Domain Study monitors silently
+        # log status=ok with empty value and never get flagged.
+        _stripped = (new_value or "").strip()
+        if monitor.check_type == "query" and len(_stripped) < 50:
+            logger.warning(
+                "[Heartbeat] '%s' returned empty/short result (%d chars) — soft retry on next tick",
+                monitor.name, len(_stripped),
+            )
+            self.store.add_result(
+                monitor.id, "skip",
+                value=_stripped,
+                message=f"empty result ({len(_stripped)} chars) — will retry",
+            )
+            return
+
         # Categorize the result BEFORE recording
         _lower = (new_value or "").lower()
 
@@ -257,13 +363,33 @@ class HeartbeatLoop:
         # Only record check (update last_check_at) on successful results
         self.store.record_check(monitor.id, new_value)
 
-        # Extract KG triples from all factual query monitors (skip non-factual ones)
+        # Extract KG triples from all factual query monitors (skip non-factual ones).
+        # We hold a strong reference to each create_task() result in `_kg_bg_tasks`
+        # so the GC can't cancel the coroutine before it finishes (raw
+        # asyncio.create_task without retention was the prior pattern, and
+        # Python's docs flag that as unsafe). The done_callback logs at
+        # WARNING when the extraction raised so failures surface in operator
+        # logs instead of vanishing.
         if monitor.check_type == "query" and monitor.name not in _NO_KG_MONITORS and new_value and len(new_value) > 100:
             try:
                 from app.core.brain import get_services, _extract_kg_triples
                 svc = get_services()
                 if svc.kg:
-                    asyncio.create_task(_extract_kg_triples(svc.kg, monitor.name, new_value[:2000], source_name=monitor.name))
+                    _kg_task = asyncio.create_task(
+                        _extract_kg_triples(svc.kg, monitor.name, new_value[:2000], source_name=monitor.name)
+                    )
+                    self._kg_bg_tasks.add(_kg_task)
+
+                    def _on_kg_done(t: asyncio.Task, _name: str = monitor.name) -> None:
+                        self._kg_bg_tasks.discard(t)
+                        if t.cancelled():
+                            logger.warning("[KG bg] extraction for %r was cancelled", _name)
+                            return
+                        exc = t.exception()
+                        if exc is not None:
+                            logger.warning("[KG bg] extraction for %r raised: %s", _name, exc)
+
+                    _kg_task.add_done_callback(_on_kg_done)
             except Exception:
                 pass
 
@@ -323,13 +449,41 @@ class HeartbeatLoop:
             # message splitting (Discord splits at 2000, Telegram at 4096)
             analysis = new_value[:4000] if new_value else ""
 
+        # Empty-body gate: if Nova returned nothing meaningful, don't broadcast
+        # a silent/placeholder message to the user's alert channels. Nothing
+        # is better than noise in a monitor feed.
+        if not analysis or len(analysis.strip()) < 20:
+            logger.info(
+                "[Heartbeat] '%s' produced empty/tiny body (%d chars); skipping alert",
+                monitor.name, len(analysis.strip()) if analysis else 0,
+            )
+            self.store.add_result(monitor.id, "ok", value=new_value[:4000] if new_value else "",
+                                  message="empty_body_suppressed")
+            return
+
         # Send alert
         await self._send_alert(monitor, analysis)
 
-        # Auto-disable one-shot reminders after first alert
-        if monitor.name.startswith("[Reminder]"):
-            self.store.update(monitor.id, enabled=False)
-            logger.info("[Heartbeat] Reminder '%s' auto-disabled after alert", monitor.name)
+        # Auto-disable one-shot reminders after first alert (supports both
+        # legacy "[Reminder]" and current "reminder:" prefixes). Recurring
+        # reminders carry a `recurring` flag in check_config and stay enabled.
+        is_reminder = (
+            monitor.name.startswith("[Reminder]")
+            or monitor.name.startswith("reminder:")
+        )
+        if is_reminder:
+            cfg = monitor.check_config or {}
+            if cfg.get("recurring"):
+                # Recurring: monitor's schedule_seconds is the recurrence period;
+                # leave enabled so it fires again next cycle.
+                logger.info(
+                    "[Heartbeat] Recurring reminder '%s' fired — staying enabled "
+                    "(period=%ds)",
+                    monitor.name, monitor.schedule_seconds,
+                )
+            else:
+                self.store.update(monitor.id, enabled=False)
+                logger.info("[Heartbeat] Reminder '%s' auto-disabled after alert", monitor.name)
 
         # Record
         status = "changed" if change_info else "ok"
@@ -368,7 +522,28 @@ class HeartbeatLoop:
             return await self._execute_system_health()
 
         elif monitor.check_type == "query":
-            # Use brain.think() directly — collect tokens
+            # For Domain Study:* monitors use the direct-fetch runner that
+            # gets dates from the search engine (not from the LLM's belief
+            # about what year it is). nova-ft hedges dates badly and the
+            # citation gate then fails everything; the direct-fetch runner
+            # sidesteps that by handing pre-verified items to the LLM only
+            # for formatting.
+            # Route through the direct-fetch runner if Domain Study:* OR
+            # the monitor has curated RSS feeds (SEC Insider Trading, FOMC,
+            # Hacker News, FDA, etc). brain.think() hallucinates fake
+            # filings and dates for these niche topics — the runner pulls
+            # real items from real RSS sources.
+            from app.monitors.rss_feeds import feeds_for
+            if monitor.name.startswith("Domain Study:") or feeds_for(monitor.name):
+                from app.monitors.domain_study_runner import run_domain_study
+                try:
+                    result = await run_domain_study(monitor.name)
+                except Exception as e:
+                    logger.exception("[Heartbeat] domain_study_runner failed")
+                    result = f"## ⚠️ {monitor.name} — runner error\n\n{e}"
+                return result
+            # Operator/internal queries (Morning Check-in, [Reminder]:* etc)
+            # keep the brain.think() path.
             query = cfg.get("query", "")
             return await self._think_query(query)
 
@@ -405,6 +580,10 @@ class HeartbeatLoop:
         elif monitor.check_type == "db_size":
             return await self._execute_db_size_check()
 
+        elif monitor.check_type == "kg_consistency":
+            from app.monitors.kg_consistency import run_kg_consistency_check
+            return await run_kg_consistency_check()
+
         elif monitor.check_type == "ollama_latency":
             return await self._execute_ollama_latency_check()
 
@@ -426,7 +605,67 @@ class HeartbeatLoop:
         elif monitor.check_type == "ollama_model":
             return await self._execute_ollama_model_check()
 
+        elif monitor.check_type == "goal_derivation":
+            return await self._execute_goal_derivation()
+
+        elif monitor.check_type == "synthesis":
+            return await self._execute_cross_synthesis()
+
+        elif monitor.check_type == "auto_tool":
+            return await self._execute_auto_tool_synthesis()
+
+        elif monitor.check_type == "output_eval":
+            return await self._execute_output_eval()
+
         return f"[Unknown check_type: {monitor.check_type}]"
+
+    async def _execute_goal_derivation(self) -> str:
+        """Derive new goals from operational state. The KAIROS executor
+        picks them up on its next tick."""
+        from app.database import get_db
+        from app.core.goal_deriver import derive_and_log
+        try:
+            return await derive_and_log(get_db())
+        except Exception as e:
+            logger.exception("[Heartbeat] Goal derivation failed")
+            return f"GOAL DERIVATION ERROR: {e}"
+
+    async def _execute_cross_synthesis(self) -> str:
+        """Read recent monitor outputs across categories, surface cross-cutting
+        themes, write them to the KG as cross_synthesis facts."""
+        from app.database import get_db
+        from app.core.brain import get_services
+        from app.core.cross_monitor import synthesize_and_log
+        try:
+            svc = get_services()
+            kg = getattr(svc, "kg", None)
+            return await synthesize_and_log(get_db(), kg)
+        except Exception as e:
+            logger.exception("[Heartbeat] Cross-monitor synthesis failed")
+            return f"CROSS-SYNTHESIS ERROR: {e}"
+
+    async def _execute_auto_tool_synthesis(self) -> str:
+        """Mine capability_gap clusters, ask the LLM to write a tool to fix
+        each, and store passes in custom_tools — Nova literally writes its
+        own tools without needing a code rebuild."""
+        from app.database import get_db
+        from app.core.auto_tools import synthesize_and_log
+        try:
+            return await synthesize_and_log(get_db())
+        except Exception as e:
+            logger.exception("[Heartbeat] Auto-tool synthesis failed")
+            return f"AUTO-TOOL ERROR: {e}"
+
+    async def _execute_output_eval(self) -> str:
+        """Grade a sample of recent monitor outputs on relevance/facts/
+        freshness/format. Tracks production-quality drift over time."""
+        from app.database import get_db
+        from app.core.output_eval import grade_and_log
+        try:
+            return await grade_and_log(get_db())
+        except Exception as e:
+            logger.exception("[Heartbeat] Output eval failed")
+            return f"OUTPUT EVAL ERROR: {e}"
 
     async def _execute_system_health(self) -> str:
         """Gather system health using Python stdlib — cross-platform (Linux + Windows)."""
@@ -660,7 +899,7 @@ class HeartbeatLoop:
             logger.warning("[Heartbeat] _think_query timed out for: %s", query[:80])
             return "[Query timed out]"
         except Exception as e:
-            logger.error("[Heartbeat] think() failed: %s", e)
+            logger.error("[Heartbeat] think() failed: %s", e, exc_info=True)
             return f"[Query failed: {e}]"
 
         result = "".join(tokens).strip()
@@ -747,7 +986,10 @@ class HeartbeatLoop:
         if not lessons:
             return "[No lessons to quiz on — skipped]"
 
-        # Spaced repetition: skip lessons stuck in failure loops (5+ failures, quizzed < 7 days ago)
+        # Spaced repetition: skip lessons stuck in failure loops (5+ failures, quizzed < 7 days ago).
+        # Priority: lessons with PENDING failures from >7 days ago jump the queue —
+        # they've been waiting for a re-test to either close (#167) or escalate.
+        # Otherwise NULLS FIRST → unquizzed; then oldest-quizzed by failure count.
         db = svc.learning._db
         lesson = None
         row = db.fetchone(
@@ -756,7 +998,12 @@ class HeartbeatLoop:
             "   OR last_quizzed_at < datetime('now', '-7 days') "
             "   OR last_quizzed_at IS NULL) "
             "AND correct_answer IS NOT NULL AND correct_answer != '' "
-            "ORDER BY last_quizzed_at ASC NULLS FIRST, quiz_failures DESC "
+            "ORDER BY "
+            "  (CASE WHEN quiz_failures > 0 "
+            "        AND (last_quizzed_at IS NULL OR last_quizzed_at < datetime('now','-7 days')) "
+            "        THEN 0 ELSE 1 END), "
+            "  last_quizzed_at ASC NULLS FIRST, "
+            "  quiz_failures DESC "
             "LIMIT 1"
         )
         if row:
@@ -844,12 +1091,46 @@ class HeartbeatLoop:
         except Exception as e:
             logger.warning("[Heartbeat] Quiz tracking update failed: %s", e)
 
+        # RLVR — record quiz outcome as a verifiable signal regardless of pass/fail.
+        try:
+            from app.config import config as _cfg
+            if getattr(_cfg, "ENABLE_RLVR_SIGNALS", False):
+                from app.core import rlvr as _rlvr
+                _rlvr.record_signal(
+                    "quiz_correct",
+                    1.0 if passed else 0.0,
+                    query=str(question)[:500],
+                    response=str(answer)[:500],
+                    evidence=f"lesson_id={lesson.id} topic={(lesson.topic or '')[:80]}",
+                )
+        except Exception:
+            pass
+
         if passed:
             # Reinforce the lesson
             try:
                 svc.learning.mark_lesson_helpful(lesson.id)
             except Exception as e:
                 logger.warning("[Heartbeat] mark_lesson_helpful failed: %s", e)
+            # CLOSURE: clear the quiz_failures counter — the lesson has been
+            # re-validated. This is the closure signal for the
+            # quiz-fail → curiosity-research → re-quiz feedback loop.
+            try:
+                cleared_row = db.fetchone(
+                    "SELECT quiz_failures FROM lessons WHERE id = ?", (lesson.id,)
+                )
+                prior_failures = int(cleared_row["quiz_failures"]) if cleared_row else 0
+                if prior_failures > 0:
+                    db.execute(
+                        "UPDATE lessons SET quiz_failures = 0 WHERE id = ?",
+                        (lesson.id,),
+                    )
+                    logger.info(
+                        "[Quiz] CLOSURE: cleared %d prior failures on lesson #%d (%s)",
+                        prior_failures, lesson.id, lesson.topic[:60],
+                    )
+            except Exception as e:
+                logger.warning("[Heartbeat] Quiz failure reset failed: %s", e)
             return f"QUIZ PASSED | topic={lesson.topic} | q={question[:80]} | a={answer[:80]}"
 
         # Failed — increment quiz_failures counter
@@ -977,6 +1258,29 @@ class HeartbeatLoop:
                 if re.search(skill.trigger_pattern, fallback, re.IGNORECASE):
                     test_query = fallback
             if not test_query:
+                # Last-resort fallback: ask the LLM to invent ONE concrete string
+                # that would match the regex. Works for skills whose regex needs
+                # a digit ("\d+ days in seconds") or specific casing ("TVL")
+                # that the keyword-group prompt above misses. We only ask for the
+                # match; we don't run brain on a synthetic query unless it does
+                # actually match the trigger.
+                regex_prompt = (
+                    "Here is a Python regular expression:\n"
+                    f"  {skill.trigger_pattern}\n\n"
+                    "Output ONE short example user query (under 10 words) that this "
+                    "regex would match. No explanation, no quotes, just the query."
+                )
+                try:
+                    candidate = await llm.invoke_nothink(
+                        [{"role": "user", "content": regex_prompt}],
+                        max_tokens=40, temperature=0.4,
+                    )
+                    candidate = candidate.strip().strip('"\'').strip()
+                    if re.search(skill.trigger_pattern, candidate, re.IGNORECASE):
+                        test_query = candidate
+                except Exception as e:
+                    logger.debug("[Heartbeat] regex-fallback skill query failed: %s", e)
+            if not test_query:
                 logger.warning(
                     "[Heartbeat] Skill '%s' — 4 attempts + fallback failed to match trigger '%s'",
                     skill.name, skill.trigger_pattern,
@@ -1015,10 +1319,16 @@ class HeartbeatLoop:
         if not item:
             return "[No pending curiosity items — skipped]"
 
-        # Research via think() with web search
+        # Research via think() — memory-first, web only for public/external facts.
         research_query = (
-            f"Research this topic thoroughly using web_search: {item.topic}\n"
-            f"Provide a concise, factual summary of what you find."
+            f"Research question: {item.topic}\n\n"
+            f"First consult personal memory (user facts, knowledge graph, conversation history). "
+            f"If the question is about the user's own projects, preferences, or things they've said, "
+            f"answer from memory only — do NOT web search. "
+            f"Only use web_search for clearly public/external information (news, prices, public figures, public documentation). "
+            f"If a name is ambiguous — could refer to a user project OR a commercial product with the same name — "
+            f"assume user context and answer from memory. "
+            f"Provide a concise, factual summary."
         )
         try:
             result = await self._think_query(research_query)
@@ -1033,6 +1343,16 @@ class HeartbeatLoop:
                 return f"[Curiosity skipped — LLM unavailable, will retry]"
 
             if result and not result.startswith("["):
+                # --- Semantic closure check ---
+                # Verify the result ACTUALLY answers the original question.
+                # Pattern check filters obvious deflections; LLM judge handles
+                # the rest. Failed closure → requeue (fail() bumps attempts).
+                _resolved_ok = await self._curiosity_closure_check(item.topic, result)
+                if not _resolved_ok:
+                    svc.curiosity.fail(item.id)
+                    logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
+                    return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
+
                 # Store findings in KG if possible
                 if svc.kg and len(result) > 50:
                     from app.core.brain import _extract_kg_triples
@@ -1044,7 +1364,18 @@ class HeartbeatLoop:
                 svc.curiosity.resolve(item.id, result[:2000])
 
                 # --- Convert research findings into a lesson ---
-                if svc.learning:
+                # Gate: only create a lesson when the research result LOOKS LIKE actual
+                # findings, not a "I cannot do this" / "I don't have access" deflection.
+                # Without this gate, failed-research outputs become poisoned lessons
+                # ("Tooling lacks capability to retrieve lessons" — false).
+                _result_lower = result.lower()
+                _looks_like_failure = any(p in _result_lower[:300] for p in (
+                    "i cannot", "i can't", "i don't have", "i dont have",
+                    "unable to", "lacks the capability", "not able to",
+                    "without access", "requires direct access",
+                    "limitations", "no data", "no findings",
+                ))
+                if svc.learning and not _looks_like_failure:
                     try:
                         from app.core import llm as llm_mod
                         extract_prompt = (
@@ -1080,6 +1411,50 @@ class HeartbeatLoop:
         except Exception as e:
             svc.curiosity.fail(item.id)
             return f"CURIOSITY ERROR | topic={item.topic[:80]} | error={e}"
+
+    async def _curiosity_closure_check(self, topic: str, result: str) -> bool:
+        """Return True if `result` plausibly answers the curiosity `topic`.
+
+        Two-stage: cheap heuristic (length + deflection patterns) → LLM judge.
+        The LLM judge runs on FAST_MODEL with strict json output, single call.
+        """
+        # Stage 1: cheap heuristics
+        if not result or len(result.strip()) < 80:
+            return False
+        rl = result.lower()[:600]
+        deflection_markers = (
+            "i cannot", "i can't", "i don't have", "i dont have",
+            "unable to", "lacks the capability", "not able to",
+            "without access", "requires direct access",
+            "no findings", "no data available", "unclear from",
+            "i'm not sure", "i am not sure", "uncertain about",
+        )
+        if any(m in rl for m in deflection_markers):
+            return False
+
+        # Stage 2: LLM judge — does this answer the question?
+        try:
+            from app.core import llm as llm_mod
+            judge_prompt = (
+                f"QUESTION: {topic[:300]}\n\n"
+                f"PROPOSED ANSWER:\n{result[:1200]}\n\n"
+                f"Did the proposed answer actually answer the question with concrete information? "
+                f"Reply with JSON: {{\"answers\": true|false, \"reason\": \"<one short sentence>\"}}"
+            )
+            raw = await llm_mod.invoke_nothink(
+                [{"role": "user", "content": judge_prompt}],
+                json_mode=True, json_prefix="{",
+                max_tokens=120, model=config.FAST_MODEL, temperature=0.0,
+            )
+            obj = llm_mod.extract_json_object(raw) or {}
+            answered = bool(obj.get("answers"))
+            if not answered:
+                logger.info("[Curiosity] judge says no: %s", str(obj.get("reason", ""))[:120])
+            return answered
+        except Exception as e:
+            # On judge failure, default to True so we don't loop forever
+            logger.warning("[Curiosity] closure judge failed (defaulting to resolve): %s", e)
+            return True
 
     async def _send_curiosity_followup(self, topic: str, findings: str) -> None:
         """Send a proactive message when curiosity resolves a topic the user asked about."""
@@ -1152,13 +1527,19 @@ class HeartbeatLoop:
         # Filter out invalid/low-quality topics
         from app.core.curiosity import CuriosityQueue
         import re as _re
+        # Python 3.12 disallows inline (?i) anywhere except position 0; rely on
+        # the IGNORECASE flag below instead.
         _BAD_MONITOR_RE = _re.compile(
-            r"(?i)^(?:what|who|where|when|how|is|are|was|were|do|does|did|can|could|will|would|should)\b"  # questions
-            r"|(?i)\b(?:price|cost|worth|trading at|how much)\b"  # price queries
-            r"|(?i)\b(?:dont search|don.t search|just tell|from memory)\b"  # test queries
-            r"|(?i)\b(?:time is it|what time|current time)\b"  # time queries
-            r"|(?i)\b(?:calculate|compute|solve|equation)\b"  # math
-            r"|(?i)\b(?:write|generate|create|make me)\b",  # generation requests
+            r"^(?:what|who|where|when|how|is|are|was|were|do|does|did|can|could|will|would|should|find|search|look\s+up|show|tell|give|list)\b"  # questions + imperative verbs
+            r"|\b(?:price|cost|worth|trading at|how much)\b"  # price queries
+            r"|\b(?:dont search|don.t search|just tell|from memory)\b"  # test queries
+            r"|\b(?:time is it|what time|current time)\b"  # time queries
+            r"|\b(?:calculate|compute|solve|equation|multipl[yi](?:ed)?|divid(?:e|ed)|plus|minus|equals?)\b"  # math
+            r"|\b(?:write|generate|create|make me)\b"  # generation requests
+            r"|\bgreat\s+question\b"  # conversational filler
+            r"|\bshow\s+work\b"  # math/homework
+            r"|^\d+\s*[\+\-\*x×]\s*\d+"  # bare arithmetic ("847 x 193")
+            r"|\bbefore\s+you\s+answer\b",  # adversarial framing
             _re.IGNORECASE,
         )
         candidates = [
@@ -1220,6 +1601,13 @@ class HeartbeatLoop:
             except Exception as e:
                 parts.append(f"lesson decay failed: {e}")
                 logger.warning("[Heartbeat] Lesson decay failed: %s", e)
+            try:
+                deleted = svc.learning.prune_dead_lessons()
+                if deleted:
+                    parts.append(f"dead lessons pruned: {deleted}")
+            except Exception as e:
+                parts.append(f"dead-lesson prune failed: {e}")
+                logger.warning("[Heartbeat] Dead-lesson prune failed: %s", e)
         if svc.kg:
             try:
                 decayed = await svc.kg.decay_stale(days=60)
@@ -1228,6 +1616,31 @@ class HeartbeatLoop:
             except Exception as e:
                 parts.append(f"KG decay failed: {e}")
                 logger.warning("[Heartbeat] KG decay failed: %s", e)
+            # Hard-retire never-retrieved old facts. Runtime audit found 92%
+            # of KG facts are never queried — they're dead weight diluting
+            # retrieval quality. Soft retire (valid_to set), not delete, so
+            # they're still recoverable.
+            try:
+                pruned = await svc.kg.hard_prune_dead_facts(days=60, max_count=500)
+                if pruned:
+                    parts.append(f"KG dead-fact retire: {pruned}")
+            except Exception as e:
+                parts.append(f"KG hard-prune failed: {e}")
+                logger.warning("[Heartbeat] KG hard-prune failed: %s", e)
+            # Aggressively decay speculative cross_synthesis facts that no
+            # query ever retrieved — closes the loop on synthesis quality.
+            try:
+                cs_decayed = await svc.kg.decay_unused_speculative(
+                    provenance="cross_synthesis", days=14, decay_amount=0.15
+                )
+                cs_stats = svc.kg.get_provenance_usage_stats("cross_synthesis")
+                parts.append(
+                    f"cross_synthesis: total={cs_stats['total']} used={cs_stats['used']} "
+                    f"avg_retrievals={cs_stats['avg_retrievals']:.1f} decayed={cs_decayed}"
+                )
+            except Exception as e:
+                parts.append(f"cross_synthesis decay failed: {e}")
+                logger.warning("[Heartbeat] cross_synthesis decay failed: %s", e)
         if svc.reflexions:
             try:
                 decayed = svc.reflexions.decay_stale(days=90)
@@ -1236,6 +1649,22 @@ class HeartbeatLoop:
             except Exception as e:
                 parts.append(f"reflexion decay failed: {e}")
                 logger.warning("[Heartbeat] Reflexion decay failed: %s", e)
+            # Demote success patterns whose injection correlates with low quality
+            # (A/B closure — useless suggestions get filtered out over time).
+            try:
+                useless_ids = svc.reflexions.get_useless_success_patterns(
+                    min_uses=5, max_avg_quality=0.5
+                )
+                if useless_ids:
+                    placeholders = ",".join("?" for _ in useless_ids)
+                    svc.reflexions._db.execute(
+                        f"UPDATE reflexions SET outcome='failure' WHERE id IN ({placeholders})",
+                        tuple(useless_ids),
+                    )
+                    parts.append(f"useless success patterns demoted: {len(useless_ids)}")
+            except Exception as e:
+                parts.append(f"success pattern A/B demotion failed: {e}")
+                logger.warning("[Heartbeat] Success pattern demotion failed: %s", e)
         if svc.curiosity:
             try:
                 pruned = svc.curiosity.prune(days=30)
@@ -1244,6 +1673,89 @@ class HeartbeatLoop:
             except Exception as e:
                 parts.append(f"curiosity prune failed: {e}")
                 logger.warning("[Heartbeat] Curiosity prune failed: %s", e)
+        # Disable auto-tools that aren't earning their keep — unused or low success rate.
+        try:
+            from app.core.auto_tools import prune_unused_tools, get_auto_tool_health
+            from app.database import get_db
+            _db = get_db()
+            res = prune_unused_tools(_db, min_age_days=3)
+            if res.get("disabled"):
+                parts.append(
+                    f"auto-tools disabled: {res['disabled']} "
+                    f"(unused={res.get('unused', 0)} bad={res.get('bad', 0)})"
+                )
+            health = get_auto_tool_health(_db)
+            if health.get("total", 0) > 0:
+                parts.append(
+                    f"auto-tool health: total={health['total']} enabled={health['enabled']} "
+                    f"used={health['used']} avg_uses={health['avg_uses']:.1f} "
+                    f"avg_success={health['avg_success']:.2f}"
+                )
+        except Exception as e:
+            parts.append(f"auto-tool prune failed: {e}")
+            logger.warning("[Heartbeat] Auto-tool prune failed: %s", e)
+        # Audit log retention — keep 30 days for action_log, 30 days for trust_audit_log.
+        # Was unbounded; 20k+ rows accumulated over 6 weeks.
+        try:
+            from app.database import get_db
+            db = get_db()
+            action_deleted = db.execute(
+                "DELETE FROM action_log WHERE created_at < datetime('now', '-30 days')"
+            ).rowcount
+            if action_deleted:
+                parts.append(f"action_log pruned: {action_deleted}")
+            trust_deleted = db.execute(
+                "DELETE FROM trust_audit_log WHERE timestamp < datetime('now', '-30 days')"
+            ).rowcount
+            if trust_deleted:
+                parts.append(f"trust_audit pruned: {trust_deleted}")
+        except Exception as e:
+            logger.warning("[Heartbeat] Audit prune failed: %s", e)
+        # Periodic SQLite backup — keep last 7 daily snapshots so a corruption
+        # event isn't catastrophic. Shutil.copy with WAL is safe at SQLite level
+        # because the source DB is opened with WAL mode and the copy includes
+        # both nova.db and nova.db-wal. Backups land in /data/backups.
+        try:
+            import shutil
+            from pathlib import Path
+            backup_dir = Path("/data/backups")
+            backup_dir.mkdir(exist_ok=True)
+            today = datetime.now(timezone.utc).strftime("%Y%m%d")
+            target = backup_dir / f"nova-{today}.db"
+            if not target.exists():
+                # SQLite recommends VACUUM INTO for atomic snapshots
+                from app.database import get_db
+                _db = get_db()
+                _db.execute(f"VACUUM INTO '{target}'")
+                # Retain last 7 backups
+                snapshots = sorted(backup_dir.glob("nova-*.db"))
+                for old in snapshots[:-7]:
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+                parts.append(f"backup created: {target.name}")
+        except Exception as e:
+            logger.warning("[Heartbeat] DB backup failed: %s", e)
+        # Auto-disable garbage monitors — any whose last 3 results all match
+        # known no-signal patterns. This used to require manual SQL from the
+        # operator; now Nova prunes himself.
+        try:
+            disabled = await self._auto_disable_garbage_monitors()
+            if disabled:
+                parts.append(f"garbage monitors disabled: {disabled}")
+        except Exception as e:
+            logger.warning("[Heartbeat] Garbage monitor disable failed: %s", e)
+        # Principle distillation — surface load-bearing facts from clusters of
+        # high-confidence lessons. Survives lesson decay (provenance='principle').
+        try:
+            from app.core.principles import distill_principles
+            if svc.kg:
+                distilled = await distill_principles(get_db(), svc.kg)
+                if distilled:
+                    parts.append(f"principles distilled: {distilled}")
+        except Exception as e:
+            logger.warning("[Heartbeat] Principle distillation failed: %s", e)
         # Cross-monitor feedback loops
         try:
             loop_parts = await self._check_feedback_loops(svc)
@@ -1252,6 +1764,53 @@ class HeartbeatLoop:
             logger.warning("[Heartbeat] Feedback loops failed: %s", e)
 
         return f"MAINTENANCE | {', '.join(parts)}" if parts else "[No maintenance needed]"
+
+    async def _auto_disable_garbage_monitors(self) -> int:
+        """Disable monitors whose last 3 results are all structurally garbage.
+
+        Garbage patterns: 'No Significant Developments' filler, 'no change |'
+        empty deltas, dictionary.com hits (search returning definition not
+        signal), 'no results found' empty searches. The check only fires for
+        monitors with 3+ results so we don't kill new ones.
+        """
+        import re
+        from app.database import get_db
+
+        db = get_db()
+        garbage = re.compile(
+            r"no significant developments|"
+            r"no significant\b.*\bdevelopments|"
+            r"no change \| last:|"
+            r"dictionary\.com|"
+            r"no results found|"
+            r"\bno significant\b.*\bin the past|"
+            r"completely irrelevant",
+            re.IGNORECASE,
+        )
+        rows = db.fetchall(
+            "SELECT id, name FROM monitors WHERE enabled = 1"
+        )
+        disabled_count = 0
+        for row in rows:
+            mid, name = row["id"], row["name"]
+            results = db.fetchall(
+                "SELECT value FROM monitor_results "
+                "WHERE monitor_id = ? ORDER BY created_at DESC LIMIT 3",
+                (mid,),
+            )
+            if len(results) < 3:
+                continue
+            if all(r["value"] and garbage.search(r["value"]) for r in results):
+                db.execute(
+                    "UPDATE monitors SET enabled = 0 WHERE id = ?", (mid,)
+                )
+                disabled_count += 1
+                logger.info(
+                    "[Heartbeat] Auto-disabled garbage monitor: [%d] %s "
+                    "(3 consecutive no-signal results)",
+                    mid, name,
+                )
+        return disabled_count
 
     async def _check_feedback_loops(self, svc) -> list[str]:
         """Cross-monitor intelligence: quiz→curiosity, skill degradation→early test, curiosity→quiz log."""
@@ -1326,8 +1885,16 @@ class HeartbeatLoop:
     async def _execute_finetune_check(self, cfg: dict) -> str:
         """Check if enough new training pairs exist for fine-tuning.
 
-        Reports readiness status — does NOT auto-trigger training.
-        The heartbeat alert notifies the user so they can trigger manually.
+        When `ENABLE_AUTO_FINETUNE=true`, automatically fires the full
+        finetune_auto pipeline (DPO train → GGUF → A/B eval → deploy or
+        rollback). Otherwise reports readiness and waits for the owner to
+        run `python scripts/finetune_auto.py` manually.
+
+        The auto path is gated because fine-tuning stops Ollama (frees
+        VRAM) for ~30-60 minutes — chat is unavailable during that window.
+        Owner opts in via env. The pipeline keeps the prior model around
+        and rolls back if A/B eval fails, so the worst case is a cycle
+        of unavailability with no quality regression.
         """
         import json as _json
         from pathlib import Path
@@ -1366,17 +1933,117 @@ class HeartbeatLoop:
 
         new_pairs = total - last_count
 
-        if new_pairs >= min_pairs:
+        if new_pairs < min_pairs:
+            return (
+                f"FINETUNE NOT READY | {new_pairs} new pairs "
+                f"(need {min_pairs}, total: {total})"
+            )
+
+        # Ready. Decide between auto-fire and notify-only based on:
+        #   (a) operator opt-in via ENABLE_AUTO_FINETUNE
+        #   (b) the runtime environment can actually run training
+        # Live history (2026-05-07..12): six consecutive auto-fires failed
+        # silently because finetune_auto.py wasn't in the container image and
+        # unsloth/CUDA weren't available either. _can_auto_finetune detects
+        # all three known blockers and surfaces them in the monitor result so
+        # next time something breaks, the operator sees it on the dashboard.
+        can_auto, blocker = self._can_auto_finetune()
+
+        if not config.ENABLE_AUTO_FINETUNE or not can_auto:
+            if not config.ENABLE_AUTO_FINETUNE:
+                hint = "Set ENABLE_AUTO_FINETUNE=true (and run on host) to auto-train."
+            else:
+                hint = f"Auto-fire blocked: {blocker}. Run manually on host (finetune_env venv):"
             return (
                 f"FINETUNE READY | {new_pairs} new training pairs available "
                 f"(total: {total}, threshold: {min_pairs}). "
-                f"Run: python scripts/finetune_auto.py"
+                f"{hint} python scripts/finetune_auto.py"
             )
 
-        return (
-            f"FINETUNE NOT READY | {new_pairs} new pairs "
-            f"(need {min_pairs}, total: {total})"
-        )
+        # Auto-fire path. Spawn detached so it survives across heartbeat
+        # ticks, but probe briefly for immediate failures (script not found,
+        # import error) so we don't silently report STARTED for jobs that
+        # already crashed.
+        try:
+            import asyncio as _asyncio
+            import subprocess
+            logger.info("[Heartbeat] AUTO FINETUNE firing (%d new pairs)", new_pairs)
+            log_path = Path(output_dir) / f"auto_finetune_{int(_asyncio.get_event_loop().time())}.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_path, "wb") as logf:
+                proc = subprocess.Popen(
+                    [
+                        "python", "scripts/finetune_auto.py",
+                        "--data", data_path,
+                        "--output", output_dir,
+                    ],
+                    stdout=logf, stderr=subprocess.STDOUT,
+                    cwd="/app",
+                    start_new_session=True,
+                )
+            # Fail-fast probe: short async sleep, then check returncode.
+            # 3s catches missing-file / import-error failures (sub-second).
+            # Long-running training stays in proc.poll() is None state.
+            await _asyncio.sleep(3.0)
+            rc = proc.poll()
+            if rc is not None and rc != 0:
+                try:
+                    tail = log_path.read_text(encoding="utf-8", errors="replace")[-400:]
+                except Exception:
+                    tail = "<log unreadable>"
+                logger.warning(
+                    "[Heartbeat] auto-finetune exited %d within probe window; tail=%s",
+                    rc, tail,
+                )
+                return (
+                    f"FINETUNE LAUNCH FAILED | exit_code={rc} | "
+                    f"log_tail={tail!r}"
+                )
+            return (
+                f"FINETUNE STARTED | {new_pairs} new pairs → DPO training in background. "
+                f"Logs: {log_path}. Will auto A/B against current model and roll back on regression."
+            )
+        except Exception as e:
+            logger.exception("[Heartbeat] auto-finetune launch failed")
+            return f"FINETUNE LAUNCH FAILED | {e}"
+
+    def _can_auto_finetune(self) -> tuple[bool, str]:
+        """Detect whether this process can actually run scripts/finetune_auto.py.
+
+        Returns (can_run, blocker). The check covers the three failure modes
+        seen in production 2026-05-07..12:
+          (1) finetune_auto.py not in the container image (Dockerfile gap)
+          (2) unsloth not installed in this Python (read-only container)
+          (3) no CUDA visible (GPU lives in a sibling container)
+
+        Cheap — file stat + importlib probe + torch attribute check. Safe to
+        call on every heartbeat tick. Any unexpected exception is converted
+        to (False, reason) so the heartbeat loop never crashes on a probe.
+        """
+        try:
+            from pathlib import Path as _Path
+            # (1) script presence
+            if not _Path("/app/scripts/finetune_auto.py").exists() and not _Path("scripts/finetune_auto.py").exists():
+                return False, "scripts/finetune_auto.py missing from runtime"
+            # (2) unsloth importable
+            try:
+                import importlib.util as _ilu
+                if _ilu.find_spec("unsloth") is None:
+                    return False, "unsloth not installed in this Python"
+            except Exception as e:
+                return False, f"import system error: {e}"
+            # (3) CUDA visible
+            try:
+                import torch as _torch
+                if not getattr(_torch, "cuda", None) or not _torch.cuda.is_available():
+                    return False, "no CUDA device visible to this process"
+            except Exception as e:
+                return False, f"torch not importable: {e}"
+            return True, ""
+        except Exception as e:
+            # Catch-all so a broken filesystem / odd Path implementation /
+            # weird import-system state can never crash the heartbeat tick.
+            return False, f"capability probe raised: {e}"
 
     async def _execute_consolidation(self, cfg: dict) -> str:
         """Run a Dream Consolidation cycle — compacts memory, resolves contradictions, mines DPO pairs.
@@ -1447,7 +2114,7 @@ class HeartbeatLoop:
 
         gap_count = len(rows)
         gap_summaries = "\n".join(
-            f"- [{row['id']}] quality={row['quality_score']:.2f}: {row['query'][:120]}"
+            f"- [{row['id']}] quality={(row['quality_score'] or 0.0):.2f}: {(row['query'] or '')[:120]}"
             for row in rows
         )
 
@@ -1492,10 +2159,48 @@ class HeartbeatLoop:
         except Exception as e:
             logger.warning("[Heartbeat] Failed to mark gaps reviewed: %s", e)
 
+        # Take ACTION on the suggestions: enqueue gaps as goals so KAIROS picks
+        # them up. Without this hook the suggestions just sit in the alert
+        # text and never drive any work.
+        actions_taken = []
+        try:
+            from app.core.goal_deriver import derive_goals
+            new_goals = await derive_goals(db, max_new_goals=3)
+            actions_taken.extend(f"goal #{g['id']} ({g['source_kind']})" for g in new_goals)
+        except Exception as e:
+            logger.warning("[Heartbeat] Capability review goal-derivation failed: %s", e)
+
+        action_summary = (
+            "\n\nActions taken: " + "; ".join(actions_taken)
+            if actions_taken
+            else "\n\nActions taken: none (no goal patterns met threshold)"
+        )
+
         return (
             f"CAPABILITY REVIEW | gaps_reviewed={gap_count}\n\n"
-            f"Suggestions:\n{suggestion}"
+            f"Suggestions:\n{suggestion}{action_summary}"
         )
+
+    # Numeric/health monitors produce structured key=value output (e.g. KG
+    # Growth Rate's "kg growth drop (-33.0%) | last_6h: 65 | prev_6h: 97").
+    # Asking the LLM to "summarize" them produces hallucinated math like
+    # "$35tn occurred in 2024" or "-156.66%, shifting the metric value down
+    # by 209 units" when neither figure is in the source. Trust the raw line
+    # for these check types and skip the LLM rephrasing pass.
+    _RAW_RESULT_CHECK_TYPES: frozenset[str] = frozenset({
+        "kg_growth", "kg_health", "ollama_latency", "ollama_model",
+        "system_health", "db_size", "chromadb_integrity", "skill_quality",
+        "training_job",
+        # capability_review's output already has its own structured "CAPABILITY
+        # REVIEW | gaps=N\n\nSuggestions:\n..." shape; the alert summarizer
+        # mis-detects its long-form suggestion as off-format and falls back to
+        # a [:250]-char raw truncation that cuts mid-sentence (observed
+        # 2026-05-08 — "...issues reg." dangling). Treat as raw to preserve
+        # the full text.
+        "capability_review",
+        "consolidation",  # dream digests are already concise
+        "eval",           # eval reports are already structured
+    })
 
     async def _analyze_result(
         self,
@@ -1505,6 +2210,10 @@ class HeartbeatLoop:
     ) -> str:
         """Ask Nova to analyze a monitor result intelligently."""
         from app.core import llm
+
+        # Numeric/health monitors: skip LLM rephrasing — see comment above.
+        if monitor.check_type in self._RAW_RESULT_CHECK_TYPES:
+            return new_value[:600] if new_value else ""
 
         # Build a concise analysis prompt
         parts = [f"Monitor '{monitor.name}' ({monitor.check_type}) just ran."]
@@ -1574,42 +2283,78 @@ class HeartbeatLoop:
     async def _send_alert(self, monitor: Monitor, message: str) -> None:
         """Send an alert via available channel bots.
 
-        Channel routing by category:
-        - system : Telegram ONLY. Internal health/meta output (DB size,
-                   ollama latency, consolidation, eval harness, etc.). Discord
-                   has users who get confused by this output so it stays
-                   behind the operator channel.
-        - content: Discord + Telegram + WhatsApp + Signal (all configured).
-                   News feeds, domain studies, public-facing monitor results.
+        Routing precedence (per owner directive 2026-04-25):
+          1. Per-monitor `channels` column — if set (CSV like "discord,signal"),
+             routes ONLY to those channels. Overrides everything else.
+          2. Category default fallback if `channels` is NULL/empty:
+             - system  → Telegram ONLY (internal health/meta)
+             - content → Discord + Telegram + WhatsApp + Signal (all configured)
+
+        Cross-monitor dedup: content monitors that produce the same salient
+        claims as another recent monitor get suppressed. Prevents the same
+        Iran-Israel ceasefire showing up in 3 different domain studies.
         """
-        prefix = f"[{monitor.name}] "
-        full_message = prefix + message
+        # Cross-monitor dedup for content monitors (system/health monitors
+        # always post — they're about Nova's own state and shouldn't dedupe).
+        if monitor.category != "system":
+            try:
+                from app.monitors.dedup import is_duplicate
+                from app.database import get_db
+                if is_duplicate(get_db(), monitor.name, message):
+                    logger.info(
+                        "[Heartbeat] '%s' suppressed by cross-monitor dedup",
+                        monitor.name,
+                    )
+                    return
+            except Exception as e:
+                logger.warning("[Heartbeat] dedup check failed: %s", e)
+
+        # Newline-terminate the prefix so any leading `##` heading in the
+        # message stays at line-start (the per-channel formatters require it
+        # to convert `## Title` → bold).
+        prefix = f"[{monitor.name}]\n"
+        full_message = prefix + message.lstrip("\n")
+
+        # Per-monitor override
+        if monitor.channels:
+            allowed = {c.strip().lower() for c in monitor.channels.split(",") if c.strip()}
+        else:
+            allowed = None  # None → use category defaults
 
         is_system = monitor.category == "system"
 
+        def _route(channel_name: str) -> bool:
+            """Should this channel receive the alert?"""
+            if allowed is not None:
+                return channel_name in allowed
+            # Category default
+            if channel_name == "telegram":
+                return True
+            return not is_system
+
         sent = False
-        if self._discord and not is_system:
+        if self._discord and _route("discord"):
             try:
                 await self._discord.send_alert(full_message)
                 sent = True
             except Exception as e:
                 logger.error("[Heartbeat] Discord alert failed: %s", e)
 
-        if self._telegram:
+        if self._telegram and _route("telegram"):
             try:
                 await self._telegram.send_alert(full_message)
                 sent = True
             except Exception as e:
                 logger.error("[Heartbeat] Telegram alert failed: %s", e)
 
-        if self._whatsapp and not is_system:
+        if self._whatsapp and _route("whatsapp"):
             try:
                 await self._whatsapp.send_alert(full_message)
                 sent = True
             except Exception as e:
                 logger.error("[Heartbeat] WhatsApp alert failed: %s", e)
 
-        if self._signal and not is_system:
+        if self._signal and _route("signal"):
             try:
                 await self._signal.send_alert(full_message)
                 sent = True
@@ -1883,8 +2628,16 @@ class HeartbeatLoop:
         import json as _json
         from pathlib import Path
 
-        history_path = Path(config.FINETUNE_OUTPUT_DIR) / "run_history.json"
-        if not history_path.exists():
+        # Check both the in-container data path AND the host-mounted finetune_output
+        # path (where finetune_oneclick.py writes). One-click writes to the host
+        # repo dir, so we need to fall back to it when the data-side file is missing.
+        candidate_paths = [
+            Path(config.FINETUNE_OUTPUT_DIR) / "run_history.json",
+            Path("/repo/finetune_output/run_history.json"),  # host bind-mount, if present
+            Path("/data/finetune_output/run_history.json"),  # alt data location
+        ]
+        history_path = next((p for p in candidate_paths if p.exists()), None)
+        if history_path is None:
             return format_monitor_result(
                 "Training Job Watch", "info", "no training history yet",
             )

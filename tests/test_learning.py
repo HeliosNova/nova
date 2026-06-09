@@ -746,9 +746,15 @@ class TestReflexionCritiqueFacts:
 
 class TestShouldUseLLMCritique:
 
-    def test_clean_tools_skip(self):
+    def test_clean_tools_with_long_answer_triggers(self):
+        """Substantial answers (>200 chars) now always get LLM critique even
+        with clean tools — heuristic starts at 1.0 and misses generation artifacts."""
         from app.core.reflexion import should_use_llm_critique
-        assert should_use_llm_critique("general", "x" * 600, [{"tool": "t", "output": "ok"}]) is False
+        assert should_use_llm_critique("general", "x" * 600, [{"tool": "t", "output": "ok"}]) is True
+
+    def test_clean_tools_short_answer_skips(self):
+        from app.core.reflexion import should_use_llm_critique
+        assert should_use_llm_critique("general", "x" * 50, [{"tool": "t", "output": "ok"}]) is False
 
     def test_failed_tools_trigger(self):
         from app.core.reflexion import should_use_llm_critique
@@ -993,8 +999,16 @@ class TestReflexionBrowserScoring:
             {"output": "", "error": "Selector 'button.fake' not found. Available elements:\n..."},
         ]
         score, reason = assess_quality("I clicked the button", tool_results, 5)
-        # Browser selector miss = -0.05, not -0.15
-        assert score >= 0.9, f"Score too low for browser selector miss: {score}"
+        # New scoring model (2026-04-21) starts at 0.6 baseline, not 1.0.
+        # Browser selector miss = -0.05 (mild) vs hard failure = -0.15.
+        # Compare against what a hard failure would produce (0.45).
+        hard_tool_results = [
+            {"output": "", "error": "Database query failed: connection refused"},
+        ]
+        hard_score, _ = assess_quality("I clicked the button", hard_tool_results, 5)
+        assert score > hard_score, (
+            f"Selector miss ({score}) should score higher than hard failure ({hard_score})"
+        )
         assert "selector miss" in reason.lower()
 
     def test_hard_tool_failure_still_penalized(self):

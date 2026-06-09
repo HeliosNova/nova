@@ -13,7 +13,13 @@ from pathlib import Path
 import pytest
 
 # Add scripts to path for import
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
+_scripts_dir = Path(__file__).resolve().parent.parent / "scripts"
+sys.path.insert(0, str(_scripts_dir))
+
+# Skip whole module if the training signal exporter isn't available (e.g. Docker runtime
+# image ships only verify_phase_0.py, not the heavyweight training scripts).
+_export_available = (_scripts_dir / "export_training_signal.py").is_file()
+pytestmark = pytest.mark.skipif(not _export_available, reason="scripts/export_training_signal.py not present")
 
 from app.database import SafeDB
 

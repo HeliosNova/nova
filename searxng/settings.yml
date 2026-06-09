@@ -4,6 +4,7 @@ server:
   secret_key: "2709d60d00ac9c6c2ea2feb381001464dc624d6c92f6ac0a195d1fc3c74155a7"
   limiter: false
   image_proxy: false
+  bind_address: "0.0.0.0"
 
 search:
   safe_search: 0
@@ -13,30 +14,14 @@ search:
     - html
     - json
 
+# 30+ engines spanning every category SearXNG supports. The defaults file
+# already enables most of them; we only need to override timeouts and
+# explicitly disable things that are reliably broken or rate-limited.
 engines:
-  - name: google
-    engine: google
-    shortcut: g
-    disabled: false
-    timeout: 10.0
-  - name: duckduckgo
-    engine: duckduckgo
-    shortcut: ddg
-    disabled: false
-    timeout: 10.0
-  - name: wikipedia
-    engine: wikipedia
-    shortcut: wp
-    disabled: false
-    timeout: 10.0
+  # ---------- General web ----------
   - name: bing
     engine: bing
     shortcut: bi
-    disabled: false
-    timeout: 10.0
-  - name: brave
-    engine: brave
-    shortcut: br
     disabled: false
     timeout: 10.0
   - name: startpage
@@ -44,17 +29,263 @@ engines:
     shortcut: sp
     disabled: false
     timeout: 10.0
-  - name: mojeek
-    engine: mojeek
-    shortcut: mjk
+  - name: ecosia
+    engine: ecosia
+    shortcut: ec
+    disabled: false
+    timeout: 10.0
+  - name: yandex
+    engine: yandex
+    shortcut: yn
+    disabled: false
+    timeout: 10.0
+  - name: yahoo
+    engine: yahoo
+    shortcut: yh
     disabled: false
     timeout: 10.0
   - name: qwant
     engine: qwant
     shortcut: qw
+    categories: [general, web]
+    disabled: false
+    timeout: 10.0
+  - name: mojeek
+    engine: mojeek
+    shortcut: mjk
+    categories: [general, web]
+    disabled: false
+    timeout: 10.0
+  - name: duckduckgo
+    engine: duckduckgo
+    shortcut: ddg
+    disabled: false
+    timeout: 10.0
+  - name: brave
+    engine: brave
+    shortcut: br
+    disabled: false
+    timeout: 10.0
+  - name: presearch
+    engine: presearch
+    shortcut: ps
+    categories: [general, web]
+    disabled: false
+    timeout: 10.0
+  # ---------- News ----------
+  - name: bing news
+    engine: bing_news
+    categories: [news]
+    shortcut: bin
+    disabled: false
+    timeout: 10.0
+    additional_tests: false
+  - name: yahoo news
+    engine: yahoo_news
+    shortcut: yhn
+    disabled: false
+    timeout: 10.0
+  - name: google news
+    engine: google_news
+    shortcut: gon
+    disabled: false
+    timeout: 10.0
+  - name: reuters
+    engine: xpath
+    paging: false
+    search_url: https://www.reuters.com/site-search/?query={query}&offset=0
+    url_xpath: //div[contains(@class,"search-result__")]//a/@href
+    title_xpath: //div[contains(@class,"search-result__")]//a
+    content_xpath: //div[contains(@class,"search-result__")]//p
+    categories: [news]
+    shortcut: rtr
+    disabled: true   # Some Reuters layouts block scrapers; keep off until verified
+    timeout: 12.0
+  # ---------- Wiki / encyclopedic ----------
+  - name: wikipedia
+    engine: wikipedia
+    shortcut: wp
+    disabled: false
+    timeout: 10.0
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: false
+    timeout: 10.0
+  - name: wikiquote
+    engine: mediawiki
+    shortcut: wq
+    categories: [general]
+    base_url: 'https://en.wikiquote.org/'
+    number_of_results: 5
+    disabled: false
+    timeout: 10.0
+  - name: wikibooks
+    engine: mediawiki
+    shortcut: wb
+    categories: [general]
+    base_url: 'https://en.wikibooks.org/'
+    number_of_results: 5
+    disabled: false
+    timeout: 10.0
+  # ---------- Science / academic ----------
+  - name: arxiv
+    engine: arxiv
+    shortcut: arx
+    categories: [science]
+    timeout: 15.0
+    disabled: false
+  - name: semantic scholar
+    engine: semantic_scholar
+    shortcut: se
+    categories: [science]
+    disabled: false
+    timeout: 15.0
+  - name: pubmed
+    engine: pubmed
+    shortcut: pub
+    categories: [science]
+    disabled: false
+    timeout: 15.0
+  - name: crossref
+    engine: crossref
+    shortcut: cr
+    categories: [science]
+    disabled: false
+    timeout: 15.0
+  - name: openairedatasets
+    engine: json_engine
+    paging: true
+    search_url: https://api.openaire.eu/search/datasets?format=json&page={pageno}&size=10&title={query}
+    results_query: response/results/result
+    url_query: metadata/oaf:entity/oaf:result/children/instance/webresource/url
+    title_query: metadata/oaf:entity/oaf:result/title/$
+    content_query: metadata/oaf:entity/oaf:result/description/$
+    categories: [science]
+    shortcut: oad
+    disabled: true   # Sometimes returns malformed JSON; keep off by default
+    timeout: 15.0
+  # ---------- Code / IT ----------
+  - name: github
+    engine: github
+    shortcut: gh
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: stackoverflow
+    engine: stackexchange
+    shortcut: st
+    api_site: 'stackoverflow'
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: askubuntu
+    engine: stackexchange
+    shortcut: ubuntu
+    api_site: 'askubuntu'
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: superuser
+    engine: stackexchange
+    shortcut: su
+    api_site: 'superuser'
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: gitlab
+    engine: gitlab
+    shortcut: gl
+    base_url: https://gitlab.com/
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: codeberg
+    engine: gitea
+    shortcut: cb
+    base_url: https://codeberg.org/
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: hoogle
+    engine: xpath
+    paging: false
+    search_url: https://hoogle.haskell.org/?hoogle={query}
+    results_xpath: //div[@class="result"]
+    title_xpath: ./div[@class="ans"]//a
+    url_xpath: ./div[@class="ans"]//a/@href
+    content_xpath: ./div[@class="from"]
+    categories: [it]
+    shortcut: ho
+    disabled: true   # Niche; opt-in
+  # ---------- Discussion / social ----------
+  - name: reddit
+    engine: reddit
+    shortcut: re
+    categories: [social]
+    disabled: false
+    timeout: 10.0
+  - name: hackernews
+    engine: hackernews
+    shortcut: hn
+    categories: [it, news]
+    disabled: false
+    timeout: 10.0
+  # ---------- Files / packages ----------
+  - name: pypi
+    engine: pypi
+    shortcut: pypi
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  - name: npm
+    engine: npm
+    shortcut: npm
+    categories: [it]
+    disabled: false
+    timeout: 10.0
+  # ---------- Q&A / dictionaries ----------
+  - name: duden
+    engine: duden
+    shortcut: du
+    disabled: true   # German dictionary, opt-in
+  - name: wiktionary
+    engine: wikipedia
+    shortcut: wt
+    categories: [general]
+    base_url: 'https://en.wiktionary.org/'
+    disabled: false
+    timeout: 10.0
+  # ---------- Images (so multimodal queries have a real source) ----------
+  - name: bing images
+    engine: bing_images
+    shortcut: bii
+    disabled: false
+    timeout: 10.0
+  - name: duckduckgo images
+    engine: duckduckgo_extra
+    categories: [images, web]
+    ddg_category: images
+    shortcut: ddi
+    disabled: false
+    timeout: 10.0
+  # ---------- Videos ----------
+  - name: youtube
+    engine: youtube_noapi
+    shortcut: yt
+    categories: [videos]
+    disabled: false
+    timeout: 10.0
+  # ---------- Maps ----------
+  - name: openstreetmap
+    engine: openstreetmap
+    shortcut: osm
     disabled: false
     timeout: 10.0
 
 outgoing:
   request_timeout: 15.0
   max_request_timeout: 20.0
+  pool_connections: 100
+  pool_maxsize: 20
+  enable_http2: true

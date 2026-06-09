@@ -8,6 +8,27 @@ services:
       OLLAMA_MAX_LOADED_MODELS: "3"
       OLLAMA_FLASH_ATTENTION: "1"
       OLLAMA_KEEP_ALIVE: "24h"
+      # Default load timeout is 5m. A 27B Q4 (~17GB) loading fully onto the GPU
+      # from this volume's disk takes ~10m; 20m gives headroom. Once loaded,
+      # KEEP_ALIVE holds it resident so the slow load is a one-time cost.
+      OLLAMA_LOAD_TIMEOUT: "20m"
+      # Ollama 0.17.5 + qwen35 architecture on the OLD engine (default) does
+      # NOT honor OLLAMA_NUM_PARALLEL — see startup log:
+      #   "model architecture does not currently support parallel requests
+      #    architecture=qwen35"
+      # OLLAMA_NEW_ENGINE=true *does* enable parallel for qwen35 but the new
+      # engine is less battle-tested for our throughput profile. Keep disabled
+      # until proven; tests have to set num_parallel themselves if they care.
+      OLLAMA_NEW_ENGINE: "true"
+      # NEW_ENGINE=true honors NUM_PARALLEL for qwen35; old engine silently
+      # ignored it. 4 lets multi-agent + parallel tool calls actually run
+      # concurrently on the GPU instead of queuing serially.
+      OLLAMA_NUM_PARALLEL: "4"
+      # OLLAMA_NUM_CTX is also silently clamped by VRAM budget. The 9B Q8
+      # model on 24GB lands at num_ctx=32768. Asking for 65536 is a no-op —
+      # the model loads with 32K and Ollama logs a vram-default-context line.
+      # Leaving the setting documents the ceiling we'd hit if we dropped to
+      # Q4 or moved to a 48GB card; today the runtime delivers 32K.
       OLLAMA_NUM_CTX: "32768"
       # Required models (pull manually or via entrypoint):
       #   ollama pull qwen3.5:27b      (main model)
@@ -26,7 +47,14 @@ services:
       - ollama_data:/root/.ollama
       # - C:/data/finetune/merged:/finetune-model:ro  # Temp mount for model import
     healthcheck:
-      test: ["CMD", "ollama", "list"]
+      # `ollama list` alone passes whenever the CLI responds, even if the
+      # production model failed to register or was deleted. Grep for the
+      # expected production model so a missing/corrupt registry trips the
+      # healthcheck. Accepts either nova-ft (fine-tuned) or a qwen3 base —
+      # both are valid working states. Real inference probing happens from
+      # nova-app via the `Ollama Latency Monitor` heartbeat, since the
+      # Ollama image has no curl/wget/python for in-container API probes.
+      test: ["CMD-SHELL", "ollama list | grep -q '^nova-ft' || ollama list | grep -q '^qwen3'"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -65,15 +93,37 @@ services:
       ENABLE_DESKTOP_AUTOMATION: "true"
       ENABLE_PLANNING: "true"
       ENABLE_CRITIQUE: "true"
+      # Auto-finetune: heartbeat fires DPO training when ≥50 new pairs accumulate.
+      # Stops Ollama for 30-60 min during training; the script reruns A/B and
+      # rolls back on regression so chat is unavailable but never gets worse.
+      ENABLE_AUTO_FINETUNE: "true"
+      # MCP: expose Nova as MCP server (for Claude Code/Cursor) and consume
+      # external MCP tools. Both default-on now that auto-finetune protects model quality.
+      ENABLE_MCP: "true"
+      ENABLE_MCP_SERVER: "true"
+      # Voice: Whisper STT + Piper TTS (both already installed in image).
+      ENABLE_VOICE: "true"
+      ENABLE_TTS: "true"
+      # Eval-suite per-task timeouts were sized for the 9B base. With Qwen
+      # 3.6:27b loaded, each generation is 2-3× slower (especially when KV
+      # cache is cold). 2.5× multiplier gives every task headroom.
+      EVAL_TIMEOUT_MULTIPLIER: "2.5"
     volumes:
       - nova_data:/data
       - ./mcp:/data/mcp:ro
+      # /home/nova/.cache as tmpfs mounted with mode 1777 so nova (uid 1000)
+      # can write ChromaDB's internal cache. Short-form tmpfs defaults to mode
+      # 755/root — use long-form volume syntax instead.
+      - type: tmpfs
+        target: /home/nova/.cache
+        tmpfs:
+          size: 536870912
+          mode: 1023  # 01777 octal = 1023 decimal (world-writable + sticky)
       # Uncomment for desktop automation (requires X11 on host):
       # - /tmp/.X11-unix:/tmp/.X11-unix:ro
     read_only: true
     tmpfs:
       - /tmp
-      - /home/nova/.cache
     security_opt:
       - no-new-privileges:true
     cap_drop:

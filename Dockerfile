@@ -35,6 +35,11 @@ COPY pytest.ini .
 # are heavyweight training pipelines that don't belong in the runtime image.
 COPY scripts/__init__.py scripts/__init__.py
 COPY scripts/verify_phase_0.py scripts/verify_phase_0.py
+# GRPO trainer — small, no torch import at module load. Lets us run
+# `docker exec nova-app python -m scripts.grpo_train --dry-run` without
+# staging the file via /data each time. The actual training step still
+# requires the full finetune venv outside the container.
+COPY scripts/grpo_train.py scripts/grpo_train.py
 
 # Data directory + non-root user
 RUN mkdir -p /data /data/screenshots /data/mcp && \

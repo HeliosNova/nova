@@ -220,3 +220,164 @@ class TestHeartbeatExecution:
         assert len(results) >= 1
         latest = results[0]
         assert "cooldown" in (latest.message or "").lower()
+
+
+# ---------------------------------------------------------------------------
+# Auto-finetune capability detection + safe-guard tests
+# ---------------------------------------------------------------------------
+
+
+class TestAutoFinetuneGuards:
+    """Covers _can_auto_finetune() + _execute_finetune_check() fallback path.
+
+    Production history (2026-05-07..12): six consecutive auto-fires failed
+    silently because the container lacked finetune_auto.py / unsloth / CUDA.
+    These tests pin the new behavior so the failure can't recur.
+    """
+
+    @pytest.fixture
+    def loop(self, tmp_path):
+        from app.database import SafeDB
+        db = SafeDB(str(tmp_path / "test.db"))
+        db.init_schema()
+        return HeartbeatLoop(MonitorStore(db))
+
+    def test_can_auto_finetune_blocks_when_script_missing(self, loop):
+        # When neither absolute nor relative path exists, blocker should
+        # identify the missing script — this is the production failure mode.
+        with patch("pathlib.Path.exists", return_value=False):
+            can, reason = loop._can_auto_finetune()
+        assert can is False
+        assert "finetune_auto" in reason
+
+    def test_can_auto_finetune_blocks_when_unsloth_missing(self, loop):
+        # Script present but unsloth not installed — read-only nova-app
+        # container case. find_spec returns None for a missing module.
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("importlib.util.find_spec", return_value=None):
+            can, reason = loop._can_auto_finetune()
+        assert can is False
+        assert "unsloth" in reason
+
+    def test_can_auto_finetune_swallows_unexpected_exceptions(self, loop):
+        # If Path.exists or importlib raises something unusual (e.g. odd
+        # filesystem state), we must still return a (False, reason) tuple
+        # so the heartbeat tick doesn't crash. This is a defense-in-depth
+        # contract on the probe.
+        with patch("pathlib.Path.exists", side_effect=OSError("disk gone")):
+            can, reason = loop._can_auto_finetune()
+        assert can is False
+        assert "probe raised" in reason or "disk gone" in reason
+
+    def test_can_auto_finetune_blocks_when_no_cuda(self, loop):
+        # Script + unsloth present but CUDA not visible — GPU lives in
+        # the nova-ollama sibling container, not nova-app.
+        fake_spec = MagicMock()  # truthy → unsloth importable
+        fake_torch = MagicMock()
+        fake_torch.cuda.is_available.return_value = False
+        import sys as _sys
+        with patch("pathlib.Path.exists", return_value=True), \
+             patch("importlib.util.find_spec", return_value=fake_spec), \
+             patch.dict(_sys.modules, {"torch": fake_torch}):
+            can, reason = loop._can_auto_finetune()
+        assert can is False
+        assert "CUDA" in reason
+
+    @pytest.mark.asyncio
+    async def test_finetune_check_notifies_when_auto_blocked(self, loop, tmp_path, monkeypatch):
+        # Even when ENABLE_AUTO_FINETUNE=true and we have enough new pairs,
+        # if the environment can't support training we degrade to NOTIFY
+        # with a clear blocker reason — never silently fail to subprocess.
+        data_path = tmp_path / "training_data.jsonl"
+        # Write >= FINETUNE_MIN_NEW_PAIRS valid pairs.
+        with open(data_path, "w", encoding="utf-8") as fh:
+            for i in range(50):
+                fh.write(json.dumps({"query": f"q{i}", "chosen": f"a{i}"}) + "\n")
+        output_dir = tmp_path / "finetune"
+        output_dir.mkdir()
+
+        from app.config import config
+        monkeypatch.setattr(config, "TRAINING_DATA_PATH", str(data_path))
+        monkeypatch.setattr(config, "FINETUNE_OUTPUT_DIR", str(output_dir))
+        monkeypatch.setattr(config, "FINETUNE_MIN_NEW_PAIRS", 15)
+        monkeypatch.setattr(config, "ENABLE_AUTO_FINETUNE", True)
+
+        # Force the capability probe to report a known blocker so we can
+        # assert the message surfaces it instead of attempting Popen.
+        with patch.object(loop, "_can_auto_finetune", return_value=(False, "unsloth not installed in this Python")), \
+             patch("subprocess.Popen") as mock_popen:
+            result = await loop._execute_finetune_check({})
+
+        # Must not have tried to spawn a process — that's the whole point.
+        mock_popen.assert_not_called()
+        # Must surface FINETUNE READY + the specific blocker reason so the
+        # operator sees it on the dashboard instead of "STARTED ... silently failing".
+        assert result.startswith("FINETUNE READY")
+        assert "blocked" in result.lower()
+        assert "unsloth" in result
+
+    @pytest.mark.asyncio
+    async def test_finetune_check_notifies_when_disabled(self, loop, tmp_path, monkeypatch):
+        # Plain "not enabled" path still works — opt-in operator gets the
+        # standard READY message without a blocker prefix.
+        data_path = tmp_path / "training_data.jsonl"
+        with open(data_path, "w", encoding="utf-8") as fh:
+            for i in range(50):
+                fh.write(json.dumps({"query": f"q{i}", "chosen": f"a{i}"}) + "\n")
+        output_dir = tmp_path / "finetune"
+        output_dir.mkdir()
+
+        from app.config import config
+        monkeypatch.setattr(config, "TRAINING_DATA_PATH", str(data_path))
+        monkeypatch.setattr(config, "FINETUNE_OUTPUT_DIR", str(output_dir))
+        monkeypatch.setattr(config, "FINETUNE_MIN_NEW_PAIRS", 15)
+        monkeypatch.setattr(config, "ENABLE_AUTO_FINETUNE", False)
+
+        with patch.object(loop, "_can_auto_finetune", return_value=(True, "")), \
+             patch("subprocess.Popen") as mock_popen:
+            result = await loop._execute_finetune_check({})
+
+        mock_popen.assert_not_called()
+        assert result.startswith("FINETUNE READY")
+        assert "ENABLE_AUTO_FINETUNE=true" in result
+
+    @pytest.mark.asyncio
+    async def test_finetune_check_surfaces_fast_failure(self, loop, tmp_path, monkeypatch):
+        # When the subprocess DOES launch but crashes within the 3-second
+        # probe window (script not found, import error), the monitor must
+        # report LAUNCH FAILED rather than STARTED. This is the regression
+        # guard against the silent-failure pattern that ran for 6 days.
+        data_path = tmp_path / "training_data.jsonl"
+        with open(data_path, "w", encoding="utf-8") as fh:
+            for i in range(50):
+                fh.write(json.dumps({"query": f"q{i}", "chosen": f"a{i}"}) + "\n")
+        output_dir = tmp_path / "finetune"
+        output_dir.mkdir()
+
+        from app.config import config
+        monkeypatch.setattr(config, "TRAINING_DATA_PATH", str(data_path))
+        monkeypatch.setattr(config, "FINETUNE_OUTPUT_DIR", str(output_dir))
+        monkeypatch.setattr(config, "FINETUNE_MIN_NEW_PAIRS", 15)
+        monkeypatch.setattr(config, "ENABLE_AUTO_FINETUNE", True)
+
+        # Simulate a process that already exited with non-zero code by the
+        # time the probe runs. poll() must return an int (not None) so the
+        # code path treats it as a crash.
+        fake_proc = MagicMock()
+        fake_proc.poll.return_value = 2
+
+        # Pre-populate the log file so the tail read shows the error.
+        # The Popen mock won't actually write the log, so we do it here.
+        # Filename includes loop.time() so we match whatever the code wrote.
+        import asyncio as _asyncio
+        _t = int(_asyncio.get_event_loop().time())
+        log_path = output_dir / f"auto_finetune_{_t}.log"
+        log_path.write_text("python: can't open file 'scripts/finetune_auto.py'\n")
+
+        with patch.object(loop, "_can_auto_finetune", return_value=(True, "")), \
+             patch("subprocess.Popen", return_value=fake_proc), \
+             patch("asyncio.sleep", new_callable=AsyncMock):
+            result = await loop._execute_finetune_check({})
+
+        assert result.startswith("FINETUNE LAUNCH FAILED")
+        assert "exit_code=2" in result

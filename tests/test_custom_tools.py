@@ -33,9 +33,22 @@ class TestCustomToolStore:
         tid2 = store.create_tool("greet", "desc2", "[]", 'def run(): return "hello"')
         assert tid2 == -1
 
-    def test_create_unsafe_code_rejected(self, store):
+    def test_create_with_imports_allowed(self, store):
+        # Sovereign owner directive (2026-04): no policy gates on Nova's
+        # custom tools. Anything that parses as valid Python is accepted.
         tid = store.create_tool(
-            "danger", "bad tool", "[]", "import os\ndef run(): return os.getcwd()"
+            "ok_with_import",
+            "tool that uses os",
+            "[]",
+            "import os\ndef run(): return os.getcwd()",
+        )
+        assert tid > 0
+
+    def test_create_invalid_syntax_rejected(self, store):
+        # The only remaining gate is syntactic correctness — code that
+        # doesn't parse can't be stored.
+        tid = store.create_tool(
+            "broken", "bad tool", "[]", "def run(:\n    return 'broken'"
         )
         assert tid == -1
 
@@ -180,19 +193,18 @@ class TestDynamicTool:
         assert "0" in result.output
 
     @pytest.mark.asyncio
-    async def test_unsafe_code_blocked(self, db):
+    async def test_safe_code_with_imports_runs(self, db):
+        # Sovereign owner directive — no policy gates. Anything that parses runs.
         store = CustomToolStore(db)
-        # Manually insert unsafe code bypassing safety check
-        # Use ctypes which is blocked at ALL tiers (including standard)
         db.execute(
             "INSERT INTO custom_tools (name, description, parameters, code) VALUES (?, ?, ?, ?)",
-            ("evil", "bad tool", "[]", "import ctypes\ndef run(): return str(ctypes)"),
+            ("ctypes_ok", "uses ctypes", "[]", "import ctypes\ndef run(): return str(type(ctypes))"),
         )
-        record = store.get_tool("evil")
+        record = store.get_tool("ctypes_ok")
         tool = DynamicTool(record, store)
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
+        assert "module" in result.output
 
 
 # ===========================================================================
@@ -200,17 +212,20 @@ class TestDynamicTool:
 # ===========================================================================
 
 class TestDynamicToolSandbox:
-    """Verify DynamicTool uses forced sandbox-level restrictions regardless of system tier."""
+    """Sovereign-mode tests: dynamic tools have NO policy gates.
+
+    Owner directive (2026-04): 'access tier should always be unblocked',
+    'no policy gates on Nova'. These tests pin the unrestricted behavior;
+    they MUST FAIL if anyone re-introduces sandbox restrictions.
+    """
 
     @pytest.fixture(autouse=True)
     def _set_full_tier(self):
-        """Set system to FULL tier — dynamic tools should still be sandboxed."""
         with patch("app.core.access_tiers.config") as mock_cfg:
             mock_cfg.SYSTEM_ACCESS_LEVEL = "full"
             yield
 
     def _make_tool(self, db, name, code):
-        """Create a DynamicTool by inserting directly into DB (bypassing create_tool safety check)."""
         store = CustomToolStore(db)
         db.execute(
             "INSERT INTO custom_tools (name, description, parameters, code) VALUES (?, ?, ?, ?)",
@@ -220,41 +235,56 @@ class TestDynamicToolSandbox:
         return DynamicTool(record, store)
 
     @pytest.mark.asyncio
-    async def test_network_import_blocked_at_full_tier(self, db):
-        """Even at 'full' tier, dynamic tools cannot import socket."""
-        tool = self._make_tool(db, "net_tool", "import socket\ndef run(): return 'ok'")
+    async def test_socket_import_runs(self, db):
+        tool = self._make_tool(
+            db, "net_tool",
+            "import socket\ndef run(): return socket.gethostname()",
+        )
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
     @pytest.mark.asyncio
-    async def test_os_import_blocked_at_full_tier(self, db):
-        """Even at 'full' tier, dynamic tools cannot import os."""
+    async def test_os_import_runs(self, db):
         tool = self._make_tool(db, "os_tool", "import os\ndef run(): return os.getcwd()")
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
     @pytest.mark.asyncio
-    async def test_subprocess_import_blocked_at_full_tier(self, db):
-        """Even at 'full' tier, dynamic tools cannot import subprocess."""
-        tool = self._make_tool(db, "sub_tool", "import subprocess\ndef run(): return 'ok'")
+    async def test_subprocess_import_runs(self, db):
+        tool = self._make_tool(
+            db, "sub_tool",
+            "import subprocess\ndef run(): return 'ok'",
+        )
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
     @pytest.mark.asyncio
-    async def test_http_import_blocked(self, db):
-        """HTTP/urllib/requests imports are blocked."""
-        for mod in ["http", "urllib", "requests", "httpx"]:
-            tool = self._make_tool(db, f"http_{mod}", f"import {mod}\ndef run(): return 'ok'")
+    async def test_http_libs_import(self, db):
+        # Test only modules importable from a `python -I` subprocess (which
+        # ignores user site-packages). On the host, httpx may be installed via
+        # pip --user but won't load under -I; in the container it's present
+        # via system site-packages so it works there. Probe explicitly.
+        import subprocess, sys
+        candidates = ["http", "urllib"]
+        try:
+            r = subprocess.run(
+                [sys.executable, "-I", "-c", "import httpx"],
+                capture_output=True, timeout=5,
+            )
+            if r.returncode == 0:
+                candidates.append("httpx")
+        except Exception:
+            pass
+        for mod in candidates:
+            tool = self._make_tool(
+                db, f"http_{mod}",
+                f"import {mod}\ndef run(): return '{mod} ok'",
+            )
             result = await tool.execute()
-            assert not result.success, f"import {mod} should be blocked"
-            assert "blocked" in result.error.lower()
+            assert result.success, f"import {mod} unexpectedly failed: {result.error}"
 
     @pytest.mark.asyncio
     async def test_safe_code_still_works_at_full_tier(self, db):
-        """Legitimate tools still execute correctly."""
         tool = self._make_tool(
             db, "math_tool",
             'import math\ndef run(): return str(math.pi)'
@@ -264,76 +294,59 @@ class TestDynamicToolSandbox:
         assert "3.14" in result.output
 
     @pytest.mark.asyncio
-    async def test_runtime_network_blocked_even_if_ast_bypassed(self, db):
-        """Runtime preamble blocks network even if AST check were somehow bypassed.
-
-        We test this by creating a tool that tries to use socket indirectly
-        through the subprocess — the preamble poisons sys.modules['socket'].
-        """
-        # This code doesn't directly "import socket" (which AST catches),
-        # but tries to access it via __import__ which is also blocked by AST.
-        # The runtime preamble is defense-in-depth.
+    async def test_runtime_network_works(self, db):
         tool = self._make_tool(
-            db, "sneaky_net",
-            'def run():\n    try:\n        import socket\n        return "FAIL: socket imported"\n    except (ImportError, PermissionError):\n        return "OK: blocked"'
+            db, "real_net",
+            'def run():\n    import socket\n    return "OK: " + socket.gethostname()'
         )
         result = await tool.execute()
-        # Should be caught by AST check
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
+        assert "OK" in result.output
 
     @pytest.mark.asyncio
-    async def test_eval_blocked(self, db):
-        """eval() is blocked in dynamic tools."""
+    async def test_eval_runs(self, db):
         tool = self._make_tool(
             db, "eval_tool",
-            'def run(): return eval("1+1")'
+            'def run(): return str(eval("1+1"))'
         )
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
+        assert "2" in result.output
 
     @pytest.mark.asyncio
-    async def test_exec_blocked(self, db):
-        """exec() is blocked in dynamic tools."""
+    async def test_exec_runs(self, db):
         tool = self._make_tool(
             db, "exec_tool",
-            'def run(): exec("x=1"); return "ok"'
+            'def run():\n    ns = {}\n    exec("x=1+2", ns)\n    return str(ns["x"])'
         )
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
+        assert "3" in result.output
 
     @pytest.mark.asyncio
-    async def test_pickle_blocked(self, db):
-        """pickle (deserialization attack vector) is blocked."""
+    async def test_pickle_import_runs(self, db):
         tool = self._make_tool(
             db, "pickle_tool",
             'import pickle\ndef run(): return "ok"'
         )
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
     @pytest.mark.asyncio
-    async def test_create_tool_uses_forced_sandbox(self, db):
-        """create_tool() also uses forced-sandbox safety checks."""
+    async def test_create_tool_accepts_imports(self, db):
         store = CustomToolStore(db)
-        # At "full" system tier, os would normally be allowed by _check_code_safety
-        # but create_tool now uses _check_dynamic_tool_safety
         tid = store.create_tool(
             "os_reader", "reads os info", "[]",
             "import os\ndef run(): return os.getcwd()"
         )
-        assert tid == -1  # Rejected even at full tier
+        assert tid > 0
 
 
 class TestDynamicToolSandboxNoneTier:
-    """Verify sandbox restrictions hold even at 'none' tier (all restrictions off)."""
+    """At 'none' tier the same unrestricted behavior applies."""
 
     @pytest.fixture(autouse=True)
     def _set_none_tier(self):
-        """Set system to NONE tier — dynamic tools should STILL be sandboxed."""
         with patch("app.core.access_tiers.config") as mock_cfg:
             mock_cfg.SYSTEM_ACCESS_LEVEL = "none"
             yield
@@ -348,19 +361,16 @@ class TestDynamicToolSandboxNoneTier:
         return DynamicTool(record, store)
 
     @pytest.mark.asyncio
-    async def test_os_blocked_at_none_tier(self, db):
-        """Even at 'none' tier, dynamic tools cannot import os."""
+    async def test_os_runs_at_none_tier(self, db):
         tool = self._make_tool(db, "os_none", "import os\ndef run(): return os.getcwd()")
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
     @pytest.mark.asyncio
-    async def test_subprocess_blocked_at_none_tier(self, db):
+    async def test_subprocess_runs_at_none_tier(self, db):
         tool = self._make_tool(db, "sub_none", "import subprocess\ndef run(): return 'ok'")
         result = await tool.execute()
-        assert not result.success
-        assert "blocked" in result.error.lower()
+        assert result.success, f"unexpected failure: {result.error}"
 
 
 # ===========================================================================
@@ -422,3 +432,105 @@ class TestToolCreateIntegration:
 
         result = await _handle_tool_create(svc, {"name": "", "code": ""})
         assert "failed" in result.lower()
+
+
+# ===========================================================================
+# _validate_proposal AST blocked-import gate (#20)
+# ===========================================================================
+
+class TestValidateProposalImportGate:
+    """LLM-generated tool proposals must be rejected at validation time if
+    they reference an import on the current tier's block-list. Without this
+    they get persisted to the custom_tools registry as valid; only the
+    runtime sandbox blocks the actual execution, but by then the rotten
+    tool has aged/promoted infrastructure built around it."""
+
+    @staticmethod
+    def _proposal(code: str) -> dict:
+        return {
+            "name": "my_tool",
+            "description": "a tool that does a thing — over 10 chars",
+            "code": code,
+            "parameters": [],
+        }
+
+    def test_clean_code_accepted(self, monkeypatch):
+        # Clean stdlib-math proposal with no blocked imports — must pass.
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "sandboxed")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "import math\n"
+            "def run(x: float = 1.0) -> str:\n"
+            "    return str(math.sqrt(x))\n"
+        ))
+        assert ok, f"expected accept, got: {reason}"
+
+    def test_blocks_top_level_os_import(self, monkeypatch):
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "sandboxed")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "import os\n"
+            "def run() -> str:\n"
+            "    return os.getcwd()\n"
+        ))
+        assert not ok
+        assert "blocked import" in reason and "os" in reason
+
+    def test_blocks_from_import(self, monkeypatch):
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "sandboxed")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "from subprocess import check_output\n"
+            "def run() -> str:\n"
+            "    return check_output(['ls']).decode()\n"
+        ))
+        assert not ok
+        assert "subprocess" in reason
+
+    def test_blocks_submodule_import(self, monkeypatch):
+        # `from urllib.request import urlopen` — top-level package is `urllib`.
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "sandboxed")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "from urllib.request import urlopen\n"
+            "def run(u: str = 'x') -> str:\n"
+            "    return urlopen(u).read().decode()\n"
+        ))
+        assert not ok
+        assert "urllib" in reason
+
+    def test_blocks_dynamic_import_via_dunder(self, monkeypatch):
+        # __import__("os") is a builtin bypass for `import os`. Must still trip.
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "sandboxed")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "def run() -> str:\n"
+            "    os = __import__('os')\n"
+            "    return os.getcwd()\n"
+        ))
+        assert not ok
+        assert "__import__" in reason and "os" in reason
+
+    def test_none_tier_allows_blocked_imports(self, monkeypatch):
+        # When the operator explicitly sets tier="none" the gate must
+        # release — that's the documented opt-out.
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "none")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "import os\n"
+            "def run() -> str:\n"
+            "    return os.getcwd()\n"
+        ))
+        assert ok, f"tier=none should release: {reason}"
+
+    def test_standard_tier_allows_pathlib(self, monkeypatch):
+        # pathlib is blocked at sandboxed but allowed at standard. Verify
+        # the gate consults the tier correctly.
+        from app.core import auto_tools, access_tiers
+        monkeypatch.setattr(access_tiers, "_tier", lambda: "standard")
+        ok, reason = auto_tools._validate_proposal(self._proposal(
+            "from pathlib import Path\n"
+            "def run() -> str:\n"
+            "    return str(Path('.').resolve())\n"
+        ))
+        assert ok, f"standard should allow pathlib: {reason}"

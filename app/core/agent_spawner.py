@@ -78,6 +78,8 @@ class AgentResult:
     latency_seconds: float
     error: str | None = None
     truncated: bool = False
+    depth: int = 0  # the structural-depth value this sub-agent ran at (1 = first level, 2 = nested)
+    sub_decomposed: bool = False  # True if THIS sub-agent itself triggered further decomposition
 
 
 @dataclass
@@ -86,7 +88,7 @@ class DecompositionPlan:
     strategy: Literal["parallel", "sequential", "map-reduce"]
     tasks: list[AgentTask]
     merge_instruction: str
-    max_parallel: int = 3
+    max_parallel: int = 6  # default lifted from 3 — see config.MAX_PARALLEL_AGENTS
 
 
 # ---------------------------------------------------------------------------
@@ -158,9 +160,16 @@ class AgentSpawner:
                     return await self._execute_think(task)
             return await self._execute_think(task)
 
+        # Tighter timeout for sub-sub-agents (depth >= 2): they should reason
+        # deeply from context, not spawn long tool loops. Keeps recursive
+        # decomposition from serializing into multi-minute hangs on a single GPU.
+        effective_timeout = task.timeout
+        if _structural_depth.get() >= 1:  # we're about to spawn a depth-2 agent
+            effective_timeout = min(task.timeout, 90)
+
         start = time.monotonic()
         try:
-            return await asyncio.wait_for(_do(), timeout=task.timeout)
+            return await asyncio.wait_for(_do(), timeout=effective_timeout)
         except asyncio.TimeoutError:
             latency = time.monotonic() - start
             logger.warning(
@@ -194,10 +203,12 @@ class AgentSpawner:
         skill_used: str | None = None
         start = time.monotonic()
 
-        # Increment structural depth so the sub-agent cannot itself decompose.
+        # Increment structural depth so the sub-agent runs at depth+1.
         # ContextVar.reset(token) restores the previous value on exit — correct
         # even for sequential execution within the same coroutine.
-        token = _structural_depth.set(_structural_depth.get() + 1)
+        new_depth = _structural_depth.get() + 1
+        token = _structural_depth.set(new_depth)
+        sub_decomposed = False
         try:
             async for event in think(
                 query=full_query,
@@ -212,6 +223,10 @@ class AgentSpawner:
                         tools_invoked.append(tool_name)
                 elif event.type == EventType.DONE:
                     skill_used = event.data.get("skill_used")
+                    # If the sub-agent itself triggered structural decomposition, it's
+                    # a depth-N+1 nested case — surface the signal upward.
+                    if event.data.get("decomposed"):
+                        sub_decomposed = True
         finally:
             _structural_depth.reset(token)
 
@@ -233,6 +248,8 @@ class AgentSpawner:
             reflexion_score=None,  # Sub-agent quality not stored
             latency_seconds=round(latency, 2),
             truncated=truncated,
+            depth=new_depth,
+            sub_decomposed=sub_decomposed,
         )
 
 
@@ -276,22 +293,91 @@ async def merge_agent_results(
     successful = [r for r in results if r.response and not r.error]
 
     if not successful:
+        # All sub-agents timed out or errored — instead of returning a useless
+        # refusal string (which fails any keyword assertion and confuses the
+        # user), make a single-pass best-effort answer to the original query
+        # from the model's own knowledge. The merge prompt below will be told
+        # explicitly that it has no agent inputs and must answer directly.
+        try:
+            from app.core import llm
+            recovery = await asyncio.wait_for(
+                llm.invoke_nothink(
+                    [
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are answering a complex question. The research-stage "
+                                "agents that were supposed to gather supporting material "
+                                "all failed or timed out, so synthesize the best answer "
+                                "you can from your own knowledge. Be direct, cover every "
+                                "entity or topic in the question, and do not mention "
+                                "sub-agents, research stages, timeouts, or apologize for "
+                                "lack of fresh data. If you can give a confident answer, do."
+                            ),
+                        },
+                        {"role": "user", "content": query},
+                    ],
+                    max_tokens=min(config.RESPONSE_TOKEN_BUDGET + 400, 2400),
+                    temperature=config.TEMPERATURE_DEFAULT,
+                ),
+                timeout=max(float(config.INTERNAL_LLM_TIMEOUT), 60.0),
+            )
+            recovery = (recovery or "").strip()
+            if recovery:
+                logger.info(
+                    "[merge_agent_results] all sub-agents failed — recovered "
+                    "via single-pass synthesis (%d chars)", len(recovery),
+                )
+                return recovery
+        except Exception as e:
+            logger.warning(
+                "[merge_agent_results] single-pass recovery failed (%s)", e,
+            )
+        # Fall back to the old refusal only if even the recovery LLM call dies.
         return "[All sub-agents failed to produce results.]"
 
     if len(successful) == 1 and not merge_instruction:
         return successful[0].response
 
-    # Build compact merge prompt (no full system prompt, no tools)
+    # Build compact merge prompt (no full system prompt, no tools).
+    # Each agent block carries structured metadata — tools_invoked +
+    # reflexion_score — so the synthesizer can cite provenance instead of
+    # re-reasoning from scratch. Per-response pre-trim to ~1500 chars caps
+    # context bloat when sub-agents emit long tool dumps (web_search etc.);
+    # the original observation is preserved in the agent's own task result
+    # if needed.
+    _PER_RESP_TRIM = 1500
     parts: list[str] = []
     for r in results:
-        if r.response and not r.error:
-            parts.append(f"[{r.role}]\n{r.response}")
+        header_bits: list[str] = []
+        if r.tools_invoked:
+            header_bits.append("tools=" + ",".join(r.tools_invoked))
         else:
-            parts.append(f"[{r.role}]\n[Agent failed: {r.error or 'no output'}]")
+            header_bits.append("tools=(none)")
+        if r.reflexion_score is not None:
+            header_bits.append(f"quality={r.reflexion_score:.2f}")
+        if r.truncated:
+            header_bits.append("truncated=true")
+        header = " | ".join(header_bits)
+        if r.response and not r.error:
+            body = r.response
+            if len(body) > _PER_RESP_TRIM:
+                body = body[:_PER_RESP_TRIM] + " [...trimmed]"
+            parts.append(f"[{r.role}] ({header})\n{body}")
+        else:
+            parts.append(f"[{r.role}] ({header})\n[Agent failed: {r.error or 'no output'}]")
 
     merge_body = "\n\n".join(parts)
     if merge_instruction:
         merge_body += f"\n\n[Instructions]\n{merge_instruction}"
+
+    # Scale budget and timeout with agent count. At N>=5 the base budget (600
+    # tokens) truncates before the model finishes enumerating results, which
+    # is how the N=10 probe lost half its targets. Cap at 4000 to keep the
+    # merge from running longer than a normal response.
+    n = len(successful)
+    merge_tokens = min(config.RESPONSE_TOKEN_BUDGET + 200 * max(0, n - 1), 4000)
+    merge_timeout = max(float(config.INTERNAL_LLM_TIMEOUT), 30.0 + 10.0 * n)
 
     try:
         from app.core import llm
@@ -303,8 +389,29 @@ async def merge_agent_results(
                         "content": (
                             "You are a synthesis assistant. You have received research findings "
                             "from multiple specialized agents. Synthesize them into a single, "
-                            "coherent, direct response. Do not mention the agents or their roles. "
-                            "Respond as if you did all the research yourself."
+                            "coherent, direct response.\n\n"
+                            "Each agent block in the user message starts with a header in "
+                            "parentheses showing the tools that agent invoked (web_search, "
+                            "calculator, code_exec, etc.) and a quality score where available. "
+                            "Use this provenance: if a fact came from `web_search`, treat it as "
+                            "fresh-source-grounded; if `tools=(none)`, the agent answered from "
+                            "the model's own knowledge — weight contested numeric facts toward "
+                            "the tool-grounded agent.\n\n"
+                            "STRICT RULES:\n"
+                            "- NEVER mention 'group-N-researcher', 'agent', 'sub-agent', "
+                            "  'group 1', 'group 2', or any internal task naming. The user has "
+                            "  no idea those exist and will be confused.\n"
+                            "- NEVER quote the headers (`tools=...`, `quality=...`) in the output. "
+                            "  Use them only to choose which findings to trust when they conflict.\n"
+                            "- NEVER second-guess yourself in the output ('No wait, let me re-read...', "
+                            "  'Hmm I'm confusing things'). Make ONE confident pass.\n"
+                            "- Respond as if YOU did all the research yourself.\n"
+                            "- Cover every entity or topic from the agent outputs — drop nothing.\n"
+                            "- If the agent outputs disagree on a fact, pick the most well-sourced "
+                            "  one and report it. Do NOT include both contradicting numbers.\n"
+                            "- If an agent returned an error or empty result, silently work around "
+                            "  it — say 'I couldn't verify X' rather than 'agent N failed'.\n"
+                            "- For long outputs use concise bullets, not rambling prose."
                         ),
                     },
                     {
@@ -312,10 +419,10 @@ async def merge_agent_results(
                         "content": f"Original question: {query}\n\n{merge_body}",
                     },
                 ],
-                max_tokens=config.RESPONSE_TOKEN_BUDGET,
+                max_tokens=merge_tokens,
                 temperature=config.TEMPERATURE_DEFAULT,
             ),
-            timeout=float(config.INTERNAL_LLM_TIMEOUT),
+            timeout=merge_timeout,
         )
         return (merged or "").strip() or _fallback_concat(successful)
     except Exception as e:

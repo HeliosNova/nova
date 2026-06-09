@@ -757,48 +757,37 @@ class TestConfigOrphansAndValidation:
         from app.config import Config
         assert not hasattr(Config(), "TEMPERATURE_REFLEXION")
 
-    def test_openai_use_completion_tokens_removed(self):
-        """OPENAI_USE_COMPLETION_TOKENS has no reader in app code — must not exist."""
+    def test_cloud_provider_fields_removed(self):
+        """All cloud provider config fields must be gone (Ollama-only architecture)."""
         from app.config import Config
-        assert not hasattr(Config(), "OPENAI_USE_COMPLETION_TOKENS")
+        cfg = Config()
+        for f in (
+            "OPENAI_USE_COMPLETION_TOKENS", "ANTHROPIC_API_VERSION", "ANTHROPIC_BETA_HEADER",
+            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+            "OPENAI_MODEL", "ANTHROPIC_MODEL", "GOOGLE_MODEL",
+            "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "GOOGLE_BASE_URL",
+        ):
+            assert not hasattr(cfg, f), f"Cloud field {f!r} should be removed"
 
-    def test_anthropic_api_version_removed(self):
-        """ANTHROPIC_API_VERSION has no reader in app code — must not exist."""
+    def test_validate_warns_on_non_ollama_provider(self):
+        """validate() must warn when LLM_PROVIDER is anything other than ollama."""
         from app.config import Config
-        assert not hasattr(Config(), "ANTHROPIC_API_VERSION")
-
-    def test_anthropic_beta_header_removed(self):
-        """ANTHROPIC_BETA_HEADER has no reader in app code — must not exist."""
-        from app.config import Config
-        assert not hasattr(Config(), "ANTHROPIC_BETA_HEADER")
-
-    def test_validate_warns_on_unimplemented_provider_anthropic(self):
-        """validate() must warn when LLM_PROVIDER=anthropic but the module doesn't exist."""
-        from app.config import Config
-        cfg = Config(LLM_PROVIDER="anthropic", ANTHROPIC_API_KEY="sk-fake")
-        warnings = cfg.validate()
-        assert any("anthropic" in w.lower() and "not exist" in w.lower() for w in warnings), (
-            f"Expected warning about missing anthropic module. Got: {warnings}"
-        )
-
-    def test_validate_warns_on_unimplemented_provider_openai(self):
-        """validate() must warn when LLM_PROVIDER=openai but the module doesn't exist."""
-        from app.config import Config
-        cfg = Config(LLM_PROVIDER="openai", OPENAI_API_KEY="sk-fake")
-        warnings = cfg.validate()
-        assert any("openai" in w.lower() and "not exist" in w.lower() for w in warnings)
+        for prov in ("anthropic", "openai", "google"):
+            cfg = Config(LLM_PROVIDER=prov)
+            warnings = cfg.validate()
+            assert any("ollama" in w.lower() for w in warnings), (
+                f"Expected warning for {prov}. Got: {warnings}"
+            )
 
     def test_validate_no_warning_for_ollama(self):
-        """validate() must NOT warn about provider when LLM_PROVIDER=ollama (implemented)."""
+        """validate() must NOT warn about provider when LLM_PROVIDER=ollama."""
         from app.config import Config
         cfg = Config(LLM_PROVIDER="ollama")
         warnings = cfg.validate()
-        assert not any("not exist" in w.lower() for w in warnings)
+        assert not any("ollama" in w.lower() and "must" in w.lower() for w in warnings)
 
-    def test_base_urls_still_present(self):
-        """Provider base URLs must be kept — they'll be needed when providers are implemented."""
+    def test_ollama_url_still_present(self):
+        """OLLAMA_URL must remain — it's the only LLM provider."""
         from app.config import Config
         cfg = Config()
-        assert hasattr(cfg, "OPENAI_BASE_URL")
-        assert hasattr(cfg, "ANTHROPIC_BASE_URL")
-        assert hasattr(cfg, "GOOGLE_BASE_URL")
+        assert hasattr(cfg, "OLLAMA_URL")

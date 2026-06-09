@@ -1,6 +1,6 @@
 # Phase-0 cron verification (Windows host).
 #
-# Companion to scripts/verify_phase_0.py — that script checks the in-container
+# Companion to scripts/verify_phase_0.py - that script checks the in-container
 # state. This one checks the Windows Scheduled Task that triggers the weekly
 # fine-tune pipeline, which lives on the host rather than in the container.
 #
@@ -23,7 +23,7 @@ function Write-Result($name, $ok, $detail) {
 }
 
 Write-Host ('=' * 72)
-Write-Host "Phase-0 Cron Verification — $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
+Write-Host "Phase-0 Cron Verification - $(Get-Date -Format 'yyyy-MM-ddTHH:mm:ssZ')"
 Write-Host ('=' * 72)
 
 $allOk = $true
@@ -31,7 +31,7 @@ $allOk = $true
 # 1. Scheduled task registered
 $task = Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 $ok = $null -ne $task
-$detail = if ($ok) { "registered, state=$($task.State)" } else { 'not registered — run setup_weekly_finetune.ps1' }
+$detail = if ($ok) { "registered, state=$($task.State)" } else { 'not registered - run setup_weekly_finetune.ps1' }
 $allOk = (Write-Result 'task_registered' $ok $detail) -and $allOk
 
 # 2. Task is enabled
@@ -83,7 +83,7 @@ $allOk = (Write-Result 'python_script' $ok $detail) -and $allOk
 
 # 7. git-bash exists
 $ok = Test-Path $BashExe
-$detail = if ($ok) { $BashExe } else { "missing: $BashExe — install Git for Windows" }
+$detail = if ($ok) { $BashExe } else { "missing: $BashExe - install Git for Windows" }
 $allOk = (Write-Result 'bash_exe' $ok $detail) -and $allOk
 
 # 8. Last run info (informational only, not a pass/fail gate)

@@ -69,10 +69,20 @@ def _check_command_safety(command: str, *, depth: int = 0, max_depth: int = 5) -
         if not sub_cmd:
             continue
 
-        # Use shlex for proper quote handling; reject malformed input
+        # Use shlex for proper quote handling; reject malformed input.
+        # For SQL queries, the helpful hint matters: the LLM kept retrying
+        # `sqlite3 /data/db "SELECT ..."` with nested quotes that shlex
+        # rejects. The right answer is code_exec, not retrying with more
+        # quotes — explicit redirect saves the next 9 retries.
         try:
             tokens = shlex.split(sub_cmd)
         except ValueError:
+            if "sqlite3 " in sub_cmd or "SELECT " in sub_cmd.upper():
+                return (
+                    "Command rejected: malformed shell quoting. For SQL queries, "
+                    "use code_exec with `import sqlite3; conn = sqlite3.connect('/data/nova.db')` "
+                    "instead of shelling out to the sqlite3 CLI — it avoids quote-escape headaches."
+                )
             return "Command rejected: malformed shell quoting"
 
         # Extract the base command (skip sudo/env/nice/etc.)

@@ -112,10 +112,13 @@ def normalize_predicate(pred: str) -> str:
                 if short == alias_key.replace(" ", "_"):
                     return canon
 
-    # Allow well-formed custom predicates (lowercase, underscores, 3-31 chars, max 3 underscores)
-    if re.match(r"^[a-z][a-z_]{2,30}$", p) and p.count("_") <= 3:
-        return p
-
+    # Hard allow-list — only canonical predicates and explicit aliases pass.
+    # Permissive custom-predicate matching was removed 2026-05-13: LLM
+    # extractions like "founded_in_year" or "custom_metric_v2" would orphan
+    # facts (stored under a unique key that no canonical query ever hits).
+    # The 31 canonical predicates + ~50 alias phrases cover the common shapes;
+    # anything else degrades to `related_to`, preserving the relationship
+    # without splintering the predicate space.
     return "related_to"
 
 
@@ -159,6 +162,15 @@ _GARBAGE_PATTERNS = [
     re.compile(r"^[\d\s\.\+\-\*\/\=\(\)]+$"),        # math expressions
     re.compile(r"[/\\][\w/\\]+\.\w+"),                 # file paths
     re.compile(r"^\d+(\.\d+)?$"),                      # bare numbers
+    # Monitor category labels — NEVER a real entity
+    re.compile(r"^domain study[:\s]", re.IGNORECASE),
+    re.compile(r"^monitor(ing)?\s+system\b", re.IGNORECASE),
+    # Underscored/lowercase pseudo-entities generated from monitor names:
+    # "energy_and_climate_intelligence", "trading_and_positioning_intelligence", etc.
+    re.compile(r"^[a-z][a-z0-9_]*_intelligence$"),
+    # Title-cased "X Architecture" as an Intel/CPU thing when conflated with Nova.
+    # Nova's "nova architecture" question caused "Nova Architecture is_a Intel Cpu Platform".
+    re.compile(r"^Nova\s+Architecture$", re.IGNORECASE),
 ]
 
 _GARBAGE_VALUES = frozenset({
@@ -171,6 +183,66 @@ _SHORT_ENTITY_ALLOWLIST = frozenset({
     "c", "r", "go", "us", "uk", "eu", "ai", "ml",
     "os", "js", "ts", "py", "c#", "c++", "f#", "qt", "vi",
 })
+
+# Predicate-direction sanity checks. Catches the most common LLM reversals.
+# Subject and object are checked against small known-entity lists; if the
+# triple has the WRONG entity on the wrong side, reject (the LLM can re-emit
+# it correctly next time). False negatives are fine — these are heuristics
+# meant to filter the obvious garbage we observed in production.
+
+# Known countries/regions that should never be the SUBJECT of capital_of
+_KNOWN_COUNTRIES = frozenset({
+    "us", "usa", "u.s.", "u.s.a.", "united states", "united states of america",
+    "uk", "u.k.", "united kingdom", "great britain", "britain", "england",
+    "russia", "russian federation", "soviet union", "ussr",
+    "china", "people's republic of china", "prc",
+    "india", "japan", "germany", "france", "italy", "spain", "canada", "mexico",
+    "brazil", "argentina", "australia", "south korea", "north korea", "vietnam",
+    "thailand", "indonesia", "philippines", "malaysia", "singapore", "ukraine",
+    "poland", "turkey", "egypt", "israel", "iran", "iraq", "saudi arabia", "uae",
+    "south africa", "nigeria", "kenya", "ethiopia", "morocco", "algeria",
+    "pakistan", "bangladesh", "afghanistan", "switzerland", "sweden", "norway",
+    "finland", "denmark", "netherlands", "belgium", "austria", "greece",
+    "portugal", "ireland", "new zealand", "chile", "peru", "colombia", "venezuela",
+    "european union", "eu", "scotland", "wales", "northern ireland",
+    "taiwan", "hong kong", "korea", "czech republic", "hungary", "romania",
+    "bulgaria", "serbia", "croatia", "slovenia", "slovakia", "kazakhstan",
+    "uzbekistan", "syria", "lebanon", "jordan", "palestine", "qatar", "kuwait",
+    "bahrain", "oman", "yemen", "libya", "tunisia", "ghana", "tanzania",
+    "uganda", "zimbabwe", "angola", "mozambique", "cuba", "panama", "costa rica",
+    "ecuador", "bolivia", "uruguay", "paraguay",
+})
+
+# Known orgs (companies, government agencies, sports teams) — never the SUBJECT
+# of works_at / leads (those should have a person as subject).
+_KNOWN_ORGS = frozenset({
+    "tesla", "spacex", "apple", "google", "alphabet", "microsoft", "amazon",
+    "meta", "facebook", "instagram", "twitter", "x", "openai", "anthropic",
+    "nvidia", "amd", "intel", "tsmc", "samsung", "sony", "ibm", "oracle",
+    "salesforce", "adobe", "uber", "lyft", "airbnb", "netflix", "disney",
+    "spotify", "shopify", "stripe", "paypal", "visa", "mastercard",
+    "berkshire hathaway", "jpmorgan", "goldman sachs", "morgan stanley",
+    "blackrock", "bank of america", "wells fargo", "citigroup",
+    "boeing", "lockheed martin", "northrop grumman", "raytheon",
+    "ford", "general motors", "toyota", "honda", "bmw", "mercedes-benz",
+    "exxon", "chevron", "shell", "bp", "saudi aramco",
+    "deepseek", "alibaba", "tencent", "baidu", "huawei", "xiaomi", "byd",
+    "sec", "fbi", "cia", "doj", "fda", "epa", "irs", "fed", "federal reserve",
+    "ecb", "european central bank", "imf", "world bank",
+    "un", "united nations", "nato", "who", "world health organization",
+    "office of the us trade representative",
+    "premier league", "nfl", "nba", "mlb", "nhl", "fifa",
+    "arsenal", "chelsea", "manchester united", "manchester city", "liverpool",
+    "real madrid", "barcelona", "los angeles dodgers", "new york yankees",
+})
+
+
+def _is_country(name: str) -> bool:
+    return name.strip().lower() in _KNOWN_COUNTRIES
+
+
+def _is_org(name: str) -> bool:
+    return name.strip().lower() in _KNOWN_ORGS
 
 
 def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
@@ -195,6 +267,19 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     for pat in _GARBAGE_PATTERNS:
         if pat.match(s) or pat.match(o):
             return True
+
+    # Predicate-direction sanity (rejects obvious reversals)
+    p = predicate.strip().lower()
+    if p == "capital_of" and _is_country(s):
+        # "Russia capital_of Moscow" — backwards
+        return True
+    if p in ("works_at", "leads") and _is_org(s) and not _is_org(o):
+        # "Tesla works_at Elon Musk" or "Federal Reserve leads Jerome Powell"
+        return True
+    if p in ("created_by", "invented_by", "founded_by") and _is_org(o) and _is_org(s):
+        # Two orgs in created_by is almost always wrong (acquisitions/parents
+        # use different predicates — part_of, owned_by, contains)
+        return True
 
     return False
 
@@ -267,6 +352,14 @@ class KnowledgeGraph:
             ("provenance", "TEXT DEFAULT ''"),
             ("superseded_by", "INTEGER"),
             ("times_retrieved", "INTEGER DEFAULT 0"),
+            # Bitemporal: transaction time of supersession (added 2026-05-16, task #29).
+            # Distinct from valid_to: valid_to = when the fact stopped being true in
+            # the world; superseded_at = when WE recorded the supersession. For
+            # current ingest they coincide, but the column lets us answer "what did
+            # Nova believe about X on date Y" by filtering out facts that were
+            # logically deleted by Y. created_at is the partner column (transaction
+            # time of insertion).
+            ("superseded_at", "TIMESTAMP"),
         ]:
             try:
                 self._db.execute(f"ALTER TABLE kg_facts ADD COLUMN {col} {typedef}")
@@ -280,10 +373,24 @@ class KnowledgeGraph:
             )
         except Exception:
             pass
+        try:
+            # Index for bitemporal as-of queries on transaction time
+            self._db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_kg_superseded_at ON kg_facts(superseded_at)"
+            )
+        except Exception:
+            pass
 
         # Backfill valid_from from created_at for existing rows
         self._db.execute(
             "UPDATE kg_facts SET valid_from = created_at WHERE valid_from IS NULL"
+        )
+        # Backfill superseded_at from valid_to for rows that were logically
+        # deleted before this migration ran. valid_to was conflating world-validity
+        # with transaction-time supersession; for historical rows the two coincide.
+        self._db.execute(
+            "UPDATE kg_facts SET superseded_at = valid_to "
+            "WHERE superseded_at IS NULL AND valid_to IS NOT NULL"
         )
 
         # Insert counter for batched pruning (only prune every 50 inserts)
@@ -364,13 +471,27 @@ class KnowledgeGraph:
             pass
 
     @staticmethod
-    def _rrf_fuse(keyword_ids: list[int], vector_ids: list[int], k: int = 60) -> list[int]:
-        """Reciprocal Rank Fusion of two ranked ID lists."""
+    def _rrf_fuse(
+        keyword_ids: list[int],
+        vector_ids: list[int],
+        ppr_ids: list[int] | None = None,
+        k: int = 60,
+    ) -> list[int]:
+        """Reciprocal Rank Fusion of up to three ranked ID lists.
+
+        Each list contributes 1/(k + rank + 1) to a fact's score; final order
+        is by descending sum. The PPR list is the HippoRAG 2 graph-walk signal
+        — facts reachable from query entities via the kg_facts graph rank up
+        even when their literal text doesn't match the query.
+        """
         scores: dict[int, float] = {}
         for rank, rid in enumerate(keyword_ids):
             scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
         for rank, rid in enumerate(vector_ids):
             scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
+        if ppr_ids:
+            for rank, rid in enumerate(ppr_ids):
+                scores[rid] = scores.get(rid, 0.0) + 1.0 / (k + rank + 1)
         return sorted(scores, key=lambda x: scores[x], reverse=True)
 
     # --- Core operations ---
@@ -482,11 +603,17 @@ class KnowledgeGraph:
                 )
                 new_id = old_superseded["id"]
             else:
+                # Explicitly set created_at = now (the bitemporal transaction
+                # time) rather than letting SQLite's CURRENT_TIMESTAMP default
+                # take it — keeps add_fact's own time control in one place and
+                # makes the column reliable as a "when we recorded" filter.
                 tx.execute(
                     "INSERT INTO kg_facts "
-                    "(subject, predicate, object, confidence, source, valid_from, valid_to, provenance) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                    (subject, predicate, object_, confidence, source, fact_valid_from, valid_to, provenance),
+                    "(subject, predicate, object, confidence, source, "
+                    " created_at, valid_from, valid_to, provenance) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (subject, predicate, object_, confidence, source,
+                     now, fact_valid_from, valid_to, provenance),
                 )
                 new_row = tx.fetchone(
                     "SELECT id FROM kg_facts "
@@ -498,9 +625,12 @@ class KnowledgeGraph:
 
             if conflicts and new_id is not None:
                 for conflict in conflicts:
+                    # Bitemporal: superseded_at records the transaction-time
+                    # of the supersession (when we LEARNED the new fact),
+                    # parallel to valid_to which records world-time.
                     tx.execute(
-                        "UPDATE kg_facts SET superseded_by = ? WHERE id = ?",
-                        (new_id, conflict["id"]),
+                        "UPDATE kg_facts SET superseded_by = ?, superseded_at = ? WHERE id = ?",
+                        (new_id, now, conflict["id"]),
                     )
             logger.info(
                 "KG: superseded %d fact(s) for %s/%s -> %s",
@@ -523,6 +653,17 @@ class KnowledgeGraph:
         try:
             from app.monitors.event_trigger import emit_event
             emit_event("internal:kg_fact_added", {"subject": subject, "predicate": predicate, "object": object_})
+        except Exception:
+            pass
+
+        # PPR adjacency cache invalidation — only invalidate when a contradicting
+        # supersede happened (graph topology changed) or when this is a high-confidence
+        # user/correction-sourced fact. Routine extraction flows (confidence < 0.85,
+        # no supersede) coast on the 5 min TTL to avoid cache thrash.
+        try:
+            if conflicts or (confidence >= 0.85 and source in ("user", "correction", "user_stated")):
+                from app.core import ppr as _ppr
+                _ppr.invalidate_cache()
         except Exception:
             pass
 
@@ -567,7 +708,14 @@ class KnowledgeGraph:
             (subject, predicate, object_),
         )
         if row:
-            return self._retire_fact(row["id"])
+            ok = self._retire_fact(row["id"])
+            if ok:
+                try:
+                    from app.core import ppr as _ppr
+                    _ppr.invalidate_cache()
+                except Exception:
+                    pass
+            return ok
         return False
 
     async def check_and_resolve_contradictions(
@@ -885,9 +1033,18 @@ class KnowledgeGraph:
         Uses RRF fusion of keyword overlap and ChromaDB vector similarity.
         Only returns current facts (valid_to IS NULL).
         """
+        # Candidate set for relevance scoring. This MUST cover all valid facts:
+        # a hard "LIMIT 500 ORDER BY confidence" silently made the majority of
+        # facts unretrievable once the KG grew past 500 (found 2026-05-30 — 2734
+        # valid facts, 1863 at conf>=0.95, so a freshly-relevant fact fell
+        # outside the confidence window and get_relevant_facts returned []).
+        # Use the KG cap so every valid fact is a candidate; keyword/vector/PPR
+        # then rank by actual query relevance, not by a confidence pre-truncation.
+        _cand_limit = int(getattr(_config, "MAX_KG_FACTS", 5000))
         all_facts = self._db.fetchall(
             "SELECT * FROM kg_facts WHERE valid_to IS NULL "
-            "ORDER BY confidence DESC LIMIT 500"
+            "ORDER BY confidence DESC LIMIT ?",
+            (_cand_limit,),
         )
         if not all_facts:
             return []
@@ -933,68 +1090,79 @@ class KnowledgeGraph:
             except Exception as e:
                 logger.debug("KG vector search failed: %s", e)
 
+        # --- PPR (HippoRAG 2 style graph walk) ---
+        # Adds a third signal: facts whose endpoints are reachable from query
+        # entities via the kg_facts graph score high even when their literal
+        # text doesn't match the query keywords. Captures multi-hop reasoning
+        # like "tell me about Apple" surfacing facts about "Tim Cook" and
+        # "iOS" without those entities being in the query.
+        ppr_ids: list[int] = []
+        if getattr(_config, "ENABLE_PPR_RETRIEVAL", False):
+            try:
+                from app.core import ppr as ppr_mod
+                seeds = ppr_mod.extract_entities(query, max_seeds=6)
+                if seeds:
+                    ranked = ppr_mod.rank_facts_by_ppr(all_facts, seeds, top_k=limit * 3)
+                    ppr_ids = [rid for rid, _ in ranked]
+                    if ppr_ids:
+                        logger.debug(
+                            "[KG/PPR] %d facts ranked by graph walk (seeds=%s)",
+                            len(ppr_ids), seeds[:3],
+                        )
+            except Exception as e:
+                logger.warning("[KG/PPR] graph walk failed: %s", e)
+
         # --- RRF fusion ---
-        # Require keyword matches for fusion — vector-only matches are too noisy
-        # in small KGs where ChromaDB returns whatever it has regardless of relevance.
-        if keyword_ids:
-            fused_ids = self._rrf_fuse(keyword_ids, vector_ids)
+        # Require keyword matches OR PPR signal for fusion — vector-only matches
+        # are too noisy in small KGs where ChromaDB returns whatever it has
+        # regardless of relevance. PPR-only allowed because graph reachability
+        # is a strong relevance signal even without keyword overlap (HippoRAG 2).
+        if keyword_ids or ppr_ids:
+            fused_ids = self._rrf_fuse(keyword_ids, vector_ids, ppr_ids)
             # Filter to valid IDs and take top limit
             top_ids = [rid for rid in fused_ids if rid in rows_by_id][:limit]
         elif query_words:
-            # No keyword matches with overlap >= 2 and no vector boost.
-            # Do NOT fall back to overlap >= 1 — single-word matches are too noisy.
+            # No keyword matches with overlap >= 2, no PPR seeds in graph,
+            # and no vector boost. Do NOT fall back to overlap >= 1 — single-
+            # word matches are too noisy.
             top_ids = []
         else:
             return []
 
-        scored: list[tuple[int, dict]] = []
-
-        for row in all_facts:
-            fact_words = (
-                _normalize_words(row["subject"])
-                | _normalize_words(row["predicate"].replace("_", " "))
-                | _normalize_words(row["object"])
-            )
-            overlap = len(query_words & fact_words)
-            if overlap >= 2:
-                scored.append((overlap, row))
-
-        scored.sort(key=lambda x: (-x[0], -x[1]["confidence"]))
-
-        top = scored[:limit]
-
-        # --- Graph-neighbor enrichment (1-hop) ---
-        # Expand top results by finding neighbors of matched entities.
-        # This clusters related concepts together instead of scattering them.
-        if top and len(top) < limit:
-            seen_ids = {row["id"] for _, row in top}
-            entities = set()
-            for _, row in top:
-                entities.add(row["subject"].lower())
-                entities.add(row["object"].lower())
-
-            # Find 1-hop neighbors of matched entities
-            neighbor_budget = limit - len(top)
+        # --- Graph-neighbor enrichment (1-hop) on the FUSED result ---
+        # If the fused (keyword + vector + PPR) result is short of `limit`, add
+        # high-confidence neighbors of the matched entities so related facts
+        # cluster together. Fixed 2026-05-30: this previously rebuilt a
+        # keyword-overlap-only list and OVERWROTE `top_ids`, silently discarding
+        # the vector/PPR ranking from the RRF fusion above. The fused result is
+        # now authoritative; keyword/vector/PPR all contribute to ranking.
+        if top_ids and len(top_ids) < limit:
+            seen_ids = set(top_ids)
+            entities: set[str] = set()
+            for rid in top_ids:
+                row = rows_by_id.get(rid)
+                if row:
+                    entities.add(row["subject"].lower())
+                    entities.add(row["object"].lower())
+            neighbor_budget = limit - len(top_ids)
             if entities and neighbor_budget > 0:
                 placeholders = ",".join("?" for _ in entities)
                 neighbors = self._db.fetchall(
-                    f"SELECT * FROM kg_facts WHERE valid_to IS NULL "
+                    f"SELECT id FROM kg_facts WHERE valid_to IS NULL "
                     f"AND (LOWER(subject) IN ({placeholders}) OR LOWER(object) IN ({placeholders})) "
                     f"ORDER BY confidence DESC LIMIT ?",
                     tuple(entities) + tuple(entities) + (neighbor_budget * 3,),
                 )
                 for nrow in neighbors:
-                    if nrow["id"] not in seen_ids:
-                        seen_ids.add(nrow["id"])
-                        # Lower score than keyword matches (neighbor bonus = 1)
-                        top.append((1, nrow))
-                        if len(top) >= limit:
+                    nid = nrow["id"]
+                    if nid not in seen_ids and nid in rows_by_id:
+                        seen_ids.add(nid)
+                        top_ids.append(nid)
+                        if len(top_ids) >= limit:
                             break
 
         # Batch increment retrieval counts and update last_retrieved_at
-        if top:
-            retrieved_ids = [row["id"] for _, row in top]
-            top_ids = retrieved_ids
+        if top_ids:
             placeholders = ",".join("?" for _ in top_ids)
             try:
                 self._db.execute(
@@ -1064,6 +1232,85 @@ class KnowledgeGraph:
 
         return [dict(r) for r in rows]
 
+    def query_as_of(
+        self,
+        entity: str,
+        *,
+        valid_at: str | None = None,
+        recorded_at: str | None = None,
+    ) -> list[dict]:
+        """Bitemporal query: what was the KG's belief about `entity` at a
+        specific (valid_time, transaction_time) point?
+
+        Two timelines, in Memento-style bitemporal logic:
+          - valid_time: when the fact was/is true in the world
+              (kept in `valid_from`/`valid_to`)
+          - transaction_time: when the system recorded / superseded the fact
+              (kept in `created_at`/`superseded_at`; superseded_at added
+               2026-05-16, task #29)
+
+        Args:
+            entity: subject or object to look for (normalized).
+            valid_at: ISO timestamp. If given, return only facts whose
+                world-validity window contains this instant. If `None`,
+                no valid-time filter (treat all rows as world-valid).
+            recorded_at: ISO timestamp. If given, return only facts that
+                the KG had recorded by this instant AND had not yet
+                superseded by then. If `None`, no transaction-time filter
+                (treat all rows as "currently recorded").
+
+        Returns: list of fact dicts ordered by confidence DESC. Empty if
+        the entity is unknown.
+
+        Example — "What did we believe about Alice's job on 2026-04-01?":
+            kg.query_as_of("Alice", recorded_at="2026-04-01T00:00:00")
+        Returns rows we had in the DB on that date and hadn't superseded yet,
+        regardless of whether those records were later overturned.
+        """
+        entity = normalize_entity(entity)
+        if not entity:
+            return []
+
+        clauses = ["(subject = ? OR object = ?)"]
+        params: list[Any] = [entity, entity]
+
+        # Bitemporal filter cases — split on which arguments were given so each
+        # has its own clean semantic (no double-filter conflation):
+        if valid_at is not None and recorded_at is not None:
+            # Audit query: "Which rows EXISTED in the DB by recorded_at AND
+            # were world-valid at valid_at?" Row presence at recorded_at is
+            # just `created_at <= RT`; supersession status at RT is irrelevant —
+            # we want to reconstruct what records we *had* about that VT period.
+            clauses.append("created_at <= ?")
+            clauses.append("COALESCE(valid_from, created_at) <= ?")
+            clauses.append("(valid_to IS NULL OR valid_to > ?)")
+            params.extend([recorded_at, valid_at, valid_at])
+        elif recorded_at is not None:
+            # Belief query: "What did we believe at recorded_at?" — rows that
+            # existed by RT and had not yet been superseded by RT.
+            clauses.append("created_at <= ?")
+            clauses.append("(superseded_at IS NULL OR superseded_at > ?)")
+            params.extend([recorded_at, recorded_at])
+        elif valid_at is not None:
+            # Historical world-time query: any row world-valid at VT, including
+            # ones currently superseded (we still HAVE the historical record).
+            clauses.append("COALESCE(valid_from, created_at) <= ?")
+            clauses.append("(valid_to IS NULL OR valid_to > ?)")
+            params.extend([valid_at, valid_at])
+        else:
+            # No filters — currently believed facts (mirrors query_at(None)).
+            clauses.append("superseded_at IS NULL")
+
+        sql = (
+            "SELECT id, subject, predicate, object, confidence, source, "
+            "created_at, valid_from, valid_to, provenance, "
+            "superseded_by, superseded_at "
+            "FROM kg_facts WHERE " + " AND ".join(clauses) + " "
+            "ORDER BY confidence DESC"
+        )
+        rows = self._db.fetchall(sql, tuple(params))
+        return [dict(r) for r in rows]
+
     def get_fact_history(self, subject: str, predicate: str) -> list[dict]:
         """Return all versions of a fact over time (current + superseded).
 
@@ -1118,7 +1365,9 @@ class KnowledgeGraph:
         """Format facts as a prompt-ready string with confidence and temporal labels.
 
         Facts with valid_from within the last 7 days get a [NEW] label.
-        Superseded facts are excluded.
+        Superseded facts are excluded. Source provenance is appended in parens
+        when non-default so the model can weight evidence by where it came from
+        (monitor vs chat extraction vs user-provided correction).
         """
         if not facts:
             return ""
@@ -1137,9 +1386,17 @@ class KnowledgeGraph:
             if _is_recent(f.valid_from, days=7):
                 new_tag = "[NEW] "
 
+            # Surface source for grounding — skip plain "extracted" since that's the
+            # default for chat answers and adds no signal. Real provenance (monitor
+            # name, "user", "correction") is informative for the model.
+            src = f.provenance or f.source or ""
+            src_tag = ""
+            if src and src not in ("extracted", "inferred"):
+                src_tag = f", src: {src[:40]}"
+
             lines.append(
                 f"- {new_tag}{label} {f.subject} {pred} {f.object} "
-                f"[confidence: {conf:.2f}]"
+                f"[confidence: {conf:.2f}{src_tag}]"
             )
         return "\n".join(lines)
 
@@ -1254,3 +1511,82 @@ class KnowledgeGraph:
                 )
                 return cursor.rowcount
             return await asyncio.to_thread(_do_decay)
+
+    async def hard_prune_dead_facts(self, days: int = 60, max_count: int = 1000) -> int:
+        """Permanently retire facts that have NEVER been retrieved and are
+        older than `days`. Runtime audit (2026-05-06) found 92% of KG facts
+        are never retrieved — they dilute the useful signal and grow the DB
+        without payoff. Conservative: only marks valid_to (soft retire), not
+        physical delete; max_count caps per-cycle work.
+        """
+        async with self._write_lock:
+            def _do_prune():
+                cursor = self._db.execute(
+                    "UPDATE kg_facts SET valid_to = datetime('now') "
+                    "WHERE id IN ("
+                    "  SELECT id FROM kg_facts "
+                    "  WHERE valid_to IS NULL "
+                    "  AND last_retrieved_at IS NULL "
+                    "  AND created_at < datetime('now', ?) "
+                    "  ORDER BY created_at ASC LIMIT ?"
+                    ")",
+                    (f"-{days} days", max_count),
+                )
+                return cursor.rowcount
+            return await asyncio.to_thread(_do_prune)
+
+    def get_provenance_usage_stats(self, provenance: str) -> dict:
+        """Return usage stats for facts with a given provenance.
+
+        Used to validate whether speculative provenance like 'cross_synthesis'
+        actually produces useful facts (high times_retrieved) or just noise
+        (high count, zero retrieval).
+
+        Matches by prefix — e.g. provenance='cross_synthesis' will match
+        'cross_synthesis:3_monitors:24h' (cross_monitor writes suffixed
+        provenance for breadth metadata).
+        """
+        try:
+            like_pattern = f"{provenance}%"
+            row = self._db.fetchone(
+                "SELECT "
+                "  COUNT(*) AS total, "
+                "  SUM(CASE WHEN times_retrieved > 0 THEN 1 ELSE 0 END) AS used, "
+                "  AVG(times_retrieved) AS avg_retrievals, "
+                "  MAX(times_retrieved) AS max_retrievals "
+                "FROM kg_facts WHERE provenance LIKE ? AND valid_to IS NULL",
+                (like_pattern,),
+            )
+            if not row:
+                return {"total": 0, "used": 0, "avg_retrievals": 0.0, "max_retrievals": 0}
+            return {
+                "total": int(row["total"] or 0),
+                "used": int(row["used"] or 0),
+                "avg_retrievals": float(row["avg_retrievals"] or 0.0),
+                "max_retrievals": int(row["max_retrievals"] or 0),
+            }
+        except Exception as e:
+            logger.warning("Provenance usage stats failed: %s", e)
+            return {"total": 0, "used": 0, "avg_retrievals": 0.0, "max_retrievals": 0}
+
+    async def decay_unused_speculative(self, provenance: str = "cross_synthesis",
+                                        days: int = 14, decay_amount: float = 0.15) -> int:
+        """Aggressively decay speculative facts (e.g. cross_synthesis) that
+        weren't retrieved within `days`. Closes the loop on synthesis quality —
+        useful synthesis gets retrieved; useless synthesis decays out fast.
+
+        Matches by prefix so 'cross_synthesis' covers 'cross_synthesis:3_monitors:24h' etc.
+        """
+        cutoff = f"-{days} days"
+        like_pattern = f"{provenance}%"
+        async with self._write_lock:
+            def _do():
+                cursor = self._db.execute(
+                    "UPDATE kg_facts SET confidence = MAX(0.05, confidence - ?) "
+                    "WHERE provenance LIKE ? AND valid_to IS NULL "
+                    "AND created_at < datetime('now', ?) "
+                    "AND COALESCE(times_retrieved, 0) = 0",
+                    (decay_amount, like_pattern, cutoff),
+                )
+                return cursor.rowcount
+            return await asyncio.to_thread(_do)

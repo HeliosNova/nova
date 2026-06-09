@@ -125,9 +125,13 @@ class TestCodeExecExecution:
 
     @pytest.mark.asyncio
     async def test_timeout_returns_error(self):
+        # Patch the config reference inside app.tools.code_exec — the module
+        # does `from app.config import config` which copies the singleton
+        # binding, so patching `app.config.config` doesn't reach this
+        # caller's namespace. Patch the local attribute instead.
         from app.tools.code_exec import CodeExecTool
         tool = CodeExecTool()
-        with patch("app.config.config") as m:
+        with patch("app.tools.code_exec.config") as m:
             m.CODE_EXEC_TIMEOUT = 0.1
             m.TOOL_OUTPUT_MAX_CHARS = 10000
             result = await tool.execute(code="import time\ntime.sleep(10)")

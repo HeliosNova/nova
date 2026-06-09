@@ -32,6 +32,83 @@ _STATUS_EMOJI = {
     "stats": "\U0001f4ca",
 }
 
+
+# Subject-specific emoji appended to monitor titles so each domain/topic
+# stands out at a glance in Discord/Telegram. First match (case-insensitive
+# substring) wins — order matters for overlapping terms like "AI" inside
+# "financial AI" (we want the more specific match higher up).
+_TOPIC_EMOJI: tuple[tuple[str, str], ...] = (
+    ("ai and ml", "\U0001f916"),          # 🤖
+    ("quantum", "\u269b\ufe0f"),          # ⚛️
+    ("robotics", "\U0001f9be"),           # 🦾
+    ("semiconductor", "\U0001f9ea"),      # 🧪
+    ("cybersecurity", "\U0001f512"),      # 🔒
+    ("biotech", "\U0001f9ec"),            # 🧬
+    ("health and medicine", "\U0001f48a"),# 💊
+    ("space and astronomy", "\U0001f680"),# 🚀
+    ("physics", "\U0001f52c"),            # 🔬
+    ("energy and climate", "\u26a1"),     # ⚡
+    ("crypto", "\u20bf"),                 # ₿
+    ("defi", "\U0001f4b0"),               # 💰
+    ("whale", "\U0001f40b"),              # 🐋
+    ("commodit", "\U0001f6e2\ufe0f"),     # 🛢️
+    ("earnings", "\U0001f4c8"),           # 📈
+    ("fomc", "\U0001f3db\ufe0f"),         # 🏛️
+    ("sec insider", "\U0001f575\ufe0f"),  # 🕵️
+    ("economics and markets", "\U0001f4ca"), # 📊
+    ("finance", "\U0001f4b5"),            # 💵
+    ("us policy", "\U0001f3db\ufe0f"),    # 🏛️
+    ("geopolitics", "\U0001f30d"),        # 🌍
+    ("defense and military", "\u2694\ufe0f"), # ⚔️
+    ("china", "\U0001f1e8\U0001f1f3"),    # 🇨🇳
+    ("russia", "\U0001f1f7\U0001f1fa"),   # 🇷🇺
+    ("middle east", "\U0001f54c"),        # 🕌
+    ("india", "\U0001f1ee\U0001f1f3"),    # 🇮🇳
+    ("europe and eu", "\U0001f1ea\U0001f1fa"), # 🇪🇺
+    ("latin america", "\U0001f1f2\U0001f1fd"), # 🇲🇽
+    ("africa", "\U0001f1f0\U0001f1ea"),   # 🇰🇪
+    ("startups and vc", "\U0001f680"),    # 🚀
+    ("open source", "\U0001f419"),        # 🐙
+    ("developer ecosystem", "\U0001f4bb"),# 💻
+    ("hacker news", "\U0001f4f0"),        # 📰
+    ("product hunt", "\U0001f43e"),       # 🐾
+    ("fda", "\U0001f48a"),                # 💊
+    ("github", "\U0001f419"),             # 🐙
+    ("government contract", "\U0001f4dd"),# 📝
+    ("research frontiers", "\U0001f9e0"), # 🧠
+    ("science", "\U0001f52c"),            # 🔬
+    ("technology", "\U0001f4bb"),         # 💻
+    ("current events", "\U0001f4f0"),     # 📰
+    ("world awareness", "\U0001f30e"),    # 🌎
+    ("supply chain", "\U0001f69a"),       # 🚚
+    ("morning check", "\U0001f305"),      # 🌅
+    ("system health", "\U0001f49a"),      # 💚
+    ("system maintenance", "\U0001f527"), # 🔧
+    ("fine-tune", "\U0001f3cb\ufe0f"),    # 🏋️
+    ("auto-monitor", "\U0001f9ed"),       # 🧭
+    ("lesson quiz", "\U0001f9e0"),        # 🧠
+    ("skill validation", "\U0001f3af"),   # 🎯
+    ("curiosity research", "\U0001f50d"), # 🔍
+    ("eval harness", "\U0001f9ea"),       # 🧪
+    ("prompt optimizer", "\u2699\ufe0f"), # ⚙️
+)
+
+
+def topic_emoji_for(monitor_name: str) -> str:
+    """Return a single subject emoji for the monitor title, or '' if no match.
+
+    First case-insensitive substring match wins. Intended for appending to
+    the end of the `**title**` header line so each monitor's topic is visible
+    at a glance.
+    """
+    if not monitor_name:
+        return ""
+    low = monitor_name.lower()
+    for needle, emoji in _TOPIC_EMOJI:
+        if needle in low:
+            return emoji
+    return ""
+
 # ---------------------------------------------------------------------------
 # Unified one-line format
 # ---------------------------------------------------------------------------
@@ -125,6 +202,11 @@ DISCORD_LIMIT = 2000
 # Reserve space for header/footer
 _BODY_BUDGET = DISCORD_LIMIT - 200
 
+# Visual divider so adjacent monitor posts in the channel don't blur into
+# each other. Picked for Discord rendering: solid line of box-drawing
+# heavy chars renders as a thick horizontal rule.
+_DIVIDER = "━" * 30
+
 
 def classify_status(value: str) -> str:
     """Classify a monitor result into ok/warning/error based on content."""
@@ -136,6 +218,106 @@ def classify_status(value: str) -> str:
     return "ok"
 
 
+# Date patterns we'll detect inside monitor bodies. We accept "April 25",
+# "Apr 26, 2026", "2026-04-26", "04/26/2026" and bold them in the output.
+_DATE_RE = re.compile(
+    r"\b("
+    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}(?:[,\s]+\d{4})?"
+    r"|"
+    r"\d{4}-\d{2}-\d{2}"
+    r"|"
+    r"\d{1,2}/\d{1,2}/\d{2,4}"
+    r")\b",
+    re.IGNORECASE,
+)
+
+# Bullet-line markers we normalize to a consistent style.
+_NUMBERED_HEADLINE = re.compile(
+    r"^\s*\*\*?\s*(\d+)[\.\)]\s*\[?([^\]\n*]+?)\]?\*?\*?\s*$",
+    re.MULTILINE,
+)
+
+
+def _normalize_body(body: str) -> str:
+    """Tighten up the LLM's body so Discord renders it cleanly:
+
+    - Bold every "**N. Headline**" line and add ▸ marker for visual scan
+    - Bold every detected date inline so it stands out
+    - Collapse 3+ blank lines to 2
+    - Strip any leftover '---' source lists at the bottom (we render them
+      separately if needed)
+    """
+    if not body:
+        return body
+    text = body.strip()
+
+    # Bold + arrow on numbered headlines: "**1. Foo**" → "▸ **1. Foo**"
+    text = _NUMBERED_HEADLINE.sub(lambda m: f"▸ **{m.group(1)}. {m.group(2).strip()}**", text)
+
+    # Bold dates inline (only the first occurrence per line to avoid noise)
+    seen_per_line: set[int] = set()
+    out_lines: list[str] = []
+    for i, line in enumerate(text.splitlines()):
+        if i in seen_per_line or "**" in line:  # skip lines that already have bold
+            out_lines.append(line)
+            continue
+        new_line, n = _DATE_RE.subn(lambda m: f"**{m.group(1)}**", line, count=1)
+        if n:
+            seen_per_line.add(i)
+        out_lines.append(new_line)
+    text = "\n".join(out_lines)
+
+    # Collapse triple blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# Time-window enforcement: detect dates older than this many days inside
+# a monitor body and surface a warning. The actual reject/re-roll happens
+# in the heartbeat loop; here we just annotate.
+_STALE_DAYS = 14
+
+
+def _detect_stale_dates(body: str) -> list[str]:
+    """Return list of date strings in the body that are older than _STALE_DAYS."""
+    if not body:
+        return []
+    from datetime import datetime as _dt, timedelta as _td
+    cutoff = _dt.utcnow() - _td(days=_STALE_DAYS)
+    stale: list[str] = []
+    for m in _DATE_RE.finditer(body):
+        raw = m.group(1)
+        parsed = _try_parse_date(raw)
+        if parsed and parsed < cutoff:
+            stale.append(raw)
+    # Dedupe preserving order
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in stale:
+        if s not in seen:
+            seen.add(s)
+            out.append(s)
+    return out
+
+
+def _try_parse_date(raw: str):
+    from datetime import datetime as _dt
+    formats = (
+        "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
+        "%B %d", "%b %d",   # year-less, assume current year
+        "%Y-%m-%d", "%m/%d/%Y", "%m/%d/%y",
+    )
+    for fmt in formats:
+        try:
+            d = _dt.strptime(raw.strip().rstrip("."), fmt)
+            if "%Y" not in fmt and "%y" not in fmt:
+                d = d.replace(year=_dt.utcnow().year)
+            return d
+        except ValueError:
+            continue
+    return None
+
+
 def format_monitor_output(
     monitor_name: str,
     value: str,
@@ -144,6 +326,15 @@ def format_monitor_output(
     metrics: dict[str, str | int | float] | None = None,
 ) -> str:
     """Format a monitor result for Discord.
+
+    Layout:
+
+        ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━     ← divider so feeds don't blur
+        ✅ **Monitor Name** 📰              ← title with status + topic emoji
+        📊  metric: value                   ← optional metrics block
+        (body, with bolded dates + headlines, normalised bullets)
+        ⚠️ Stale dates detected: …          ← only if body mentions dates > 14d old
+        `08:42 UTC`                         ← timestamp footer
 
     Args:
         monitor_name: Name of the monitor.
@@ -160,8 +351,9 @@ def format_monitor_output(
     emoji = _STATUS_EMOJI.get(status, _STATUS_EMOJI["unknown"])
     now = datetime.now(timezone.utc).strftime("%H:%M UTC")
 
-    # Header
-    header = f"{emoji} **{monitor_name}**"
+    # Header — divider, then bold title with subject-specific trailing emoji
+    topic = topic_emoji_for(monitor_name)
+    header = f"{_DIVIDER}\n{emoji} **{monitor_name}**" + (f" {topic}" if topic else "")
 
     # Metrics block (compact)
     metrics_block = ""
@@ -169,35 +361,25 @@ def format_monitor_output(
         lines = [f"  **{k}:** {v}" for k, v in metrics.items()]
         metrics_block = "\n\U0001f4ca " + "\n".join(lines)  # 📊
 
-    # Body
-    body = value.strip()
+    # Body — normalize whitespace + bold dates + bold/arrow numbered headlines
+    body = _normalize_body(value)
+
+    # Stale date warning
+    stale = _detect_stale_dates(value)
+    stale_warn = ""
+    if stale:
+        sample = ", ".join(stale[:3])
+        if len(stale) > 3:
+            sample += f", +{len(stale)-3} more"
+        stale_warn = f"\n⚠️ **Stale dates detected** (>{_STALE_DAYS}d old): {sample}"
 
     # Footer
     footer = f"\n`{now}`"
 
-    # Assemble and truncate if needed
-    full = header + metrics_block + "\n" + body + footer
-    if len(full) <= DISCORD_LIMIT:
-        return full
-
-    # Truncate body to fit
-    suffix = "...\n*[truncated for Discord limit]*"
-    overhead = len(header) + len(metrics_block) + len(footer) + len(suffix) + 5  # 5 for separators
-    body_budget = DISCORD_LIMIT - overhead
-    if body_budget < 100:
-        body_budget = 100
-
-    # Smart truncation: find last sentence boundary
-    truncated = body[:body_budget]
-    for sep in (". ", ".\n", "\n\n", "\n"):
-        last = truncated.rfind(sep)
-        if last > body_budget // 2:
-            truncated = truncated[:last + len(sep)]
-            break
-
-    truncated += suffix
-
-    return header + metrics_block + "\n" + truncated + footer
+    # Assemble — channel adapters split for their per-platform limits, so
+    # we do NOT truncate here. A 2-page Domain Study should ship as 2
+    # Discord messages, not get cut mid-sentence.
+    return header + metrics_block + "\n" + body + stale_warn + footer
 
 
 def format_system_health(

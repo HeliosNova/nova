@@ -108,7 +108,9 @@ def test_reflexion_summary():
                   quality_score=0.3, tools_used="web_search", revision_count=3,
                   created_at="2026-01-01"),
     ]
-    result = ReflexionStore.format_summary_for_prompt(reflexions)
-    assert "[R15]" in result
-    assert "[failure]" in result
-    assert "weather query" in result
+    result = ReflexionStore.format_for_prompt(reflexions)
+    # format_for_prompt outputs a "Previous failure" / "Previous success" prefix
+    # plus the reflection text and tools_used. It does NOT include the raw R-id
+    # or task summary (those went out when the prompt format was tightened).
+    assert "Previous failure" in result
+    assert "web_search" in result  # tools_used appears in output

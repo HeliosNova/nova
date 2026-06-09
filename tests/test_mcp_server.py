@@ -102,7 +102,8 @@ class TestNovaKnowledgeGraph:
 
         facts = kg.query("python")
         assert len(facts) >= 2
-        subjects = {f["subject"] for f in facts}
+        # KG normalizes subjects (titlecase). Compare case-insensitively.
+        subjects = {f["subject"].lower() for f in facts}
         assert "python" in subjects
 
     def test_query_empty_entity(self, services):

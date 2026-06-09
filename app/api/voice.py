@@ -1,4 +1,4 @@
-"""Voice API — speech-to-text transcription and voice chat."""
+"""Voice API — speech-to-text transcription, text-to-speech, and voice chat."""
 
 from __future__ import annotations
 
@@ -6,8 +6,9 @@ import logging
 import tempfile
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Body, Depends, File, HTTPException, Query, UploadFile
+from fastapi.responses import Response, StreamingResponse
+from pydantic import BaseModel, Field
 
 from app.auth import require_auth
 from app.config import config
@@ -19,8 +20,15 @@ router = APIRouter(tags=["voice"], dependencies=[Depends(require_auth)])
 # Max upload size (25MB)
 MAX_AUDIO_SIZE = 25 * 1024 * 1024
 
+# Max characters for TTS synthesis (prevent runaway requests)
+MAX_TTS_CHARS = 5000
+
 # Supported audio extensions
 AUDIO_EXTENSIONS = {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".webm", ".mp4", ".mpeg", ".mpga", ".oga", ".opus"}
+
+
+class SynthesizeRequest(BaseModel):
+    text: str = Field(min_length=1, max_length=MAX_TTS_CHARS)
 
 
 @router.post("/voice/transcribe")
@@ -137,3 +145,36 @@ async def voice_chat(
         yield "data: [DONE]\n\n"
 
     return StreamingResponse(_stream(), media_type="text/event-stream")
+
+
+@router.post("/voice/synthesize")
+async def synthesize_speech(payload: SynthesizeRequest = Body(...)):
+    """Synthesize text to speech using local Piper TTS. Returns audio/wav bytes.
+
+    Sovereign — no external API. Requires Piper model file at TTS_MODEL_PATH
+    (default /data/tts/en_US-amy-medium.onnx). Disabled by default.
+    """
+    if not getattr(config, "ENABLE_TTS", False):
+        raise HTTPException(status_code=400, detail="TTS is disabled. Set ENABLE_TTS=true")
+
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Empty text")
+
+    try:
+        from app.core.voice import get_synthesizer
+        synthesizer = get_synthesizer()
+        wav_bytes, sample_rate = await synthesizer.synthesize(text)
+    except RuntimeError as e:
+        # Missing model file or piper package — return clear error
+        logger.error("[TTS] synthesis runtime error: %s", e)
+        raise HTTPException(status_code=503, detail=str(e))
+    except Exception as e:
+        logger.error("[TTS] synthesis failed: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail="Synthesis failed")
+
+    return Response(
+        content=wav_bytes,
+        media_type="audio/wav",
+        headers={"X-TTS-Sample-Rate": str(sample_rate)},
+    )

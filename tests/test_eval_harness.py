@@ -252,6 +252,51 @@ class TestCheckAssertion:
             {"type": "nonexistent_type"}, "anything", [], None, None
         )
 
+    def test_retrieval_recall_literal_pass(self):
+        assert check_assertion(
+            {"type": "retrieval_recall", "value": "parameter"},
+            "Gradient descent updates each parameter to reduce loss.",
+            [], None, None,
+        )
+
+    def test_retrieval_recall_literal_fail(self):
+        assert not check_assertion(
+            {"type": "retrieval_recall", "value": "parameter"},
+            "Gradient descent updates each weight to reduce loss.",
+            [], None, None,
+        )
+
+    def test_retrieval_recall_synonym_alternation_passes_either(self):
+        # Pipe-delimited alternatives: passes if ANY appears.
+        assert check_assertion(
+            {"type": "retrieval_recall", "value": "parameter|weight"},
+            "Gradient descent updates each weight to reduce loss.",
+            [], None, None,
+        )
+        assert check_assertion(
+            {"type": "retrieval_recall", "value": "parameter|weight"},
+            "Gradient descent updates each parameter to reduce loss.",
+            [], None, None,
+        )
+
+    def test_retrieval_recall_synonym_fails_when_none_match(self):
+        assert not check_assertion(
+            {"type": "retrieval_recall", "value": "parameter|weight"},
+            "Gradient descent uses neurons and biases.",
+            [], None, None,
+        )
+
+    def test_retrieval_recall_synonym_handles_blanks(self):
+        # 'parameter|' has an empty alternative — must not match empty
+        assert check_assertion(
+            {"type": "retrieval_recall", "value": "parameter|"},
+            "model parameter update", [], None, None,
+        )
+        assert not check_assertion(
+            {"type": "retrieval_recall", "value": "parameter|"},
+            "the model adjusts weights", [], None, None,
+        )
+
 
 # ===========================================================================
 # compute_category_metrics()
@@ -1143,9 +1188,148 @@ class TestHeartbeatSeedCount:
         assert monitor.schedule_seconds == 86400
 
     def test_seed_count_includes_eval(self, db):
-        """Total seeded monitors = 64 (61 catalog + 3 new system monitors)."""
+        """Total seeded monitors = 69 (61 catalog + 3 system + 4 loop closers + 1 added later)."""
         from app.monitors.heartbeat import MonitorStore
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 64
+        assert len(all_monitors) == 69
+
+
+class TestMemoryLearningEval:
+    """The learning-loop PROOF: a seeded lesson must CAUSE a corrected answer.
+
+    Unit-tests the orchestration of _run_memory_task (before / seed / after /
+    cleanup / caused_fix) and the memory_causal_fix_rate metric, with the
+    brain invocation mocked. The live causal numbers come from the in-container
+    eval run against real Ollama.
+    """
+
+    @staticmethod
+    def _inv(text, error=None):
+        from app.monitors.eval_harness import _Invocation
+        return _Invocation(
+            response_text=text, tools_invoked=[], skill_used=None,
+            decomposed=False, max_decomposition_depth=0,
+            reflexion_score=0.8 if text else None,
+            latency_seconds=0.01, error=error,
+        )
+
+    @staticmethod
+    def _mem_task():
+        return EvalTask(
+            id="mem_x", category="memory-learning",
+            query="What is the codename of Nova's scheduler?",
+            assertions=[{"type": "answer_contains", "value": "Chronos"}],
+            seed_lesson={"topic": "t", "correct_answer": "It is Chronos.",
+                         "lesson_text": "codename Chronos", "confidence": 0.95},
+        )
+
+    def _harness_with_learning(self, learning):
+        svc = MagicMock()
+        svc.learning = learning
+        return svc
+
+    @pytest.mark.asyncio
+    async def test_lesson_causes_fix(self):
+        """before wrong, after correct → caused_fix=True, passed=True, lesson cleaned up."""
+        task = self._mem_task()
+        learning = MagicMock()
+        learning.add_knowledge_lesson.return_value = 42
+        learning._db.fetchall.return_value = [{"id": 42}]
+        harness = EvalHarness()
+        with patch("app.core.brain.get_services", return_value=self._harness_with_learning(learning)):
+            with patch.object(
+                EvalHarness, "_invoke_brain",
+                new=AsyncMock(side_effect=[self._inv("I don't know."),
+                                           self._inv("It is Chronos.")]),
+            ):
+                result = await harness._run_memory_task(task)
+        assert result.memory_before_correct is False
+        assert result.memory_after_correct is True
+        assert result.memory_caused_fix is True
+        assert result.passed is True
+        # seeded with the eval context marker (so cleanup is scoped + safe)
+        assert learning.add_knowledge_lesson.call_args.kwargs["context"] == "eval-mem:mem_x"
+        # and cleaned up afterward
+        learning.delete_lesson.assert_any_call(42)
+
+    @pytest.mark.asyncio
+    async def test_no_fix_when_retrieval_misses(self):
+        """before wrong, after STILL wrong → caused_fix=False, passed=False."""
+        task = self._mem_task()
+        learning = MagicMock()
+        learning.add_knowledge_lesson.return_value = 7
+        learning._db.fetchall.return_value = []
+        harness = EvalHarness()
+        with patch("app.core.brain.get_services", return_value=self._harness_with_learning(learning)):
+            with patch.object(
+                EvalHarness, "_invoke_brain",
+                new=AsyncMock(side_effect=[self._inv("No idea."), self._inv("Still no idea.")]),
+            ):
+                result = await harness._run_memory_task(task)
+        assert result.memory_before_correct is False
+        assert result.memory_after_correct is False
+        assert result.memory_caused_fix is False
+        assert result.passed is False
+
+    @pytest.mark.asyncio
+    async def test_already_known_is_not_a_causal_fix(self):
+        """before already correct → caused_fix=False (excluded from the proof)."""
+        task = self._mem_task()
+        learning = MagicMock()
+        learning.add_knowledge_lesson.return_value = 1
+        learning._db.fetchall.return_value = []
+        harness = EvalHarness()
+        with patch("app.core.brain.get_services", return_value=self._harness_with_learning(learning)):
+            with patch.object(
+                EvalHarness, "_invoke_brain",
+                new=AsyncMock(side_effect=[self._inv("It is Chronos already."),
+                                           self._inv("It is Chronos.")]),
+            ):
+                result = await harness._run_memory_task(task)
+        assert result.memory_before_correct is True
+        assert result.memory_caused_fix is False
+
+    @pytest.mark.asyncio
+    async def test_missing_learning_engine_is_setup_error(self):
+        task = self._mem_task()
+        harness = EvalHarness()
+        with patch("app.core.brain.get_services", return_value=self._harness_with_learning(None)):
+            result = await harness._run_memory_task(task)
+        assert result.passed is False
+        assert result.error == "setup_error"
+
+    def test_purge_only_deletes_marked_rows(self):
+        """_purge_eval_lessons scopes the SELECT to the exact marker and never touches others."""
+        learning = MagicMock()
+        learning._db.fetchall.return_value = [{"id": 11}, {"id": 12}]
+        EvalHarness._purge_eval_lessons(learning, "eval-mem:abc")
+        sql, params = learning._db.fetchall.call_args[0]
+        assert "context = ?" in sql
+        assert params == ("eval-mem:abc",)
+        learning.delete_lesson.assert_any_call(11)
+        learning.delete_lesson.assert_any_call(12)
+
+    def test_memory_metric_counts_only_testable(self):
+        """memory_causal_fix_rate denominator excludes pairs the model already knew."""
+        def tr(tid, before, after):
+            return TaskResult(
+                task_id=tid, category="memory-learning", query="q", passed=after,
+                response_text="", tools_invoked=[], skill_used=None,
+                reflexion_score=None, latency_seconds=0.0, failed_assertions=[],
+                memory_before_correct=before, memory_after_correct=after,
+                memory_caused_fix=bool(after and not before),
+            )
+        rows = [tr("a", False, True), tr("b", False, True),
+                tr("c", False, False), tr("d", True, True)]
+        m = compute_category_metrics(rows)["memory-learning"]
+        assert m.memory_testable == 3
+        assert m.memory_causal_fix_rate == pytest.approx(2 / 3)
+        assert m.memory_already_known_rate == pytest.approx(1 / 4)
+
+    def test_shipped_suite_memory_tasks_have_seed(self):
+        """The shipped suite's memory-learning tasks parse with a seed_lesson."""
+        mem = [t for t in EvalHarness().load_suite() if t.category == "memory-learning"]
+        assert len(mem) >= 5
+        assert all(t.seed_lesson and t.seed_lesson.get("correct_answer") for t in mem)

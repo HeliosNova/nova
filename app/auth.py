@@ -91,8 +91,8 @@ def load_lockouts_from_db() -> None:
             "(failures = '[]' OR failures IS NULL)",
             (now,),
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning("Failed to clean expired auth lockouts: %s", e)
 
     if loaded_lockouts or loaded_failures:
         logger.info(

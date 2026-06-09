@@ -36,3 +36,26 @@ build/
 *.whl
 finetune_progress.log
 .tmp/
+
+# Virtualenvs (never commit — huge, machine-specific)
+.venv/
+venv/
+finetune_env/
+finetune_env_py313_BROKEN/
+
+# Model weights, caches, and training artifacts (huge / regenerable)
+Qwen/
+hf_cache/
+unsloth_compiled_cache/
+finetune_output/
+finetune_output_27b/
+local_train_data/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+
+# Logs and one-off diagnostic scripts
+*.log
+_phase0_*
+_phase1_*

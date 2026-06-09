@@ -57,14 +57,18 @@ def detect_next_version() -> str:
         capture_output=True, text=True, timeout=30,
     )
     max_ver = 0
+    import re as _re
+    # Match nova-ft-v3, nova-ft-v2, nova-ft-v8-q8, nova-ft-v8-fp16, etc.
+    # Extract just the leading version digits after 'nova-ft-v', ignoring any
+    # quantization suffix like -q8 / -fp16 / -q4km.
+    _ver_re = _re.compile(r"^nova-ft-v(\d+)(?:[-:].*)?$")
     for line in result.stdout.splitlines():
-        # Match nova-ft-v3, nova-ft-v2, etc.
         for token in line.split():
-            if token.startswith("nova-ft-v"):
+            m = _ver_re.match(token)
+            if m:
                 try:
-                    ver = int(token.split("nova-ft-v")[1].split(":")[0])
-                    max_ver = max(max_ver, ver)
-                except (ValueError, IndexError):
+                    max_ver = max(max_ver, int(m.group(1)))
+                except ValueError:
                     pass
             elif token == "nova-ft:latest" or token.startswith("nova-ft:"):
                 max_ver = max(max_ver, 1)

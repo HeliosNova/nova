@@ -10,8 +10,10 @@ References: AgeMem (arXiv 2601.01885), Letta/MemGPT memory blocks
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -22,12 +24,33 @@ logger = logging.getLogger(__name__)
 
 MAX_ACTIVE_MEMORIES = 500
 
+# Set by brain.py before running the tool loop. The add gate uses this to verify
+# the owner has actually asked Nova to remember something, not just mentioned a fact.
+current_user_query: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "active_memory_current_user_query", default=""
+)
+
+# Explicit memory-intent signals: owner must use language that means "store this"
+_EXPLICIT_MEMORY_INTENT = re.compile(
+    r"(?i)\b(?:remember|note\s+(?:that|this)|save\s+(?:that|this)|keep\s+in\s+mind|"
+    r"don'?t\s+forget|make\s+a\s+note|store\s+(?:that|this)|log\s+that|"
+    r"from\s+now\s+on|going\s+forward|always|never|for\s+future\s+reference)\b"
+)
+
+# Correction signals — when owner corrects Nova, the correction itself authorizes storage
+_CORRECTION_SIGNAL = re.compile(
+    r"(?i)\b(?:no[,.]|actually|wrong|incorrect|that'?s\s+(?:not|wrong)|"
+    r"you'?re\s+(?:mistaken|wrong)|it'?s\s+not|i\s+said)\b"
+)
+
 
 class ActiveMemoryTool(BaseTool):
     name = "active_memory"
     description = (
-        "Manage your long-term memory. Use this to deliberately store important information, "
-        "search for past memories, update or delete entries, and summarize related memories. "
+        "Manage your long-term memory. ADD is gated — only succeeds when the owner's "
+        "current message contains explicit memory intent ('remember', 'note that', "
+        "'always', 'from now on', 'never') or is a correction. Otherwise the add will "
+        "be rejected. SEARCH/LIST/UPDATE/DELETE are always available. "
         "Actions: add, search, update, delete, list, summarize."
     )
     parameters = "action: str, content: str, category: str, id: int, query: str"
@@ -128,6 +151,28 @@ class ActiveMemoryTool(BaseTool):
             return ToolResult(output="", success=False, error="No content provided",
                               error_category=ErrorCategory.VALIDATION)
 
+        # Gate: owner must have explicitly authorized storage. The fine-tuned model
+        # eagerly calls add() on any self-referential statement (poisoning memory
+        # with test personas). Require the current user message to contain either
+        # explicit memory-intent language ("remember", "note", "always", "from now on")
+        # or a correction signal ("no, actually", "you're wrong about X").
+        query = current_user_query.get("")
+        if query and not (_EXPLICIT_MEMORY_INTENT.search(query) or _CORRECTION_SIGNAL.search(query)):
+            logger.info(
+                "active_memory.add rejected: no explicit intent in query %r",
+                query[:120],
+            )
+            return ToolResult(
+                output=(
+                    "Not stored. Owner did not explicitly ask to remember this. "
+                    "Only store when the owner says 'remember', 'note that', 'always', "
+                    "'from now on', or issues a correction."
+                ),
+                success=False,
+                error="No explicit memory-intent signal in current user message",
+                error_category=ErrorCategory.VALIDATION,
+            )
+
         category = kwargs.get("category", "fact")
         now = datetime.now(timezone.utc).isoformat()
 
@@ -155,8 +200,8 @@ class ActiveMemoryTool(BaseTool):
                     documents=[content],
                     metadatas=[{"category": category}],
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("active_memory ChromaDB sync failed: %s", e)
 
         return ToolResult(output=f"Memory stored (id={mem_id}, category={category}): {content[:100]}", success=True)
 
@@ -233,8 +278,8 @@ class ActiveMemoryTool(BaseTool):
         if collection:
             try:
                 collection.upsert(ids=[str(mem_id)], documents=[content])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("active_memory ChromaDB sync failed: %s", e)
 
         return ToolResult(output=f"Memory {mem_id} updated.", success=True)
 
@@ -255,8 +300,8 @@ class ActiveMemoryTool(BaseTool):
         if collection:
             try:
                 collection.delete(ids=[str(mem_id)])
-            except Exception:
-                pass
+            except Exception as e:
+                logger.warning("active_memory ChromaDB sync failed: %s", e)
 
         return ToolResult(output=f"Memory {mem_id} deleted.", success=True)
 

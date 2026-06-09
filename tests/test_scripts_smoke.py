@@ -20,9 +20,9 @@ if _project_root not in sys.path:
 
 import pytest
 
-# Skip all tests if scripts/ directory isn't available (e.g., in Docker container)
-_scripts_available = os.path.isdir(os.path.join(_project_root, "scripts"))
-pytestmark = pytest.mark.skipif(not _scripts_available, reason="scripts/ not in container")
+# Skip if finetune.py isn't present (Docker runtime image only ships verify_phase_0.py).
+_finetune_available = os.path.isfile(os.path.join(_project_root, "scripts", "finetune.py"))
+pytestmark = pytest.mark.skipif(not _finetune_available, reason="scripts/finetune.py not present in this image")
 
 
 class TestFinetuneImport:

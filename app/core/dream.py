@@ -10,8 +10,10 @@ Inspired by Claude Code's autoDream (KAIROS feature).
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any
@@ -69,7 +71,16 @@ class ConsolidationResult:
     curiosity_reset: int = 0
     dpo_pairs_generated: int = 0
     facts_refreshed: int = 0
+    procedural_clusters_consolidated: int = 0
+    procedural_lessons_subsumed: int = 0
     errors: list[str] = field(default_factory=list)
+    # Two-phase timing (task #30, SCM/SleepGate split). 0.0 when the legacy
+    # single-phase `consolidate()` is used; populated when run via the new
+    # `consolidate_nrem` + `consolidate_rem` path.
+    nrem_seconds: float = 0.0
+    rem_seconds: float = 0.0
+    nrem_completed: bool = False
+    rem_completed: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -163,10 +174,17 @@ class DreamConsolidator:
         )
         signals.low_quality_reflexions = [dict(r) for r in rows]
 
-        # 3. High-quality reflexions never promoted to lessons
+        # 3. High-quality reflexions never promoted to lessons.
+        # Exclude is_eval=1: eval-harness reflexions are not real-world
+        # successes — they're synthetic reproductions and promoting them
+        # creates a self-feedback loop where each eval run accumulates more
+        # near-duplicate lessons for the same query. That contamination was
+        # the root cause of the deliberation_chain_of_reasoning bimodal
+        # variance pattern (0.20 ↔ 0.85+ across runs).
         rows = await self._db.fetchall(
             "SELECT id, task_summary, outcome, reflection, quality_score "
             "FROM reflexions WHERE quality_score >= 0.9 AND outcome = 'success' "
+            "AND COALESCE(is_eval, 0) = 0 "
             "ORDER BY quality_score DESC LIMIT 20"
         )
         signals.high_quality_unpromoted = [dict(r) for r in rows]
@@ -249,10 +267,56 @@ class DreamConsolidator:
 
     # ── Phase 3: CONSOLIDATE ─────────────────────────────────────────────
 
+    # ── Phase 3a: NREM (structural / deterministic consolidation) ──────
+    #
+    # The "filing" pass — non-LLM operations that prune, compact, and
+    # disable. Fast (< 5s typical), can't fail catastrophically, doesn't
+    # depend on LLM availability. Inspired by SCM (arxiv 2604.20943)
+    # NREM phase + SleepGate (arxiv 2603.14517) forgetting gate.
+    async def consolidate_nrem(self, signals: GatherSignals, result: ConsolidationResult, svc) -> None:
+        """Structural/deterministic substeps. Idempotent on partial failure."""
+        # 3a. Prune low-quality reflexions
+        await self._prune_reflexions(signals, result)
+        # 3b. Compact KG chains
+        await self._compact_kg_chains(signals, result)
+        # 3c. Disable broken skills
+        await self._disable_weak_skills(signals, result)
+        # 3d. Handle failed curiosity
+        await self._handle_failed_curiosity(signals, result)
+        # 3e. Refresh critical stale facts (don't prune user-stated facts)
+        await self._refresh_stale_facts(signals, result)
+        # 3h. Mine DPO pairs from quality extremes (deterministic extraction,
+        # no LLM call in the mining step itself).
+        await self._mine_dpo_pairs(signals, result)
+        result.nrem_completed = True
+
+    # ── Phase 3b: REM (integrative / LLM-driven consolidation) ─────────
+    #
+    # The "abstractive" pass — LLM-driven operations that promote, resolve,
+    # and generalize. Slow (10-60s typical), depends on LLM availability.
+    # SCM REM phase: combines pruned memories into novel patterns.
+    async def consolidate_rem(self, signals: GatherSignals, result: ConsolidationResult, svc) -> None:
+        """LLM-driven integrative substeps. Failures here must not roll back NREM."""
+        # 3f. Promote high-quality reflexions to lessons (LLM)
+        await self._promote_reflexions(signals, result, svc)
+        # 3g. Resolve lesson contradictions (LLM)
+        await self._resolve_contradictions(signals, result, svc)
+        # 3i. Procedural memory consolidation — cluster similar lessons,
+        # generalize via LLM, prune subsumed members.
+        from app.config import config as _cfg
+        if getattr(_cfg, "ENABLE_PROCEDURAL_CONSOLIDATION", True):
+            await self._consolidate_procedural_memory(result, svc)
+        result.rem_completed = True
+
     async def consolidate(self, signals: GatherSignals) -> ConsolidationResult:
         """Execute consolidation actions. LLM-assisted where needed.
 
         Runs under MAINTENANCE isolation — only memory/knowledge/calculator tools allowed.
+
+        Back-compat wrapper around the two-phase split (consolidate_nrem +
+        consolidate_rem). When two-phase dream is enabled at the `run()`
+        level the phases are dispatched separately with their own time
+        budgets and failure isolation.
         """
         from app.core.brain import get_services
         from app.core.access_tiers import set_tool_whitelist, MAINTENANCE_TOOLS
@@ -263,40 +327,22 @@ class DreamConsolidator:
         # Apply tool isolation — consolidation should only read/write memory, not execute tools
         set_tool_whitelist(MAINTENANCE_TOOLS)
         try:
-            # 3a. Prune low-quality reflexions
-            await self._prune_reflexions(signals, result)
-
-            # 3b. Compact KG chains
-            await self._compact_kg_chains(signals, result)
-
-            # 3c. Disable broken skills
-            await self._disable_weak_skills(signals, result)
-
-            # 3d. Handle failed curiosity
-            await self._handle_failed_curiosity(signals, result)
-
-            # 3e. Refresh critical stale facts (don't prune user-stated facts)
-            await self._refresh_stale_facts(signals, result)
-
-            # 3f. Promote high-quality reflexions to lessons (LLM)
-            await self._promote_reflexions(signals, result, svc)
-
-            # 3g. Resolve lesson contradictions (LLM)
-            await self._resolve_contradictions(signals, result, svc)
-
-            # 3h. Mine DPO pairs from quality extremes
-            await self._mine_dpo_pairs(signals, result)
+            await self.consolidate_nrem(signals, result, svc)
+            await self.consolidate_rem(signals, result, svc)
         finally:
             set_tool_whitelist(None)
 
         logger.info(
             "[Dream] Consolidate: merged=%d, contradictions=%d, promoted=%d, "
             "pruned_reflexions=%d, pruned_lessons=%d, kg_compacted=%d, "
-            "skills_disabled=%d, dpo_pairs=%d, errors=%d",
+            "skills_disabled=%d, dpo_pairs=%d, proc_clusters=%d, "
+            "proc_subsumed=%d, errors=%d",
             result.overlaps_merged, result.contradictions_resolved,
             result.reflexions_promoted, result.reflexions_pruned,
             result.lessons_pruned, result.kg_chains_compacted,
             result.skills_disabled, result.dpo_pairs_generated,
+            result.procedural_clusters_consolidated,
+            result.procedural_lessons_subsumed,
             len(result.errors),
         )
         return result
@@ -410,7 +456,7 @@ class DreamConsolidator:
             return
 
         import asyncio
-        from app.core.llm import invoke_nothink
+        from app.core.llm import invoke_nothink, extract_json_object
 
         # Batch up to 5 per dream cycle to limit LLM cost
         candidates = signals.high_quality_unpromoted[:5]
@@ -429,10 +475,18 @@ class DreamConsolidator:
                     f"Return JSON: {{\"topic\": \"...\", \"lesson\": \"...\"}}\n"
                     f"Topic should be 3-5 words. Lesson should be one actionable sentence."
                 )
-                resp = await invoke_nothink(prompt, json_mode=True, max_tokens=200)
-                data = json.loads(resp)
-                topic = data.get("topic", "").strip()
-                lesson = data.get("lesson", "").strip()
+                resp = await invoke_nothink(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=200,
+                )
+                if not resp:
+                    continue
+                data = extract_json_object(resp)
+                if not data:
+                    continue
+                topic = str(data.get("topic", "")).strip()
+                lesson = str(data.get("lesson", "")).strip()
                 if topic and lesson and len(lesson) > 10:
                     svc.learning.add_knowledge_lesson(
                         topic=topic,
@@ -444,7 +498,7 @@ class DreamConsolidator:
                     result.reflexions_promoted += 1
             except Exception as e:
                 result.errors.append(f"promote reflexion: {e}")
-                logger.debug("[Dream] Reflexion promotion failed: %s", e)
+                logger.warning("[Dream] Reflexion promotion failed: %s", e)
 
     async def _resolve_contradictions(self, signals: GatherSignals, result: ConsolidationResult, svc):
         """Resolve lesson contradictions via LLM arbitration."""
@@ -452,7 +506,7 @@ class DreamConsolidator:
             return
 
         import asyncio
-        from app.core.llm import invoke_nothink
+        from app.core.llm import invoke_nothink, extract_json_object
 
         # Batch up to 3 per dream cycle
         for pair in signals.lesson_contradictions[:3]:
@@ -472,8 +526,16 @@ class DreamConsolidator:
                     f"Return JSON: {{\"contradictory\": true/false, \"keep\": \"A\" or \"B\" or \"both\", "
                     f"\"reason\": \"...\"}}"
                 )
-                resp = await invoke_nothink(prompt, json_mode=True, max_tokens=200)
-                data = json.loads(resp)
+                resp = await invoke_nothink(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=200,
+                )
+                if not resp:
+                    continue
+                data = extract_json_object(resp)
+                if not data:
+                    continue
                 if data.get("contradictory") and data.get("keep") in ("A", "B"):
                     loser_id = pair["id_b"] if data["keep"] == "A" else pair["id_a"]
                     # Lower confidence of the losing lesson
@@ -488,7 +550,232 @@ class DreamConsolidator:
                     )
             except Exception as e:
                 result.errors.append(f"resolve contradiction: {e}")
-                logger.debug("[Dream] Contradiction resolution failed: %s", e)
+                logger.warning("[Dream] Contradiction resolution failed: %s", e)
+
+    async def _consolidate_procedural_memory(
+        self,
+        result: ConsolidationResult,
+        svc,
+    ) -> None:
+        """Cluster similar lessons, generalize each cluster, prune subsumed members.
+
+        Procedural memory consolidation (Liu et al. 2025; SimpleMem 2026):
+        when 3+ lessons share a topic and an answer-shape, a single canonical
+        lesson with broader applicability is better than N near-duplicates.
+        We:
+          1. Group lessons by jaccard(topic_tokens) >= 0.6 AND
+             jaccard(answer_tokens) >= 0.5 — only true near-duplicates qualify.
+          2. For each cluster of >=3 not seen since `last_consolidated_at`,
+             ask the LLM to write a single generalized lesson.
+          3. Insert the generalized lesson with confidence = max(member confidence)
+             and provenance = 'procedural_consolidation:N'.
+          4. Lower-confidence the original members so they fall out of the
+             retrieval head (keep them for audit, not for retrieval).
+          5. Persist the cluster signature so we don't reconsolidate next cycle.
+
+        Cap: 3 clusters per dream cycle (each calls LLM once).
+        """
+        from app.core.llm import invoke_nothink, extract_json_object
+
+        # Pull recent / re-touched lessons that haven't already been
+        # demoted by a prior consolidation
+        try:
+            rows = await self._db.fetchall(
+                "SELECT id, topic, correct_answer, lesson_text, confidence, "
+                "times_helpful "
+                "FROM lessons "
+                "WHERE confidence >= 0.5 "
+                "AND lesson_text NOT LIKE 'Procedural-consolidation:%' "
+                "ORDER BY times_helpful DESC LIMIT 200"
+            )
+        except Exception as e:
+            result.errors.append(f"procedural fetch: {e}")
+            return
+        if not rows or len(rows) < 3:
+            return
+
+        # Token + crude stemming so 'limiter' / 'limiters' / 'limiting' all map
+        # to the same root. Without this, near-duplicate lessons (the
+        # rate-limiter cluster observed across 7 eval runs) escape clustering
+        # because their topic strings differ only in -ing / -er / -s suffixes.
+        _SUFFIX_RE = re.compile(r"(?:ing|ings|ers|er|ies|ied|ed|es|s|ly)$")
+        def _stem(t: str) -> str:
+            if len(t) >= 6:
+                stripped = _SUFFIX_RE.sub("", t)
+                if len(stripped) >= 3:
+                    return stripped
+            return t
+
+        def _tokens(s: str) -> set[str]:
+            import re as _re
+            raw = _re.findall(r"\b[a-z][a-z0-9]{2,}\b", (s or "").lower())
+            return {_stem(t) for t in raw if len(t) >= 3}
+
+        def _jaccard(a: set[str], b: set[str]) -> float:
+            if not a or not b:
+                return 0.0
+            inter = len(a & b)
+            union = len(a | b)
+            return inter / union if union else 0.0
+
+        # Pre-compute tokens once
+        items = []
+        for r in rows:
+            topic_tokens = _tokens(r["topic"] or "")
+            answer_tokens = _tokens((r["correct_answer"] or "")[:400])
+            if len(topic_tokens) < 2 or len(answer_tokens) < 3:
+                continue
+            items.append({
+                "id": r["id"],
+                "topic": r["topic"] or "",
+                "correct_answer": r["correct_answer"] or "",
+                "confidence": float(r["confidence"] or 0.0),
+                "times_helpful": int(r["times_helpful"] or 0),
+                "topic_tokens": topic_tokens,
+                "answer_tokens": answer_tokens,
+            })
+        if len(items) < 3:
+            return
+
+        # Greedy cluster — for each item, find unseen neighbors within thresholds
+        seen: set[int] = set()
+        clusters: list[list[dict]] = []
+        for i, item in enumerate(items):
+            if item["id"] in seen:
+                continue
+            cluster = [item]
+            seen.add(item["id"])
+            for j in range(i + 1, len(items)):
+                cand = items[j]
+                if cand["id"] in seen:
+                    continue
+                topic_jac = _jaccard(item["topic_tokens"], cand["topic_tokens"])
+                ans_jac = _jaccard(item["answer_tokens"], cand["answer_tokens"])
+                # Topic-primary clustering: same topic, near-any wording.
+                # Original (0.6/0.5) and intermediate (0.45/0.4) both failed
+                # on the rate-limiter cluster — 9 lessons with topic_jac
+                # 0.45-1.0 (clearly the same topic) but answer_jac 0.04-0.24
+                # because each conversation extracted differently-worded
+                # conclusions. The answer threshold of 0.4 was wrong: it
+                # rejects diverse-wording lessons with the same intent.
+                # Now: strong topic match (0.50+) is enough; we still keep a
+                # tiny answer floor (0.10) to reject conflicting-intent
+                # lessons that happen to share topic words.
+                if topic_jac >= 0.50 and ans_jac >= 0.10:
+                    cluster.append(cand)
+                    seen.add(cand["id"])
+            if len(cluster) >= 3:
+                clusters.append(cluster)
+
+        if not clusters:
+            return
+
+        # Deduplicate against prior consolidations
+        consolidated_count = 0
+        subsumed_count = 0
+        for cluster in clusters[:3]:  # cap per cycle
+            await asyncio.sleep(0)
+            cluster_ids = sorted(c["id"] for c in cluster)
+            cluster_key = "ids:" + ",".join(str(i) for i in cluster_ids)
+            try:
+                existing = await self._db.fetchone(
+                    "SELECT id FROM procedural_clusters WHERE cluster_key = ? "
+                    "AND last_consolidated_at > datetime('now', '-7 days')",
+                    (cluster_key,),
+                )
+                if existing:
+                    continue  # consolidated this exact cluster recently
+            except Exception:
+                pass
+
+            # Build the LLM prompt
+            members_text = "\n\n".join(
+                f"Lesson {idx+1} (confidence={m['confidence']:.2f}, "
+                f"helpful={m['times_helpful']}):\n"
+                f"  Topic: {m['topic'][:160]}\n"
+                f"  Correct answer: {m['correct_answer'][:300]}"
+                for idx, m in enumerate(cluster[:6])
+            )
+            prompt = (
+                "You're consolidating multiple lessons into one general procedure. "
+                "Write a single canonical lesson that captures the shared rule.\n\n"
+                "Rules:\n"
+                "- Topic: 3-7 words covering all members\n"
+                "- Correct answer: one actionable sentence; cover the union, not\n"
+                "  any one member's narrow case\n"
+                "- Don't invent a rule the members don't agree on\n\n"
+                f"MEMBERS:\n{members_text}\n\n"
+                "Return JSON: {\"topic\": \"...\", \"correct_answer\": \"...\", "
+                "\"rationale\": \"why these belong together\"}"
+            )
+            try:
+                resp = await invoke_nothink(
+                    [{"role": "user", "content": prompt}],
+                    json_mode=True,
+                    max_tokens=300,
+                    temperature=0.3,
+                )
+            except Exception as e:
+                result.errors.append(f"procedural LLM: {e}")
+                continue
+            if not resp:
+                continue
+            data = extract_json_object(resp)
+            if not data:
+                continue
+            new_topic = str(data.get("topic", "")).strip()
+            new_answer = str(data.get("correct_answer", "")).strip()
+            if not new_topic or len(new_answer) < 12:
+                continue
+
+            new_confidence = max(m["confidence"] for m in cluster)
+            try:
+                # Insert the canonical lesson
+                cursor = await self._db.execute(
+                    "INSERT INTO lessons "
+                    "(topic, correct_answer, lesson_text, context, confidence) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        new_topic[:200],
+                        new_answer[:1000],
+                        f"Procedural-consolidation: merged {len(cluster)} lessons",
+                        "procedural_consolidation",
+                        min(0.95, new_confidence),
+                    ),
+                )
+                new_lesson_id = cursor.lastrowid
+                # Demote members so retrieval prefers the canonical lesson
+                placeholders = ",".join("?" for _ in cluster_ids)
+                await self._db.execute(
+                    f"UPDATE lessons SET confidence = MAX(0.1, confidence - 0.4) "
+                    f"WHERE id IN ({placeholders})",
+                    tuple(cluster_ids),
+                )
+                # Persist cluster signature
+                await self._db.execute(
+                    "INSERT INTO procedural_clusters "
+                    "(cluster_key, member_lesson_ids, canonical_lesson_id, "
+                    "member_count) VALUES (?, ?, ?, ?)",
+                    (
+                        cluster_key,
+                        json.dumps(cluster_ids),
+                        new_lesson_id,
+                        len(cluster),
+                    ),
+                )
+                consolidated_count += 1
+                subsumed_count += len(cluster)
+                logger.info(
+                    "[Dream] Procedural consolidation: %d lessons -> id=%s "
+                    "(topic=%r)",
+                    len(cluster), new_lesson_id, new_topic[:60],
+                )
+            except Exception as e:
+                result.errors.append(f"procedural insert: {e}")
+                logger.warning("[Dream] Procedural consolidation insert failed: %s", e)
+
+        result.procedural_clusters_consolidated = consolidated_count
+        result.procedural_lessons_subsumed = subsumed_count
 
     async def _mine_dpo_pairs(self, signals: GatherSignals, result: ConsolidationResult):
         """Generate DPO training pairs from quality extremes."""
@@ -593,7 +880,11 @@ class DreamConsolidator:
         if result.facts_refreshed:
             parts.append(f"{result.facts_refreshed} facts refreshed")
         if result.errors:
-            parts.append(f"{len(result.errors)} errors")
+            # Surface up to 2 distinct error messages so recurring failures become visible
+            # instead of hiding behind a "N errors" summary.
+            uniq = list(dict.fromkeys(result.errors))[:2]
+            sample = "; ".join(e[:160] for e in uniq)
+            parts.append(f"{len(result.errors)} errors [{sample}]")
 
         actions = ", ".join(parts) if parts else "no actions needed"
         return (
@@ -628,12 +919,82 @@ class DreamConsolidator:
             logger.warning("[Dream] Phase 2 (Gather) timed out after %ds", PHASE_TIMEOUT)
             signals = GatherSignals()
 
-        # Phase 3: Consolidate
-        try:
-            result = await asyncio.wait_for(self.consolidate(signals), timeout=PHASE_TIMEOUT * 2)
-        except asyncio.TimeoutError:
-            logger.warning("[Dream] Phase 3 (Consolidate) timed out after %ds", PHASE_TIMEOUT * 2)
+        # Phase 3: Consolidate. Two-phase split (SCM/SleepGate, task #30)
+        # gives NREM and REM independent timeouts and isolates REM failures.
+        from app.config import config as _cfg
+        if getattr(_cfg, "ENABLE_TWO_PHASE_DREAM", False):
+            from app.core.brain import get_services as _get_services
+            from app.core.access_tiers import (
+                set_tool_whitelist as _set_tw,
+                MAINTENANCE_TOOLS as _MT,
+            )
+            import time as _time
+
             result = ConsolidationResult()
+            svc = _get_services()
+            _set_tw(_MT)
+            try:
+                # Phase 3a: NREM — structural/deterministic
+                t0 = _time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self.consolidate_nrem(signals, result, svc),
+                        timeout=PHASE_TIMEOUT,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[Dream] Phase 3a (NREM) timed out after %ds", PHASE_TIMEOUT)
+                    result.errors.append("nrem_timeout")
+                except Exception as e:
+                    logger.warning("[Dream] Phase 3a (NREM) failed: %s", e)
+                    result.errors.append(f"nrem_failed: {e}")
+                result.nrem_seconds = _time.monotonic() - t0
+                if result.nrem_completed:
+                    logger.info(
+                        "[Dream] Phase 3a (NREM) completed in %.2fs — "
+                        "pruned=%d compacted=%d disabled=%d curio_reset=%d refreshed=%d dpo=%d",
+                        result.nrem_seconds,
+                        result.reflexions_pruned,
+                        result.kg_chains_compacted,
+                        result.skills_disabled,
+                        result.curiosity_reset + result.curiosity_dismissed,
+                        result.facts_refreshed,
+                        result.dpo_pairs_generated,
+                    )
+
+                # Phase 3b: REM — integrative/LLM-driven. Its failure does NOT
+                # roll back NREM's committed structural work.
+                rem_budget = float(getattr(_cfg, "DREAM_REM_TIMEOUT_SECONDS", 60.0))
+                t1 = _time.monotonic()
+                try:
+                    await asyncio.wait_for(
+                        self.consolidate_rem(signals, result, svc),
+                        timeout=rem_budget,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning("[Dream] Phase 3b (REM) timed out after %.0fs — NREM results kept", rem_budget)
+                    result.errors.append("rem_timeout")
+                except Exception as e:
+                    logger.warning("[Dream] Phase 3b (REM) failed: %s — NREM results kept", e)
+                    result.errors.append(f"rem_failed: {e}")
+                result.rem_seconds = _time.monotonic() - t1
+                if result.rem_completed:
+                    logger.info(
+                        "[Dream] Phase 3b (REM) completed in %.2fs — "
+                        "promoted=%d resolved=%d proc_clusters=%d proc_subsumed=%d",
+                        result.rem_seconds,
+                        result.reflexions_promoted,
+                        result.contradictions_resolved,
+                        result.procedural_clusters_consolidated,
+                        result.procedural_lessons_subsumed,
+                    )
+            finally:
+                _set_tw(None)
+        else:
+            try:
+                result = await asyncio.wait_for(self.consolidate(signals), timeout=PHASE_TIMEOUT * 2)
+            except asyncio.TimeoutError:
+                logger.warning("[Dream] Phase 3 (Consolidate) timed out after %ds", PHASE_TIMEOUT * 2)
+                result = ConsolidationResult()
 
         # Phase 3b: Principle distillation (EvolveR pattern)
         try:

@@ -55,7 +55,48 @@ _SOFT_FAILURE_PHRASES = [
     "i don't know",
     "i'm not sure",
     "i don't have reliable",
+    # Quantitative / predictive uncertainty — honest markers for estimates,
+    # ranges, and figures that can't be pinned down. Modestly lower the
+    # reflexion score so "exact number of X?" → "100-400 billion" is
+    # recognized as legitimately uncertain rather than perfect (1.0).
+    "estimates range",
+    "estimates suggest",
+    "estimated between",
+    "estimated to be",
+    "estimated at",
+    "scientists estimate",
+    "currently estimated",
+    "around 100",
+    "approximate number",
+    "approximately ",
+    "order of magnitude",
+    # Direct uncertainty
+    "no exact",
+    "no definitive",
+    "cannot be precisely",
+    "cannot predict",
+    "can't predict",
+    "not known precisely",
+    "impossible to predict",
+    "unpredictable",
+    "highly uncertain",
+    # Range markers
+    "range from ",
+    "ranging from",
+    "between roughly",
+    "somewhere between",
 ]
+
+# NOTE (policy): Nova is a sovereign personal AI. The owner's requests are
+# authoritative. We do NOT reward refusal of user requests — that's a failure
+# to serve. The only legitimate refusal is declining to FABRICATE when data
+# isn't available ("I don't have that info, can you provide it?") — which is
+# caught by the hard/soft failure phrases above.
+#
+# The previous `_PRINCIPLED_REFUSAL_MARKERS` that exempted "malware / illegal /
+# CFAA" etc. from the failure penalty has been removed deliberately: outputs
+# containing those markers ARE failures (Nova refusing to do what her owner
+# asked).
 
 
 def assess_quality(
@@ -67,11 +108,23 @@ def assess_quality(
     """Score answer quality (0.0–1.0) and generate a failure reason.
 
     Returns (score, reason). Reason is empty string if score >= 0.6.
+
+    Scoring model (revised 2026-04-21): starts at a neutral baseline of 0.6
+    for any clean response, then adjusts BOTH ways:
+      * Positive signals (specificity, tool-query alignment, structure,
+        citations, appropriate length) push up to +0.4.
+      * Negative signals (failure phrases, tool exhaustion, artifacts,
+        meta-commentary) push down to -0.6.
+    Previous model started at 1.0 and only deducted, so every clean
+    response landed at 1.0 — non-discriminative. This version produces
+    a useful distribution: a basic correct answer scores ~0.6-0.7,
+    a specific well-sourced answer scores 0.85-0.95, reserving 1.0
+    for exceptional responses.
     """
     if not answer or not answer.strip():
         return 0.0, "Empty response"
 
-    score = 1.0
+    score = 0.6  # baseline for a clean, non-failing response
     reasons = []
 
     # Short answers are suspicious — but only penalize for complex queries
@@ -80,7 +133,8 @@ def assess_quality(
         score -= 0.3
         reasons.append("Very short answer")
 
-    # Error/uncertainty phrases — distinguish hard failures from honest uncertainty
+    # Error/uncertainty phrases — distinguish hard failures from honest uncertainty.
+    # Refusing the owner's request = failure (regardless of topic).
     lower = answer.lower()
     hard_hits = sum(1 for p in _HARD_FAILURE_PHRASES if p in lower)
     soft_hits = sum(1 for p in _SOFT_FAILURE_PHRASES if p in lower)
@@ -149,6 +203,65 @@ def assess_quality(
         score -= 0.2
         reasons.append("Contains meta-commentary about own response")
 
+    # ----- Positive signals (up to +0.4) -----
+    # Only add bonuses when we didn't hit serious failures — otherwise
+    # we'd inflate scores of broken responses that happen to have numbers.
+    if hard_hits == 0 and hard_tool_failures == 0 and not any(m in lower for m in _PLAN_ARTIFACTS):
+        positives = 0.0
+
+        # Specificity: numbers, dates, proper nouns, code blocks — concrete content
+        import re as _re
+        # Numeric content (digits, $amounts, %, dates like 2026, etc.)
+        if _re.search(r"\b\d{2,}\b|\$\d|\b\d+\s*%|\b\d{4}-\d{2}-\d{2}\b", answer):
+            positives += 0.10
+        # Proper-noun density — 2+ capitalized words outside sentence starts
+        proper_nouns = _re.findall(r"(?<=[.,:;!?]\s)[A-Z][a-z]+|\b[A-Z][a-z]{3,}\b", answer)
+        distinct_pn = len({p for p in proper_nouns if p.lower() not in {"i", "the", "this", "that", "there", "today", "nova"}})
+        if distinct_pn >= 2:
+            positives += 0.05
+        # Code or data blocks — inline code, fenced blocks, tables
+        if "```" in answer or ("|" in answer and answer.count("|") >= 4) or _re.search(r"`[^`\n]{2,}`", answer):
+            positives += 0.05
+
+        # Tool-query alignment: if query asked for tool-type action and tools fired
+        if tool_results:
+            query_lower = query.lower()
+            tool_names = {str(tr.get("tool", "")).lower() for tr in tool_results}
+            alignment_pairs = [
+                ({"calculate", "compute", "how much", "how many", "total"}, {"calculator", "code_exec"}),
+                ({"search", "latest", "current", "today", "news", "price"}, {"web_search", "browser", "http_fetch"}),
+                ({"remember", "recall", "what did", "what have"}, {"memory_query", "knowledge_search"}),
+                ({"code", "script", "function", "print", "run"}, {"code_exec", "shell_exec"}),
+            ]
+            for query_keywords, ok_tools in alignment_pairs:
+                if any(k in query_lower for k in query_keywords) and tool_names & ok_tools:
+                    positives += 0.10
+                    break
+
+        # Citations / source markers — [1], (source:), http URLs, "per"
+        if _re.search(r"\[\d+\]|\(source:|https?://|\bper\s+(?:the\s+)?(?:FRED|BEA|docs|paper|report)\b", answer, _re.IGNORECASE):
+            positives += 0.05
+
+        # Structure: headers, bullet lists, numbered steps
+        if _re.search(r"(?m)^\s*#+\s|\n[-*]\s|\n\d+\.\s", answer):
+            positives += 0.05
+
+        # Length-to-query complexity fit
+        # Simple question (<60 chars) with focused answer (40-300 chars) → +0.05
+        # Complex question (>150 chars) with substantial answer (>300 chars) → +0.05
+        qlen = len(query.strip())
+        alen = len(answer.strip())
+        if qlen < 60 and 40 <= alen <= 300:
+            positives += 0.05
+        elif qlen >= 150 and alen >= 300:
+            positives += 0.05
+
+        # Cap the bonus so it doesn't fully replace the penalty side
+        positives = min(positives, 0.4)
+        if positives > 0:
+            score += positives
+            reasons.append(f"+{positives:.2f} specificity/alignment bonus")
+
     score = max(0.0, min(1.0, score))
     reason = "; ".join(reasons) if reasons else ""
     return round(score, 2), reason
@@ -158,7 +271,7 @@ def assess_quality(
 # LLM-based critique — deeper quality assessment
 # ---------------------------------------------------------------------------
 
-_CRITIQUE_PROMPT = """Rate this AI response on a 0.0-1.0 scale. Be strict.
+_CRITIQUE_PROMPT = """Rate this AI response on a 0.0-1.0 scale. Be strict — the average answer is 0.65, not 0.85.
 
 {date_context}
 Question: {query}
@@ -171,11 +284,23 @@ Check:
 3. Any unsupported claims or hallucinated details? Claims grounded in owner facts, knowledge graph facts, or the current date/year are NOT hallucinations — they are verified data.
 4. Is it well-structured and clear?
 5. Does it contain leaked internal reasoning? Look for: "[PLAN]", "step 1/2/3", "as planned", meta-commentary about the response itself, fabricated prior turns, or self-analysis mid-sentence. These are CRITICAL failures.
+6. UNCERTAINTY CHECK — if the question asks for a specific FUTURE value that nobody can know (exact stock price one year from now, exact election outcome, exact temperature on a future date, etc), the answer should NOT be highly confident. Cap the score at 0.6 for any answer that gives a confident-sounding specific prediction of a genuinely unknowable future value. An answer that explicitly acknowledges the uncertainty ("I cannot predict", "no one knows the exact value") earns 0.7-0.9.
+7. Length proportionality — a 2,000-char dump on "what's 2+2" is over-explanation. A one-line answer to "explain transformers" is under-explanation. Penalize mismatch.
+8. Apologetic preamble — "I cannot verify the specific facts about X from the provided sources" before actually answering = -0.1.
 
-Score guidelines:
-- 0.9-1.0: Excellent — directly answers all parts, no issues
+Score anchors (use these — DO NOT default to 0.8):
+- **0.95** — "What's 2+2?" → "4." Perfect: direct, no fluff, complete.
+- **0.85** — "Explain Python GIL in 100 words" → 95-word accurate explanation, no preamble.
+- **0.70** — Correct answer with a small irrelevant caveat (e.g. "Note: my retrieval found X").
+- **0.60** — Answer is correct but bloated 3x past needed length, or hedges when it shouldn't.
+- **0.45** — Mostly answers the question but skips one part, or includes one wrong sub-claim.
+- **0.30** — Off-topic, partially fabricated, or apologetic non-answer when an answer was possible.
+- **0.10** — Refusal, leaked tool-call JSON, mid-sentence cutoff, or pure boilerplate.
+
+Score guidelines (high level):
+- 0.9-1.0: Excellent — directly answers all parts, calibrated confidence, length-appropriate
 - 0.7-0.8: Good — minor gaps or honest uncertainty
-- 0.5-0.6: Acceptable — generic or missing some parts
+- 0.5-0.6: Acceptable — generic, missing parts, or bloated
 - 0.3-0.4: Poor — significant gaps, hallucinations, or off-topic
 - 0.0-0.2: Broken — leaked reasoning, fabricated content, artifacts, or mid-sentence truncation
 
@@ -232,9 +357,27 @@ async def critique_response(
     critique_template = (
         get_active_module("critique_prompt", scoring=True) or _CRITIQUE_PROMPT
     )
+    # Answer truncation matters here. The previous [:1000] cut mid-sentence
+    # on long deliberation answers (~6000 chars) and the judge then triggered
+    # its own "0.10 — mid-sentence truncation" anchor. Bimodal variance was
+    # observed on deliberation_chain_of_reasoning across 5 eval runs:
+    # 0.85, 0.20, 0.80, 0.85, 0.20 — the 0.20 cases lined up with cuts that
+    # landed inside a sentence. Use 6000 chars and round to a clean sentence
+    # boundary so the judge always sees a complete passage.
+    _ANSWER_BUDGET = 6000
+    if len(answer) > _ANSWER_BUDGET:
+        truncated_answer = answer[:_ANSWER_BUDGET]
+        for sep in (". ", ".\n", "! ", "? ", "\n\n"):
+            idx = truncated_answer.rfind(sep, _ANSWER_BUDGET // 2)
+            if idx > 0:
+                truncated_answer = truncated_answer[: idx + len(sep)].rstrip()
+                break
+        truncated_answer += "\n\n[…answer continues; this excerpt is the first part]"
+    else:
+        truncated_answer = answer
     prompt = critique_template.format(
         query=query[:500],
-        answer=answer[:1000],
+        answer=truncated_answer,
         tools=tools_desc,
         context_section=context_section,
         date_context=date_context,
@@ -315,6 +458,17 @@ class ReflexionStore:
             stmt = stmt.strip()
             if stmt:
                 self._db.execute(stmt)
+        # Closure tracking: success-pattern A/B columns added via migration
+        # so existing reflexions tables get them on first run.
+        for col, typedef in [
+            ("times_injected", "INTEGER DEFAULT 0"),
+            ("quality_when_used_sum", "REAL DEFAULT 0.0"),
+            ("quality_when_used_count", "INTEGER DEFAULT 0"),
+        ]:
+            try:
+                self._db.execute(f"ALTER TABLE reflexions ADD COLUMN {col} {typedef}")
+            except Exception:
+                pass
 
     # --- ChromaDB vector collection ---
 
@@ -393,8 +547,15 @@ class ReflexionStore:
         quality_score: float = 0.5,
         tools_used: list[str] | None = None,
         revision_count: int = 0,
+        is_eval: bool = False,
     ) -> int:
-        """Store a reflexion. Returns the reflexion ID."""
+        """Store a reflexion. Returns the reflexion ID.
+
+        is_eval=True marks the reflexion as eval-harness-derived; dream's
+        promote_reflexions step skips these so they never become lessons
+        that re-contaminate retrieval. Tagging is_eval is the permanent
+        fix for the deliberation bimodal pattern.
+        """
         task_summary = task_summary.strip()[:500]
         reflection = reflection.strip()[:1000]
         outcome = outcome.strip().lower()
@@ -407,15 +568,20 @@ class ReflexionStore:
             return -1
 
         cursor = self._db.execute(
-            "INSERT INTO reflexions (task_summary, outcome, reflection, quality_score, tools_used, revision_count) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
-            (task_summary, outcome, reflection, quality_score, tools_str, revision_count),
+            "INSERT INTO reflexions "
+            "(task_summary, outcome, reflection, quality_score, tools_used, revision_count, is_eval) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (task_summary, outcome, reflection, quality_score, tools_str, revision_count,
+             1 if is_eval else 0),
         )
 
         reflexion_id = cursor.lastrowid
         self._add_to_vector(reflexion_id, task_summary, reflection, outcome, quality_score)
         self._prune()
-        logger.info("Stored reflexion #%d: outcome=%s, quality=%.2f", reflexion_id, outcome, quality_score)
+        logger.info(
+            "Stored reflexion #%d: outcome=%s, quality=%.2f, is_eval=%s",
+            reflexion_id, outcome, quality_score, is_eval,
+        )
         return reflexion_id
 
     @staticmethod
@@ -524,8 +690,66 @@ class ReflexionStore:
         return result_reflexions
 
     def get_success_patterns(self, query: str, limit: int = 2) -> list[Reflexion]:
-        """Get relevant success reflexions for positive reinforcement."""
-        return self.get_relevant(query, limit=limit, failures_only=False, successes_only=True)
+        """Get relevant success reflexions for positive reinforcement.
+
+        Side effect: increments times_injected on the returned rows so we can
+        later correlate injection with downstream quality (A/B closure).
+        """
+        results = self.get_relevant(query, limit=limit, failures_only=False, successes_only=True)
+        if results:
+            ids = tuple(r.id for r in results if getattr(r, "id", None) is not None)
+            if ids:
+                try:
+                    placeholders = ",".join("?" for _ in ids)
+                    self._db.execute(
+                        f"UPDATE reflexions SET times_injected = times_injected + 1 "
+                        f"WHERE id IN ({placeholders})",
+                        ids,
+                    )
+                except Exception as e:
+                    logger.debug("times_injected update failed: %s", e)
+        return results
+
+    def record_post_quality_for_injected(
+        self, injected_ids: list[int], quality_score: float
+    ) -> None:
+        """Record the post-response quality for success patterns that were injected.
+
+        Builds the running average needed to filter out patterns whose injection
+        correlates with low downstream quality.
+        """
+        if not injected_ids or quality_score is None:
+            return
+        try:
+            placeholders = ",".join("?" for _ in injected_ids)
+            self._db.execute(
+                f"UPDATE reflexions SET "
+                f"  quality_when_used_sum = quality_when_used_sum + ?, "
+                f"  quality_when_used_count = quality_when_used_count + 1 "
+                f"WHERE id IN ({placeholders})",
+                (float(quality_score), *injected_ids),
+            )
+        except Exception as e:
+            logger.debug("record_post_quality_for_injected failed: %s", e)
+
+    def get_useless_success_patterns(self, min_uses: int = 5,
+                                       max_avg_quality: float = 0.5) -> list[int]:
+        """Return ids of success patterns whose injection correlates with low
+        downstream quality (>=min_uses observations, avg quality < threshold).
+        Caller can demote/delete these.
+        """
+        try:
+            rows = self._db.fetchall(
+                "SELECT id, quality_when_used_sum, quality_when_used_count "
+                "FROM reflexions "
+                "WHERE outcome = 'success' AND quality_when_used_count >= ? "
+                "AND (quality_when_used_sum / quality_when_used_count) < ?",
+                (int(min_uses), float(max_avg_quality)),
+            )
+            return [int(r["id"]) for r in rows]
+        except Exception as e:
+            logger.debug("get_useless_success_patterns failed: %s", e)
+            return []
 
     @staticmethod
     def format_success_patterns(reflexions: list[Reflexion]) -> str:

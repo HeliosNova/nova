@@ -1,8 +1,13 @@
 """Nova Fine-Tuning Pipeline — DPO with Unsloth + QLoRA.
 
-This script fine-tunes Qwen3.5:27b using Direct Preference Optimization (DPO)
-on corrections Nova has collected. It produces a LoRA adapter that makes
-Nova permanently better at the things its owner corrected.
+EXPERIMENTAL — off by default. This script runs a local DPO (Direct Preference
+Optimization) fine-tune on the corrections Nova has collected (default base:
+Qwen3.5-9B), producing a LoRA adapter. It is NOT how Nova learns facts: in honest
+cross-family A/B evals these small-data fine-tunes tie the base model, and Nova's
+production "learning" is the in-context memory loop (lessons + temporal KG). Use
+this only for style/behavior experiments, and only deploy a result that wins an
+A/B under an INDEPENDENT (different-family) judge — see scripts/eval_harness.py
+and the deploy gate in finetune_auto.py.
 
 REQUIREMENTS:
     - RTX 3090 (24GB VRAM) or better
@@ -55,9 +60,17 @@ if sys.platform == "win32":
     except Exception:
         pass  # Non-critical cleanup
 
-# Fix CUDA fragmentation (note: expandable_segments not supported on Windows,
-# but max_split_size_mb still helps)
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
+# Fix CUDA fragmentation. On Linux, expandable_segments lets the allocator
+# grow the address space dynamically and avoids fragmentation when running
+# at the VRAM ceiling — critical for 9B fits in 24GB. Windows doesn't
+# support expandable_segments; falls back to max_split_size_mb only.
+if sys.platform == "win32":
+    # 27B QLoRA OOM'd at max_split_size=128 with 3.68GB free but no contiguous 170MB block.
+    # Lower split size = more granular allocation, less fragmentation. Windows has no
+    # expandable_segments equivalent, so this is the only fragmentation lever.
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:64"
+else:
+    os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True,max_split_size_mb:128"
 from datetime import datetime
 from pathlib import Path
 
@@ -81,13 +94,13 @@ logger.info("=== Fine-tune log: %s ===", _LOG_FILE)
 _NOVA_DATA_DIR = os.environ.get("NOVA_DATA_DIR", "/data")
 DEFAULT_DATA_PATH = os.getenv("TRAINING_DATA_PATH", os.path.join(_NOVA_DATA_DIR, "training_data.jsonl"))
 DEFAULT_OUTPUT_DIR = os.getenv("FINETUNE_OUTPUT_DIR", os.path.join(_NOVA_DATA_DIR, "finetune"))
-DEFAULT_MODEL = "Qwen/Qwen3.5-9B"
-DEFAULT_MAX_SEQ_LENGTH = 8192
-DEFAULT_LORA_RANK = 16
+DEFAULT_MODEL = "Qwen/Qwen3.6-27B"  # Switched from Qwen3.5-27B after the converted Qwen3.5 GGUF failed to load in Ollama 0.17.5 (known qwen3next loader bug). Qwen3.6 architecture works in user's Ollama (qwen3.6:27b is already loaded and tested).
+DEFAULT_MAX_SEQ_LENGTH = 192  # 2026-05-20: DPO processes chosen+rejected (~2x SFT activation memory). 192 keeps 27B QLoRA-DPO in 24GB and still covers prompt+rejected (~155 tok). SFT alone fit 256.
+DEFAULT_LORA_RANK = 16  # 2026-05-20: raised from 4 for DPO. Attn-only adapter memory is trivial even at 16 (~21M params); rank drives adapter expressiveness, and the SFT-rank-4 run A/B-tied v16.
 DEFAULT_EPOCHS = 3
 DEFAULT_BATCH_SIZE = 1
-DEFAULT_GRAD_ACCUM = 2
-DEFAULT_LR = 5e-7  # Low LR; safe across loss types (SimPO paper: 5e-7)
+DEFAULT_GRAD_ACCUM = 8  # Effective batch 8 per the proven SFT config; larger than DPO's 2 because SFT has half the per-step memory.
+DEFAULT_LR = 2e-4  # SFT-appropriate LR (DPO was 5e-7). Per the working config.
 # trl 0.24.0 DPOTrainer/DPOConfig does NOT accept loss_type="simpo" — it raises
 # `ValueError: Unknown loss type: ['simpo']. Should be one of [...]`. SimPO
 # lives in CPOTrainer/CPOConfig (not DPO) as of trl 0.17+. To keep this
@@ -96,6 +109,8 @@ DEFAULT_LR = 5e-7  # Low LR; safe across loss types (SimPO paper: 5e-7)
 # VRAM (or precomputed log-probs — we do the latter). SimPO is reference-free
 # and ~40% cheaper in VRAM — if we want that back, switch train() to CPOTrainer.
 DEFAULT_LOSS_TYPE = "sigmoid"
+DEFAULT_DPO_BETA = 0.1   # DPO temperature — standard value
+DEFAULT_DPO_LR = 5e-6    # DPO LR is much lower than SFT's 2e-4; LoRA-DPO standard range 5e-6..1e-5
 MIN_TRAINING_PAIRS = 10  # Minimum pairs before training is worthwhile
 
 
@@ -180,95 +195,58 @@ def train(
     grad_accum: int = DEFAULT_GRAD_ACCUM,
     learning_rate: float = DEFAULT_LR,
     loss_type: str = DEFAULT_LOSS_TYPE,
+    use_dpo: bool | None = None,
 ) -> str:
-    """Run DPO fine-tuning with QLoRA.
+    """Run QLoRA fine-tuning — DPO or SFT.
 
-    Uses DPOTrainer with a precomputed reference log-probs pass to fit in
-    24GB VRAM. Default loss="sigmoid" (original DPO). SimPO is not supported
-    by DPOTrainer in trl 0.24+ — it lives in CPOTrainer. Returns path to the
-    saved adapter.
+    DPO (use_dpo=True, or env FINETUNE_USE_DPO=true): trains on chosen vs
+    rejected preference pairs via DPOTrainer. Contrastive signal, ~2x the
+    activation memory of SFT (processes both responses). Needs the smaller
+    max_seq (192) to fit 27B on 24GB. Reference model is the base with the
+    LoRA adapter disabled (ref_model=None) — no second model in VRAM.
+
+    SFT (default): trains only on the chosen response. Half the activation
+    memory; loses the contrastive signal. Fit 27B on 24GB at max_seq 256.
     """
+    if use_dpo is None:
+        use_dpo = os.getenv("FINETUNE_USE_DPO", "false").strip().lower() == "true"
+    # IMPORTANT: Unsloth must be imported before torch to install its patches.
+    from unsloth import FastLanguageModel
     import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-    from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from trl import DPOTrainer, DPOConfig
+    from trl import SFTTrainer, SFTConfig
     from datasets import Dataset
 
     adapter_dir = os.path.join(output_dir, "adapter")
     os.makedirs(adapter_dir, exist_ok=True)
 
-    # --- Step 1: Load model with 4-bit quantization ---
-    logger.info("Loading %s with 4-bit quantization (sequential loading)...", model_name)
-    bnb_config = BitsAndBytesConfig(
+    # --- Step 1: Load model via Unsloth (4-bit, fused kernels for memory efficiency) ---
+    logger.info("Loading %s via Unsloth FastLanguageModel (4-bit, max_seq=%d)...", model_name, max_seq_length)
+    model, tokenizer = FastLanguageModel.from_pretrained(
+        model_name=model_name,
+        max_seq_length=max_seq_length,
+        dtype=torch.bfloat16,
         load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.bfloat16,
-        bnb_4bit_use_double_quant=True,
     )
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        torch_dtype=torch.bfloat16,
-        trust_remote_code=True,
-    )
-    tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # --- Step 2: Apply LoRA ---
-    logger.info("Applying LoRA (rank=%d)...", lora_rank)
-    model = prepare_model_for_kbit_training(model)
-    lora_config = LoraConfig(
+    # --- Step 2: Apply LoRA via Unsloth (full target_modules, rank-16) ---
+    logger.info("Applying Unsloth LoRA (rank=%d, alpha=%d, attn-only)...", lora_rank, lora_rank * 2)
+    model = FastLanguageModel.get_peft_model(
+        model,
         r=lora_rank,
-        lora_alpha=lora_rank,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                        "gate_proj", "up_proj", "down_proj"],
+        lora_alpha=lora_rank * 2,
+        # Attn-only modules: dropped MLP (gate_proj/up_proj/down_proj) after rank-16 full-MLP
+        # OOM'd at step 2 in WSL2. 27B MLP intermediate dim is huge; excluding cuts adapter
+        # trainable params by ~75%. Still teaches identity/format/tool-call from chosens.
+        target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
         lora_dropout=0,
         bias="none",
-        task_type="CAUSAL_LM",
+        use_gradient_checkpointing="unsloth",
+        random_state=3407,
+        max_seq_length=max_seq_length,
     )
-    model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
-
-    # --- Step 3: Prepare dataset ---
-    logger.info("Preparing DPO dataset (%d pairs)...", len(data))
-    dataset = Dataset.from_list(data)
-
-    # --- Step 4: DPO Training ---
-    # Standard DPO: needs a reference model. Precompute log-probs so we can
-    # fit in 24GB VRAM (otherwise the ref model has to be resident alongside
-    # the policy model during training).
-    _dpo_kwargs = {
-        "precompute_ref_log_probs": True,
-        "precompute_ref_batch_size": 1,
-    }
-
-    training_args = DPOConfig(
-        output_dir=adapter_dir,
-        num_train_epochs=epochs,
-        per_device_train_batch_size=batch_size,
-        gradient_accumulation_steps=grad_accum,
-        learning_rate=learning_rate,
-        optim="adamw_8bit",
-        warmup_steps=2,
-        logging_steps=1,
-        save_strategy="epoch",
-        max_length=max_seq_length,
-        loss_type=loss_type,
-        beta=0.1,
-        remove_unused_columns=False,
-        bf16=True,
-        report_to="none",
-        gradient_checkpointing=True,
-        **_dpo_kwargs,
-    )
-
-    logger.info("Starting DPO training...")
-    logger.info(
-        "  Loss: %s, Epochs: %d, Batch: %d, Grad accum: %d, LR: %s, Beta: %s",
-        loss_type, epochs, batch_size, grad_accum, learning_rate, training_args.beta,
-    )
 
     # Patch for TRL + Qwen3.5 compatibility
     if not hasattr(model, "warnings_issued"):
@@ -293,13 +271,107 @@ def train(
             import time; self._start = time.time()
             logger.info("Training started!")
 
-    trainer = DPOTrainer(
-        model=model,
-        args=training_args,
-        train_dataset=dataset,
-        processing_class=tokenizer,
-        callbacks=[ProgressCallback()],
-    )
+    if use_dpo:
+        # --- Step 3 (DPO): Format preference dataset (prompt / chosen / rejected) ---
+        # DPO keeps the contrastive signal SFT throws away: it learns chosen > rejected.
+        logger.info("Formatting DPO dataset (%d preference pairs)...", len(data))
+        def _fmt_dpo(ex):
+            return {
+                "prompt": [{"role": "user", "content": ex["prompt"]}],
+                "chosen": [{"role": "assistant", "content": ex["chosen"]}],
+                "rejected": [{"role": "assistant", "content": ex["rejected"]}],
+            }
+        raw_ds = Dataset.from_list(data)
+        dataset = raw_ds.map(_fmt_dpo, remove_columns=raw_ds.column_names)
+
+        # --- Step 4 (DPO): DPOTrainer (ref_model=None → base w/ adapter disabled) ---
+        from trl import DPOTrainer, DPOConfig
+        try:
+            from unsloth import PatchDPOTrainer
+            PatchDPOTrainer()
+        except Exception as e:  # noqa: BLE001 — Unsloth auto-patches in recent versions
+            logger.info("PatchDPOTrainer unavailable (%s) — relying on Unsloth auto-patch", e)
+
+        dpo_lr = float(os.getenv("FINETUNE_DPO_LR", str(DEFAULT_DPO_LR)))
+        dpo_beta = float(os.getenv("FINETUNE_DPO_BETA", str(DEFAULT_DPO_BETA)))
+
+        training_args = DPOConfig(
+            output_dir=adapter_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=dpo_lr,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.05,
+            optim="paged_adamw_8bit",
+            logging_steps=1,
+            save_strategy="no",
+            beta=dpo_beta,
+            max_length=max_seq_length,
+            max_prompt_length=max_seq_length // 2,
+            loss_type=loss_type,
+            bf16=True,
+            report_to="none",
+            gradient_checkpointing=True,
+        )
+        logger.info("Starting DPO training...")
+        logger.info(
+            "  Epochs: %d, Batch: %d, Grad accum: %d, LR: %s, beta: %s, max_seq: %d, rank: %d",
+            epochs, batch_size, grad_accum, dpo_lr, dpo_beta, max_seq_length, lora_rank,
+        )
+        trainer = DPOTrainer(
+            model=model,
+            ref_model=None,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            callbacks=[ProgressCallback()],
+        )
+    else:
+        # --- Step 3 (SFT): Format dataset (chosen-only, applied chat template) ---
+        logger.info("Formatting SFT dataset (%d pairs, chosen-only)...", len(data))
+        def _fmt(ex):
+            msgs = [
+                {"role": "user", "content": ex["prompt"]},
+                {"role": "assistant", "content": ex["chosen"]},
+            ]
+            text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=False)
+            return {"text": text}
+        raw_ds = Dataset.from_list(data)
+        dataset = raw_ds.map(_fmt, remove_columns=raw_ds.column_names)
+
+        # --- Step 4 (SFT): SFTTrainer ---
+        training_args = SFTConfig(
+            output_dir=adapter_dir,
+            num_train_epochs=epochs,
+            per_device_train_batch_size=batch_size,
+            gradient_accumulation_steps=grad_accum,
+            learning_rate=learning_rate,
+            lr_scheduler_type="cosine",
+            warmup_ratio=0.05,
+            optim="paged_adamw_8bit",  # paged variant spills optimizer state to CPU under VRAM pressure
+            logging_steps=1,
+            # save_strategy="no": skip per-epoch checkpoint saves (serializing 27B model VRAM-spikes beyond training peak — caused step-23 OOM even on WSL2 with expandable_segments).
+            save_strategy="no",
+            max_length=max_seq_length,
+            dataset_text_field="text",
+            packing=False,
+            bf16=True,
+            report_to="none",
+            gradient_checkpointing=True,
+        )
+        logger.info("Starting SFT training...")
+        logger.info(
+            "  Epochs: %d, Batch: %d, Grad accum: %d, LR: %s, max_seq: %d",
+            epochs, batch_size, grad_accum, learning_rate, max_seq_length,
+        )
+        trainer = SFTTrainer(
+            model=model,
+            args=training_args,
+            train_dataset=dataset,
+            processing_class=tokenizer,
+            callbacks=[ProgressCallback()],
+        )
 
     train_result = trainer.train()
     logger.info("Training complete! Loss: %.4f", train_result.training_loss)
@@ -312,7 +384,9 @@ def train(
     # Save training metadata
     meta = {
         "model": model_name,
+        "method": "dpo" if use_dpo else "sft",
         "lora_rank": lora_rank,
+        "max_seq_length": max_seq_length,
         "training_pairs": len(data),
         "epochs": epochs,
         "final_loss": train_result.training_loss,
@@ -322,62 +396,147 @@ def train(
         json.dump(meta, f, indent=2)
 
     logger.info("Adapter saved successfully!")
+
+    # Optional: TIES continual-merge with prior adapter to preserve old corrections
+    # while applying the new ones. Activated by ENABLE_LORA_CONTINUAL_MERGE; falls
+    # back to the unmerged adapter on any failure (no harm done).
+    if os.getenv("ENABLE_LORA_CONTINUAL_MERGE", "false").lower() == "true":
+        try:
+            from scripts.lora_merge import ties_merge, get_prior_adapter_path
+            prior = get_prior_adapter_path()
+            if prior:
+                alpha = float(os.getenv("LORA_MERGE_ALPHA", "0.5"))
+                merged_dir = ties_merge(adapter_dir, prior, alpha=alpha)
+                if merged_dir:
+                    logger.info("[LoRA-merge] using merged adapter: %s", merged_dir)
+                    return merged_dir
+                else:
+                    logger.info("[LoRA-merge] merge skipped — using new adapter as-is")
+            else:
+                logger.info("[LoRA-merge] no prior adapter — this run is the seed")
+        except Exception as e:
+            logger.warning("[LoRA-merge] failed: %s — using unmerged adapter", e)
+
     return adapter_dir
+
+
+def _find_convert_hf_to_gguf() -> str:
+    """Locate the vanilla convert_hf_to_gguf.py script.
+
+    Unsloth ships a copy at ~/.unsloth/llama.cpp/. Prefer it over
+    unsloth_convert_hf_to_gguf.py — the unsloth wrapper has the same
+    stale-cache and dynamic-module-loading bugs that motivated this
+    manual path in the first place.
+    """
+    candidates = [
+        Path.home() / ".unsloth" / "llama.cpp" / "convert_hf_to_gguf.py",
+        # Fallback: a system-installed llama.cpp clone
+        Path("/usr/local/share/llama.cpp/convert_hf_to_gguf.py"),
+    ]
+    for p in candidates:
+        if p.exists():
+            return str(p)
+    raise RuntimeError(
+        "convert_hf_to_gguf.py not found in any known location. "
+        "Expected at ~/.unsloth/llama.cpp/convert_hf_to_gguf.py. "
+        "Reinstall Unsloth or clone llama.cpp."
+    )
 
 
 def export_gguf(adapter_dir: str, output_dir: str, model_name: str = DEFAULT_MODEL) -> str:
     """Merge LoRA adapter and export to GGUF format for Ollama.
 
-    Returns path to the GGUF file.
-    """
-    try:
-        from unsloth import FastLanguageModel
-    except ImportError:
-        raise RuntimeError("Unsloth not installed. Run: pip install -r scripts/requirements-finetune.txt")
+    Uses a manual PEFT merge + vanilla convert_hf_to_gguf.py rather than
+    Unsloth's `save_pretrained_gguf`, which has two recurring bugs hit
+    on v9, v10, and v17:
+      (a) stale-cache: reuses cached merged shards from a prior run keyed
+          on the snapshot path, producing a "fresh" GGUF that is actually
+          the previous run's weights;
+      (b) dynamic-module loading: downloads a temp script that fails
+          with `ModuleNotFoundError: No module named 'conversion'`.
+    See CLAUDE.md "Fine-Tuning -> Two quirks" for context.
 
-    merged_dir = os.path.join(output_dir, "merged")
+    Returns path to the Q8_0 GGUF file.
+    """
+    import subprocess
+    import sys as _sys
+    import shutil as _shutil
+
+    import torch
+    from peft import PeftModel
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    merged_dir = os.path.join(output_dir, "merged_manual")
     gguf_path = os.path.join(output_dir, "nova-ft.gguf")
 
-    logger.info("Loading base model + adapter for merge...")
-    model, tokenizer = FastLanguageModel.from_pretrained(
-        model_name=adapter_dir,
-        max_seq_length=DEFAULT_MAX_SEQ_LENGTH,
-        load_in_4bit=True,
-    )
+    # Clean any stale prior-run output to avoid the same kind of cache
+    # confusion that bit Unsloth.
+    if os.path.isdir(merged_dir):
+        logger.info("Removing prior merged_manual at %s", merged_dir)
+        _shutil.rmtree(merged_dir)
+    os.makedirs(merged_dir, exist_ok=True)
+    if os.path.exists(gguf_path):
+        os.remove(gguf_path)
 
-    logger.info("Exporting to GGUF (Q8_0 — near-lossless, optimal VRAM/context tradeoff)...")
-    model.save_pretrained_gguf(
+    logger.info("Loading base model (%s) for manual merge", model_name)
+    base = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        torch_dtype=torch.bfloat16,
+        device_map="cpu",  # CPU merge — merge is mostly IO, frees GPU for next run
+        low_cpu_mem_usage=True,
+    )
+    logger.info("Applying LoRA adapter from %s", adapter_dir)
+    peft_model = PeftModel.from_pretrained(base, adapter_dir)
+    logger.info("Merging weights (merge_and_unload)")
+    merged = peft_model.merge_and_unload()
+    logger.info("Saving merged model to %s", merged_dir)
+    merged.save_pretrained(merged_dir, safe_serialization=True, max_shard_size="5GB")
+
+    # Carry tokenizer + chat template alongside the merged weights so
+    # convert_hf_to_gguf.py can pick them up.
+    tok = AutoTokenizer.from_pretrained(adapter_dir)
+    tok.save_pretrained(merged_dir)
+    src_tpl = os.path.join(adapter_dir, "chat_template.jinja")
+    if os.path.exists(src_tpl):
+        _shutil.copy2(src_tpl, os.path.join(merged_dir, "chat_template.jinja"))
+
+    convert_script = _find_convert_hf_to_gguf()
+    logger.info("Converting merged model to Q8_0 GGUF via %s", convert_script)
+    cmd = [
+        _sys.executable, convert_script,
         merged_dir,
-        tokenizer,
-        quantization_method="q8_0",
+        "--outtype", "q8_0",
+        "--outfile", gguf_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        logger.error("convert_hf_to_gguf.py failed (exit=%d)\nstdout:\n%s\nstderr:\n%s",
+                     result.returncode, result.stdout[-2000:], result.stderr[-2000:])
+        raise RuntimeError(f"GGUF conversion failed: {result.stderr[-500:]}")
+
+    if not os.path.exists(gguf_path):
+        raise RuntimeError(f"GGUF conversion reported success but file missing: {gguf_path}")
+
+    sz_gb = os.path.getsize(gguf_path) / (1024 ** 3)
+    logger.info("GGUF exported: %s (%.2f GiB)", gguf_path, sz_gb)
+
+    # Create Ollama Modelfile
+    modelfile_path = os.path.join(output_dir, "Modelfile")
+    with open(modelfile_path, "w") as f:
+        f.write(f'FROM {gguf_path}\n')
+        f.write('TEMPLATE {{ .Prompt }}\n')
+        f.write('RENDERER qwen3.5\n')
+        f.write('PARSER qwen3.5\n')
+        f.write('PARAMETER temperature 0.7\n')
+        f.write('PARAMETER num_predict 4000\n')
+        f.write('PARAMETER num_ctx 32768\n')
+    logger.info("Ollama Modelfile created: %s", modelfile_path)
+    logger.info(
+        "To register with Ollama:\n"
+        "  ollama create nova-ft -f %s",
+        modelfile_path,
     )
-
-    # The GGUF file will be in merged_dir with a standard name
-    gguf_files = list(Path(merged_dir).glob("*.gguf"))
-    if gguf_files:
-        actual_path = str(gguf_files[0])
-        logger.info("GGUF exported: %s", actual_path)
-
-        # Create Ollama Modelfile
-        modelfile_path = os.path.join(output_dir, "Modelfile")
-        with open(modelfile_path, "w") as f:
-            f.write(f'FROM {actual_path}\n')
-            f.write('TEMPLATE {{ .Prompt }}\n')
-            f.write('RENDERER qwen3.5\n')
-            f.write('PARSER qwen3.5\n')
-            f.write('PARAMETER temperature 0.7\n')
-            f.write('PARAMETER num_predict 4000\n')
-            f.write('PARAMETER num_ctx 32768\n')
-        logger.info("Ollama Modelfile created: %s", modelfile_path)
-        logger.info(
-            "To register with Ollama:\n"
-            "  ollama create nova-ft -f %s",
-            modelfile_path,
-        )
-        return actual_path
-
-    logger.warning("No GGUF file found in %s", merged_dir)
-    return ""
+    return gguf_path
 
 
 def main():

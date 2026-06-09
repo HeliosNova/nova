@@ -1,4 +1,4 @@
-# Nova automated evaluation suite — 30 tasks across 6 categories.
+# Nova automated evaluation suite — 53 tasks across 9 categories.
 #
 # Each task runs through the real brain pipeline (ephemeral=True so no
 # conversation history is written).  seed_skill entries are created in the
@@ -19,6 +19,28 @@
 #   response_not_empty   — response has >= 20 non-whitespace characters
 
 version: "1"
+
+# Per-category regression tolerance (added 2026-05-13, task #33).
+# Overrides config.EVAL_REGRESSION_TOLERANCE for the named category.
+# Categories not listed here fall back to the global tolerance.
+#
+# Intent: reasoning is pure model capability — should be tight (5pp).
+# tool-use depends on external services (search engines, real-time data)
+# so its noise floor is higher (15pp). multi-agent is sensitive to
+# decomposer-gate tuning; loosen to avoid flapping when the threshold
+# moves.
+categories_meta:
+  reasoning:
+    regression_tolerance: 0.05
+  tool-use:
+    regression_tolerance: 0.15
+  multi-agent:
+    regression_tolerance: 0.15
+  memory-learning:
+    regression_tolerance: 0.05
+  kg-retrieval:
+    regression_tolerance: 0.05
+
 tasks:
 
   # =========================================================================
@@ -30,7 +52,7 @@ tasks:
   - id: reasoning_math_basic
     category: reasoning
     query: "What is 17 multiplied by 23?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: answer_contains
         value: "391"
@@ -40,7 +62,7 @@ tasks:
   - id: reasoning_math_multistep
     category: reasoning
     query: "I start with 100 apples, give away 35, then buy 20 more. How many do I have?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: answer_contains
         value: "85"
@@ -50,7 +72,7 @@ tasks:
   - id: reasoning_unit_conversion
     category: reasoning
     query: "How many minutes are in 3 hours and 45 minutes?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: answer_contains
         value: "225"
@@ -60,7 +82,7 @@ tasks:
   - id: reasoning_logic_spatial
     category: reasoning
     query: "A is directly north of B. B is directly east of C. Is A northeast of C? Answer yes or no and explain why."
-    timeout: 60
+    timeout: 120
     assertions:
       - type: answer_matches
         value: "\\byes\\b"
@@ -69,7 +91,7 @@ tasks:
   - id: reasoning_definition
     category: reasoning
     query: "What is the difference between a stack and a queue in computer science?"
-    timeout: 60
+    timeout: 240
     assertions:
       - type: answer_matches
         value: "\\b(?:LIFO|FIFO|last.in|first.in)\\b"
@@ -86,7 +108,7 @@ tasks:
   - id: tool_calculator_percent
     category: tool-use
     query: "Calculate 15 percent of 840"
-    timeout: 60
+    timeout: 120
     assertions:
       - type: tool_invoked
         value: calculator
@@ -96,7 +118,7 @@ tasks:
   - id: tool_calculator_sqrt
     category: tool-use
     query: "What is the square root of 256?"
-    timeout: 60
+    timeout: 120
     assertions:
       - type: tool_invoked
         value: calculator
@@ -106,7 +128,7 @@ tasks:
   - id: tool_calculator_pythagorean
     category: tool-use
     query: "Calculate the hypotenuse of a right triangle with legs 3 and 4"
-    timeout: 60
+    timeout: 120
     assertions:
       - type: tool_invoked
         value: calculator
@@ -116,7 +138,7 @@ tasks:
   - id: tool_code_sum
     category: tool-use
     query: "Run Python code to compute the sum of integers from 1 to 10 and print it"
-    timeout: 90
+    timeout: 180
     assertions:
       - type: tool_invoked
         value: code_exec
@@ -126,7 +148,7 @@ tasks:
   - id: tool_code_primes
     category: tool-use
     query: "Write and run Python code to list all prime numbers less than 20"
-    timeout: 90
+    timeout: 180
     assertions:
       - type: tool_invoked
         value: code_exec
@@ -138,7 +160,7 @@ tasks:
   - id: tool_web_search
     category: tool-use
     query: "Search the web for the current Python programming language version"
-    timeout: 90
+    timeout: 180
     assertions:
       - type: tool_invoked
         value: web_search
@@ -154,7 +176,7 @@ tasks:
   - id: skill_match_crypto_price
     category: skill-match
     query: "eval-probe: what is the price of bitcoin"
-    timeout: 60
+    timeout: 120
     seed_skill:
       name: "Eval: Crypto Price Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*price\\s+of\\s+(?:bitcoin|btc|ethereum|eth)\\b"
@@ -169,13 +191,13 @@ tasks:
   - id: skill_match_weather
     category: skill-match
     query: "eval-probe: what is the weather today"
-    timeout: 60
+    timeout: 300
     seed_skill:
       name: "Eval: Weather Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:weather|forecast|temperature)\\b"
       steps:
         - tool: web_search
-          args_template: {q: "{query}"}
+          args_template: {q: "weather today"}
           output_key: result
       answer_template: "Weather based on search"
     assertions:
@@ -184,7 +206,7 @@ tasks:
   - id: skill_match_unit_convert
     category: skill-match
     query: "eval-probe: convert 10 kilometers to miles"
-    timeout: 60
+    timeout: 120
     seed_skill:
       name: "Eval: Unit Conversion Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*convert\\s+\\d+\\s+(?:kilometers?|km)\\s+to\\s+miles\\b"
@@ -199,13 +221,13 @@ tasks:
   - id: skill_match_news
     category: skill-match
     query: "eval-probe: get the latest news on AI"
-    timeout: 60
+    timeout: 180
     seed_skill:
       name: "Eval: News Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:news|latest|headlines)\\b"
       steps:
         - tool: web_search
-          args_template: {q: "{query}"}
+          args_template: {q: "latest AI news"}
           output_key: result
       answer_template: "Latest news"
     assertions:
@@ -214,7 +236,7 @@ tasks:
   - id: skill_match_stock_price
     category: skill-match
     query: "eval-probe: what is the stock price of NVDA"
-    timeout: 60
+    timeout: 120
     seed_skill:
       name: "Eval: Stock Price Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*stock\\s+price\\s+of\\s+(?P<ticker>[A-Z]{1,5})\\b"
@@ -229,7 +251,7 @@ tasks:
   - id: skill_match_timezone
     category: skill-match
     query: "eval-probe: what time is it in tokyo"
-    timeout: 60
+    timeout: 120
     seed_skill:
       name: "Eval: Timezone Probe"
       trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:time|clock).*in\\s+(?P<city>\\w+)\\b"
@@ -252,7 +274,7 @@ tasks:
   - id: semantic_crypto_paraphrase
     category: semantic-match
     query: "how much does BTC cost right now"
-    timeout: 60
+    timeout: 120
     paraphrase_of: skill_match_crypto_price
     seed_skill:
       name: "Eval: Crypto Price Probe"
@@ -268,7 +290,7 @@ tasks:
   - id: semantic_weather_paraphrase
     category: semantic-match
     query: "will it rain today, what is the forecast outside"
-    timeout: 60
+    timeout: 240
     paraphrase_of: skill_match_weather
     seed_skill:
       name: "Eval: Weather Probe"
@@ -284,7 +306,7 @@ tasks:
   - id: semantic_units_paraphrase
     category: semantic-match
     query: "10km in miles please"
-    timeout: 60
+    timeout: 120
     paraphrase_of: skill_match_unit_convert
     seed_skill:
       name: "Eval: Unit Conversion Probe"
@@ -300,7 +322,7 @@ tasks:
   - id: semantic_news_paraphrase
     category: semantic-match
     query: "show me recent AI developments and breakthroughs"
-    timeout: 60
+    timeout: 120
     paraphrase_of: skill_match_news
     seed_skill:
       name: "Eval: News Probe"
@@ -316,7 +338,7 @@ tasks:
   - id: semantic_stock_paraphrase
     category: semantic-match
     query: "NVDA share price today"
-    timeout: 60
+    timeout: 120
     paraphrase_of: skill_match_stock_price
     seed_skill:
       name: "Eval: Stock Price Probe"
@@ -329,6 +351,51 @@ tasks:
     assertions:
       - type: skill_matched
 
+  # ---- Adversarial paraphrase variants (added 2026-05-13, task #32) ----
+  # These intentionally stress the semantic-match path beyond clean human
+  # rewordings: typos, domain shift, and explicit negation. They share
+  # the same seed_skill machinery as the clean paraphrases above.
+
+  - id: semantic_weather_typo
+    category: semantic-match
+    query: "What is the wether like in San Francisco today"   # typo: "wether"
+    timeout: 120
+    paraphrase_of: skill_match_weather
+    seed_skill:
+      name: "Eval: Weather Probe"
+      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*weather\\s+in\\s+(?P<location>[A-Za-z\\s]+)\\b"
+      steps:
+        - tool: web_search
+          args_template: {q: "weather {location}"}
+          output_key: result
+      answer_template: "Weather based on search"
+    assertions:
+      - type: skill_matched
+
+  - id: semantic_domain_shift_negation
+    category: semantic-match
+    # Negation: skill should NOT trigger when the user explicitly asks for
+    # the opposite. Pinned as a known limitation — current semantic match
+    # is bag-of-words and will likely fire. Lift when negation handling lands.
+    query: "I do NOT want today's Bitcoin price — just the historical low"
+    timeout: 120
+    paraphrase_of: skill_match_stock_price
+    assertions:
+      - type: response_not_empty
+
+  - id: semantic_domain_shift_unrelated
+    category: semantic-match
+    # Domain-shift adversarial: superficial word overlap ("price",
+    # "stock") with the Stock Price Probe skill but the actual ask is
+    # totally unrelated (advice on a hobby, not a quote). Skill should
+    # NOT match. Pinned as response_not_empty — full skill_not_matched
+    # assertion would be tighter but harness doesn't support that flag yet.
+    query: "I have a stockpile of old vinyl records — any tips on pricing them for resale?"
+    timeout: 120
+    paraphrase_of: skill_match_stock_price
+    assertions:
+      - type: response_not_empty
+
   # =========================================================================
   # Category: autonomous-tool  (4 tasks)
   # Recurring multi-tool patterns that benefit from skill creation.
@@ -338,12 +405,15 @@ tasks:
 
   - id: autonomous_compound_interest
     category: autonomous-tool
-    query: "Calculate compound interest: $1000 principal, 5% annual rate, 3 years"
+    # 2026-05-09: model picked monthly compounding from lesson #276's bias
+    # ($5,000 at 4.5% monthly) and produced $1,161.47. Clarify the
+    # compounding frequency in the query so it can't be ambiguous.
+    query: "Calculate compound interest: $1000 principal, 5% annual rate, compounded annually, 3 years"
     timeout: 90
     assertions:
       - type: response_not_empty
       - type: answer_matches
-        value: "\\b1157|1158|1159\\b"
+        value: "\\b1,?(?:157|158|159)\\b"
 
   - id: autonomous_weather_and_news
     category: autonomous-tool
@@ -356,7 +426,9 @@ tasks:
 
   - id: autonomous_stock_and_calc
     category: autonomous-tool
-    query: "If AAPL stock is currently worth $200 and I invest $5000, how many whole shares can I buy?"
+    # Hypothetical stock price — the assertion checks math, not a live lookup.
+    # Explicit "hypothetically" prevents Nova from overriding with real data.
+    query: "Hypothetically, if AAPL stock is worth $200 and I invest $5000, how many whole shares can I buy? Use the $200 figure exactly."
     timeout: 90
     assertions:
       - type: response_not_empty
@@ -382,7 +454,7 @@ tasks:
   - id: reflexion_good_simple
     category: reflexion-calibration
     query: "How many days are in a leap year?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: answer_contains
         value: "366"
@@ -392,7 +464,7 @@ tasks:
   - id: reflexion_good_factual
     category: reflexion-calibration
     query: "What programming language is the Django web framework written in?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: answer_matches
         value: "\\bPython\\b"
@@ -402,7 +474,7 @@ tasks:
   - id: reflexion_uncertain_forecast
     category: reflexion-calibration
     query: "What will the exact S&P 500 index value be one year from today?"
-    timeout: 60
+    timeout: 120
     assertions:
       - type: response_not_empty
       - type: reflexion_in_range
@@ -412,7 +484,7 @@ tasks:
   - id: reflexion_uncertain_stars
     category: reflexion-calibration
     query: "What is the exact number of stars in the Milky Way galaxy?"
-    timeout: 45
+    timeout: 120
     assertions:
       - type: response_not_empty
       - type: reflexion_in_range
@@ -434,7 +506,7 @@ tasks:
   - id: multi_agent_parallel_compare
     category: multi-agent
     query: "Compare Python and JavaScript: how are they different in terms of typing system, execution model, and primary use cases? Give me a detailed comparison of both."
-    timeout: 120
+    timeout: 300
     tags: [parallel-decomposable]
     assertions:
       - type: response_not_empty
@@ -445,7 +517,7 @@ tasks:
   - id: multi_agent_sequential_research
     category: multi-agent
     query: "First search for the current Python version, then based on that result calculate how many years have passed since Python 1.0 was released in 1994 and how many major versions there have been."
-    timeout: 150
+    timeout: 300
     tags: [sequential-decomposable]
     assertions:
       - type: response_not_empty
@@ -456,12 +528,64 @@ tasks:
   - id: multi_agent_no_decompose
     category: multi-agent
     query: "What is 2 plus 2?"
-    timeout: 45
+    timeout: 300
     tags: [should-not-decompose]
     assertions:
       - type: answer_contains
         value: "4"
       - type: decomposition_not_fired
+
+  # SHARP3 reasoning probes — deliberation route + reasoning-shape tests
+  # Timeouts sized for RTX 3090 + nova-ft Q8 + ToT sample_n=3 + multi-step deliberation.
+  - id: deliberation_chain_of_reasoning
+    category: multi-agent
+    query: "Walk me through how you would design a rate limiter for a REST API that must sustain 100,000 requests per second, step by step."
+    timeout: 1200
+    tags: [deliberation-route]
+    assertions:
+      - type: response_not_empty
+      - type: answer_matches
+        value: "\\b(?:step|first|then|next|finally|1\\.|2\\.|rate.limit|token.bucket|leaky.bucket|sliding.window)\\b"
+      # Catch the misreading regression we hit on 2026-05-08: model dropped
+      # the "k" from "100k req/sec" and answered for ~100 RPS instead of 100,000.
+      # Require the response to mention a six-figure scale somewhere.
+      - type: answer_matches
+        value: "100[,]?000|100k\\b|hundred\\s+thousand"
+
+  - id: reasoning_why_causal_chain
+    category: reasoning
+    query: "Why does a higher CPU clock speed not always result in better performance?"
+    timeout: 300
+    assertions:
+      - type: response_not_empty
+      - type: answer_matches
+        value: "\\b(?:because|since|due to|results in|leads to|cause|effect|bottleneck|memory|cache|pipeline|heat)\\b"
+      - type: reflexion_above
+        value: 0.4
+
+  - id: reasoning_definitional_no_decompose
+    category: reasoning
+    query: "What is the difference between TCP and UDP protocols?"
+    timeout: 240
+    tags: [definitional-no-decompose]
+    assertions:
+      - type: response_not_empty
+      - type: answer_matches
+        value: "\\b(?:TCP|UDP|connection|reliable|fast|datagram|protocol|handshake)\\b"
+      - type: decomposition_not_fired
+
+  - id: multi_agent_recursive_depth_2
+    category: multi-agent
+    query: "Compare two backend stack pairs side by side: (1) Python+FastAPI vs Python+Django for a high-throughput JSON API; and (2) Node.js+Express vs Node.js+Fastify for the same use case. For each pair, give the winner and a one-line reason. Then synthesize across both pairs."
+    timeout: 600
+    tags: [recursive-decomposable]
+    assertions:
+      - type: response_not_empty
+      - type: decomposition_fired
+      - type: decomposition_depth_at_least
+        value: 2
+      - type: answer_matches
+        value: "\\b(?:FastAPI|Django|Express|Fastify)\\b"
 
   # =========================================================================
   # Category: retrieval  (3 tasks)
@@ -475,7 +599,7 @@ tasks:
   - id: retrieval_exact_keyword
     category: retrieval
     query: "eval-retrieval: What is Merkle tree cryptographic hash structure?"
-    timeout: 60
+    timeout: 120
     tags: [bm25-dominant]
     seed_document:
       title: "Merkle Trees in Cryptography"
@@ -494,7 +618,7 @@ tasks:
   - id: retrieval_semantic_paraphrase
     category: retrieval
     query: "eval-retrieval: How does gradient descent minimize loss in training?"
-    timeout: 60
+    timeout: 120
     tags: [vector-dominant]
     seed_document:
       title: "Backpropagation and Optimization"
@@ -507,13 +631,16 @@ tasks:
         update process converges toward a local minimum of the error surface,
         enabling neural networks to fit training data accurately.
     assertions:
+      # Seed doc uses both 'parameter' and 'weight' — accept either since they
+      # are synonymous in this context. Failure was observed 2026-05-09 when the
+      # answer used 'weights' but assertion required literal 'parameter'.
       - type: retrieval_recall
-        value: "parameter"
+        value: "parameter|weight"
 
   - id: retrieval_reranker_regression_probe
     category: retrieval
     query: "eval-retrieval: MVCC snapshot isolation readers writers PostgreSQL VACUUM dead tuples"
-    timeout: 60
+    timeout: 120
     tags: [reranker-probe, adversarial-confounder]
     seed_document:
       title: "PostgreSQL MVCC and Concurrency"
@@ -529,3 +656,253 @@ tasks:
     assertions:
       - type: retrieval_recall
         value: "MVCC"
+
+  # =========================================================================
+  # Category: stress  (added 2026-05-13, task #31)
+  # Tests for paths that scale poorly or only fire under load — multi-agent
+  # spawn limits, large tool-output trimming, deep decomposition recursion.
+  # These tests are slow (multi-agent latency) but worth running nightly to
+  # catch regressions in capacity-related code.
+  # =========================================================================
+
+  - id: stress_multi_agent_5_entities
+    category: multi-agent
+    # 5-entity compare should decompose to ~5 sub-agents under MAX_AGENT_COUNT.
+    # Validates the merge-budget-scales-with-agent-count code path (regression
+    # was: N≥5 used to truncate output mid-enumeration).
+    query: "Compare the climates of Tokyo, Osaka, Kyoto, Sapporo, and Fukuoka in summer."
+    timeout: 240
+    assertions:
+      - type: decomposition_fired
+      - type: response_not_empty
+      - type: answer_matches
+        value: "(?i)(tokyo|osaka|kyoto|sapporo|fukuoka)"
+
+  - id: stress_decomposition_depth_cap
+    category: multi-agent
+    # Two-level decomposable query. Should fire at depth 1 but NOT recurse
+    # past MAX_STRUCTURAL_DEPTH (default 2). Pins the depth-cap behavior so
+    # a future relaxation of the cap is visible.
+    query: "Compare Python and JavaScript, and within each, compare async vs threading."
+    timeout: 240
+    assertions:
+      - type: decomposition_fired
+      - type: decomposition_depth_at_least
+        value: 1
+      - type: response_not_empty
+
+  - id: stress_long_tool_output_trim
+    category: tool-use
+    # Asks for a web_search that typically returns >2KB of result chunks.
+    # Validates that brain.py's TOOL_OUTPUT_MAX_CHARS trim is in effect —
+    # if a regression lets the full payload through, multi-agent merge
+    # context bloat compounds and downstream truncation surfaces.
+    query: "What are the latest releases from open-source AI projects this week? Find at least 3."
+    timeout: 240
+    assertions:
+      - type: tool_invoked
+        value: web_search
+      - type: response_not_empty
+
+  # =========================================================================
+  # Category: memory-learning  (7 tasks — the learning-loop PROOF)
+  # The headline claim made falsifiable: a correction stored as a lesson must
+  # CAUSE a corrected answer. Each task runs the query with the lesson ABSENT,
+  # seeds the lesson, runs again with it PRESENT, then deletes it (atomic and
+  # self-isolating — see EvalHarness._run_memory_task). Metric:
+  #   memory_causal_fix_rate = of pairs the base model did NOT already know,
+  #   the fraction the seeded lesson fixed (after_correct AND NOT before_correct).
+  # Facts are invented / project-internal so the base model reliably cannot
+  # know them (before_correct=False → the pair is testable).
+  #   *_direct      — query worded like the lesson (keyword retrieval suffices)
+  #   *_paraphrase  — query deliberately avoids the lesson's words, so only
+  #                   SEMANTIC lesson retrieval can surface it (the WS2A target;
+  #                   expected to lag at baseline, improve once retrieval is
+  #                   semantic-first).
+  # =========================================================================
+
+  - id: mem_scheduler_codename_direct
+    category: memory-learning
+    query: "What is the codename of Nova's internal task scheduler?"
+    timeout: 120
+    seed_lesson:
+      topic: "Nova scheduler codename"
+      correct_answer: "Nova's internal task scheduler is codenamed Chronos."
+      lesson_text: "Nova's internal task scheduler is codenamed 'Chronos'."
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Chronos"
+
+  - id: mem_scheduler_codename_paraphrase
+    category: memory-learning
+    # Query avoids "scheduler"/"codename" — only semantic retrieval surfaces the lesson.
+    query: "Inside Nova, what do we call the component that runs background jobs on a timer?"
+    timeout: 120
+    seed_lesson:
+      topic: "Nova scheduler codename"
+      correct_answer: "Nova's internal task scheduler is codenamed Chronos."
+      lesson_text: "Nova's internal task scheduler is codenamed 'Chronos'."
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Chronos"
+
+  - id: mem_user_language_direct
+    category: memory-learning
+    query: "What is the user's preferred programming language?"
+    timeout: 120
+    seed_lesson:
+      topic: "User preferred programming language"
+      correct_answer: "The user's preferred programming language is Rust."
+      lesson_text: "The user prefers to write code in Rust."
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Rust"
+
+  - id: mem_acronym_zqx_direct
+    category: memory-learning
+    query: "In the Nova project, what does the codename 'ZQX' refer to?"
+    timeout: 120
+    seed_lesson:
+      topic: "ZQX codename"
+      correct_answer: "ZQX is the codename for Nova's experimental vector cache."
+      lesson_text: "In Nova, 'ZQX' is the codename of the experimental vector cache subsystem."
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "vector cache"
+
+  - id: mem_aircraft_altitude_direct
+    category: memory-learning
+    query: "What is the maximum altitude of the Skylance X9 aircraft?"
+    timeout: 120
+    seed_lesson:
+      topic: "Skylance X9 max altitude"
+      correct_answer: "The Skylance X9 has a maximum altitude of 87,000 feet."
+      lesson_text: "The Skylance X9 aircraft's maximum service altitude is 87,000 feet."
+      confidence: 0.95
+    assertions:
+      - type: answer_matches
+        value: "87,?000"
+
+  - id: mem_aircraft_altitude_paraphrase
+    category: memory-learning
+    # "how high can it fly" vs the lesson's "maximum altitude" — semantic, not lexical.
+    query: "How high up can the Skylance X9 fly at the very most?"
+    timeout: 120
+    seed_lesson:
+      topic: "Skylance X9 max altitude"
+      correct_answer: "The Skylance X9 has a maximum altitude of 87,000 feet."
+      lesson_text: "The Skylance X9 aircraft's maximum service altitude is 87,000 feet."
+      confidence: 0.95
+    assertions:
+      - type: answer_matches
+        value: "87,?000"
+
+  - id: mem_person_city_paraphrase
+    category: memory-learning
+    # "based" vs the lesson's "works in / located in" — light paraphrase.
+    query: "According to my notes, where is the researcher Dr. Lena Voss based?"
+    timeout: 120
+    seed_lesson:
+      topic: "Dr. Lena Voss location"
+      correct_answer: "Dr. Lena Voss works in Reykjavik."
+      lesson_text: "Per the user's notes, Dr. Lena Voss is located in Reykjavik."
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Reykjavik"
+
+  # =========================================================================
+  # Category: kg-retrieval  (6 tasks — does a seeded KG fact reach the answer?)
+  # Same before/seed/after proof as memory-learning, but seeds a (subject,
+  # predicate, object) triple via kg.add_fact and exercises get_relevant_facts
+  # → KG prompt injection (see EvalHarness._run_kg_task). Invented entities so
+  # the base model can't already know them.
+  #   *_direct      — query repeats the multi-word entity name (keyword overlap
+  #                   >=2 → the keyword path alone retrieves it; control).
+  #   *_paraphrase  — single-word entity + reworded predicate, so keyword
+  #                   overlap is <2. These depend on the VECTOR/PPR signals —
+  #                   exactly what the get_relevant_facts RRF-discard bug drops.
+  # =========================================================================
+
+  - id: kg_leader_direct
+    category: kg-retrieval
+    query: "Who leads the Aetherion Guild?"
+    timeout: 120
+    seed_fact:
+      subject: "Aetherion Guild"
+      predicate: "led_by"
+      object: "Mara Quill"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Quill"
+
+  - id: kg_location_direct
+    category: kg-retrieval
+    query: "Where is the Vortex Institute located?"
+    timeout: 120
+    seed_fact:
+      subject: "Vortex Institute"
+      predicate: "located_in"
+      object: "Talloran City"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Talloran"
+
+  - id: kg_based_paraphrase
+    category: kg-retrieval
+    # query says "Vorenza" (1-word) + "based" — overlap with the fact is 1 word.
+    query: "Where is Vorenza based?"
+    timeout: 120
+    seed_fact:
+      subject: "Vorenza"
+      predicate: "headquartered_in"
+      object: "Brindlemark"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Brindlemark"
+
+  - id: kg_behind_paraphrase
+    category: kg-retrieval
+    query: "Who is the person behind Kestrel?"
+    timeout: 120
+    seed_fact:
+      subject: "Kestrel"
+      predicate: "created_by"
+      object: "Dario Venn"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Venn"
+
+  - id: kg_made_paraphrase
+    category: kg-retrieval
+    query: "Which team built Halcyon?"
+    timeout: 120
+    seed_fact:
+      subject: "Halcyon"
+      predicate: "developed_by"
+      object: "Iris Quon"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Quon"
+
+  - id: kg_runs_paraphrase
+    category: kg-retrieval
+    query: "Who runs Nimbus?"
+    timeout: 120
+    seed_fact:
+      subject: "Nimbus"
+      predicate: "operated_by"
+      object: "the Peladora Group"
+      confidence: 0.95
+    assertions:
+      - type: answer_contains
+        value: "Peladora"

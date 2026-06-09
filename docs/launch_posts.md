@@ -2,15 +2,15 @@
 
 ## 1. Hacker News (Show HN)
 
-**Title:** Show HN: Nova – Self-hosted personal AI that learns from corrections and fine-tunes itself
+**Title:** Show HN: Nova – Self-hosted personal AI that learns from your corrections (durable memory, not fine-tuning)
 
 **Body:**
 
-Hey HN, I built Nova — a personal AI assistant that runs entirely on your hardware and actually gets smarter over time.
+Hey HN, I built Nova — a personal AI assistant that runs entirely on your hardware and remembers what you teach it.
 
-The core idea: every time you correct Nova, it extracts a lesson, generates a DPO training pair, and when enough pairs accumulate, it automatically fine-tunes itself with A/B evaluation before deploying the new model.
+The core idea: every time you correct Nova, it stores a lesson and a knowledge-graph fact and retrieves them on future answers — durable, in-context learning, no retraining. (It can also run an optional local DPO fine-tune, but that's experimental and off by default — in honest A/B evals our small-data fine-tunes only tie the base model, so the *memory* is what does the learning.)
 
-No other open-source project combines all of these in one system.
+I haven't found another self-hosted assistant that pairs a *measured* memory loop with all of the below.
 
 **What it does:**
 - Correction detection (2-stage: regex + LLM) → lesson extraction → DPO training data → automated fine-tuning with A/B eval
@@ -26,7 +26,7 @@ No other open-source project combines all of these in one system.
 
 **Security:** 4-tier access control, prompt injection detection (4 categories), SSRF protection, HMAC skill signing, Docker hardening (read-only root, no-new-privileges, all caps dropped). Built with OWASP Agentic Security in mind.
 
-**Stack:** Python, FastAPI, httpx, Ollama, ChromaDB, SQLite, React. 1,689 tests.
+**Stack:** Python, FastAPI, httpx, Ollama, ChromaDB, SQLite, React. 2,387 tests.
 
 No GPU? Set `LLM_PROVIDER=openai` and use cloud inference while keeping all data local.
 
@@ -36,7 +36,7 @@ https://github.com/HeliosNova/nova
 
 ## 2. Reddit r/LocalLLaMA
 
-**Title:** Nova — self-hosted personal AI that learns from your corrections and fine-tunes itself (DPO + A/B eval, runs on RTX 3090)
+**Title:** Nova — self-hosted personal AI that learns from your corrections via a measured memory loop (runs on RTX 3090)
 
 **Body:**
 
@@ -48,9 +48,9 @@ I've been building Nova for a while and just open-sourced it. It's a personal AI
 4. Extracts a structured lesson (topic, wrong answer, correct answer)
 5. Generates a DPO training pair {query, chosen, rejected}
 6. On future similar queries, retrieves the lesson and gets it right
-7. When enough training pairs accumulate, runs automated DPO fine-tuning with A/B evaluation
+7. (Optional, experimental, off by default) it can export those pairs for a local DPO fine-tune behind an A/B gate — but in honest evals the fine-tune only ties the base, so step 6 (memory retrieval) is what actually makes it right next time.
 
-No other open-source project combines all of these capabilities.
+I haven't seen another self-hosted assistant pair this kind of *measured* memory loop with everything below.
 
 **Beyond the learning loop:**
 - Temporal knowledge graph (facts track when they were valid, supersession chains)
@@ -64,7 +64,7 @@ No other open-source project combines all of these capabilities.
 
 **Not a LangChain project.** Single async pipeline, ~79 files of Python. No frameworks.
 
-1,689 tests. AGPL-3.0.
+2,387 tests. AGPL-3.0.
 
 https://github.com/HeliosNova/nova
 
@@ -105,16 +105,16 @@ https://github.com/HeliosNova/nova
 
 ## 4. Reddit r/opensource
 
-**Title:** Nova — AGPL-3.0 personal AI that learns from corrections and fine-tunes itself. 1,689 tests, zero cloud dependency.
+**Title:** Nova — AGPL-3.0 personal AI that learns from your corrections via durable memory. 2,387 tests, zero cloud dependency.
 
 **Body:**
 
-Open-sourced Nova today. It's a personal AI assistant that runs on your hardware and gets permanently smarter through a self-improvement pipeline.
+Open-sourced Nova today. It's a personal AI assistant that runs on your hardware and gets permanently more useful to you through a memory loop — corrections become lessons and knowledge-graph facts it retrieves on every future answer.
 
-The differentiator: correct Nova once, it remembers forever. Correct it enough, it fine-tunes itself into a better model (automated DPO + A/B evaluation).
+The differentiator: correct Nova once, it remembers — durably, in-context, no retraining. (An optional local DPO fine-tune exists but is experimental and off by default; honest A/B evals show it only ties the base.)
 
-No other open-source project combines:
-- Self-improving (corrections → lessons → DPO → fine-tuning)
+Few open-source projects combine:
+- A measured memory loop (corrections → lessons + temporal KG → retrieval)
 - Sovereign (zero cloud dependency, bundled Ollama)
 - Knowledge graph (temporal, with fact supersession)
 - Hybrid retrieval (vectors + BM25 + reciprocal rank fusion)
@@ -122,7 +122,7 @@ No other open-source project combines:
 - Secure (4-tier access, injection detection, HMAC signing, Docker hardening)
 
 Stack: Python, FastAPI, SQLite, ChromaDB, Ollama, React
-Tests: 1,689 across 60+ files
+Tests: 2,387 across 60+ files
 License: AGPL-3.0
 
 https://github.com/HeliosNova/nova
@@ -145,15 +145,15 @@ I'd been building my own self-hosted AI assistant for months. I decided to open-
 
 ## What makes Nova different
 
-Every AI assistant answers questions. Nova is the only one that *learns from getting them wrong*.
+Every AI assistant answers questions. Nova is built to *learn from getting them wrong* — and to prove it with a measurable eval.
 
 ```
 You: "What's the capital of Australia?"
 Nova: "Sydney"
 You: "That's wrong, it's Canberra"
 
-Nova detects the correction, extracts a lesson, generates a
-DPO training pair, and updates its knowledge graph.
+Nova detects the correction, stores a lesson, and adds a
+knowledge-graph fact.
 
 --- 3 months later, different conversation ---
 
@@ -161,11 +161,11 @@ You: "What's the capital of Australia?"
 Nova: "Canberra"
 ```
 
-That's not retrieval-augmented generation. That's not prompt engineering. The model itself got smarter.
+That's durable, inspectable memory: the correction is retrieved into context on the next ask. No retraining — and, unlike fine-tuning a small model on a handful of examples, no risk of forgetting everything else.
 
 ## The learning loop — how it actually works
 
-Nova has a 7-stage self-improvement pipeline. No other open-source project combines all seven stages.
+Nova's learning is a **memory loop**, and there's an eval that proves it: it asks a question *without* the lesson, stores the lesson, asks again *with* it, and checks the answer flipped wrong→right.
 
 ### Stage 1: Correction Detection
 
@@ -195,22 +195,13 @@ Every correction also generates a DPO (Direct Preference Optimization) training 
 }
 ```
 
-These accumulate in a JSONL file. When enough pairs exist, Nova can fine-tune its own base model.
+These accumulate in a JSONL file for the optional fine-tune experiment below — but they're not how Nova learns facts; the lesson + KG above are.
 
-### Stage 4: Automated Fine-Tuning
+### Stage 4: Optional local fine-tuning (experimental — off by default)
 
-Nova includes an 8-step automated pipeline (`scripts/finetune_auto.py`):
+Nova can *also* export the `{query, chosen, rejected}` pairs and run a local DPO fine-tune behind an A/B gate (`scripts/finetune_auto.py`, disabled unless `ENABLE_AUTO_FINETUNE=true`). The gate is real: a candidate deploys only if it beats the base model under an **independent, different-family judge**, position-swapped across both A/B orders.
 
-1. Check readiness (minimum 50 new DPO pairs)
-2. Load training data
-3. Stop Ollama (free GPU VRAM)
-4. Run DPO training via Unsloth
-5. Export to GGUF
-6. Restart Ollama
-7. **A/B evaluation** — run holdout queries through both base and fine-tuned models, LLM-as-judge with randomized ordering to prevent position bias
-8. Deploy only if the fine-tuned model wins >50% with positive average preference
-
-The model literally gets smarter. Not through bigger context windows or better prompts — through actual weight updates from your corrections.
+Honest result: on a few hundred corrections the fine-tune **ties** the base — it does not reliably get smarter. That's expected (RAG/memory beats fine-tuning for facts; small models degrade under small-data tuning), and it's exactly why Nova's learning lives in the memory loop above, not in weight updates. Use weight fine-tuning for *style/behavior* experiments, if at all.
 
 ### Stage 5: Reflexion
 
@@ -265,7 +256,7 @@ The prompt injection detector runs on every piece of external content — web se
 - **Frontend:** React + TypeScript + Vite
 - **Search:** SearXNG (privacy-respecting, self-hosted)
 - **Deployment:** Docker Compose (4 services)
-- **Tests:** 1,689 across 60+ files (including security offensive, stress, and behavioral tests)
+- **Tests:** 2,387 across 60+ files (including security offensive, stress, and behavioral tests)
 
 No GPU? Use `docker-compose.cloud.yml` — cloud handles inference, all data stays on your machine.
 

@@ -178,27 +178,43 @@ class DiscordBot:
             logger.warning("[Discord] No token configured, skipping")
             return
 
-        backoff = 5.0
-        max_backoff = 60.0
+        import time
+        _INITIAL_BACKOFF = 5.0
+        _MAX_BACKOFF = 60.0
+        _STABLE_UPTIME_S = 300.0   # 5 min of uptime resets the backoff
+        backoff = _INITIAL_BACKOFF
 
         while True:
+            connect_started = time.monotonic()
             try:
                 await self._client.start(self.token)
                 return  # Clean exit
             except discord.LoginFailure as e:
                 logger.error("[Discord] Authentication failed (check DISCORD_TOKEN): %s", e)
                 return  # Don't retry auth failures
-            except discord.ConnectionClosed as e:
-                logger.warning("[Discord] Connection closed (code=%s), reconnecting in %.0fs...", e.code, backoff)
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
             except asyncio.CancelledError:
                 logger.info("[Discord] Bot shutting down")
                 return
-            except Exception as e:
-                logger.error("[Discord] Bot failed: %s, reconnecting in %.0fs...", e, backoff)
+            except (discord.ConnectionClosed, Exception) as e:
+                # Reset backoff if the connection was stable for ≥5 min before
+                # dropping — otherwise a long-running bot that occasionally
+                # blips at the gateway would compound backoff to MAX_BACKOFF
+                # permanently and reconnect slowly.
+                uptime = time.monotonic() - connect_started
+                if uptime >= _STABLE_UPTIME_S:
+                    if backoff > _INITIAL_BACKOFF:
+                        logger.info(
+                            "[Discord] Connection was stable for %.0fs — resetting backoff %.0f → %.0fs",
+                            uptime, backoff, _INITIAL_BACKOFF,
+                        )
+                    backoff = _INITIAL_BACKOFF
+                level = "warning" if isinstance(e, discord.ConnectionClosed) else "error"
+                getattr(logger, level)(
+                    "[Discord] %s after %.0fs uptime: %s — reconnecting in %.0fs",
+                    type(e).__name__, uptime, e, backoff,
+                )
                 await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
 
     async def close(self):
         """Gracefully close the Discord connection."""

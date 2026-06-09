@@ -208,6 +208,17 @@ class CuriosityQueue:
         re.compile(r"(?i)^(?:what is|calculate|compute)\s+\d"),
         # Very short generic queries
         re.compile(r"(?i)^(?:use|do|make|run|set|get|put|add|try|fix)\s"),
+        # Self-referential — Nova should not research herself or the conversation.
+        # These go to identity/memory, not web search.
+        re.compile(r"(?i)\bnova\b"),
+        re.compile(r"(?i)\bhelios\b"),
+        re.compile(r"(?i)\b(?:what|how|who)\s+(?:can|do|are)\s+you\b"),
+        re.compile(r"(?i)\b(?:your|you'?re)\s+(?:capabilit|skill|tool|architecture|role|purpose)"),
+        re.compile(r"(?i)\btell\s+me\s+about\s+(?:yourself|you)\b"),
+        re.compile(r"(?i)\bwho\s+are\s+you\b"),
+        re.compile(r"(?i)\b(?:summarize|recap)\s+.*\b(?:told|said|conversation|we'?ve|you'?ve)\b"),
+        re.compile(r"(?i)\bwhat\s+(?:was|did)\s+(?:my|i)\s+(?:last|previous|just)\s+(?:question|say|said)"),
+        re.compile(r"(?i)\bwhat\s+have\s+(?:i|you)\s+(?:said|told)"),
     ]
 
     @classmethod
@@ -226,6 +237,17 @@ class CuriosityQueue:
         topic = topic.strip()[:500]
         if not topic:
             return -1
+        # Strip WILL-MODULE framing if it leaked in. The KAIROS goal-pursuit
+        # path wraps goal text with a multi-line system-style prompt prefix
+        # ("=== WILL-MODULE TASK ===\n... =\n=== END TASK ===\nGOAL: ..."), and
+        # downstream curiosity-add calls were storing the wrapped text as the
+        # topic. Verified runtime 2026-05-06: a curiosity item's topic was the
+        # entire prompt template (>400 chars) instead of the actual GOAL.
+        if "=== END TASK ===" in topic and "GOAL:" in topic:
+            _, _, after = topic.partition("=== END TASK ===")
+            _, _, after_goal = after.partition("GOAL:")
+            if after_goal.strip():
+                topic = after_goal.strip()[:500]
 
         if not self._is_valid_topic(topic):
             logger.debug("Curiosity topic rejected (validation): '%s'", topic[:80])
@@ -245,21 +267,31 @@ class CuriosityQueue:
             )
             return existing["id"]
 
-        # Dedup: Jaccard fuzzy match against pending topics
+        # Dedup: Jaccard fuzzy match against pending topics. Tracks the max
+        # observed score for instrumentation — even when nothing matches we
+        # want to know how close near-misses got to the 0.6 threshold so the
+        # threshold can be tuned empirically. See app.core.dedup_metrics.
+        from app.core import dedup_metrics as _dm
+
         pending = self._db.fetchall(
             "SELECT id, topic, urgency FROM curiosity_queue WHERE status = 'pending'"
         )
+        max_jaccard = 0.0
         for row in pending:
-            if self._jaccard_similarity(topic, row["topic"]) > 0.6:
+            score = self._jaccard_similarity(topic, row["topic"])
+            if score > max_jaccard:
+                max_jaccard = score
+            if score > 0.6:
                 new_urgency = min(1.0, row["urgency"] + 0.1)
                 self._db.execute(
                     "UPDATE curiosity_queue SET urgency = ? WHERE id = ?",
                     (new_urgency, row["id"]),
                 )
                 logger.debug(
-                    "Curiosity dedup: '%s' fuzzy-matched existing '%s' (Jaccard > 0.6)",
-                    topic[:80], row["topic"][:80],
+                    "Curiosity dedup: '%s' fuzzy-matched existing '%s' (Jaccard=%.3f > 0.6)",
+                    topic[:80], row["topic"][:80], score,
                 )
+                _dm.record_decision("curiosity", score, 0.6, "merged")
                 return row["id"]
 
         # Cap pending items — FIFO eviction when queue exceeds MAX_CURIOSITY_QUEUE_SIZE
@@ -279,6 +311,9 @@ class CuriosityQueue:
             "INSERT INTO curiosity_queue (topic, source, urgency) VALUES (?, ?, ?)",
             (topic, source, urgency),
         )
+        # Record the "no match" decision with the max score we saw — lets
+        # the operator see how many near-misses there were below threshold.
+        _dm.record_decision("curiosity", max_jaccard, 0.6, "inserted_new")
         return cursor.lastrowid
 
     def get_next(self) -> CuriosityItem | None:

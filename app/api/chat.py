@@ -62,6 +62,7 @@ async def chat_stream(request: ChatRequest):
                     query=request.query,
                     conversation_id=request.conversation_id,
                     image=request.image_base64,
+                    ephemeral=request.ephemeral,
                 ):
                     await queue.put(event.to_sse())
             except Exception:
@@ -128,6 +129,7 @@ async def chat_sync(request: ChatRequest):
             query=request.query,
             conversation_id=request.conversation_id,
             image=request.image_base64,
+            ephemeral=request.ephemeral,
         ):
             if event.type == EventType.TOKEN:
                 tokens.append(event.data.get("text", ""))
@@ -152,8 +154,16 @@ async def chat_sync(request: ChatRequest):
         logger.exception("Error in sync chat")
         raise HTTPException(status_code=500, detail="An internal error occurred while processing your request")
 
+    # Chat UX floor: if the streamed answer collapsed to empty after meta
+    # stripping, surface a polite placeholder so interactive callers see
+    # *something* instead of silence. Not applied for ephemeral requests
+    # (probes/eval/monitors handle empty natively).
+    _answer = "".join(tokens)
+    if not _answer.strip() and not request.ephemeral:
+        _answer = "I couldn't produce a useful answer to that — can you rephrase or give more context?"
+
     return ChatResponse(
-        answer="".join(tokens),
+        answer=_answer,
         conversation_id=conversation_id or "",
         sources=sources,
         tool_results=tool_results,

@@ -351,8 +351,14 @@ class HttpFetchTool(BaseTool):
                 method, _sanitize_url_for_log(url), _sanitize_for_log(auth),
             )
 
-        # Build headers
-        req_headers = {"User-Agent": "Nova/1.0"}
+        # Build headers — sec.gov enforces a fair-access UA policy
+        # (anything with "Mozilla/" or "Nova/" + no contact info gets 403).
+        ua = "Nova/1.0"
+        if original_host and "sec.gov" in original_host.lower():
+            ua = "Nova Personal Assistant espinozarogelio323@gmail.com"
+        elif "sec.gov" in (urlparse(url).netloc or "").lower():
+            ua = "Nova Personal Assistant espinozarogelio323@gmail.com"
+        req_headers = {"User-Agent": ua}
         # Pin the original Host header when using IP-based URL to prevent DNS rebinding
         if original_host:
             req_headers["Host"] = original_host

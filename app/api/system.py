@@ -53,37 +53,14 @@ async def providers_health():
     # Build list of configured providers to check
     providers_to_check: dict[str, object] = {}
 
-    # Ollama: always configured (has default URL)
+    # Ollama is the only supported provider (cloud providers were removed
+    # when Nova committed to sovereign-only operation).
     if config.OLLAMA_URL:
         if active_name == "ollama":
             providers_to_check["ollama"] = active_provider
         else:
             from app.core.providers.ollama import OllamaProvider
             providers_to_check["ollama"] = OllamaProvider(base_url=config.OLLAMA_URL)
-
-    # OpenAI: configured if API key is set
-    if config.OPENAI_API_KEY:
-        if active_name == "openai":
-            providers_to_check["openai"] = active_provider
-        else:
-            from app.core.providers.openai import OpenAIProvider
-            providers_to_check["openai"] = OpenAIProvider(api_key=config.OPENAI_API_KEY, model=config.OPENAI_MODEL)
-
-    # Anthropic: configured if API key is set
-    if config.ANTHROPIC_API_KEY:
-        if active_name == "anthropic":
-            providers_to_check["anthropic"] = active_provider
-        else:
-            from app.core.providers.anthropic import AnthropicProvider
-            providers_to_check["anthropic"] = AnthropicProvider(api_key=config.ANTHROPIC_API_KEY, model=config.ANTHROPIC_MODEL)
-
-    # Google: configured if API key is set
-    if config.GOOGLE_API_KEY:
-        if active_name == "google":
-            providers_to_check["google"] = active_provider
-        else:
-            from app.core.providers.google import GoogleProvider
-            providers_to_check["google"] = GoogleProvider(api_key=config.GOOGLE_API_KEY, model=config.GOOGLE_MODEL)
 
     if not providers_to_check:
         return {"active": active_name, "providers": {"ollama": "not_configured"}}
@@ -159,6 +136,28 @@ async def status() -> StatusResponse:
 
     counts = await asyncio.to_thread(_sync_status)
     return StatusResponse(**counts)
+
+
+@router.get("/trust", dependencies=[Depends(require_auth)])
+async def get_trust_status():
+    """Trust score health metric.
+
+    Trust is observational only — it tracks tool reliability over time but does
+    NOT gate tool access (Nova is the owner's sovereign agent). Score drops are
+    a signal that tools are failing in the wild and you should investigate.
+    """
+    from app.core.trust import TrustManager
+    db = get_db()
+    tm = TrustManager(db)
+    stats = tm.get_stats()
+    recent = tm.get_audit_trail(limit=20)
+    return {
+        "score": stats["score"],
+        "successes_total": stats["successes"],
+        "failures_total": stats["failures"],
+        "recent_audit": recent,
+        "policy": "observational only — no tool gating",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -247,12 +246,7 @@ class ConfigUpdateRequest(BaseModel):
     LLM_PROVIDER: str | None = None
     LLM_MODEL: str | None = None
     OLLAMA_URL: str | None = None
-    OPENAI_MODEL: str | None = None
-    ANTHROPIC_MODEL: str | None = None
-    GOOGLE_MODEL: str | None = None
     VISION_MODEL: str | None = None
-    FAST_MODEL: str | None = None
-    HEAVY_MODEL: str | None = None
     EMBEDDING_MODEL: str | None = None
     RETRIEVAL_TOP_K: int | None = Field(None, ge=1, le=50)
     CHUNK_SIZE: int | None = Field(None, ge=64, le=4096)
@@ -308,6 +302,10 @@ class ConfigUpdateRequest(BaseModel):
     CRITIQUE_FACTS_LIMIT: int | None = Field(None, ge=100, le=10000)
     MAX_CRITIQUE_ROUNDS: int | None = Field(None, ge=1, le=10)
     DIGEST_HOUR: int | None = Field(None, ge=0, le=23)
+    ENABLE_MULTI_AGENT: bool | None = None
+    MULTI_AGENT_TRIGGER_THRESHOLD: int | None = Field(None, ge=1, le=20)
+    MAX_AGENT_COUNT: int | None = Field(None, ge=1, le=20)
+    AGENT_TASK_TIMEOUT: int | None = Field(None, ge=10, le=600)
 
 
 @router.patch("/config", dependencies=[Depends(require_auth)])
@@ -316,11 +314,7 @@ async def update_config(body: ConfigUpdateRequest):
     Returns {updated: [...], warnings: [...], restart_required: bool}
     """
     # Fields that require LLM provider reinitialization
-    PROVIDER_FIELDS = {"LLM_PROVIDER", "LLM_MODEL", "OLLAMA_URL",
-                       "OPENAI_API_KEY", "OPENAI_MODEL",
-                       "ANTHROPIC_API_KEY", "ANTHROPIC_MODEL",
-                       "GOOGLE_API_KEY", "GOOGLE_MODEL",
-                       "VISION_MODEL", "FAST_MODEL", "HEAVY_MODEL"}
+    PROVIDER_FIELDS = {"LLM_PROVIDER", "LLM_MODEL", "OLLAMA_URL", "VISION_MODEL"}
 
     # Fields that need full restart
     RESTART_FIELDS = {"DB_PATH", "CHROMADB_PATH", "HOST", "PORT"}
@@ -510,6 +504,42 @@ async def delete_custom_tool(name: str):
         if tool:
             svc.tool_registry._tools.pop(name, None)
     return {"deleted": name}
+
+
+# ---------------------------------------------------------------------------
+# Extensions (Nova-authored modules in /data/extensions/)
+# ---------------------------------------------------------------------------
+
+@router.get("/extensions", dependencies=[Depends(require_auth)])
+async def get_extensions_status():
+    """Show what extensions are loaded and any errors."""
+    from app.core.extensions import status
+    return status()
+
+
+@router.post("/extensions/reload", dependencies=[Depends(require_auth)])
+async def reload_extensions():
+    """Re-scan /data/extensions/ and re-import every module. No restart needed."""
+    from app.core.extensions import reload_all
+    from app.core.brain import get_services
+    svc = get_services()
+    return reload_all(svc)
+
+
+class ExtensionWriteRequest(BaseModel):
+    filename: str = Field(min_length=4, max_length=100)
+    source: str = Field(min_length=20, max_length=50_000)
+
+
+@router.post("/extensions/write", dependencies=[Depends(require_auth)])
+async def write_extension_endpoint(req: ExtensionWriteRequest):
+    """Write a Python source file into /data/extensions/. Caller is responsible
+    for calling /extensions/reload afterward to load it."""
+    from app.core.extensions import write_extension
+    ok, msg = write_extension(req.filename, req.source)
+    if not ok:
+        raise HTTPException(400, msg)
+    return {"path": msg, "filename": req.filename}
 
 
 # ---------------------------------------------------------------------------

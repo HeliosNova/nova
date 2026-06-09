@@ -36,6 +36,8 @@ from app.database import get_db
 from app.tools.base import ToolRegistry
 from app.tools.calculator import CalculatorTool
 from app.tools.code_exec import CodeExecTool
+from app.tools.code_verify import CodeVerifyTool
+from app.tools.code_understand import CodeUnderstandTool
 from app.tools.file_ops import FileOpsTool
 from app.tools.http_fetch import HttpFetchTool
 from app.tools.knowledge import KnowledgeSearchTool
@@ -46,6 +48,7 @@ from app.tools.active_memory import ActiveMemoryTool
 from app.tools.screenshot import ScreenshotTool
 from app.tools.shell_exec import ShellExecTool
 from app.tools.web_search import WebSearchTool
+from app.tools.search_agent import SearchAgentTool
 from app.tools.action_email import EmailSendTool
 from app.tools.action_calendar import CalendarTool
 from app.tools.action_reminder import ReminderTool
@@ -70,6 +73,15 @@ logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
     handlers=[_log_handler],
 )
+# Silence ChromaDB's noisy "Delete of nonexisting embedding" + "Add of existing"
+# warnings. They fire on every prune or upsert when ChromaDB IDs don't match SQLite,
+# which is normal during cleanup; the operations succeed regardless.
+logging.getLogger("chromadb.segment.impl.vector.local_persistent_hnsw").setLevel(logging.ERROR)
+# ChromaDB's posthog telemetry pings still fire even with ANONYMIZED_TELEMETRY=false
+# because it imports posthog before reading the flag. Each call logs an exception
+# ("capture() takes 1 positional argument but 3 were given"). Silence the logger
+# itself so we stop seeing dozens of these per hour.
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 logger = logging.getLogger(__name__)
 
 
@@ -165,10 +177,13 @@ async def lifespan(app: FastAPI):
     registry = ToolRegistry()
     _tool_instances = [
         ("WebSearchTool", lambda: WebSearchTool()),
+        ("SearchAgentTool", lambda: SearchAgentTool()),
         ("CalculatorTool", lambda: CalculatorTool()),
         ("HttpFetchTool", lambda: HttpFetchTool()),
         ("KnowledgeSearchTool", lambda: KnowledgeSearchTool(retriever=retriever)),
         ("CodeExecTool", lambda: CodeExecTool()),
+        ("CodeVerifyTool", lambda: CodeVerifyTool()),
+        ("CodeUnderstandTool", lambda: CodeUnderstandTool()),
         ("MemorySearchTool", lambda: MemorySearchTool(conversations=conversations, user_facts=user_facts)),
         ("FileOpsTool", lambda: FileOpsTool()),
         ("ShellExecTool", lambda: ShellExecTool()),
@@ -185,10 +200,12 @@ async def lifespan(app: FastAPI):
     from app.tools.context_detail import ContextDetailTool
     _tool_instances.append(("ContextDetailTool", lambda: ContextDetailTool()))
 
-    # Background task manager
+    # Background task manager — persists to SQLite so restarts leave an audit trail.
+    from app.database import get_db as _get_db
     task_manager = TaskManager(
         max_concurrent=config.MAX_BACKGROUND_TASKS,
         task_timeout=config.BACKGROUND_TASK_TIMEOUT,
+        db=_get_db(),
     )
     _tool_instances.append(("BackgroundTaskTool", lambda: BackgroundTaskTool()))
 
@@ -318,6 +335,27 @@ async def lifespan(app: FastAPI):
     )
     set_services(svc)
 
+    # Load Nova-authored extensions from /data/extensions/. Modules can
+    # register additional tools, monitors, or hooks via a register(svc)
+    # function. Failures are non-fatal — one broken extension doesn't break
+    # the system.
+    try:
+        from app.core.extensions import load_all as _load_extensions
+        ext_report = _load_extensions(svc)
+        if ext_report["loaded"]:
+            logger.info(
+                "[Extensions] loaded %d at boot: %s",
+                len(ext_report["loaded"]), ", ".join(ext_report["loaded"]),
+            )
+        if ext_report["failed"]:
+            for f in ext_report["failed"]:
+                logger.warning(
+                    "[Extensions] %s failed at boot: %s",
+                    f["name"], f["error"],
+                )
+    except Exception as e:
+        logger.warning("Extensions load failed: %s", e)
+
     # Cleanup old conversations on startup
     try:
         cleaned = conversations.cleanup_old_conversations(days=90)
@@ -361,6 +399,14 @@ async def lifespan(app: FastAPI):
             logger.info("Lesson decay: all lessons are fresh")
     except Exception as e:
         logger.warning("Lesson decay failed: %s", e)
+
+    # Prune dead lessons (never used, too old)
+    try:
+        deleted = learning.prune_dead_lessons()
+        if deleted:
+            logger.info("Pruned %d dead lessons on startup", deleted)
+    except Exception as e:
+        logger.warning("Dead-lesson prune failed: %s", e)
 
     logger.info("Model: %s", config.LLM_MODEL)
     logger.info("Ollama: %s", config.OLLAMA_URL)
@@ -454,6 +500,22 @@ async def lifespan(app: FastAPI):
                 logger.info("Event trigger system started")
         except Exception as e:
             logger.warning("Heartbeat/proactive startup failed: %s", e)
+
+    # --- Model warmup ---
+    # Issue a tiny generation so Ollama loads the model into VRAM before the
+    # first user query. Cuts first-query latency from ~30-60s to <1s.
+    async def _warmup():
+        try:
+            from app.core import llm
+            t0 = time.monotonic()
+            await llm.invoke_nothink(
+                [{"role": "user", "content": "ok"}], max_tokens=2, temperature=0.0,
+            )
+            logger.info("Model warmup complete (%.1fs)", time.monotonic() - t0)
+        except Exception as e:
+            logger.warning("Model warmup failed (non-fatal): %s", e)
+    _warm_task = asyncio.create_task(_warmup())
+    _warm_task.add_done_callback(_on_bg_task_done)
 
     logger.info("Nova ready.")
 
@@ -694,10 +756,17 @@ app.include_router(daemon_router, prefix="/api")
 from app.api.exports import router as exports_router
 app.include_router(exports_router, prefix="/api")
 
+from app.api.agent import router as agent_router
+app.include_router(agent_router, prefix="/api")
+
 from app.api.events import router as events_router
 app.include_router(events_router, prefix="/api")
 
-if config.ENABLE_VOICE:
+if config.ENABLE_VOICE or getattr(config, "ENABLE_TTS", False):
     from app.api.voice import router as voice_router
     app.include_router(voice_router, prefix="/api")
-    logger.info("Voice API enabled (model: %s)", config.WHISPER_MODEL_SIZE)
+    logger.info(
+        "Voice API enabled (STT model: %s, TTS: %s)",
+        config.WHISPER_MODEL_SIZE,
+        "on" if getattr(config, "ENABLE_TTS", False) else "off",
+    )

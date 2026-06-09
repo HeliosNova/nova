@@ -1,28 +1,69 @@
-# Fine-tuning dependencies — install in a separate venv
+# Fine-tuning dependencies — install in a separate venv.
 # These are heavy and GPU-specific. Do NOT install in the Nova app container.
 #
 # Setup:
-#   python -m venv finetune_env
+#   python -m venv finetune_env                                       # Python 3.11.x — 3.13 segfaults during torch+unsloth init
 #   finetune_env\Scripts\activate  (Windows) or source finetune_env/bin/activate (Linux)
 #   pip install -r scripts/requirements-finetune.txt
+#   python scripts/finetune_env_compat_patches.py                     # one-shot fix for trl 0.24 + transformers 5.x + llm_blender 0.0.2 skew
 #
-# Requires: CUDA 12.x, RTX 3090 (24GB)
+# Requires: CUDA 12.x, RTX 3090 (24GB), Python 3.11.x (NOT 3.13+ — pinned torch wheels don't ship for it).
+#
+# IMPORTANT — version pinning rationale:
+#
+# nova-ft was trained 2026-03-23 with then-current libs. Re-training in May
+# with the *same* data + recipe (v17/v18/v19 experiments) produced a -0.14
+# regression on multi-agent (the `deliberation_chain_of_reasoning` task
+# locked at 0.20 vs baseline 0.85). Confirmed via v19 control: no RLVR pairs,
+# same regression. Cause is library drift between March and May.
+#
+# These pins lock the current versions (Q2 2026 line) so subsequent training
+# runs are at least *reproducible against each other*. They do NOT recover
+# the March nova-ft training environment (those older unsloth/trl/transformers
+# wheels are not retained by their upstreams — date-based releases churn weekly).
+#
+# For exact bit-reproducibility, use `scripts/finetune_env.frozen.txt`
+# (full `pip freeze` output, all 119 packages). This file lists only the
+# high-level packages we depend on directly.
 
-# Unsloth — optimized fine-tuning for consumer GPUs
-# Pinned to specific commits for reproducibility
-unsloth[colab-new] @ git+https://github.com/unslothai/unsloth.git@2025.3.19
-unsloth_zoo @ git+https://github.com/unslothai/unsloth-zoo.git@2025.3.6
+# PyTorch CUDA wheels are not on PyPI — they're on the PyTorch index.
+# Without this, `pip install` resolves torch==2.10.0+cu126 to a hash error.
+--extra-index-url https://download.pytorch.org/whl/cu126
 
-# TRL — Transformers Reinforcement Learning (DPO trainer)
-trl>=0.12.0
+# --- Unsloth ---
+# Pinned to specific Q2 2026 release. Newer than the 2025.3.19 git pin that
+# the requirements file shipped with — that pin was a year stale and pip
+# pulled the newer release whenever the venv was rebuilt.
+unsloth==2026.3.17
+unsloth_zoo==2026.3.6
 
-# Core ML
-torch>=2.4.0
-transformers>=4.46.0
-datasets>=3.0.0
-accelerate>=1.0.0
-peft>=0.13.0
-bitsandbytes>=0.44.0
+# --- TRL (DPO trainer) ---
+# 0.24.0 changed DPO loss normalization vs earlier 0.12.x line — locking now.
+trl==0.24.0
 
-# Utilities
-safetensors
+# --- Core ML ---
+# Transformers 5.3.0 introduced Qwen3.5 vision arch as default
+# (`Qwen3_5ForConditionalGeneration`). Don't downgrade without testing —
+# breaks Qwen3.5-9B loading; AutoConfig snapshot-path workaround is needed.
+transformers==5.3.0
+torch==2.10.0+cu126
+torchvision==0.25.0
+torchao==0.16.0
+
+datasets==4.3.0
+accelerate==1.6.0
+peft==0.18.1
+bitsandbytes==0.49.2
+
+# --- Utilities ---
+safetensors==0.5.3
+triton-windows==3.6.0.post26  # Linux: use `triton==3.6.0` instead
+xformers==0.0.35
+
+# --- trl 0.24.0 hidden requirements ---
+# trl's callbacks.py + trainers eagerly import from mergekit_utils.py and llm_blender
+# (via the `judges` extra). Without these, every Trainer import crashes with
+# ModuleNotFoundError. Discovered 2026-05-13 during venv rebuild — were never
+# in the original pin because the v16 training env had them installed manually.
+mergekit==0.1.4
+llm_blender==0.0.2  # only version on PyPI; needs the compat patch (see setup notes above)

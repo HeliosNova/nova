@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any  # noqa: F401 — re-exported for type annotations
 
@@ -43,6 +43,13 @@ class Monitor:
     created_at: str
     category: str = "content"  # 'system' (telegram-only, internal health) or
                                # 'content' (domain/news feeds, all channels)
+    # Event-trigger fields (used by EventTrigger to fire monitors on emit_event())
+    trigger_events: list[str] = field(default_factory=list)  # ["internal:lesson_saved", "webhook:*"]
+    trigger_mode: str = "schedule"  # "schedule" | "event" | "both"
+    # Per-monitor channel override. CSV of channel names: "discord,signal".
+    # When NULL/empty, the category-default routing applies (system→telegram,
+    # content→all). When set, ONLY the listed channels receive alerts.
+    channels: str | None = None
 
 
 # Monitors whose output is about Nova itself (health, meta, internal state).
@@ -68,6 +75,10 @@ _SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
     "Training Job Watch",
     "KG Growth Rate",
     "Ollama Model Loaded",
+    "Goal Derivation",
+    "Cross-Monitor Synthesis",
+    "Auto-Tool Synthesis",
+    "Output Quality Eval",
 })
 
 _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
@@ -89,6 +100,10 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "training_job",
     "kg_growth",
     "ollama_model",
+    "goal_derivation",
+    "synthesis",
+    "auto_tool",
+    "output_eval",
 })
 
 
@@ -176,7 +191,7 @@ class MonitorStore:
     def update(self, monitor_id: int, **kwargs) -> bool:
         allowed = {"name", "check_type", "check_config", "schedule_seconds",
                     "enabled", "cooldown_minutes", "notify_condition", "last_check_at",
-                    "category"}
+                    "category", "channels"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -250,6 +265,36 @@ class MonitorStore:
         )
         return [self._row_to_result(r) for r in rows]
 
+    @staticmethod
+    def _event_matches(event_type: str, pattern: str) -> bool:
+        """Match an event type against a pattern (exact or wildcard suffix '*')."""
+        if pattern.endswith("*"):
+            return event_type.startswith(pattern[:-1])
+        return event_type == pattern
+
+    def get_event_monitors(self, event_type: str) -> list[Monitor]:
+        """Return enabled monitors whose trigger_events match the given event_type.
+
+        trigger_events is a JSON array stored on the monitor row (may be missing in
+        older schemas — those monitors never match).
+        """
+        # Migration may not have added trigger_events column on all DBs; guard.
+        try:
+            rows = self._db.fetchall(
+                "SELECT * FROM monitors WHERE enabled=1 AND trigger_events IS NOT NULL"
+            )
+        except Exception:
+            return []
+        matched: list[Monitor] = []
+        for row in rows:
+            try:
+                patterns = json.loads(row["trigger_events"]) if row["trigger_events"] else []
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if any(self._event_matches(event_type, p) for p in patterns):
+                matched.append(self._row_to_monitor(row))
+        return matched
+
     def _row_to_monitor(self, row) -> Monitor:
         cfg = row["check_config"]
         try:
@@ -263,6 +308,20 @@ class MonitorStore:
             category = None
         if not category:
             category = classify_category(row["name"], row["check_type"])
+        # trigger_events / trigger_mode may not exist on older schemas
+        try:
+            te_raw = row["trigger_events"] if "trigger_events" in row.keys() else None
+            trigger_events = json.loads(te_raw) if te_raw else []
+        except (KeyError, TypeError, json.JSONDecodeError):
+            trigger_events = []
+        try:
+            trigger_mode = row["trigger_mode"] if "trigger_mode" in row.keys() else "schedule"
+        except (KeyError, TypeError):
+            trigger_mode = "schedule"
+        try:
+            channels = row["channels"] if "channels" in row.keys() else None
+        except (KeyError, TypeError):
+            channels = None
         return Monitor(
             id=row["id"],
             name=row["name"],
@@ -277,6 +336,9 @@ class MonitorStore:
             last_result=row["last_result"],
             created_at=row["created_at"],
             category=category,
+            trigger_events=trigger_events,
+            trigger_mode=trigger_mode,
+            channels=channels,
         )
 
     def _row_to_result(self, row) -> MonitorResult:
@@ -382,6 +444,11 @@ class MonitorStore:
         "Auto-Monitor Detector",
         "Fine-Tune Check",
         "Hacker News Top Stories",
+        # Self-improvement loop closers (added 2026-04-25)
+        "Goal Derivation",
+        "Cross-Monitor Synthesis",
+        "Auto-Tool Synthesis",
+        "Output Quality Eval",
     })
 
     def seed_defaults(self) -> int:
@@ -547,6 +614,38 @@ class MonitorStore:
                 "notify_condition": "on_change",
             },
             {
+                "name": "Goal Derivation",
+                "check_type": "goal_derivation",
+                "check_config": {},
+                "schedule_seconds": 21600,   # every 6h — gives KAIROS a fresh queue
+                "cooldown_minutes": 300,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Cross-Monitor Synthesis",
+                "check_type": "synthesis",
+                "check_config": {},
+                "schedule_seconds": 43200,   # every 12h — cross-cuts last 36h
+                "cooldown_minutes": 660,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Auto-Tool Synthesis",
+                "check_type": "auto_tool",
+                "check_config": {},
+                "schedule_seconds": 43200,   # every 12h — close persistent gaps
+                "cooldown_minutes": 660,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Output Quality Eval",
+                "check_type": "output_eval",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily — grade a sample of outputs
+                "cooldown_minutes": 1380,
+                "notify_condition": "on_change",
+            },
+            {
                 "name": "Dream Consolidation",
                 "check_type": "consolidation",
                 "check_config": {
@@ -664,6 +763,19 @@ class MonitorStore:
                 "check_type": "prompt_analyzer",
                 "check_config": {},
                 "schedule_seconds": 90000,   # 25h -- runs after Quality Eval Harness
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            # --- KG Consistency Check (#184) ---
+            # Daily batched cross-check of recent answers vs KG facts.
+            # Surfaces "I told you X but my KG says Y" contradictions for
+            # resolution. Inline per-response checks would tax every chat
+            # call by 200-500ms — nightly batch is the right trade.
+            {
+                "name": "KG Consistency Check",
+                "check_type": "kg_consistency",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily
                 "cooldown_minutes": 1380,    # 23 hours
                 "notify_condition": "on_change",
             },

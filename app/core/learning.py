@@ -400,8 +400,8 @@ class LearningEngine:
         try:
             from app.monitors.event_trigger import emit_event
             emit_event("internal:lesson_saved", {"lesson_id": lesson_id, "topic": topic})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("emit_event(lesson_saved) failed: %s", e)
 
         return lesson_id
 
@@ -496,8 +496,11 @@ class LearningEngine:
                 if results and results["ids"] and results["ids"][0]:
                     distances = results.get("distances", [[]])[0]
                     for i, id_str in enumerate(results["ids"][0]):
-                        # Filter high-distance results (cosine: 0=identical, 2=opposite)
-                        if distances and i < len(distances) and distances[i] > 0.7:
+                        # Filter high-distance results (cosine: 0=identical, 2=opposite).
+                        # Threshold is configurable (LESSON_VECTOR_MAX_DISTANCE, default
+                        # 0.9) so paraphrased queries with low keyword overlap still
+                        # surface the relevant lesson — semantic-first retrieval (WS2A).
+                        if distances and i < len(distances) and distances[i] > config.LESSON_VECTOR_MAX_DISTANCE:
                             continue
                         try:
                             lid = int(id_str)
@@ -665,10 +668,16 @@ class LearningEngine:
         if not _is_quality_content(good_answer):
             logger.warning("Skipping training pair: low-quality good_answer")
             return
-        if len(good_answer.strip()) < 30:
+        # Length floor lowered 30→10 (2026-05-06): the old 30-char floor
+        # rejected most chat corrections ("Done.", "Got it.", "Saved as
+        # metric.") which are exactly the canonical corrections we want
+        # the model to internalize. The training_data.jsonl had not been
+        # written to in 11 days as a result. 10 chars still rules out
+        # garbage like "ok" / "[]" while admitting brief affirmations.
+        if len(good_answer.strip()) < 10:
             logger.warning("Skipping training pair: chosen too short (%d chars)", len(good_answer.strip()))
             return
-        if len(bad_answer.strip()) < 30:
+        if len(bad_answer.strip()) < 10:
             logger.warning("Skipping training pair: rejected too short (%d chars)", len(bad_answer.strip()))
             return
         # Reject extreme length asymmetry — teaches "shorter=better" not "better content"
@@ -875,19 +884,65 @@ class LearningEngine:
         """Find an existing lesson similar enough to be a duplicate.
 
         Fast path: exact match on (topic, correct_answer).
-        Slow path: normalized word overlap (Jaccard >= 0.85).
+        Topic-level dedup: same topic + correct_answer Jaccard >= 0.55.
+        Slow path: full normalized word overlap (Jaccard >= 0.85).
+
+        The topic-level pass was added 2026-05-06 after runtime audit found
+        11 copies of "2026 EV Release Schedule" — same topic, different
+        correct_answer text (because EVs ship weekly). Jaccard 0.85 on the
+        full text was too strict to catch these as duplicates. Same topic
+        almost always means same intent; treat as dup if answers overlap
+        even modestly.
+
+        Side effect: every call records a row to `dedup_decisions` (see
+        app.core.dedup_metrics) with the max Jaccard observed and the
+        threshold that drove the decision. Lets the operator empirically
+        revisit the 0.55 / 0.85 thresholds.
         """
-        # Fast path — exact match
+        from app.core import dedup_metrics as _dm
+
+        # Fast path — exact match (treated as Jaccard=1.0 against threshold=1.0)
         exact = self._db.fetchone(
             "SELECT id, confidence FROM lessons WHERE topic = ? AND correct_answer = ?",
             (topic, correct_answer),
         )
         if exact:
+            _dm.record_decision("lesson", 1.0, 1.0, "merged")
             return exact
+
+        max_jaccard = 0.0  # track best near-miss across both fuzzy passes
+
+        # Topic-level dedup — same topic, looser answer match
+        same_topic = self._db.fetchall(
+            "SELECT id, confidence, correct_answer FROM lessons WHERE topic = ?",
+            (topic,),
+        )
+        if same_topic:
+            new_answer_words = _normalize_words(correct_answer) - _STOP_WORDS
+            if len(new_answer_words) >= 2:
+                for row in same_topic:
+                    existing_words = _normalize_words(row["correct_answer"] or "") - _STOP_WORDS
+                    if not existing_words:
+                        continue
+                    overlap = len(new_answer_words & existing_words)
+                    union = len(new_answer_words | existing_words)
+                    score = overlap / union if union > 0 else 0.0
+                    if score > max_jaccard:
+                        max_jaccard = score
+                    if score >= 0.55:
+                        _dm.record_decision("lesson", score, 0.55, "merged")
+                        return row
+            else:
+                # Brief answer + same topic — treat as dup of most recent.
+                # Jaccard isn't meaningful here (too few tokens); record at
+                # the topic-level threshold so the row is still legible.
+                _dm.record_decision("lesson", 0.55, 0.55, "merged")
+                return same_topic[0]
 
         # Slow path — fuzzy word overlap
         new_words = _normalize_words(topic + " " + correct_answer) - _STOP_WORDS
         if len(new_words) < 2:
+            _dm.record_decision("lesson", max_jaccard, 0.55, "inserted_new")
             return None
 
         candidates = self._db.fetchall(
@@ -903,9 +958,14 @@ class LearningEngine:
                 continue
             overlap = len(new_words & existing_words)
             union = len(new_words | existing_words)
-            if union > 0 and overlap / union >= config.DEDUP_JACCARD_THRESHOLD:
+            score = overlap / union if union > 0 else 0.0
+            if score > max_jaccard:
+                max_jaccard = score
+            if score >= config.DEDUP_JACCARD_THRESHOLD:
+                _dm.record_decision("lesson", score, config.DEDUP_JACCARD_THRESHOLD, "merged")
                 return row
 
+        _dm.record_decision("lesson", max_jaccard, config.DEDUP_JACCARD_THRESHOLD, "inserted_new")
         return None
 
     def _prune_lessons(self) -> None:
@@ -950,9 +1010,12 @@ class LearningEngine:
     def decay_stale_lessons(self, days: int = 30, factor: float = 0.95) -> int:
         """Reduce confidence for lessons not retrieved in `days` days.
 
-        Decays lessons that either:
+        Decays lessons that:
         - Were never retrieved and are older than `days`, OR
-        - Were last retrieved more than 60 days ago.
+        - Were last retrieved more than 60 days ago, OR
+        - Are date-anchored (topic mentions a specific past month/week/day) and
+          older than 14 days — these are point-in-time facts (Bitcoin price on
+          March 28, "this week's announcements") that lose value immediately.
 
         Returns the number of lessons decayed.
         """
@@ -971,9 +1034,72 @@ class LearningEngine:
                     (round(new_conf, 4), row["id"]),
                 )
                 decayed += 1
+
+        # Aggressive decay for date-anchored lessons. These contain phrases like
+        # "March 2026", "this week", "today", "current price" — the facts in
+        # them are stale by definition once the date passes.
+        date_anchored_rows = self._db.fetchall(
+            """SELECT id, confidence, topic FROM lessons
+               WHERE confidence > 0.2
+                 AND created_at < datetime('now', '-14 days')
+                 AND (
+                     topic LIKE '%January 20%' OR topic LIKE '%February 20%' OR
+                     topic LIKE '%March 20%' OR topic LIKE '%April 20%' OR
+                     topic LIKE '%May 20%' OR topic LIKE '%June 20%' OR
+                     topic LIKE '%July 20%' OR topic LIKE '%August 20%' OR
+                     topic LIKE '%September 20%' OR topic LIKE '%October 20%' OR
+                     topic LIKE '%November 20%' OR topic LIKE '%December 20%' OR
+                     topic LIKE '%this week%' OR topic LIKE '%today%' OR
+                     topic LIKE '%current %' OR topic LIKE '%latest %' OR
+                     topic LIKE '%trading price%'
+                 )"""
+        )
+        for row in date_anchored_rows:
+            new_conf = max(0.1, row["confidence"] * 0.7)  # aggressive 30% decay per cycle
+            self._db.execute(
+                "UPDATE lessons SET confidence = ? WHERE id = ?",
+                (round(new_conf, 4), row["id"]),
+            )
+            decayed += 1
+
         if decayed:
-            logger.info("Decayed confidence on %d stale lessons", decayed)
+            logger.info("Decayed confidence on %d stale lessons (%d date-anchored)",
+                        decayed, len(date_anchored_rows))
         return decayed
+
+    def prune_dead_lessons(self) -> int:
+        """Delete lessons that are proven dead weight.
+
+        A lesson is dead when all of these hold:
+        - Created at least 21 days ago (3 weeks is enough to tell if useful).
+        - Never retrieved, OR retrieved but never helpful (times_retrieved >= 10).
+        - Not a distilled principle (principles are load-bearing even if unretrieved).
+
+        Returns number of deleted rows. Also cleans ChromaDB.
+        """
+        rows = self._db.fetchall(
+            """SELECT id FROM lessons
+               WHERE created_at < datetime('now','-21 days')
+                 AND (
+                     times_retrieved = 0
+                     OR (times_retrieved >= 10 AND COALESCE(times_helpful,0) = 0)
+                 )
+                 AND COALESCE(lesson_text,'') NOT LIKE '%Principle distilled%'"""
+        )
+        if not rows:
+            return 0
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.transaction() as tx:
+            tx.execute(f"DELETE FROM lessons WHERE id IN ({placeholders})", tuple(ids))
+        try:
+            coll = self._get_lessons_collection()
+            if coll is not None:
+                coll.delete(ids=[str(i) for i in ids])
+        except Exception as e:
+            logger.warning("Failed to sync dead-lesson prune to ChromaDB: %s", e)
+        logger.info("Pruned %d dead lessons (never-retrieved or retrieved-unhelpful)", len(ids))
+        return len(ids)
 
 
 # ---------------------------------------------------------------------------

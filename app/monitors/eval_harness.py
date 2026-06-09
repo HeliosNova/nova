@@ -24,6 +24,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import statistics
 import time
@@ -51,6 +52,11 @@ class EvalTask:
     timeout: int = 60
     seed_skill: dict | None = None
     seed_document: dict | None = None  # {title, source, text} — seeded before retrieval tasks
+    # {topic, correct_answer, lesson_text, confidence} — seeded BETWEEN the
+    # before/after runs of a memory-learning task to prove the lesson causes
+    # the fix. Auto-cleaned after the task (context-marker scoped).
+    seed_lesson: dict | None = None
+    seed_fact: dict | None = None  # {subject, predicate, object} — KG analogue (wired in WS2C)
     paraphrase_of: str | None = None
     tags: list[str] = field(default_factory=list)
 
@@ -69,6 +75,26 @@ class TaskResult:
     failed_assertions: list[str]
     error: str | None = None
     decomposed: bool = False  # True when structural multi-agent decomposition fired
+    # memory-learning specific (None for all other categories):
+    #   before_correct — did the model answer correctly WITHOUT the seeded lesson
+    #   after_correct  — did it answer correctly WITH the lesson in context
+    #   caused_fix     — after_correct AND NOT before_correct (the lesson fixed it)
+    memory_before_correct: bool | None = None
+    memory_after_correct: bool | None = None
+    memory_caused_fix: bool | None = None
+
+
+@dataclass
+class _Invocation:
+    """Result of one brain.think() run — shared by normal + memory tasks."""
+    response_text: str
+    tools_invoked: list[str]
+    skill_used: str | None
+    decomposed: bool
+    max_decomposition_depth: int
+    reflexion_score: float | None
+    latency_seconds: float
+    error: str | None
 
 
 @dataclass
@@ -93,6 +119,10 @@ class CategoryMetrics:
     decomposition_rate: float | None = None
     # retrieval specific
     retrieval_recall: float | None = None
+    # memory-learning specific
+    memory_causal_fix_rate: float | None = None   # of testable pairs, fraction the lesson fixed
+    memory_already_known_rate: float | None = None  # fraction the base model already knew
+    memory_testable: int | None = None              # # pairs where the model did NOT already know
 
 
 @dataclass
@@ -135,6 +165,7 @@ def check_assertion(
     skill_used: str | None,
     reflexion_score: float | None,
     decomposed: bool = False,
+    max_decomposition_depth: int = 0,
 ) -> bool:
     """Return True if the assertion passes."""
     atype = assertion.get("type", "")
@@ -182,11 +213,24 @@ def check_assertion(
     if atype == "decomposition_not_fired":
         return not decomposed
 
+    if atype == "decomposition_depth_at_least":
+        # Verifies recursive decomposition actually fired: at least one sub-agent
+        # spawned its own sub-agents. Reads max_decomposition_depth from the DONE event.
+        return max_decomposition_depth >= int(assertion["value"])
+
     if atype == "retrieval_recall":
         # Passes if the seeded fact keyword appears in the response.
         # The harness seeds the document before running the task; if retrieval
         # works correctly, the response should contain the expected term.
-        return assertion["value"].lower() in response.lower()
+        # Pipe-delimited values are treated as alternatives — useful when the
+        # seed doc uses synonyms (e.g. 'parameter|weight' for the gradient
+        # descent task: both words appear in the seed and either confirms
+        # retrieval surfaced the doc).
+        target = assertion["value"]
+        rl = response.lower()
+        if "|" in target:
+            return any(t.strip().lower() in rl for t in target.split("|") if t.strip())
+        return target.lower() in rl
 
     logger.warning("[EvalHarness] Unknown assertion type: %r", atype)
     return False
@@ -227,6 +271,8 @@ def format_assertion_failure(
         return "decomposition_fired — decomposition did not trigger"
     if atype == "decomposition_not_fired":
         return "decomposition_not_fired — decomposition unexpectedly triggered"
+    if atype == "decomposition_depth_at_least":
+        return f"decomposition_depth_at_least({assertion['value']}) — observed depth was insufficient"
     if atype == "retrieval_recall":
         snippet = response[:80].replace("\n", " ")
         return f"retrieval_recall({assertion['value']!r}) — not found in: {snippet!r}"
@@ -298,6 +344,18 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             # Uses pass_rate as proxy (each retrieval task has a retrieval_recall assertion)
             cm.retrieval_recall = cm.pass_rate
 
+        if cat in ("memory-learning", "kg-retrieval"):
+            # The headline proof: of the pairs where the base model did NOT
+            # already know the answer, what fraction did the seeded lesson fix?
+            # (Pairs the model already knew are excluded from the denominator
+            # and reported separately as already_known_rate.)
+            testable = [r for r in cat_results if r.memory_before_correct is False]
+            fixed = [r for r in testable if r.memory_caused_fix]
+            cm.memory_testable = len(testable)
+            cm.memory_causal_fix_rate = (len(fixed) / len(testable)) if testable else None
+            already = sum(1 for r in cat_results if r.memory_before_correct is True)
+            cm.memory_already_known_rate = already / total if total else 0.0
+
         metrics[cat] = cm
     return metrics
 
@@ -309,7 +367,7 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
 def detect_regressions(
     current: dict[str, CategoryMetrics],
     baseline: dict,
-    tolerance: float = 0.10,
+    tolerance: float | dict[str, float] = 0.10,
 ) -> list[RegressionFlag]:
     """Compare current metrics against baseline dict.
 
@@ -320,7 +378,9 @@ def detect_regressions(
     Args:
         current:   CategoryMetrics keyed by category name.
         baseline:  Raw dict from a previous report's "categories" section.
-        tolerance: Absolute drop allowed before flagging (default 0.10 = 10%).
+        tolerance: Either a float (uniform tolerance for all categories) or
+                   a dict mapping category-name to per-category tolerance.
+                   Missing categories in the dict fall back to the 0.10 default.
 
     Returns:
         List of RegressionFlag objects; only flagged items have flagged=True.
@@ -334,13 +394,21 @@ def detect_regressions(
         ("multi_tool_rate", "multi_tool_rate"),
         ("decomposition_rate", "decomposition_rate"),
         ("retrieval_recall", "retrieval_recall"),
+        ("memory_causal_fix_rate", "memory_causal_fix_rate"),
         ("reflexion_mean", "reflexion_mean"),
     ]
+
+    def _tol_for(cat: str) -> float:
+        if isinstance(tolerance, dict):
+            return float(tolerance.get(cat, tolerance.get("__default__", 0.10)))
+        return float(tolerance)
 
     for cat, cm in current.items():
         baseline_cat = baseline.get("categories", {}).get(cat, {})
         if not baseline_cat:
             continue
+
+        cat_tol = _tol_for(cat)
 
         for attr, key in _metric_keys:
             current_val = getattr(cm, attr, None)
@@ -349,14 +417,14 @@ def detect_regressions(
                 continue
 
             delta = current_val - float(baseline_val)
-            flagged = delta < -tolerance
+            flagged = delta < -cat_tol
 
             flags.append(RegressionFlag(
                 metric=f"{cat}.{key}",
                 baseline=float(baseline_val),
                 current=current_val,
                 delta=delta,
-                tolerance=tolerance,
+                tolerance=cat_tol,
                 flagged=flagged,
             ))
 
@@ -433,6 +501,13 @@ def render_markdown(report: EvalReport) -> str:
             extras.append(f"decomposition_rate={cm.decomposition_rate:.1%}")
         if cm.retrieval_recall is not None:
             extras.append(f"retrieval_recall={cm.retrieval_recall:.1%}")
+        if cm.memory_causal_fix_rate is not None:
+            extras.append(
+                f"causal_fix_rate={cm.memory_causal_fix_rate:.1%} "
+                f"(testable={cm.memory_testable})"
+            )
+        if cm.memory_already_known_rate is not None:
+            extras.append(f"already_known={cm.memory_already_known_rate:.1%}")
         if cm.reflexion_std is not None:
             extras.append(f"reflexion_std={cm.reflexion_std:.2f}")
         if cm.reflexion_p10 is not None:
@@ -501,10 +576,26 @@ class EvalHarness:
     ) -> None:
         self.suite_path = Path(suite_path or config.EVAL_SUITE_PATH)
         self.report_dir = Path(report_dir or config.EVAL_REPORT_PATH)
-        self.tolerance = (
+        _default_tol = (
             regression_tolerance
             if regression_tolerance is not None
             else config.EVAL_REGRESSION_TOLERANCE
+        )
+        # Per-category tolerance map (added 2026-05-13, task #33).
+        # Read once at init from `categories_meta` in suite.yaml. Categories
+        # not listed fall back to `__default__` which is the global config
+        # value (or the explicit kwarg). detect_regressions consults this dict.
+        cat_tols: dict[str, float] = {"__default__": float(_default_tol)}
+        try:
+            with open(self.suite_path, encoding="utf-8") as f:
+                doc = yaml.safe_load(f) or {}
+            for cat, meta in (doc.get("categories_meta") or {}).items():
+                if isinstance(meta, dict) and "regression_tolerance" in meta:
+                    cat_tols[cat] = float(meta["regression_tolerance"])
+        except Exception as e:
+            logger.warning("[EvalHarness] categories_meta parse skipped: %s", e)
+        self.tolerance: float | dict[str, float] = (
+            cat_tols if len(cat_tols) > 1 else float(_default_tol)
         )
         # Shadow-eval module overrides (set via set_module_overrides())
         self._module_overrides: dict[str, str] = {}
@@ -548,14 +639,26 @@ class EvalHarness:
                     norm_steps.append(ns)
                 seed = {**seed, "steps": norm_steps}
 
+            # Timeout multiplier — heavier base models (27B) need longer
+            # per-task budgets than the suite was originally sized for (9B).
+            # Set EVAL_TIMEOUT_MULTIPLIER=2.5 when running on Qwen 3.6:27b
+            # or any other large base. Default 1.0 keeps 9B behavior.
+            try:
+                _mult = float(os.environ.get("EVAL_TIMEOUT_MULTIPLIER", "1.0"))
+            except (TypeError, ValueError):
+                _mult = 1.0
+            _raw_timeout = raw.get("timeout", 60)
+            _scaled_timeout = max(int(_raw_timeout * _mult), int(_raw_timeout))
             tasks.append(EvalTask(
                 id=raw["id"],
                 category=raw["category"],
                 query=raw["query"],
                 assertions=raw.get("assertions", []),
-                timeout=raw.get("timeout", 60),
+                timeout=_scaled_timeout,
                 seed_skill=seed,
                 seed_document=raw.get("seed_document"),
+                seed_lesson=raw.get("seed_lesson"),
+                seed_fact=raw.get("seed_fact"),
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
             ))
@@ -640,8 +743,12 @@ class EvalHarness:
 
     # --- Single task execution ---
 
-    async def run_task(self, task: EvalTask) -> TaskResult:
-        """Run one eval task through the real brain pipeline."""
+    async def _invoke_brain(self, query: str, timeout: int) -> _Invocation:
+        """Run one query through the real brain (ephemeral) and collect signals.
+
+        Shared by run_task (normal categories) and _run_memory_task (the
+        before/after runs). Honors the shadow-eval ContextVar overrides.
+        """
         from app.core.brain import think
         from app.core.reflexion import assess_quality
         from app.schema import EventType
@@ -651,6 +758,7 @@ class EvalHarness:
         tools_invoked: list[str] = []
         skill_used: str | None = None
         decomposed: bool = False
+        max_decomposition_depth: int = 0
         error: str | None = None
 
         # Inject shadow-eval module overrides (no-op when empty)
@@ -659,8 +767,8 @@ class EvalHarness:
 
         start = time.monotonic()
         try:
-            async with asyncio.timeout(task.timeout):
-                async for event in think(query=task.query, ephemeral=True):
+            async with asyncio.timeout(timeout):
+                async for event in think(query=query, ephemeral=True):
                     if event.type == EventType.TOKEN:
                         tokens.append(event.data.get("text", ""))
                     elif event.type == EventType.TOOL_USE:
@@ -670,12 +778,13 @@ class EvalHarness:
                     elif event.type == EventType.DONE:
                         skill_used = event.data.get("skill_used")
                         decomposed = bool(event.data.get("decomposed", False))
+                        max_decomposition_depth = int(event.data.get("max_decomposition_depth", 0) or 0)
         except asyncio.TimeoutError:
-            error = f"Timeout after {task.timeout}s"
-            logger.warning("[EvalHarness] Task %s timed out", task.id)
+            error = f"Timeout after {timeout}s"
+            logger.warning("[EvalHarness] query timed out after %ss", timeout)
         except Exception as e:
             error = str(e)
-            logger.warning("[EvalHarness] Task %s failed: %s", task.id, e)
+            logger.warning("[EvalHarness] brain invocation failed: %s", e)
         finally:
             # Always restore ContextVars regardless of outcome
             _MODULE_OVERRIDES.reset(_token1)
@@ -691,42 +800,276 @@ class EvalHarness:
                 answer=response_text,
                 tool_results=[{"tool": t, "output": ""} for t in tools_invoked],
                 max_tool_rounds=config.MAX_TOOL_ROUNDS,
-                query=task.query,
+                query=query,
             )
             reflexion_score = round(score, 4)
 
-        # Evaluate assertions
-        failed_assertions: list[str] = []
-        if error and not response_text:
-            # Hard error with no response — all assertions fail
-            failed_assertions = [f"task_error: {error}"]
-        else:
-            for a in task.assertions:
-                if not check_assertion(
-                    a, response_text, tools_invoked, skill_used, reflexion_score,
-                    decomposed=decomposed,
-                ):
-                    failed_assertions.append(
-                        format_assertion_failure(
-                            a, response_text, tools_invoked, skill_used, reflexion_score
-                        )
-                    )
+        return _Invocation(
+            response_text=response_text,
+            tools_invoked=tools_invoked,
+            skill_used=skill_used,
+            decomposed=decomposed,
+            max_decomposition_depth=max_decomposition_depth,
+            reflexion_score=reflexion_score,
+            latency_seconds=latency,
+            error=error,
+        )
 
+    def _evaluate_assertions(self, assertions: list[dict], inv: _Invocation) -> list[str]:
+        """Return the list of failed-assertion descriptions for an invocation."""
+        if inv.error and not inv.response_text:
+            # Hard error with no response — all assertions fail
+            return [f"task_error: {inv.error}"]
+        failed: list[str] = []
+        for a in assertions:
+            if not check_assertion(
+                a, inv.response_text, inv.tools_invoked, inv.skill_used,
+                inv.reflexion_score,
+                decomposed=inv.decomposed,
+                max_decomposition_depth=inv.max_decomposition_depth,
+            ):
+                failed.append(
+                    format_assertion_failure(
+                        a, inv.response_text, inv.tools_invoked, inv.skill_used,
+                        inv.reflexion_score,
+                    )
+                )
+        return failed
+
+    async def run_task(self, task: EvalTask) -> TaskResult:
+        """Run one eval task through the real brain pipeline."""
+        # memory-learning / kg-retrieval tasks use dedicated before/seed/after paths
+        if task.category == "kg-retrieval" and task.seed_fact:
+            return await self._run_kg_task(task)
+        if task.category == "memory-learning" and task.seed_lesson:
+            return await self._run_memory_task(task)
+
+        inv = await self._invoke_brain(task.query, task.timeout)
+        failed_assertions = self._evaluate_assertions(task.assertions, inv)
         passed = len(failed_assertions) == 0
+
+        # When an eval task fails, write a failure reflexion so the failure
+        # injection path has data to retrieve on similar future queries.
+        # Without this, the eval harness ran ephemeral=True (which skips
+        # post-processing) and failures never surfaced into reflexions —
+        # leaving the failure side of the learning loop with 0 records.
+        # (memory-learning tasks never reach here — a "before" miss is expected
+        # and must not pollute the reflexion store.)
+        if not passed:
+            try:
+                from app.core.brain import get_services
+                svc = get_services()
+                if svc and svc.reflexions:
+                    reason = "; ".join(failed_assertions[:3])[:400]
+                    svc.reflexions.store(
+                        task_summary=task.query[:500],
+                        outcome="failure",
+                        reflection=f"[eval-harness:{task.id}] {reason}",
+                        quality_score=inv.reflexion_score if inv.reflexion_score is not None else 0.3,
+                        tools_used=inv.tools_invoked,
+                        revision_count=0,
+                    )
+            except Exception as _e:
+                logger.debug("[EvalHarness] failure-reflexion write skipped: %s", _e)
 
         return TaskResult(
             task_id=task.id,
             category=task.category,
             query=task.query,
             passed=passed,
-            response_text=response_text[:500],  # truncate for report storage
-            tools_invoked=list(dict.fromkeys(tools_invoked)),  # dedup, preserve order
-            skill_used=skill_used,
-            reflexion_score=reflexion_score,
-            latency_seconds=round(latency, 2),
+            response_text=inv.response_text[:2000],  # truncate for report storage
+            tools_invoked=list(dict.fromkeys(inv.tools_invoked)),  # dedup, preserve order
+            skill_used=inv.skill_used,
+            reflexion_score=inv.reflexion_score,
+            latency_seconds=round(inv.latency_seconds, 2),
             failed_assertions=failed_assertions,
-            error=error,
-            decomposed=decomposed,
+            error=inv.error,
+            decomposed=inv.decomposed,
+        )
+
+    # --- Memory-learning task (before / seed lesson / after) ---
+
+    async def _run_memory_task(self, task: EvalTask) -> TaskResult:
+        """Prove a seeded lesson CAUSES a corrected answer.
+
+        1. Run the query with the lesson ABSENT      -> before_correct
+        2. Seed the lesson (context-marker scoped)
+        3. Run the same query with the lesson PRESENT -> after_correct
+        4. Delete the seeded lesson
+        caused_fix = after_correct AND NOT before_correct.
+
+        Deterministic — no LLM judge. The task's assertions (typically
+        answer_contains the seeded fact) are evaluated against BOTH runs.
+        """
+        from app.core.brain import get_services
+
+        svc = get_services()
+        learning = getattr(svc, "learning", None) if svc else None
+        seed = task.seed_lesson or {}
+        marker = f"eval-mem:{task.id}"
+        start = time.monotonic()
+
+        if not learning or not seed.get("correct_answer"):
+            return TaskResult(
+                task_id=task.id, category=task.category, query=task.query,
+                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                reflexion_score=None, latency_seconds=0.0,
+                failed_assertions=[
+                    "memory-learning: learning engine or seed_lesson.correct_answer missing"
+                ],
+                error="setup_error",
+            )
+
+        # Defensive: clear any leftover eval lesson for this task id
+        self._purge_eval_lessons(learning, marker)
+
+        # 1. BEFORE — lesson absent
+        before = await self._invoke_brain(task.query, task.timeout)
+        before_failed = self._evaluate_assertions(task.assertions, before)
+        before_correct = bool(before.response_text) and not before_failed
+
+        # 2. SEED — context marker makes cleanup safe (never deletes real lessons)
+        try:
+            learning.add_knowledge_lesson(
+                topic=seed.get("topic", task.id),
+                correct_answer=seed["correct_answer"],
+                lesson_text=seed.get("lesson_text", ""),
+                context=marker,
+                confidence=float(seed.get("confidence", 0.95)),
+            )
+        except Exception as e:
+            logger.warning("[EvalHarness] memory seed failed for %s: %s", task.id, e)
+
+        # 3. AFTER — lesson present
+        after = await self._invoke_brain(task.query, task.timeout)
+        after_failed = self._evaluate_assertions(task.assertions, after)
+        after_correct = bool(after.response_text) and not after_failed
+
+        # 4. CLEANUP
+        self._purge_eval_lessons(learning, marker)
+
+        caused_fix = bool(after_correct and not before_correct)
+        latency = time.monotonic() - start
+
+        notes = [
+            f"before_correct={before_correct} after_correct={after_correct} "
+            f"caused_fix={caused_fix}"
+        ]
+        report_failures = ([] if after_correct else after_failed) + notes
+
+        return TaskResult(
+            task_id=task.id,
+            category=task.category,
+            query=task.query,
+            passed=after_correct,
+            response_text=after.response_text[:2000],
+            tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+            skill_used=after.skill_used,
+            reflexion_score=after.reflexion_score,
+            latency_seconds=round(latency, 2),
+            failed_assertions=report_failures,
+            error=after.error if not after.response_text else None,
+            decomposed=after.decomposed,
+            memory_before_correct=before_correct,
+            memory_after_correct=after_correct,
+            memory_caused_fix=caused_fix,
+        )
+
+    @staticmethod
+    def _purge_eval_lessons(learning, marker: str) -> None:
+        """Delete only lessons tagged with our eval context marker.
+
+        Scoped by the exact `context` marker so real user lessons are never
+        touched, even if a seed deduped against an existing lesson.
+        """
+        try:
+            rows = learning._db.fetchall(
+                "SELECT id FROM lessons WHERE context = ?", (marker,)
+            )
+            for row in rows:
+                learning.delete_lesson(int(row["id"]))
+        except Exception as e:
+            logger.warning("[EvalHarness] eval lesson cleanup (%s) skipped: %s", marker, e)
+
+    # --- KG-retrieval task (before / seed fact / after) ---
+
+    async def _run_kg_task(self, task: EvalTask) -> TaskResult:
+        """Prove a seeded KNOWLEDGE-GRAPH fact is retrieved + used to fix an answer.
+
+        Same shape as _run_memory_task but seeds a (subject, predicate, object)
+        triple via kg.add_fact and retires it via kg.delete_fact (which sets
+        valid_to, so the fact is auto-excluded from future retrieval — clean
+        isolation). Exercises get_relevant_facts → KG prompt injection.
+        """
+        from app.core.brain import get_services
+
+        svc = get_services()
+        kg = getattr(svc, "kg", None) if svc else None
+        seed = task.seed_fact or {}
+        s, p, o = seed.get("subject"), seed.get("predicate"), seed.get("object")
+        start = time.monotonic()
+
+        if not kg or not (s and p and o):
+            return TaskResult(
+                task_id=task.id, category=task.category, query=task.query,
+                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                reflexion_score=None, latency_seconds=0.0,
+                failed_assertions=["kg-retrieval: kg engine or seed_fact (subject/predicate/object) missing"],
+                error="setup_error",
+            )
+
+        async def _clean():
+            try:
+                await kg.delete_fact(s, p, o)
+            except Exception as e:
+                logger.warning("[EvalHarness] kg cleanup failed for %s: %s", task.id, e)
+
+        await _clean()  # defensive pre-clean
+
+        # 1. BEFORE — fact absent
+        before = await self._invoke_brain(task.query, task.timeout)
+        before_failed = self._evaluate_assertions(task.assertions, before)
+        before_correct = bool(before.response_text) and not before_failed
+
+        # 2. SEED the KG triple
+        try:
+            await kg.add_fact(s, p, o, confidence=float(seed.get("confidence", 0.95)),
+                              source="eval", provenance="eval-kg")
+        except Exception as e:
+            logger.warning("[EvalHarness] kg seed failed for %s: %s", task.id, e)
+
+        # 3. AFTER — fact present
+        after = await self._invoke_brain(task.query, task.timeout)
+        after_failed = self._evaluate_assertions(task.assertions, after)
+        after_correct = bool(after.response_text) and not after_failed
+
+        # 4. CLEANUP (retire the seeded fact)
+        await _clean()
+
+        caused_fix = bool(after_correct and not before_correct)
+        latency = time.monotonic() - start
+        notes = [
+            f"before_correct={before_correct} after_correct={after_correct} "
+            f"caused_fix={caused_fix}"
+        ]
+        report_failures = ([] if after_correct else after_failed) + notes
+
+        return TaskResult(
+            task_id=task.id,
+            category=task.category,
+            query=task.query,
+            passed=after_correct,
+            response_text=after.response_text[:2000],
+            tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+            skill_used=after.skill_used,
+            reflexion_score=after.reflexion_score,
+            latency_seconds=round(latency, 2),
+            failed_assertions=report_failures,
+            error=after.error if not after.response_text else None,
+            decomposed=after.decomposed,
+            memory_before_correct=before_correct,
+            memory_after_correct=after_correct,
+            memory_caused_fix=caused_fix,
         )
 
     # --- Full suite run ---

@@ -191,24 +191,41 @@ class TestShouldDecompose:
         )
 
     def test_structural_depth_gate_blocks(self, monkeypatch):
-        """When already inside a structural decomposition, gate must block."""
+        """When already at MAX_STRUCTURAL_DEPTH, gate must block further recursion.
+
+        Recursive sub-agents are now allowed up to MAX_STRUCTURAL_DEPTH (default 2).
+        Depth=0 is top-level, depth=1 is first-level sub-agent (allowed to recurse),
+        depth=2 hits the cap and must block.
+        """
         monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")
         monkeypatch.setenv("MULTI_AGENT_TRIGGER_THRESHOLD", "1")
+        monkeypatch.setenv("MAX_STRUCTURAL_DEPTH", "2")
         from app.config import reset_config
         reset_config()
         from app.core import agent_spawner
         from app.core.decomposer import should_decompose
 
-        # Simulate being inside a structural decomposition (depth=1)
-        token = agent_spawner._structural_depth.set(1)
+        # At depth=2 (the cap), further decomposition must block
+        token = agent_spawner._structural_depth.set(2)
         try:
-            result = should_decompose(
+            blocked = should_decompose(
                 "Compare Python and JavaScript? Which is better?",
                 "general", False, False,
             )
         finally:
             agent_spawner._structural_depth.reset(token)
-        assert not result
+        assert not blocked
+
+        # At depth=1 (under the cap), recursion is now allowed (was blocked previously)
+        token = agent_spawner._structural_depth.set(1)
+        try:
+            allowed = should_decompose(
+                "Compare Python and JavaScript? Which is better?",
+                "general", False, False,
+            )
+        finally:
+            agent_spawner._structural_depth.reset(token)
+        assert allowed
 
     def test_ephemeral_not_hard_gate(self, monkeypatch):
         """ephemeral=True must NOT block decomposition (eval harness needs it)."""
@@ -272,6 +289,27 @@ class TestTryCompareSplit:
 
     def test_difference_between(self):
         tasks = _compare_split("What is the difference between Redis and Memcached?")
+        assert tasks is not None
+        assert len(tasks) == 2
+
+    # Connector variants added 2026-05-13 — previously only "and" matched.
+    def test_compare_to(self):
+        tasks = _compare_split("Compare Tokyo weather to Osaka weather")
+        assert tasks is not None
+        assert len(tasks) == 2
+
+    def test_compare_with(self):
+        tasks = _compare_split("Compare Python with JavaScript for backend work")
+        assert tasks is not None
+        assert len(tasks) == 2
+
+    def test_compare_versus(self):
+        tasks = _compare_split("Compare Tokyo versus Osaka in summer")
+        assert tasks is not None
+        assert len(tasks) == 2
+
+    def test_compare_vs(self):
+        tasks = _compare_split("Compare Python vs JavaScript")
         assert tasks is not None
         assert len(tasks) == 2
 
@@ -408,11 +446,11 @@ class TestDecomposeQuery:
         monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")
         from app.config import reset_config
         reset_config()
-        # Query must: (a) trigger a sequential marker, (b) yield >=2 tasks via
-        # fallback split on "and" — both halves must be >=15 chars.
+        # Query must: (a) trigger a sequential marker ("first ... then ..."),
+        # (b) yield >=2 tasks via split on "and" — both halves must be >=15 chars.
         plan = self._run(
-            "First search for the Python version and calculate how many years "
-            "have passed since Python 1.0 was released in 1994"
+            "First search for the current Python version, then take that result "
+            "and calculate how many years have passed since 1994"
         )
         assert plan is not None
         assert plan.strategy == "sequential"
@@ -439,6 +477,42 @@ class TestDecomposeQuery:
             assert task.focus
             assert isinstance(task.tags, list)
             assert task.depth == 1
+
+    def test_multi_entity_query_prefers_entity_split(self, monkeypatch):
+        """Regression: 'Compare A, B, C, D, E' used to produce 2 truncated
+        tasks via compare-split. Entity-split should now win for 3+ nouns.
+        """
+        monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")
+        monkeypatch.setenv("MAX_AGENT_COUNT", "10")
+        from app.config import reset_config
+        reset_config()
+        plan = self._run(
+            "Compare these in-memory caches side by side: Redis, Memcached, "
+            "Valkey, DragonflyDB, and KeyDB. What is each best at?"
+        )
+        assert plan is not None
+        # Five entities → five per-entity agents, not two compare-split agents.
+        assert len(plan.tasks) == 5
+        # Role names come from entity-split and should match each canonical name,
+        # not the truncated compare-split prefix (which used to be something like
+        # "these-in-memory-caches-side-by-side:-red-researcher").
+        roles = {t.role for t in plan.tasks}
+        assert "redis-researcher" in roles
+        assert "keydb-researcher" in roles
+        for t in plan.tasks:
+            assert len(t.role) < 40, f"role too long — compare-split truncation bug: {t.role!r}"
+
+    def test_imperative_verbs_are_not_entities(self, monkeypatch):
+        """Regression: 'Compare' used to count as an entity, letting entity-split
+        fire on "Compare X and Y" with 3 'entities' (Compare, X, Y).
+        """
+        monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")
+        from app.config import reset_config
+        reset_config()
+        plan = self._run("Compare Python and JavaScript performance characteristics")
+        assert plan is not None
+        # Only 2 real entities → compare-split wins, not a 3-task entity-split.
+        assert len(plan.tasks) == 2
 
     def test_plan_caps_at_max_agent_count(self, monkeypatch):
         monkeypatch.setenv("ENABLE_MULTI_AGENT", "true")

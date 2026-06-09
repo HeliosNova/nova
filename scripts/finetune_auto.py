@@ -63,10 +63,142 @@ DEFAULT_DATA_PATH = os.path.join(_NOVA_DATA_DIR, "training_data.jsonl")
 DEFAULT_OUTPUT_DIR = os.path.join(_NOVA_DATA_DIR, "finetune")
 DEFAULT_MIN_NEW_PAIRS = 50
 DEFAULT_EVAL_HOLDOUT = 10
-DEFAULT_BASE_MODEL = "qwen3.5:27b"
-DEFAULT_FT_MODEL_NAME = "nova-ft"
+DEFAULT_BASE_MODEL = "qwen3.6:27b"  # Ollama tag for Modelfile FROM; we have this locally. HF base for actual training comes from finetune.DEFAULT_MODEL.
+DEFAULT_FT_MODEL_NAME = "auto"  # "auto" → next version (nova-ft-v{N}-q8); anything else is used literally
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 METADATA_FILE = "run_history.json"
+ACTIVE_MODEL_FILE = "active_model.json"
+FT_MODEL_PREFIX = "nova-ft-v"
+FT_MODEL_SUFFIX = "-q8"
+
+
+# ---------------------------------------------------------------------------
+# Versioning + active-model marker (non-destructive deploy)
+# ---------------------------------------------------------------------------
+
+def _next_version_tag(output_dir: str) -> str:
+    """Return the next versioned model tag, e.g. 'nova-ft-v9-q8'.
+
+    Computes the next version number by scanning the run_history for any
+    versioned `deployed_model` or `ft_model` entries, and bumping the max.
+    Falls back to v9 if history is empty (first v9 training).
+    """
+    history = _load_history(output_dir)
+    max_n = 8  # current production is v8
+    for run in history:
+        for key in ("deployed_model", "ft_model"):
+            name = run.get(key) or ""
+            if name.startswith(FT_MODEL_PREFIX):
+                tail = name[len(FT_MODEL_PREFIX):]
+                digits = ""
+                for ch in tail:
+                    if ch.isdigit():
+                        digits += ch
+                    else:
+                        break
+                if digits:
+                    max_n = max(max_n, int(digits))
+    return f"{FT_MODEL_PREFIX}{max_n + 1}{FT_MODEL_SUFFIX}"
+
+
+def _active_model_path(output_dir: str) -> Path:
+    return Path(output_dir) / ACTIVE_MODEL_FILE
+
+
+def _read_active_model(output_dir: str) -> dict | None:
+    p = _active_model_path(output_dir)
+    if not p.exists():
+        return None
+    try:
+        with open(p, encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+def _write_active_model(output_dir: str, model: str, stats: dict) -> None:
+    """Atomically write the active-model marker AND update config_overrides.json.
+
+    Writing only the marker would leave Nova using the previous model (since
+    /data/config_overrides.json is the live source of truth for LLM_MODEL).
+    Updating both means the next container restart picks up the new model.
+    """
+    # 1. active_model.json — provenance/history marker
+    p = _active_model_path(output_dir)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "model": model,
+        "deployed_at": datetime.now().isoformat(),
+        **stats,
+    }
+    tmp = p.with_suffix(".json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(payload, f, indent=2)
+    tmp.replace(p)
+    logger.info("Active model marker updated: %s -> %s", p, model)
+
+    # 2. config_overrides.json — live source of truth for LLM_MODEL
+    overrides_path = Path("/data/config_overrides.json")
+    overrides: dict = {}
+    if overrides_path.exists():
+        try:
+            with open(overrides_path, encoding="utf-8") as f:
+                overrides = json.load(f)
+        except (json.JSONDecodeError, OSError):
+            overrides = {}
+    prev_model = overrides.get("LLM_MODEL")
+    overrides["LLM_MODEL"] = model
+    tmp2 = overrides_path.with_suffix(".json.tmp")
+    try:
+        with open(tmp2, "w", encoding="utf-8") as f:
+            json.dump(overrides, f, indent=2)
+        tmp2.replace(overrides_path)
+        logger.info(
+            "config_overrides.json LLM_MODEL: %s -> %s (takes effect on next restart)",
+            prev_model or "(unset)", model,
+        )
+    except OSError as e:
+        logger.error("Failed to update config_overrides.json: %s — deploy marker saved but model not live", e)
+
+
+def _list_versions(output_dir: str) -> list[dict]:
+    """List all versioned runs from history, newest first."""
+    history = _load_history(output_dir)
+    out = []
+    for run in reversed(history):
+        model = run.get("deployed_model") or run.get("ft_model") or ""
+        if model.startswith(FT_MODEL_PREFIX):
+            out.append({
+                "model": model,
+                "status": run.get("status"),
+                "win_rate": (run.get("eval_results") or {}).get("win_rate"),
+                "completed_at": run.get("completed_at"),
+            })
+    return out
+
+
+def rollback(output_dir: str) -> dict | None:
+    """Revert active-model marker to the previous deployed version.
+
+    Returns the new active marker payload, or None if there's nothing to roll
+    back to (history is empty or all runs are the current active one).
+    """
+    active = _read_active_model(output_dir)
+    current_model = (active or {}).get("model") or ""
+    history = _load_history(output_dir)
+
+    # Find previous deployed version (skip the current one)
+    for run in reversed(history):
+        cand = run.get("deployed_model") or ""
+        if cand and cand != current_model and run.get("status") == "deployed":
+            _write_active_model(output_dir, cand, {
+                "rolled_back_from": current_model,
+                "win_rate": (run.get("eval_results") or {}).get("win_rate"),
+            })
+            logger.info("Rolled back: %s -> %s", current_model or "(none)", cand)
+            return _read_active_model(output_dir)
+    logger.warning("No prior deployed version found in history — cannot roll back.")
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -210,11 +342,30 @@ def _load_history(output_dir: str) -> list[dict]:
 
 
 def _save_history(output_dir: str, history: list[dict]) -> None:
-    """Save training run history."""
+    """Save training run history. Writes to host output_dir AND mirrors into
+    the running nova-app container at /data/finetune/run_history.json so the
+    API's /finetune/status + /finetune/trigger endpoints reflect the latest
+    run (the API reads from the container volume, not the host disk)."""
     path = Path(output_dir) / METADATA_FILE
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(history, f, indent=2)
+
+    # Mirror into container so the API sees this run
+    try:
+        import subprocess
+        payload = json.dumps(history)
+        # Write via python -c so we don't have to deal with shell-escaping JSON
+        result = subprocess.run(
+            ["docker", "exec", "-i", "nova-app", "python", "-c",
+             "import sys, json; "
+             "open('/data/finetune/run_history.json','w').write(sys.stdin.read())"],
+            input=payload, text=True, capture_output=True, timeout=10,
+        )
+        if result.returncode != 0:
+            print(f"[warn] container history mirror failed: {result.stderr[:200]}")
+    except Exception as e:
+        print(f"[warn] container history mirror skipped: {e}")
 
 
 def _get_last_training_count(output_dir: str) -> int:
@@ -280,6 +431,11 @@ async def run_pipeline(
 
     Returns a metadata dict describing the run outcome.
     """
+    # Resolve "auto" to the next versioned tag so old models aren't overwritten.
+    if ft_model_name in ("auto", "", None):
+        ft_model_name = _next_version_tag(output_dir)
+        logger.info("Auto-versioned ft_model: %s", ft_model_name)
+
     run_meta: dict = {
         "started_at": datetime.now().isoformat(),
         "data_path": data_path,
@@ -337,6 +493,27 @@ async def run_pipeline(
     if not stop_ollama(compose_dir):
         logger.warning("Could not stop Ollama. Training may fail due to insufficient VRAM.")
 
+    # --- Step 4a: Optional SFT bootstrap on reasoning traces (open-rs) ---
+    # Lifts the reasoning floor before DPO nudges preferences. Conservative
+    # 1-epoch run; fails open if dependencies missing or no reasoning traces
+    # available — DPO then proceeds from the unaltered base model.
+    sft_base_model = base_model_hf
+    if os.getenv("ENABLE_SFT_BOOTSTRAP", "false").lower() == "true":
+        logger.info("=" * 60)
+        logger.info("Step 4a: Running SFT bootstrap (open-rs reasoning traces)")
+        logger.info("=" * 60)
+        try:
+            from scripts.sft_bootstrap import run_sft_bootstrap
+            sft_dir = run_sft_bootstrap(base_model_hf, output_dir)
+            if sft_dir:
+                sft_base_model = sft_dir
+                run_meta["sft_bootstrap_dir"] = sft_dir
+                logger.info("[SFT-bootstrap] adapter at %s — DPO will start from this", sft_dir)
+            else:
+                logger.info("[SFT-bootstrap] skipped — DPO will train from base model directly")
+        except Exception as e:
+            logger.warning("[SFT-bootstrap] failed (%s) — falling back to base model", e)
+
     # --- Step 4: Run DPO training ---
     logger.info("=" * 60)
     logger.info("Step 4: Running DPO training")
@@ -345,7 +522,7 @@ async def run_pipeline(
     try:
         adapter_dir = train(
             training_data,
-            model_name=base_model_hf,
+            model_name=sft_base_model,
             output_dir=output_dir,
         )
         run_meta["adapter_dir"] = adapter_dir
@@ -423,6 +600,11 @@ async def run_pipeline(
             base_model=base_model_ollama,
             candidate_model=ft_model_name,
             ollama_url=ollama_url,
+            # Honest gate: judge with a DIFFERENT-family local model (set
+            # EVAL_JUDGE_MODEL, e.g. llama3.1:8b). If unset, run_eval falls back
+            # to self-judging with a warning — and the Step-8 guard below then
+            # refuses to auto-deploy on that untrustworthy result.
+            judge_model=os.getenv("EVAL_JUDGE_MODEL") or None,
         )
 
         # Save eval results
@@ -459,29 +641,47 @@ async def run_pipeline(
     logger.info("Step 8: Making deployment decision")
     logger.info("=" * 60)
 
+    # Honest deploy requires an INDEPENDENT judge. Self-judging (judge == a model
+    # under test) inflates scores, so we refuse to auto-promote on it — a deploy
+    # is only as trustworthy as its judge. (Empirically, fine-tunes here tie the
+    # base under a real cross-family judge; see MODEL_CARD / CLAUDE.md.)
+    _judge = os.getenv("EVAL_JUDGE_MODEL") or ""
+    _independent_judge = bool(_judge) and _judge not in (base_model_ollama, ft_model_name)
+    if eval_results.candidate_is_better and not _independent_judge:
+        logger.warning(
+            "Candidate 'won' but the A/B used a SELF-JUDGE (EVAL_JUDGE_MODEL unset or "
+            "equal to a model under test). Refusing to auto-deploy on an untrustworthy "
+            "eval. Set EVAL_JUDGE_MODEL to a different-family local model and confirm "
+            "with `--eval-only` before promoting."
+        )
+        run_meta["status"] = "trained"
+        run_meta["reason"] = "candidate_is_better but judge was not independent — not deployed"
+        run_meta["completed_at"] = datetime.now().isoformat()
+        _record_run(output_dir, run_meta)
+        return run_meta
+
     if eval_results.candidate_is_better:
         logger.info("Fine-tuned model WINS. Deploying '%s' as active model.", ft_model_name)
         run_meta["status"] = "deployed"
         run_meta["deployed_model"] = ft_model_name
 
-        # Write deployment marker for Nova to pick up
-        deploy_marker = Path(output_dir) / "active_model.json"
-        with open(deploy_marker, "w", encoding="utf-8") as f:
-            json.dump({
-                "model": ft_model_name,
-                "deployed_at": datetime.now().isoformat(),
-                "win_rate": eval_results.win_rate,
-                "avg_preference": eval_results.avg_preference,
-            }, f, indent=2)
-        logger.info("Deployment marker written to %s", deploy_marker)
+        # Write deployment marker atomically — this is the non-destructive swap.
+        # Previous versions remain registered in Ollama under their own tags
+        # and can be rolled back to via --rollback.
+        _write_active_model(output_dir, ft_model_name, {
+            "win_rate": eval_results.win_rate,
+            "avg_preference": eval_results.avg_preference,
+            "base_model": base_model_ollama,
+            "training_pairs": run_meta.get("total_pairs"),
+        })
         logger.info(
-            "To activate: set LLM_MODEL=%s in .env and restart Nova.",
+            "Active model is now '%s'. Previous version still available; use --rollback to revert.",
             ft_model_name,
         )
     else:
         logger.info(
-            "Base model wins or tie. Keeping '%s'. Fine-tuned model available as '%s'.",
-            base_model_ollama, ft_model_name,
+            "Base model wins or tie. Keeping previous active model. Fine-tuned '%s' is registered "
+            "but NOT active.", ft_model_name,
         )
         run_meta["status"] = "rejected"
         run_meta["reason"] = (
@@ -523,7 +723,41 @@ def main():
     parser.add_argument("--eval-only", action="store_true", help="Only run evaluation (no training)")
     parser.add_argument("--compose-dir", default=None, help="Path to docker-compose.yml directory")
     parser.add_argument("--check", action="store_true", help="Only check readiness, don't train")
+    parser.add_argument("--rollback", action="store_true",
+                        help="Revert active model marker to previous deployed version")
+    parser.add_argument("--list-versions", action="store_true",
+                        help="List all versioned fine-tune runs from history")
+    parser.add_argument("--active", action="store_true",
+                        help="Show the currently active model marker")
     args = parser.parse_args()
+
+    # Inspect-only modes
+    if args.active:
+        m = _read_active_model(args.output)
+        if m:
+            print(json.dumps(m, indent=2))
+        else:
+            print("No active model marker yet.")
+        sys.exit(0)
+
+    if args.list_versions:
+        versions = _list_versions(args.output)
+        if not versions:
+            print("No versioned runs found.")
+        else:
+            for v in versions:
+                wr = v.get("win_rate")
+                wr_s = f"{wr:.1%}" if isinstance(wr, (int, float)) else "n/a"
+                print(f"  {v['model']:<25} status={v['status']:<10} win_rate={wr_s:<6} at={v['completed_at']}")
+        sys.exit(0)
+
+    if args.rollback:
+        result = rollback(args.output)
+        if result:
+            print(f"Rolled back to: {result['model']}")
+            sys.exit(0)
+        print("Nothing to roll back to.")
+        sys.exit(1)
 
     # Check-only mode
     if args.check:
@@ -542,6 +776,7 @@ def main():
             base_model=args.base_model,
             candidate_model=args.ft_model,
             ollama_url=args.ollama_url,
+            judge_model=os.getenv("EVAL_JUDGE_MODEL") or None,
         ))
         print(f"\nWin rate: {results.win_rate:.1%}")
         print(f"Avg preference: {results.avg_preference:+.2f}")

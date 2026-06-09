@@ -67,15 +67,25 @@ class TestFormatMonitorOutput:
         assert "42.5 MB" in result
         assert "\U0001f4ca" in result  # 📊
 
-    def test_stays_under_discord_limit(self):
+    def test_long_messages_pass_through_for_channel_split(self):
+        # Truncation moved out of format_monitor_output 2026-04-26 — channel
+        # adapters (Discord/Telegram) split for their per-platform limits.
+        # The renderer should pass long messages through whole, not cut them
+        # mid-sentence with a "[truncated]" note.
         long_text = "x" * 3000
         result = format_monitor_output("Test Monitor", long_text)
-        assert len(result) <= DISCORD_LIMIT
+        # Body is preserved (no truncation marker injected by the renderer)
+        assert "[truncated for Discord limit]" not in result
+        assert long_text in result  # full body passes through
 
-    def test_truncation_adds_note(self):
+    def test_no_truncation_marker_in_long_output(self):
         long_text = "This is a long sentence. " * 200
         result = format_monitor_output("Test Monitor", long_text)
-        assert "truncated" in result.lower()
+        # Renderer no longer injects a truncation marker — channel adapter
+        # handles the split. The full body is present (modulo trailing
+        # whitespace which the formatter strips).
+        assert "[truncated" not in result.lower()
+        assert long_text.rstrip() in result
 
     def test_timestamp_included(self):
         result = format_monitor_output("Test", "ok")

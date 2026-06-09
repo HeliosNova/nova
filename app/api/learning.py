@@ -69,10 +69,58 @@ async def list_lessons(limit: int = Query(default=100, ge=1, le=500)):
             "confidence": l.confidence,
             "times_retrieved": l.times_retrieved,
             "times_helpful": l.times_helpful,
+            "helpfulness_rate": (
+                round(l.times_helpful / l.times_retrieved, 3)
+                if l.times_retrieved > 0 else None
+            ),
             "created_at": l.created_at,
         }
         for l in lessons
     ]
+
+
+@router.get("/effectiveness")
+async def lesson_effectiveness():
+    """Aggregate lesson-effectiveness metric: how often retrieved lessons actually help.
+
+    Returns per-lesson helpfulness rate (times_helpful / times_retrieved) plus
+    summary stats. Surfaces the metric Nova was already tracking but never
+    exposing — useful for spotting lessons that are heavily retrieved but
+    rarely helpful (i.e. polluting the prompt without adding value).
+    """
+    svc = get_services()
+    if not svc.learning:
+        raise HTTPException(status_code=503, detail="Learning engine not initialized")
+    db = svc.learning._db
+    rows = db.fetchall(
+        "SELECT id, topic, times_retrieved, COALESCE(times_helpful,0) as times_helpful "
+        "FROM lessons WHERE times_retrieved >= 1"
+    )
+    if not rows:
+        return {
+            "total_retrieved": 0,
+            "avg_helpfulness_rate": None,
+            "best": [],
+            "worst": [],
+        }
+    items = [
+        {
+            "id": r["id"],
+            "topic": r["topic"],
+            "times_retrieved": r["times_retrieved"],
+            "times_helpful": r["times_helpful"],
+            "helpfulness_rate": round(r["times_helpful"] / r["times_retrieved"], 3),
+        }
+        for r in rows
+    ]
+    items.sort(key=lambda x: x["helpfulness_rate"], reverse=True)
+    avg = round(sum(i["helpfulness_rate"] for i in items) / len(items), 3)
+    return {
+        "total_retrieved": len(items),
+        "avg_helpfulness_rate": avg,
+        "best": items[:10],
+        "worst": [i for i in items if i["times_retrieved"] >= 10][-10:],
+    }
 
 
 @router.delete("/lessons/{lesson_id}")
@@ -202,9 +250,16 @@ async def finetune_status():
     elif total < min_recommended:
         recommendation = f"Only {total} pairs. Need at least {min_recommended} for meaningful training. Keep correcting!"
     elif total < good_count:
-        recommendation = f"{total} pairs — enough to start. Run: python scripts/finetune.py"
+        recommendation = (
+            f"{total} pairs collected. Fine-tuning is EXPERIMENTAL and off by default — "
+            f"Nova learns via the in-context memory loop, not weight updates. Only run a "
+            f"fine-tune for style/behavior experiments."
+        )
     else:
-        recommendation = f"{total} pairs — great dataset! Ready for fine-tuning."
+        recommendation = (
+            f"{total} pairs collected. Note: fine-tuning is experimental; in honest A/B "
+            f"evals it has tied the base model. Nova's learning is the memory loop (lessons + KG)."
+        )
 
     return {
         "ready": ready,
@@ -213,6 +268,13 @@ async def finetune_status():
         "pairs_with_rejected": has_rejected,
         "min_recommended": min_recommended,
         "recommendation": recommendation,
+        "experimental": True,
+        "note": (
+            "Fine-tuning is experimental and off by default. Nova's primary learning is the "
+            "in-context memory loop (lessons + temporal KG), validated by the memory-learning "
+            "eval. A fine-tune deploys only if it beats the base model under an independent "
+            "(different-family) A/B judge."
+        ),
     }
 
 

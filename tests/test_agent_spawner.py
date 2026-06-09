@@ -296,13 +296,26 @@ class TestFallbackConcat:
 
 class TestMergeAgentResults:
     @pytest.mark.asyncio
-    async def test_all_failed_returns_marker(self):
-        from app.core.agent_spawner import merge_agent_results
+    async def test_all_failed_returns_recovery_or_marker(self, monkeypatch):
+        # Behavior change: when all sub-agents fail, merge_agent_results now
+        # falls back to a single-pass LLM synthesis from the original query
+        # rather than returning a hardcoded "[All sub-agents failed...]" string.
+        # The marker is only returned if the recovery LLM call also dies.
+        # Patch the LLM module directly (agent_spawner imports llm inside
+        # the function, so we need to patch the source module).
+        from app.core import agent_spawner, llm
+
+        async def _failing_invoke(*args, **kwargs):
+            raise RuntimeError("simulated LLM unavailable")
+
+        monkeypatch.setattr(llm, "invoke_nothink", _failing_invoke)
         results = [
             _make_result(response="", error="timeout"),
             _make_result(role="r2", response="", error="exception: boom"),
         ]
-        output = await merge_agent_results(results, "Merge please", "What is X?")
+        output = await agent_spawner.merge_agent_results(
+            results, "Merge please", "What is X?"
+        )
         assert "All sub-agents failed" in output
 
     @pytest.mark.asyncio
@@ -355,6 +368,84 @@ class TestMergeAgentResults:
 
         user_msg = captured_args["messages"][-1]["content"]
         assert "Agent failed" in user_msg or "timeout" in user_msg
+
+    @pytest.mark.asyncio
+    async def test_merge_budget_scales_with_agent_count(self):
+        """Regression: N=10 merge used to truncate at 600 tokens, dropping
+        half the entities. Budget should scale with the number of successful
+        sub-agent results.
+        """
+        from app.core.agent_spawner import merge_agent_results
+        results = [_make_result(role=f"r{i}", response=f"Info {i}.") for i in range(10)]
+        captured_kwargs = {}
+
+        async def _capture(messages, **kwargs):
+            captured_kwargs.update(kwargs)
+            return "Merged all 10."
+
+        with patch("app.core.llm.invoke_nothink", new=_capture):
+            await merge_agent_results(results, "Synthesize", "Q")
+
+        # Base budget 600 + 200*(10-1) = 2400 (or whatever base config is set to)
+        assert captured_kwargs.get("max_tokens", 0) >= 2000, (
+            f"Merge budget too tight for 10 agents: {captured_kwargs}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_merge_body_includes_tools_and_quality_header(self):
+        """#14: each agent block must include the structured header
+        (tools=, quality=) so the synthesis prompt can weight findings by
+        provenance instead of re-reasoning from prose."""
+        from app.core.agent_spawner import merge_agent_results
+        results = [
+            _make_result(
+                role="r1", response="Tokyo: 22 C", tools_invoked=["web_search"],
+            ),
+            _make_result(
+                role="r2", response="Osaka: 25 C", tools_invoked=[],
+            ),
+        ]
+        # Manually set reflexion_score on one to test the quality= field.
+        results[0].reflexion_score = 0.85
+        captured: dict = {}
+
+        async def _capture(messages, **kwargs):
+            captured["body"] = messages[-1]["content"]
+            return "Merged."
+
+        with patch("app.core.llm.invoke_nothink", new=_capture):
+            await merge_agent_results(results, "Synthesize", "Compare cities")
+
+        body = captured["body"]
+        assert "tools=web_search" in body, body
+        assert "tools=(none)" in body, body
+        assert "quality=0.85" in body, body
+
+    @pytest.mark.asyncio
+    async def test_merge_body_pretrims_long_responses(self):
+        """#16: per-response trim at ~1500 chars prevents 6KB+ web_search
+        dumps from blowing up the merge prompt for 3+ agents."""
+        from app.core.agent_spawner import merge_agent_results
+        long_payload = "X" * 5000           # well past the 1500-char cap
+        results = [
+            _make_result(role="r1", response=long_payload, tools_invoked=["web_search"]),
+            _make_result(role="r2", response="short answer"),
+        ]
+        captured: dict = {}
+
+        async def _capture(messages, **kwargs):
+            captured["body"] = messages[-1]["content"]
+            return "Merged."
+
+        with patch("app.core.llm.invoke_nothink", new=_capture):
+            await merge_agent_results(results, "Synthesize", "Q")
+
+        body = captured["body"]
+        # The trim marker must appear; the full 5000-char payload must not.
+        assert "[...trimmed]" in body
+        assert "X" * 2000 not in body         # at most ~1500 X's land in body
+        # Short response is preserved verbatim
+        assert "short answer" in body
 
 
 # ===========================================================================

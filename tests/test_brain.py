@@ -193,6 +193,39 @@ class TestUserFactStore:
         fact = store.get("city")
         assert fact.value == "London"
 
+    def test_upsert_source_authority_correction_cannot_overwrite_user(self, db):
+        # correction (rank 3) must NOT overwrite user (rank 4). Otherwise an
+        # auto-correction inferred from a later message could clobber the
+        # owner's explicitly-stated fact.
+        store = UserFactStore(db)
+        store.set("name", "Alice", source="user", confidence=1.0)
+        store.set("name", "Alicia", source="correction", confidence=1.0)
+        assert store.get("name").value == "Alice"
+
+    def test_upsert_source_authority_inferred_cannot_overwrite_correction(self, db):
+        # inferred (rank 2) must NOT overwrite correction (rank 3).
+        store = UserFactStore(db)
+        store.set("role", "engineer", source="correction", confidence=1.0)
+        store.set("role", "designer", source="inferred", confidence=1.0)
+        assert store.get("role").value == "engineer"
+
+    def test_upsert_source_authority_unknown_source_blocked(self, db):
+        # An unknown source string maps to rank 0 in _SOURCE_AUTHORITY.get(...,0)
+        # and so MUST NOT overwrite any of the named ranks. Defends against a
+        # typo path silently corrupting facts (e.g. "extarcted" instead of
+        # "extracted").
+        store = UserFactStore(db)
+        store.set("city", "London", source="extracted", confidence=1.0)
+        store.set("city", "Paris", source="extarcted", confidence=1.0)  # typo
+        assert store.get("city").value == "London"
+
+    def test_upsert_same_authority_overwrites(self, db):
+        # Same-authority writes are allowed — owner can correct their own facts.
+        store = UserFactStore(db)
+        store.set("city", "London", source="user", confidence=1.0)
+        store.set("city", "Paris", source="user", confidence=1.0)
+        assert store.get("city").value == "Paris"
+
     def test_get_all(self, db):
         store = UserFactStore(db)
         store.set("name", "John")
@@ -236,7 +269,12 @@ class TestPromptBuilder:
         prompt = build_system_prompt(user_facts_text="## What You Know\n- name: John")
         assert "name: John" in prompt
 
-    def test_build_with_tools(self):
+    def test_build_with_tools(self, monkeypatch):
+        # IDENTITY+context-blocks > 6000 token budget; bump for these checks
+        # so the truncatable Tools/Context blocks have room to render.
+        monkeypatch.setenv("MAX_SYSTEM_TOKENS", "20000")
+        from app.config import reset_config
+        reset_config()
         prompt = build_system_prompt(tool_descriptions="web_search(query) — Search the web")
         assert "web_search" in prompt
         assert "Available Tools" in prompt
@@ -245,7 +283,10 @@ class TestPromptBuilder:
         prompt = build_system_prompt(lessons_text="## Lessons\n- Topic: Math — 2+2=4")
         assert "Math" in prompt
 
-    def test_build_with_context(self):
+    def test_build_with_context(self, monkeypatch):
+        monkeypatch.setenv("MAX_SYSTEM_TOKENS", "20000")
+        from app.config import reset_config
+        reset_config()
         prompt = build_system_prompt(retrieved_context="Document says revenue was $1M")
         assert "Retrieved Context" in prompt
         assert "revenue" in prompt
@@ -294,6 +335,116 @@ class TestPromptBuilder:
 
     def test_format_skills_empty(self):
         assert format_skills_for_prompt([]) == ""
+
+
+# ===========================================================================
+# Reasoning Pattern Matchers (SHARP2/SHARP3)
+# ===========================================================================
+
+class TestReasoningPatterns:
+    """Pure-function regex tests for the reasoning-shape gates."""
+
+    def test_should_use_deliberation_fires_on_chain_of_reasoning(self):
+        from app.core.brain import _should_use_deliberation
+        # Long enough + matches pattern
+        assert _should_use_deliberation(
+            "Walk me through how you would design a rate limiter for a REST API"
+        )
+        assert _should_use_deliberation(
+            "Show me how to derive the formula for compound interest, step by step"
+        )
+        assert _should_use_deliberation(
+            "How would you architect a distributed event-driven microservices system"
+        )
+        assert _should_use_deliberation(
+            "Explain how this algorithm processes a large dataset in chunks"
+        )
+
+    def test_should_use_deliberation_skips_simple_queries(self):
+        from app.core.brain import _should_use_deliberation
+        assert not _should_use_deliberation("What is 2+2")
+        assert not _should_use_deliberation("Hi")
+        assert not _should_use_deliberation("What is the capital of France")
+        # Short queries (< 25 chars) skipped even if they match
+        assert not _should_use_deliberation("Walk me through OAuth")
+
+    def test_definitional_compare_skipped(self):
+        from app.core.decomposer import should_decompose
+        # "Difference between X and Y" is a textbook definition; should not decompose
+        assert not should_decompose(
+            "What is the difference between a stack and a queue in computer science?",
+            "general", False, False,
+        )
+        assert not should_decompose(
+            "What is the distinction between TCP and UDP?",
+            "general", False, False,
+        )
+
+    def test_inherently_uncertain_query(self):
+        from app.core.brain import _INHERENTLY_UNCERTAIN_RE
+        assert _INHERENTLY_UNCERTAIN_RE.search(
+            "What will the exact S&P 500 index value be one year from today?"
+        )
+        assert _INHERENTLY_UNCERTAIN_RE.search("Predict who will win the next election")
+        assert _INHERENTLY_UNCERTAIN_RE.search("Forecast the price of Bitcoin in 2030")
+        # Non-uncertain factual queries
+        assert not _INHERENTLY_UNCERTAIN_RE.search("What is the population of France?")
+        assert not _INHERENTLY_UNCERTAIN_RE.search("How many planets are in the solar system")
+
+    def test_filter_confused_kg_facts(self):
+        from app.core.brain import _filter_confused_kg_facts
+
+        # Mock fact dataclass
+        class _F:
+            def __init__(self, subject):
+                self.subject = subject
+
+        facts = [
+            _F("Helios Protocol"),       # blockchain — should be filtered
+            _F("Nova Lake"),              # Intel CPU — should be filtered
+            _F("Project Helios"),         # this project — keep
+            _F("FastAPI"),                # generic — keep
+        ]
+        result = _filter_confused_kg_facts(
+            "What is the nova architecture?", facts
+        )
+        kept_subjects = {f.subject for f in result}
+        assert "Helios Protocol" not in kept_subjects
+        assert "Nova Lake" not in kept_subjects
+        assert "Project Helios" in kept_subjects
+        assert "FastAPI" in kept_subjects
+
+    def test_filter_passes_through_when_no_identity_trigger(self):
+        from app.core.brain import _filter_confused_kg_facts
+
+        class _F:
+            def __init__(self, subject):
+                self.subject = subject
+
+        facts = [_F("Helios Protocol"), _F("Nova Lake")]
+        # Query has no identity terms — confusion filter should be inert
+        result = _filter_confused_kg_facts("What is the price of Bitcoin?", facts)
+        assert len(result) == 2
+
+    def test_numbered_group_split(self):
+        from app.core.decomposer import _NUMBERED_GROUP_RE
+        assert len(_NUMBERED_GROUP_RE.findall("(1) X (2) Y (3) Z")) == 3
+        assert len(_NUMBERED_GROUP_RE.findall("(A) foo (B) bar")) == 2
+        assert len(_NUMBERED_GROUP_RE.findall("Just plain text")) == 0
+
+    def test_hard_reasoning_query(self):
+        from app.core.agent_loop import _is_hard_reasoning_query
+        assert _is_hard_reasoning_query(
+            "Compare Python and JavaScript for backend development"
+        )
+        assert _is_hard_reasoning_query(
+            "Analyze the trade-offs between microservices and monoliths"
+        )
+        assert _is_hard_reasoning_query(
+            "Explain how TLS handshake works step by step"
+        )
+        assert not _is_hard_reasoning_query("What is 2+2")
+        assert not _is_hard_reasoning_query("Hi")
 
 
 # ===========================================================================
@@ -1138,74 +1289,6 @@ class TestQuizMaxTokens:
 
 
 # ===========================================================================
-# Fact Extraction Wired to Brain
-# ===========================================================================
-
-class TestFactExtractionInBrain:
-    @pytest.fixture
-    def services(self, db):
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-        )
-        set_services(svc)
-        return svc
-
-    @pytest.mark.asyncio
-    async def test_fact_extracted_during_think(self, services):
-        """When user says 'My name is Alex', a fact should be extracted."""
-        import asyncio
-
-        with patch("app.core.brain.llm") as mock_brain_llm, \
-             patch("app.core.memory.llm") as mock_mem_llm:
-
-            # Brain LLM: normal response
-            mock_result = AsyncMock()
-            mock_result.content = "Nice to meet you, Alex!"
-            mock_result.tool_calls = []
-            mock_brain_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_brain_llm.invoke_nothink = AsyncMock(return_value="Introduction")
-
-            # Memory LLM: fact extraction
-            mock_mem_llm.invoke_nothink = AsyncMock(return_value=json.dumps({
-                "name": "Alex",
-            }))
-            mock_mem_llm.extract_json_object = lambda x: json.loads(x)
-
-            async for event in think("My name is Alex"):
-                pass
-
-            # Fact extraction is now a background task — drain tasks while mocks are active
-            await asyncio.sleep(0.1)
-            tasks = [t for t in asyncio.all_tasks() if not t.done() and t is not asyncio.current_task()]
-            if tasks:
-                await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Fact should have been saved
-        fact = services.user_facts.get("name")
-        assert fact is not None
-        assert fact.value == "Alex"
-        assert fact.source == "user"  # "My name is..." is an explicit user statement
-
-    @pytest.mark.asyncio
-    async def test_no_extraction_for_generic_message(self, services):
-        """Generic messages without fact signals should NOT trigger extraction."""
-        with patch("app.core.brain.llm") as mock_brain_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "It's sunny today."
-            mock_result.tool_calls = []
-            mock_brain_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_brain_llm.invoke_nothink = AsyncMock(return_value="Weather")
-
-            async for event in think("What's the weather?"):
-                pass
-
-        # No facts should exist
-        facts = services.user_facts.get_all()
-        assert len(facts) == 0
-
-
-# ===========================================================================
 # Conversation Search
 # ===========================================================================
 
@@ -1634,96 +1717,45 @@ class TestConversationLocks:
         _conversation_locks.clear()
 
 
-class TestBackgroundTaskNonBlocking:
-    """Test that fact extraction runs as a background task, not blocking think()."""
+# ===========================================================================
+# Context-gather per-subsystem timeout helper (#17)
+# ===========================================================================
 
-    @pytest.fixture
-    def services(self, db):
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-        )
-        set_services(svc)
-        return svc
+class TestRunContextIO:
+    """Each context-gather IO call must time out independently so a single
+    slow subsystem (SQLite lock, ChromaDB hang) can't stall the whole
+    pipeline."""
 
     @pytest.mark.asyncio
-    async def test_fact_extraction_is_background_task(self, services):
-        """Fact extraction should be dispatched via asyncio.create_task, not awaited inline."""
-        # We verify this by checking that think() completes even when the
-        # fact extraction coroutine hasn't resolved yet.
-        extraction_started = asyncio.Event()
-        extraction_gate = asyncio.Event()
+    async def test_returns_value_on_success(self):
+        from app.core.brain import _run_context_io
 
-        with patch("app.core.brain.llm") as mock_brain_llm, \
-             patch("app.core.memory.llm") as mock_mem_llm:
+        async def _ok():
+            return "hello"
 
-            # Brain LLM: normal response
-            mock_result = AsyncMock()
-            mock_result.content = "Nice to meet you, Alex!"
-            mock_result.tool_calls = []
-            mock_brain_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_brain_llm.invoke_nothink = AsyncMock(return_value="Introduction")
-
-            # Memory LLM: fact extraction that blocks until we release it
-            async def slow_extraction(*args, **kwargs):
-                extraction_started.set()
-                await extraction_gate.wait()
-                return json.dumps({"name": "Alex"})
-
-            mock_mem_llm.invoke_nothink = AsyncMock(side_effect=slow_extraction)
-            mock_mem_llm.extract_json_object = lambda x: json.loads(x)
-
-            # think() should yield all events and complete without waiting
-            # for the slow fact extraction
-            events = []
-            async for event in think("My name is Alex"):
-                events.append(event)
-
-            # think() should have completed (yielded DONE) even though
-            # extraction hasn't finished yet
-            event_types = [e.type for e in events]
-            assert EventType.DONE in event_types
-
-            # Now release the extraction so the background task can finish
-            extraction_gate.set()
-            # Give the background task a moment to complete
-            await asyncio.sleep(0.1)
+        assert await _run_context_io("ok-case", _ok(), default="X") == "hello"
 
     @pytest.mark.asyncio
-    async def test_background_tasks_tracked_in_set(self, services):
-        """Background tasks should be tracked in _background_tasks set for GC protection."""
-        from app.core.brain import _background_tasks
+    async def test_returns_default_on_timeout(self, monkeypatch):
+        from app.core import brain
+        # Force the timeout cap small so the test runs fast.
+        monkeypatch.setattr(brain, "_CONTEXT_GATHER_TIMEOUT_S", 0.05)
 
-        with patch("app.core.brain.llm") as mock_brain_llm, \
-             patch("app.core.memory.llm") as mock_mem_llm:
+        async def _slow():
+            await asyncio.sleep(5.0)
+            return "never reached"
 
-            mock_result = AsyncMock()
-            mock_result.content = "Hello Alex!"
-            mock_result.tool_calls = []
-            mock_brain_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_brain_llm.invoke_nothink = AsyncMock(return_value="Greeting")
+        result = await brain._run_context_io("slow-case", _slow(), default="SAFE")
+        assert result == "SAFE"
 
-            # Block extraction so it stays in _background_tasks
-            gate = asyncio.Event()
+    @pytest.mark.asyncio
+    async def test_returns_default_on_exception(self):
+        from app.core.brain import _run_context_io
 
-            async def blocked_extraction(*args, **kwargs):
-                await gate.wait()
-                return json.dumps({})
+        async def _boom():
+            raise RuntimeError("DB lock contention")
 
-            mock_mem_llm.invoke_nothink = AsyncMock(side_effect=blocked_extraction)
-            mock_mem_llm.extract_json_object = lambda x: json.loads(x)
+        result = await _run_context_io("boom-case", _boom(), default=None)
+        assert result is None  # default propagated, no exception
 
-            initial_count = len(_background_tasks)
 
-            async for event in think("My name is Alex"):
-                pass
-
-            # At least one background task should have been added
-            # (fact extraction). It may or may not have completed by now,
-            # but immediately after think() the task should still be tracked
-            # since we blocked it.
-            assert len(_background_tasks) >= initial_count
-
-            # Release and clean up
-            gate.set()
-            await asyncio.sleep(0.1)

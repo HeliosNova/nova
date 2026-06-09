@@ -1,27 +1,27 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-1%2C540%20passing-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2%2C387-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
-**The personal AI that actually learns from its mistakes.**
+**The personal AI that actually remembers what you teach it.**
 
-Correct Nova once. It remembers forever. Correct it enough times, it fine-tunes itself into a smarter model. All on your hardware. Your data never leaves.
+Correct Nova once and it remembers — by turning the correction into a lesson and a knowledge-graph fact that it retrieves on every future answer. Durable, inspectable, in-context learning: no retraining, no weight surgery. All on your hardware. Your data never leaves.
 
 ```
 You: "What's the capital of Australia?"
 Nova: "Sydney"
 You: "That's wrong, it's Canberra"
-Nova: [saves lesson, generates DPO training pair, updates knowledge graph]
+Nova: [saves a lesson + a knowledge-graph fact]
 
 --- 3 months later, different conversation ---
 
 You: "What's the capital of Australia?"
-Nova: "Canberra"  ← learned permanently
+Nova: "Canberra"  ← recalled from memory, not retrained
 ```
 
-No other open-source project combines all of these capabilities.
+Few self-hosted assistants combine all of these — and unlike most, the learning loop is *measured*, not just asserted (see the memory-learning eval below).
 
 ### See it in action
 
@@ -33,19 +33,21 @@ No other open-source project combines all of these capabilities.
 
 ## Why Nova
 
-Nova is a sovereign personal AI that runs entirely on your hardware with zero cloud dependencies. It doesn't just answer questions — it gets permanently smarter through a self-improvement pipeline that no other open-source project has:
+Nova is a sovereign personal AI that runs entirely on your hardware with zero cloud dependencies. It doesn't just answer questions — it gets permanently more useful *to you* through a memory loop that turns your corrections into durable, automatically-retrieved knowledge:
 
 | | Nova | Khoj (32K stars) | Open WebUI (124K stars) |
 |---|---|---|---|
-| Learns from corrections | **Full pipeline** | No | No |
-| Fine-tunes itself | **DPO + A/B eval** | No | No |
-| Knowledge graph | **Temporal** | Experimental | No |
+| Learns from corrections | **Memory loop (measured)** | No | No |
+| Temporal knowledge graph | **Yes** | Experimental | No |
 | Hybrid retrieval | **Vector + BM25 + RRF** | Vector only | Vector only |
 | Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No | No |
 | Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
-| Proactive monitors | **52 across 35+ domains** | Automations | No |
+| Proactive monitors | **50 across 35+ domains** | Automations | No |
 | MCP (client + server) | **Both** | No | Client only |
+| Self fine-tune (DPO) | Experimental¹ | No | No |
+
+¹ Optional and **off by default**. In honest, independently-judged A/B evals our local fine-tunes have **not** beaten the base model — so Nova's learning comes from the memory loop above, not from weight updates. See [The Learning Loop](#the-learning-loop).
 
 ## Quick Start
 
@@ -85,7 +87,7 @@ User query -> brain.think()
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
-Meanwhile, 52 monitors run autonomously:
+Meanwhile, 50 monitors run autonomously:
   -> web search across 35+ domains every 1-24h
   -> extract knowledge graph triples from every result
   -> send alerts via Discord/Telegram when something changes
@@ -96,19 +98,29 @@ No LangChain. No LangGraph. No agent frameworks. ~79 files of async Python + htt
 
 ## The Learning Loop
 
-This is what makes Nova unique. Every conversation makes it smarter:
+Nova learns by **growing an evolving memory** — not by retraining. Every correction becomes durable, automatically-retrieved knowledge:
 
 1. **Correction Detection** (2-stage) — regex pre-filter + LLM confirmation extracts what was wrong and what's correct
-2. **Lesson Storage** — topic, wrong answer, correct answer, lesson text — retrieved on future similar queries
-3. **DPO Training Pairs** — every correction generates `{query, chosen, rejected}` data for fine-tuning
-4. **Reflexion** *(experimental)* — heuristic failure detection (bad tool choices, short answers, exhausted loops) stored as warnings for future reference
-5. **Curiosity Engine** *(experimental)* — detects knowledge gaps ("I don't know", hedging, tool failures), queues background research via scheduled monitors
-6. **Success Patterns** — high-quality responses (score >= 0.8) stored as positive reinforcement
-7. **Automated Fine-Tuning** — when enough pairs accumulate, runs DPO training with A/B evaluation before deploying
+2. **Lesson Storage** — topic, wrong answer, correct answer, lesson text — stored in SQLite + a vector index, retrieved on future similar queries
+3. **Knowledge-Graph Fact** — the correction also lands as a temporal KG triple, injected into the system prompt when relevant
+4. **Reflexion** *(experimental)* — heuristic failure detection stored as warnings for similar future queries
+5. **Curiosity Engine** *(experimental)* — detects knowledge gaps and queues background research
+6. **Success Patterns** — high-quality responses stored as positive reinforcement
+
+This is in-context, retrieval-based learning — the approach favored by 2026 agent-memory research (e.g. ACE, Memento): durable, inspectable, reversible, and immune to catastrophic forgetting.
+
+### Does it actually work? (measured, not asserted)
+
+The `memory-learning` eval category (`evals/suite.yaml`) proves it: for each test it asks a question **without** the lesson, stores the lesson, asks again **with** it, and checks the answer flipped wrong→right. On the shipped 9B model a seeded correction causally fixes the answer the **majority** of the time (`memory_causal_fix_rate`); remaining misses are tracked as work items. The harness (`app/monitors/eval_harness.py`) runs nightly and on demand.
+
+### Self fine-tuning (experimental — off by default)
+
+Nova can also export `{query, chosen, rejected}` pairs from corrections and run a local DPO fine-tune behind an A/B gate. **This is experimental and disabled by default** (`ENABLE_AUTO_FINETUNE=false`). In honest, independently-judged A/B evals (a *different-family* local judge, position-swapped, multi-dimension) our small-data fine-tunes have so far **tied or lost to the base model** — consistent with the research consensus that retrieval/memory beats fine-tuning for injecting facts, and that small models degrade under small-data tuning. A candidate deploys **only if it wins** that A/B; otherwise the base is kept. Use weight fine-tuning, if at all, for *style/behavior* — not as the way Nova learns facts.
 
 ```bash
-python scripts/finetune_auto.py --check   # Check readiness
-python scripts/finetune_auto.py           # Full pipeline: train -> eval -> deploy
+docker compose stop ollama                                              # free VRAM
+python scripts/finetune_auto.py --check                                 # readiness only (no auto-deploy)
+python scripts/eval_harness.py --base <base> --candidate <ft> --judge <other-family-model>
 ```
 
 ## Tools (20 built-in)
@@ -233,7 +245,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-1,540 tests across 74 files: brain pipeline, learning loop, tools, channels, monitors, security offensive, stress/concurrency, behavioral, and e2e.
+2,387 tests across ~95 files: brain pipeline, memory loop, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
 
 ## Hardware Requirements
 

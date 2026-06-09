@@ -271,37 +271,125 @@ class SkillStore:
     def _semantic_match(self, query: str) -> Skill | None:
         """Embedding-similarity skill lookup (fallback when regex misses).
 
-        Returns the best skill whose embedding similarity ≥ SKILL_SEMANTIC_THRESHOLD,
-        or None if no skill clears the bar.
+        Walks the top-N results above SKILL_SEMANTIC_THRESHOLD and returns
+        the first one that still exists in SQLite AND is enabled.
+        ChromaDB embeddings can drift from SQLite (skill row deleted but
+        embedding still cached) — walking the list instead of stopping at
+        the top hit handles that.
         """
         try:
             collection = self._get_skill_collection()
             if collection.count() == 0:
                 return None
+            # Pull top-5 instead of top-1 so we can skip stale embeddings
             results = collection.query(
                 query_texts=[query],
-                n_results=1,
+                n_results=5,
                 include=["distances", "metadatas"],
             )
             if not results["ids"] or not results["ids"][0]:
                 return None
-            distance = results["distances"][0][0]
-            # ChromaDB cosine distance: 0=identical, 2=opposite → similarity = 1 − distance/2
-            similarity = 1.0 - (distance / 2.0)
-            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
-                logger.debug(
-                    "Semantic skill match below threshold: sim=%.3f threshold=%.3f",
-                    similarity, config.SKILL_SEMANTIC_THRESHOLD,
-                )
-                return None
-            skill_id = int(results["metadatas"][0][0]["skill_id"])
-            skill = self.get_skill(skill_id)
-            if skill and skill.enabled:
+            stale_ids: list[str] = []
+            for idx in range(len(results["ids"][0])):
+                distance = results["distances"][0][idx]
+                similarity = 1.0 - (distance / 2.0)
+                if similarity < config.SKILL_SEMANTIC_THRESHOLD:
+                    break  # results sorted by distance ascending; remaining only worse
+                meta = results["metadatas"][0][idx] or {}
+                try:
+                    skill_id = int(meta.get("skill_id"))
+                except (TypeError, ValueError):
+                    continue
+                skill = self.get_skill(skill_id)
+                if skill is None:
+                    # Stale embedding — drop it from the collection later
+                    stale_ids.append(results["ids"][0][idx])
+                    continue
+                if not skill.enabled:
+                    continue
+                # Sanity gate: semantic match must share substantive content
+                # tokens with the query, beyond a generic verb. Without this,
+                # `factorial_calculation` matched "What is 2 plus 2?" via
+                # embedding similarity, and `compare_network_protocols`
+                # matched "hash table vs B-tree" because both contain "compare".
+                # Generic verbs alone (compare/find/get/store/set) don't prove
+                # topical relevance — require at least one CONCRETE noun match.
+                _STOPWORDS = {
+                    "what", "where", "when", "which", "show", "tell",
+                    "explain", "describe", "should", "could", "would",
+                    "their", "there", "these", "those", "about", "from",
+                    "with", "have", "been", "into", "than", "this", "that",
+                    # Prepositions / connectives — picked these up via runtime
+                    # audit: "between" was the only overlap that passed for
+                    # "hash table vs B-tree" matching `compare_network_protocols`.
+                    "between", "among", "across", "before", "after", "during",
+                    "while", "such", "some", "many", "much", "every", "each",
+                    "would", "should", "really", "actually", "currently",
+                }
+                _GENERIC_VERBS = {
+                    "compare", "comparison", "contrast", "find", "search",
+                    "lookup", "look", "get", "fetch", "retrieve", "store",
+                    "save", "remember", "set", "create", "make", "build",
+                    "give", "show", "list", "calculate", "compute", "convert",
+                    "test", "check", "validate", "verify", "explain", "describe",
+                    "preference", "user", "info", "data", "result", "value",
+                    # "difference"/"differences"/"different" are connectives in
+                    # comparison queries — they don't carry topical signal on
+                    # their own. Same for "versus", "method", "approach".
+                    "difference", "differences", "different", "versus",
+                    "method", "methods", "approach", "approaches",
+                    "type", "types", "kind", "kinds", "sort", "sorts",
+                    "case", "cases", "example", "examples",
+                }
+                _q_tokens_all = {
+                    t for t in re.findall(r"[a-z][a-z0-9]{3,}", query.lower())
+                    if t not in _STOPWORDS
+                }
+                _q_tokens_substantive = _q_tokens_all - _GENERIC_VERBS
+                _skill_tokens_all = set(re.findall(
+                    r"[a-z][a-z0-9_]{3,}",
+                    (skill.name + " " + (skill.trigger_pattern or "")).lower(),
+                ))
+                _skill_tokens_all = {
+                    t for piece in _skill_tokens_all for t in re.split(r"[_\\]", piece)
+                    if len(t) >= 4
+                }
+                _skill_tokens_substantive = _skill_tokens_all - _GENERIC_VERBS
+
+                # Reject if: query has no substantive tokens at all, OR
+                # query and skill share no substantive (non-verb) overlap.
+                _no_substantive_overlap = not (_q_tokens_substantive & _skill_tokens_substantive)
+                _query_too_short = len(_q_tokens_all) == 0
+                if _query_too_short or (_q_tokens_all and _skill_tokens_all and _no_substantive_overlap):
+                    logger.info(
+                        "Semantic skill match REJECTED (insufficient overlap): "
+                        "'%s' for query=%r — q=%r skill=%r",
+                        skill.name, query[:60],
+                        list(_q_tokens_substantive)[:5],
+                        list(_skill_tokens_substantive)[:5],
+                    )
+                    continue
                 logger.info(
-                    "Semantic skill match: '%s' (id=%d, sim=%.3f)",
-                    skill.name, skill_id, similarity,
+                    "Semantic skill match: '%s' (id=%d, sim=%.3f, walked %d)",
+                    skill.name, skill_id, similarity, idx,
                 )
+                # Best-effort cleanup of any stale embeddings we passed over
+                if stale_ids:
+                    try:
+                        collection.delete(ids=stale_ids)
+                        logger.info(
+                            "Pruned %d stale skill embedding(s): %s",
+                            len(stale_ids), stale_ids[:5],
+                        )
+                    except Exception as e:
+                        logger.debug("Stale-embedding prune failed: %s", e)
                 return skill
+            # Nothing matched — also clean up any stale we found
+            if stale_ids:
+                try:
+                    collection.delete(ids=stale_ids)
+                except Exception:
+                    pass
         except Exception as e:
             logger.warning("Semantic skill lookup failed: %s", e)
         return None
@@ -374,7 +462,11 @@ class SkillStore:
             (name,),
         )
         if existing_by_name:
-            old_trigger = existing_by_name.get("trigger_pattern", "<unknown>") or "<unknown>"
+            # sqlite3.Row has __getitem__ but no .get() — use try/except.
+            try:
+                old_trigger = existing_by_name["trigger_pattern"] or "<unknown>"
+            except (KeyError, IndexError):
+                old_trigger = "<unknown>"
             import sqlite3 as _sqlite3
             try:
                 self._db.execute(
@@ -443,8 +535,10 @@ class SkillStore:
     def record_use(self, skill_id: int, success: bool) -> None:
         """Record a skill execution. Updates times_used, success_rate, and quality counters.
 
-        Fast demotion: 3 consecutive failures disables the skill immediately
+        Fast demotion: 5 consecutive failures disables the skill immediately
         (in addition to the slow EMA-based auto-disable at success_rate < 0.3).
+        Threshold was raised from 3 — 3 is too aggressive when a skill hits a
+        transient upstream issue (SearXNG rate-limited, Ollama briefly down).
         """
         success_val = 1.0 if success else 0.0
         alpha = config.SKILL_EMA_ALPHA
@@ -499,9 +593,10 @@ class SkillStore:
         if not row:
             return
 
-        # Fast demotion: 3+ consecutive failures
+        # Fast demotion: 5+ consecutive failures (raised from 3 — transient
+        # upstream failures shouldn't instakill a skill).
         consec = row["consecutive_failures"] if "consecutive_failures" in row.keys() else 0
-        if consec >= 3:
+        if consec >= 5:
             self._db.execute("UPDATE skills SET enabled = 0 WHERE id = ?", (skill_id,))
             logger.warning(
                 "Fast-disabled skill #%d '%s': %d consecutive failures",

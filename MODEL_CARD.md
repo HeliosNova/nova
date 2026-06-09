@@ -1,6 +1,6 @@
 ---
 license: apache-2.0
-base_model: Qwen/Qwen3.5-27B
+base_model: Qwen/Qwen3.5-9B
 tags:
   - dpo
   - qlora
@@ -13,21 +13,21 @@ language:
   - en
 ---
 
-# Nova-FT — DPO Fine-Tuned Qwen3.5-27B
+# Nova-FT — DPO Fine-Tuned Qwen3.5-9B (experimental)
 
-A DPO (Direct Preference Optimization) fine-tuned version of [Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B), trained on real user corrections collected by [Nova](https://github.com/HeliosNova/nova), a self-improving personal AI assistant.
+A small-data DPO (Direct Preference Optimization) fine-tune of [Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B), built from real user corrections collected by [Nova](https://github.com/HeliosNova/nova), a sovereign personal AI assistant. **This adapter is an experiment, not Nova's primary learning mechanism** — see *Evaluation* below.
 
 ## What This Model Is
 
-Nova is a personal AI that learns from its mistakes. When you correct it, it extracts a structured lesson and generates a DPO training pair (`{query, chosen, rejected}`). When enough pairs accumulate, Nova fine-tunes its own base model using this data.
+Nova learns primarily by **memory**: when you correct it, it stores a lesson and a knowledge-graph fact that are retrieved into the prompt on future queries (durable, in-context learning). Separately and experimentally, it can also export `{query, chosen, rejected}` pairs and run a local DPO fine-tune — this model is the result of that optional path.
 
-This model is the result of that pipeline — a Qwen3.5-27B that has been aligned to prefer correct, concise answers over the verbose, hedging, or incorrect responses it originally gave.
+It is a *lightweight behavioral alignment* on a small correction set, **not** a capability upgrade: in independent, position-swapped A/B evaluation it performs **on par with the base model** (see *Evaluation*). Use it as a drop-in Qwen3.5-9B; its real value is operating inside the Nova system, where the memory loop does the learning.
 
 ## Training Details
 
 | Parameter | Value |
 |-----------|-------|
-| **Base model** | `Qwen/Qwen3.5-27B` |
+| **Base model** | `Qwen/Qwen3.5-9B` |
 | **Method** | DPO (Direct Preference Optimization) |
 | **Quantization** | QLoRA (4-bit NF4) via Unsloth |
 | **LoRA rank** | 16 |
@@ -66,6 +66,8 @@ Before deployment, the fine-tuned model is evaluated against the base model usin
 - Both base and fine-tuned models generate responses to each query
 - LLM-as-judge compares responses with randomized A/B ordering to prevent position bias
 - Deployment only if fine-tuned model wins >50% with positive average preference score
+
+**Result (honest):** under an *independent, different-family* judge (e.g. Llama-3.1-8B), position-swapped across both A/B orders and scored on four dimensions, Nova-FT and the base Qwen3.5-9B come out **statistically tied** (≈8/10 ties, near-zero average preference). The fine-tune does **not** beat its base, so by the deploy rule above it is not promoted on capability grounds. This matches the literature: RAG/memory beats fine-tuning for factual recall, and small models tend to degrade under small-data tuning. Nova's actual learning is the retrieval-based **memory loop**, validated separately by the `memory-learning` eval.
 
 ## Intended Use
 
@@ -107,10 +109,11 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 
 ## Limitations
 
-- Trained on 341 pairs — this is a lightweight alignment, not a fundamental capability change
-- Training data reflects one user's corrections and preferences — may not generalize to all use cases
-- Base model limitations (Qwen3.5-27B) still apply: knowledge cutoff, potential hallucinations, language biases
-- Best results when used within the Nova system where lessons and knowledge graph provide additional context
+- Trained on a few hundred preference pairs — a lightweight alignment, not a fundamental capability change
+- In independent A/B evaluation it **ties** (does not beat) the base model — prefer the base unless you specifically want Nova's behavioral nudges
+- Training data reflects one user's corrections and preferences — may not generalize
+- Base model limitations (Qwen3.5-9B) still apply: knowledge cutoff, potential hallucinations, language biases
+- Best results when used within the Nova system, where the memory loop (lessons + knowledge graph) does the real learning
 
 ## License
 

@@ -37,8 +37,7 @@ _OVERRIDES_PATH = Path(os.getenv("CONFIG_OVERRIDES_PATH", "/data/config_override
 # Fields that may be persisted/loaded via config overrides (security: prevents persisted bypasses)
 _MUTABLE_FIELDS = {
     "LLM_PROVIDER", "LLM_MODEL", "OLLAMA_URL",
-    "OPENAI_MODEL", "ANTHROPIC_MODEL",
-    "GOOGLE_MODEL", "VISION_MODEL", "FAST_MODEL", "HEAVY_MODEL",
+    "VISION_MODEL",
     "EMBEDDING_MODEL", "RETRIEVAL_TOP_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
     "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT", "MAX_SKILLS_CHECK",
     "MAX_CONTEXT_TOKENS", "RECENT_MESSAGES_KEEP",
@@ -47,7 +46,7 @@ _MUTABLE_FIELDS = {
     "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
     "ENABLE_PLANNING", "ENABLE_CRITIQUE", "ENABLE_CUSTOM_TOOLS",
     "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
-    "ENABLE_VOICE", "ENABLE_MODEL_ROUTING",
+    "ENABLE_VOICE", "ENABLE_TTS", "TTS_MODEL_PATH", "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
     "ENABLE_SHELL_EXEC", "ENABLE_MCP", "ENABLE_MCP_SERVER",
     "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
@@ -67,17 +66,25 @@ _MUTABLE_FIELDS = {
     # Tuning parameters
     "RESPONSE_TOKEN_BUDGET", "RETRIEVAL_RELEVANCE_THRESHOLD",
     "TEMPERATURE_DEFAULT",
-    "MIN_RRF_SCORE", "DEDUP_JACCARD_THRESHOLD",
+    "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
     "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
     "INJECTION_SUSPICIOUS_THRESHOLD",
-    "FACT_INJECTION_SKIP_THRESHOLD", "FACT_CONFIDENCE_EXTRACTED", "FACT_CONFIDENCE_USER",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
-    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT",
+    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT", "MAX_PARALLEL_AGENTS", "MAX_STRUCTURAL_DEPTH",
+    "ENABLE_TREE_OF_THOUGHT", "TOT_SAMPLE_N",
+    "ENABLE_BEST_OF_N", "BEST_OF_N_SAMPLES", "BEST_OF_N_QUALITY_THRESHOLD",
+    "RETRIEVAL_HARD_FLOOR",
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
+    "ENABLE_PPR_RETRIEVAL", "ENABLE_CONFORMAL_ABSTENTION", "ENABLE_GSW_EPISODIC",
+    "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
+    "ENABLE_RLVR_SIGNALS", "ENABLE_DEBATE", "DEBATE_TIMEOUT_SECONDS",
+    "ENABLE_PROCEDURAL_CONSOLIDATION",
+    "ENABLE_MAD_MM_MASKING", "MAD_MM_MIN_PRIOR_STEPS", "MAD_MM_JUDGE_MODEL",
+    "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
     "ENABLE_PROMPT_SELF_MOD",
     "PROMPT_MOD_MAX_PROPOSALS_PER_DAY", "PROMPT_MOD_MAX_PENDING",
@@ -89,18 +96,16 @@ _MUTABLE_FIELDS = {
 
 @dataclass
 class Config:
-    # LLM
+    # LLM — Nova is Ollama-only (cloud providers removed for sovereign operation).
     LLM_PROVIDER: str = field(default_factory=lambda: _env("LLM_PROVIDER", "ollama"))
     LLM_MODEL: str = field(default_factory=lambda: _env("LLM_MODEL", "qwen3.5:27b"))
     OLLAMA_URL: str = field(default_factory=lambda: _env("OLLAMA_URL", "http://ollama:11434"))
 
-    # Multi-provider API keys + models
-    OPENAI_API_KEY: str = field(default_factory=lambda: _env("OPENAI_API_KEY"))
-    OPENAI_MODEL: str = field(default_factory=lambda: _env("OPENAI_MODEL", "gpt-4o"))
-    ANTHROPIC_API_KEY: str = field(default_factory=lambda: _env("ANTHROPIC_API_KEY"))
-    ANTHROPIC_MODEL: str = field(default_factory=lambda: _env("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"))
-    GOOGLE_API_KEY: str = field(default_factory=lambda: _env("GOOGLE_API_KEY"))
-    GOOGLE_MODEL: str = field(default_factory=lambda: _env("GOOGLE_MODEL", "gemini-2.0-flash"))
+    # Learning / reflexion toggles — these were referenced in code but missing
+    # from config, leading to `AttributeError: ??? ` at inspection time.
+    ENABLE_REFLEXION: bool = field(default_factory=lambda: _env("ENABLE_REFLEXION", "true").lower() == "true")
+    ENABLE_BACKGROUND_TASKS: bool = field(default_factory=lambda: _env("ENABLE_BACKGROUND_TASKS", "true").lower() == "true")
+    ENABLE_AUTO_FINETUNE: bool = field(default_factory=lambda: _env("ENABLE_AUTO_FINETUNE", "false").lower() == "true")
 
     # MCP (Model Context Protocol) — client (consume external MCP tools)
     ENABLE_MCP: bool = field(default_factory=lambda: _env("ENABLE_MCP", "true").lower() == "true")
@@ -114,9 +119,9 @@ class Config:
     SKILLS_DIR: str = field(default_factory=lambda: _env("SKILLS_DIR", "/data/skills"))
 
     # Memory
-    MAX_HISTORY_MESSAGES: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 20))
+    MAX_HISTORY_MESSAGES: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 50))
     MAX_LESSONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_LESSONS_IN_PROMPT", 5))
-    MAX_SKILLS_CHECK: int = field(default_factory=lambda: _env_int("MAX_SKILLS_CHECK", 10))
+    MAX_SKILLS_CHECK: int = field(default_factory=lambda: _env_int("MAX_SKILLS_CHECK", 500))
 
     # Context window management
     MAX_CONTEXT_TOKENS: int = field(default_factory=lambda: _env_int("MAX_CONTEXT_TOKENS", 16000))
@@ -130,23 +135,67 @@ class Config:
     RRF_K: int = field(default_factory=lambda: _env_int("RRF_K", 60))
     RETRIEVAL_RRF_K: int = field(default_factory=lambda: _env_int("RETRIEVAL_RRF_K", 60))
     ENABLE_RERANKER: bool = field(default_factory=lambda: _env("ENABLE_RERANKER", "true").lower() == "true")
+    # HippoRAG 2 PPR-over-KG retrieval (graph walk for multi-hop fact recall)
+    ENABLE_PPR_RETRIEVAL: bool = field(default_factory=lambda: _env("ENABLE_PPR_RETRIEVAL", "true").lower() == "true")
+    # Conformal Abstention — calibrated confidence-footer thresholds
+    ENABLE_CONFORMAL_ABSTENTION: bool = field(default_factory=lambda: _env("ENABLE_CONFORMAL_ABSTENTION", "true").lower() == "true")
+    # GSW (Generative Semantic Workspace) — episodic memory layer
+    ENABLE_GSW_EPISODIC: bool = field(default_factory=lambda: _env("ENABLE_GSW_EPISODIC", "true").lower() == "true")
+    # Continual LoRA merging (TIES) — preserve prior adapter knowledge across fine-tunes
+    ENABLE_LORA_CONTINUAL_MERGE: bool = field(default_factory=lambda: _env("ENABLE_LORA_CONTINUAL_MERGE", "false").lower() == "true")
+    LORA_MERGE_ALPHA: float = field(default_factory=lambda: _env_float("LORA_MERGE_ALPHA", 0.5))
+    # open-rs SFT pre-DPO bootstrap — short SFT epoch on reasoning traces before DPO
+    ENABLE_SFT_BOOTSTRAP: bool = field(default_factory=lambda: _env("ENABLE_SFT_BOOTSTRAP", "false").lower() == "true")
+    # RLVR — record verifiable signals (tool/JSON/math/claim/quiz/code outcomes) so a
+    # later GRPO/RLVR fine-tune can train on real rewards instead of LLM-judge noise.
+    ENABLE_RLVR_SIGNALS: bool = field(default_factory=lambda: _env("ENABLE_RLVR_SIGNALS", "true").lower() == "true")
+    # A-HMAD style debate — role-specialized critics + judge on high-stakes drafts.
+    # Off by default: latency cost is ~3 extra LLM calls; opt in per environment.
+    ENABLE_DEBATE: bool = field(default_factory=lambda: _env("ENABLE_DEBATE", "false").lower() == "true")
+    DEBATE_TIMEOUT_SECONDS: float = field(default_factory=lambda: _env_float("DEBATE_TIMEOUT_SECONDS", 240.0))
+    # MAD-MM (ICLR 2026) subjective memory masking in the agent_loop iteration.
+    # When a step is retried (attempts > 0) AND there are >= MAD_MM_MIN_PRIOR_STEPS
+    # done steps to draw on, ask the LLM which prior step observations and findings
+    # are useful for the current step before re-rendering the scratchpad. The
+    # original attempt apparently got misled — masking drops the most likely
+    # culprits. Opt-in (default off) because it adds 1 batched LLM call per retry.
+    ENABLE_MAD_MM_MASKING: bool = field(default_factory=lambda: _env("ENABLE_MAD_MM_MASKING", "false").lower() == "true")
+    MAD_MM_MIN_PRIOR_STEPS: int = field(default_factory=lambda: _env_int("MAD_MM_MIN_PRIOR_STEPS", 3))
+    # Judge model for MAD-MM mask LLM calls. A stronger third-party model
+    # discriminates better than the production fine-tune (which is conservative
+    # and tends to keep everything). Empty string = use the default LLM_MODEL.
+    MAD_MM_JUDGE_MODEL: str = field(default_factory=lambda: _env("MAD_MM_JUDGE_MODEL", "qwen3.6:27b"))
+    # SCM/SleepGate-style two-phase dream consolidation: split the current
+    # kitchen-sink Phase 3 into NREM (structural ops: prune/compact/disable —
+    # fast, deterministic) and REM (integrative ops: promote/resolve/distill —
+    # slow, LLM-driven). Failures in REM no longer roll back NREM. Opt-in
+    # (default off) for prototype; controlled rollout. See `consolidate_nrem` +
+    # `consolidate_rem` in `app/core/dream.py`.
+    ENABLE_TWO_PHASE_DREAM: bool = field(default_factory=lambda: _env("ENABLE_TWO_PHASE_DREAM", "false").lower() == "true")
+    DREAM_REM_TIMEOUT_SECONDS: float = field(default_factory=lambda: _env_float("DREAM_REM_TIMEOUT_SECONDS", 60.0))
+    # Procedural memory consolidation in dream — cluster near-duplicate lessons,
+    # generalize via LLM, demote subsumed members so retrieval prefers the canonical.
+    ENABLE_PROCEDURAL_CONSOLIDATION: bool = field(default_factory=lambda: _env("ENABLE_PROCEDURAL_CONSOLIDATION", "true").lower() == "true")
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))
-    WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 10.0))
-    WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "google,duckduckgo,brave"))
+    # Bumped 20s → 35s after eval-suite analysis (2026-05-09): SearXNG hits
+    # multiple upstream engines, slow ones flake the whole call. User mandate:
+    # optimize for best, not fastest.
+    WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 35.0))
+    WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "bing,startpage,ecosia,yandex,yahoo"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
-    CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 10))
+    CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 15))
     MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 10))
     MAX_SAME_TOOL_CALLS: int = field(default_factory=lambda: _env_int("MAX_SAME_TOOL_CALLS", 3))
     MAX_TOOL_CALLS_PER_QUERY: int = field(default_factory=lambda: _env_int("MAX_TOOL_CALLS_PER_QUERY", 15))
-    SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 30))
-    BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 30))
+    SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 45))
+    BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 60))
     BROWSER_CDP_URL: str = field(default_factory=lambda: _env("BROWSER_CDP_URL", ""))  # http:// CDP URL to connect to host browser
     TOOL_TIMEOUT: int = field(default_factory=lambda: _env_int("TOOL_TIMEOUT", 180))
     TOOL_OUTPUT_MAX_CHARS: int = field(default_factory=lambda: _env_int("TOOL_OUTPUT_MAX_CHARS", 10000))
     GENERATION_TIMEOUT: int = field(default_factory=lambda: _env_int("GENERATION_TIMEOUT", 900))
-    INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 30))
+    INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 60))
     ENABLE_SHELL_EXEC: bool = field(default_factory=lambda: _env("ENABLE_SHELL_EXEC", "false").lower() == "true")
 
     # Desktop automation (requires display server + PyAutoGUI)
@@ -176,7 +225,14 @@ class Config:
     TRAINING_DATA_CHANNELS: str = field(default_factory=lambda: _env("TRAINING_DATA_CHANNELS", "api"))  # comma-separated: api,discord,telegram,whatsapp,signal
 
     # Fine-tuning automation
-    FINETUNE_MIN_NEW_PAIRS: int = field(default_factory=lambda: _env_int("FINETUNE_MIN_NEW_PAIRS", 15))
+    # FINETUNE_MIN_NEW_PAIRS raised 15→100 on 2026-05-14 (task #23) to match
+    # the monthly cadence policy: at ~3.3 pairs/day organic accumulation,
+    # 100 new pairs = ~30 days. v16 was trained on 699 pairs, so 100 is
+    # ~14% delta — enough to A/B meaningfully against the deployed model.
+    # The earlier 15-pair threshold notified after ~4 days, well below the
+    # noise floor (the #41 smoke run on 19 GRPO-derived pairs A/B'd 10/10
+    # ties — proving very-small deltas don't differentiate).
+    FINETUNE_MIN_NEW_PAIRS: int = field(default_factory=lambda: _env_int("FINETUNE_MIN_NEW_PAIRS", 100))
     FINETUNE_OUTPUT_DIR: str = field(default_factory=lambda: _env("FINETUNE_OUTPUT_DIR", "/data/finetune"))
 
     # Reasoning
@@ -204,8 +260,33 @@ class Config:
     # Multi-agent structural decomposition
     ENABLE_MULTI_AGENT: bool = field(default_factory=lambda: _env("ENABLE_MULTI_AGENT", "true").lower() == "true")
     MULTI_AGENT_TRIGGER_THRESHOLD: int = field(default_factory=lambda: _env_int("MULTI_AGENT_TRIGGER_THRESHOLD", 4))
-    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 5))
-    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 90))
+    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 10))
+    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 300))
+    # Concurrent sub-agent ceiling. Was hard-coded to 3; lifted now that
+    # AGENT_TASK_TIMEOUT is 300s (RTX 3090 + 9B Q8 can sustain 5+ in parallel).
+    MAX_PARALLEL_AGENTS: int = field(default_factory=lambda: _env_int("MAX_PARALLEL_AGENTS", 6))
+    # Recursive sub-agents: depth 2 = top-level can spawn level-1 sub-agents who can spawn level-2.
+    # Threshold gate prevents trivial sub-tasks from cascading; only complex sub-tasks recurse.
+    MAX_STRUCTURAL_DEPTH: int = field(default_factory=lambda: _env_int("MAX_STRUCTURAL_DEPTH", 2))
+    # Tree-of-thought: when enabled, AgentLoop samples multiple action chains for hard steps
+    # and picks the most consistent one. Adds latency proportional to sample count.
+    ENABLE_TREE_OF_THOUGHT: bool = field(default_factory=lambda: _env("ENABLE_TREE_OF_THOUGHT", "true").lower() == "true")
+    TOT_SAMPLE_N: int = field(default_factory=lambda: _env_int("TOT_SAMPLE_N", 3))
+    # Best-of-N for chat path: when a hard reasoning query ends with quality < threshold
+    # after the full critique chain, sample N alternative responses at different temperatures
+    # and pick the highest-quality one. Bounded — only fires on hard + low-quality.
+    ENABLE_BEST_OF_N: bool = field(default_factory=lambda: _env("ENABLE_BEST_OF_N", "true").lower() == "true")
+    BEST_OF_N_SAMPLES: int = field(default_factory=lambda: _env_int("BEST_OF_N_SAMPLES", 2))
+    # Median answer quality clusters around 0.75 in production. The old 0.70
+    # threshold combined with the hard-reasoning-query gate left BEST_OF_N
+    # firing on <2% of queries (audit 2026-05-04 #1). 0.65 catches more
+    # salvageable mid-quality answers without spamming on already-good ones.
+    BEST_OF_N_QUALITY_THRESHOLD: float = field(default_factory=lambda: _env_float("BEST_OF_N_QUALITY_THRESHOLD", 0.65))
+    # Hard floor for retrieval injection — chunks scoring below this are
+    # dropped entirely (regardless of RETRIEVAL_RELEVANCE_THRESHOLD which
+    # governs how many results to return). Above this, chunks reach the
+    # prompt without a quality label so the model can't echo "low relevance".
+    RETRIEVAL_HARD_FLOOR: float = field(default_factory=lambda: _env_float("RETRIEVAL_HARD_FLOOR", 0.30))
 
     # Background tasks
     MAX_BACKGROUND_TASKS: int = field(default_factory=lambda: _env_int("MAX_BACKGROUND_TASKS", 5))
@@ -228,11 +309,19 @@ class Config:
     ENABLE_VOICE: bool = field(default_factory=lambda: _env("ENABLE_VOICE", "false").lower() == "true")
     WHISPER_MODEL_SIZE: str = field(default_factory=lambda: _env("WHISPER_MODEL_SIZE", "base"))
     VOICE_MAX_DURATION: int = field(default_factory=lambda: _env_int("VOICE_MAX_DURATION", 300))
+    # Text-to-speech (Piper, sovereign/local)
+    ENABLE_TTS: bool = field(default_factory=lambda: _env("ENABLE_TTS", "false").lower() == "true")
+    TTS_MODEL_PATH: str = field(default_factory=lambda: _env("TTS_MODEL_PATH", "/data/tts/en_US-amy-medium.onnx"))
 
     # Limits
-    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 10000))
+    # Qwen3.5 supports 128K natively but Ollama's per-VRAM default clamps the
+    # 9B Q8 + 24GB-VRAM combo to num_ctx=32768. The earlier 64000 here oversold
+    # what the runtime delivers — Ollama silently truncated the prompt. Held
+    # at 18000 leaves ~14K for tool results + history + query + response within
+    # the 32K window. Bump only if you also raise Ollama's actual num_ctx.
+    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 18000))
     MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
-    MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 1000))
+    MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 5000))
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
     MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
     MAX_CURIOSITY_QUEUE_SIZE: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_QUEUE_SIZE", 100))
@@ -241,7 +330,7 @@ class Config:
     RATE_LIMIT_RPM: int = field(default_factory=lambda: _env_int("RATE_LIMIT_RPM", 60))
 
     # Prompt context limits (how many items of each type in system prompt)
-    MAX_KG_FACTS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS_IN_PROMPT", 8))
+    MAX_KG_FACTS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS_IN_PROMPT", 20))
     MAX_REFLEXIONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS_IN_PROMPT", 3))
     MAX_SUCCESS_PATTERNS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_SUCCESS_PATTERNS_IN_PROMPT", 2))
     MAX_REFLEXIONS: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS", 200))
@@ -257,10 +346,24 @@ class Config:
     MAX_QUERY_LENGTH: int = field(default_factory=lambda: _env_int("MAX_QUERY_LENGTH", 50000))
 
     # --- Tuning parameters ---
-    RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 600))
+    RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 2000))
     RETRIEVAL_RELEVANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("RETRIEVAL_RELEVANCE_THRESHOLD", 0.15))
     TEMPERATURE_DEFAULT: float = field(default_factory=lambda: _env_float("TEMPERATURE_DEFAULT", 0.7))
-    MIN_RRF_SCORE: float = field(default_factory=lambda: _env_float("MIN_RRF_SCORE", 0.015))
+    # Min blended RRF score for a lesson/fact to survive retrieval. Lowered
+    # 0.015 → 0.005 (2026-05-30): a single KEYWORD-only match scores
+    # ~0.0139 after the Q-value blend (0.85 × 1/61), so 0.015 silently dropped
+    # every keyword-only hit — making lesson retrieval depend entirely on the
+    # vector index. When that index is empty/degraded (as found in the WS2
+    # audit), the memory loop returned [] for everything. 0.005 keeps real
+    # keyword matches (filter already requires ≥2-word overlap) while still
+    # rejecting true non-matches (score 0).
+    MIN_RRF_SCORE: float = field(default_factory=lambda: _env_float("MIN_RRF_SCORE", 0.005))
+    # Max cosine distance for a lesson to pass the semantic (vector) gate in
+    # get_relevant_lessons. Cosine: 0=identical, 2=opposite. Raised from the old
+    # hardcoded 0.7 to 0.9 so paraphrased queries (low keyword overlap) still
+    # surface the relevant lesson — the WS2A "semantic-first" change. The RRF
+    # fusion, MIN_RRF_SCORE floor, and 0.40 confidence floor remain as backstops.
+    LESSON_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_MAX_DISTANCE", 0.9))
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
@@ -268,13 +371,10 @@ class Config:
     ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
     # Cosine similarity threshold for semantic skill matching (higher = stricter)
-    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.65))
+    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.55))
     # Days without use before a skill is considered stale for decay/pruning
     SKILL_STALE_DAYS: int = field(default_factory=lambda: _env_int("SKILL_STALE_DAYS", 30))
     INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
-    FACT_INJECTION_SKIP_THRESHOLD: float = field(default_factory=lambda: _env_float("FACT_INJECTION_SKIP_THRESHOLD", 0.3))
-    FACT_CONFIDENCE_EXTRACTED: float = field(default_factory=lambda: _env_float("FACT_CONFIDENCE_EXTRACTED", 0.65))
-    FACT_CONFIDENCE_USER: float = field(default_factory=lambda: _env_float("FACT_CONFIDENCE_USER", 0.9))
     REFLEXION_FAILURE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_FAILURE_THRESHOLD", 0.6))
     REFLEXION_SUCCESS_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_SUCCESS_THRESHOLD", 0.8))
     KG_GRAPH_MAX_FRONTIER: int = field(default_factory=lambda: _env_int("KG_GRAPH_MAX_FRONTIER", 1000))
@@ -298,11 +398,6 @@ class Config:
     PROMPT_MOD_STABILITY_RUNS: int = field(default_factory=lambda: _env_int("PROMPT_MOD_STABILITY_RUNS", 3))
     # Max latency overhead before blocking (1.15 = 15% overhead allowed)
     PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))
-
-    # Provider base URLs (for self-hosted / proxy setups — used when provider modules are implemented)
-    OPENAI_BASE_URL: str = field(default_factory=lambda: _env("OPENAI_BASE_URL", "https://api.openai.com"))
-    ANTHROPIC_BASE_URL: str = field(default_factory=lambda: _env("ANTHROPIC_BASE_URL", "https://api.anthropic.com"))
-    GOOGLE_BASE_URL: str = field(default_factory=lambda: _env("GOOGLE_BASE_URL", "https://generativelanguage.googleapis.com"))
 
     # System access tiers (sandboxed | standard | full | none)
     SYSTEM_ACCESS_LEVEL: str = field(default_factory=lambda: _env("SYSTEM_ACCESS_LEVEL", "sandboxed"))
@@ -367,7 +462,6 @@ class Config:
 
     # Sensitive field names — redacted in __repr__/__str__ to prevent secret leakage
     _SENSITIVE_FIELDS = frozenset({
-        "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
         "EMAIL_SMTP_PASS", "DISCORD_TOKEN", "TELEGRAM_TOKEN",
         "WHATSAPP_API_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET",
         "API_KEY",
@@ -451,11 +545,21 @@ class Config:
             pass
 
     def _load_overrides(self) -> None:
-        """Apply saved overrides from file."""
-        if not _OVERRIDES_PATH.exists():
+        """Apply saved overrides from file.
+
+        Resolution order (most specific wins):
+          1. Module-level _OVERRIDES_PATH (mutated by test helpers like
+             `monkeypatch.setattr(app.config, '_OVERRIDES_PATH', path)`)
+          2. CONFIG_OVERRIDES_PATH env var (re-read each call)
+          3. Default `/data/config_overrides.json` (module-level constant)
+        """
+        # If the module-level path differs from the default, respect it (tests mutate it)
+        default_path = Path(os.getenv("CONFIG_OVERRIDES_PATH", "/data/config_overrides.json"))
+        path = _OVERRIDES_PATH if _OVERRIDES_PATH != Path("/data/config_overrides.json") else default_path
+        if not path.exists():
             return
         try:
-            overrides = json.loads(_OVERRIDES_PATH.read_text())
+            overrides = json.loads(path.read_text())
             # Only load overrides for mutable fields (security: prevent persisted security bypasses)
             filtered = {k: v for k, v in overrides.items() if k in _MUTABLE_FIELDS}
             self.update(**filtered)
@@ -466,33 +570,10 @@ class Config:
         """Validate config values. Returns list of warning messages (empty = valid)."""
         warnings = []
 
-        valid_providers = ("ollama", "openai", "anthropic", "google")
-        if self.LLM_PROVIDER not in valid_providers:
+        if self.LLM_PROVIDER != "ollama":
             warnings.append(
-                f"LLM_PROVIDER must be one of {valid_providers}, got: '{self.LLM_PROVIDER}'"
+                f"LLM_PROVIDER must be 'ollama' (cloud providers removed), got: '{self.LLM_PROVIDER}'"
             )
-
-        # Require API key for cloud providers
-        provider_keys = {
-            "openai": self.OPENAI_API_KEY,
-            "anthropic": self.ANTHROPIC_API_KEY,
-            "google": self.GOOGLE_API_KEY,
-        }
-        if self.LLM_PROVIDER in provider_keys and not provider_keys[self.LLM_PROVIDER]:
-            key_name = f"{self.LLM_PROVIDER.upper()}_API_KEY"
-            warnings.append(f"{key_name} is required when LLM_PROVIDER={self.LLM_PROVIDER}")
-
-        # Warn when a non-Ollama provider is configured but its module isn't implemented yet
-        _unimplemented = {"openai", "anthropic", "google"}
-        if self.LLM_PROVIDER in _unimplemented:
-            import importlib.util
-            module_name = f"app.core.providers.{self.LLM_PROVIDER}"
-            if importlib.util.find_spec(module_name) is None:
-                warnings.append(
-                    f"LLM_PROVIDER={self.LLM_PROVIDER} is configured but "
-                    f"'app/core/providers/{self.LLM_PROVIDER}.py' does not exist — "
-                    f"requests will fail at runtime. Only 'ollama' is currently implemented."
-                )
 
         if not self.OLLAMA_URL.startswith(("http://", "https://")):
             warnings.append(f"OLLAMA_URL must start with http:// or https://, got: {self.OLLAMA_URL}")

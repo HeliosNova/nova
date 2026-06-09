@@ -14,6 +14,15 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DB_PATH", str(tmp_path / "test.db"))
     monkeypatch.setenv("CHROMADB_PATH", str(tmp_path / "chromadb"))
     monkeypatch.setenv("TRAINING_DATA_PATH", str(tmp_path / "training.jsonl"))
+    # Critical: redirect config overrides to a tmp path so production
+    # /data/config_overrides.json doesn't override test env vars (e.g. enabling
+    # shell exec when tests assume it's off).
+    from pathlib import Path as _Path
+    import app.config as _config_mod
+    monkeypatch.setenv("CONFIG_OVERRIDES_PATH", str(tmp_path / "no_overrides.json"))
+    # Also patch the module-level constant so _load_overrides picks it up via
+    # the env-var fallback path.
+    monkeypatch.setattr(_config_mod, "_OVERRIDES_PATH", _Path(tmp_path / "no_overrides.json"))
     monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")
     monkeypatch.setenv("SEARXNG_URL", "http://localhost:8888")
     monkeypatch.setenv("LLM_MODEL", "qwen3.5:27b")
@@ -32,6 +41,7 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("MULTI_AGENT_TRIGGER_THRESHOLD", "4")
     monkeypatch.setenv("MAX_AGENT_COUNT", "5")
     monkeypatch.setenv("AGENT_TASK_TIMEOUT", "90")
+    monkeypatch.setenv("ENABLE_PROMPT_SELF_MOD", "false")
     monkeypatch.setenv("ENABLE_EVAL_HARNESS", "true")
     monkeypatch.setenv("EVAL_SUITE_PATH", "evals/suite.yaml")
     monkeypatch.setenv("EVAL_REPORT_PATH", str(tmp_path / "eval_reports"))
@@ -49,9 +59,6 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("REFLEXION_DISTANCE_THRESHOLD", "0.7")
     monkeypatch.setenv("SKILL_EMA_ALPHA", "0.15")
     monkeypatch.setenv("INJECTION_SUSPICIOUS_THRESHOLD", "0.3")
-    monkeypatch.setenv("FACT_INJECTION_SKIP_THRESHOLD", "0.3")
-    monkeypatch.setenv("FACT_CONFIDENCE_EXTRACTED", "0.65")
-    monkeypatch.setenv("FACT_CONFIDENCE_USER", "0.9")
     monkeypatch.setenv("REFLEXION_FAILURE_THRESHOLD", "0.6")
     monkeypatch.setenv("REFLEXION_SUCCESS_THRESHOLD", "0.8")
     monkeypatch.setenv("KG_GRAPH_MAX_FRONTIER", "1000")

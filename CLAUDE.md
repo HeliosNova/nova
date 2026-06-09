@@ -3,9 +3,65 @@
 ## What This Is
 
 Nova is a sovereign personal AI assistant. Ollama only — runs entirely on your hardware.
-Default: FastAPI backend + Ollama (Qwen3.5:27b) on RTX 3090. Supports MCP (Model Context Protocol) for external tools.
-It learns from corrections, remembers user facts, uses tools, and generates training data for SimPO fine-tuning.
-~89 files. Learning is the product.
+Default: FastAPI backend + Ollama on RTX 3090. Production model is `nova-ft` (9B DPO fine-tune,
+v16 deployed 2026-04-22) — set via `LLM_MODEL=nova-ft`. The 9B is what gets fine-tuned; the 27B
+is supported as an alternate backend but isn't fine-tuned. Supports MCP (Model Context Protocol)
+for external tools. It learns from corrections, remembers user facts, uses tools, and generates
+training data for DPO fine-tuning (SimPO was the v1 loss; trl 0.24+ uses sigmoid). ~129 Python
+files in `app/`. Learning is the product.
+
+### Reality check (audit 2026-05-30) — read before touching any learning / fine-tune claim
+- **The memory loop is the product, not fine-tuning.** Nova "learns" by storing each correction as a
+  lesson + a temporal-KG fact that are retrieved into the prompt (in-context). Proven by the
+  `memory-learning` eval category (`evals/suite.yaml` + `EvalHarness._run_memory_task`): on the live
+  9B it causally fixes the majority of seeded corrections (`memory_causal_fix_rate` ≈ 0.5–0.67 at
+  baseline; misses are paraphrase-retrieval + generation-behavior gaps, tracked as work items).
+- **Weight fine-tuning is experimental and unproven.** Across every `run_history.json`: 0 successful
+  train→A/B→deploy. The one honest A/B (independent cross-family judge `llama3.1:8b`, position-swapped,
+  4-dimension) shows `nova-ft` **ties** its base `qwen3.5:9b` (≈8/10 ties, +0.03 pref). Keep
+  `ENABLE_AUTO_FINETUNE=false`. Treat FT as a *style/behavior* experiment only — never claim it makes
+  the model "smarter."
+- **FT deploy gate:** a candidate promotes only if it wins `scripts/eval_harness.py` with
+  `EVAL_JUDGE_MODEL` set to a *different-family* local model (no self-judging; swap + multi-dimension on).
+- **Config override gotcha:** `/data/config_overrides.json` overrides `.env`. A stale
+  `LLM_MODEL=nova-ft-v18-q8` (a fine-tune that never built) sat there and **404'd every generation**;
+  fixed to `nova-ft` on 2026-05-30. Keep `LLM_MODEL` pointed at a tag that exists in Ollama.
+- Do **not** re-inflate README / MODEL_CARD / docs/launch_posts back to "fine-tunes itself into a
+  smarter model" — that claim is disproven and was realigned 2026-05-30.
+- **Memory-loop quality (WS2, 2026-05-30):** two fixes raised `memory_causal_fix_rate` 0.67→0.83:
+  (1) `claim_validator.build_evidence` now includes `lessons_text` — lesson-grounded answers were
+  being silently stripped as "unsupported" (e.g. "Dr. X is based in <city>"), defeating the loop;
+  (2) `ENABLE_EXTENDED_THINKING=false` in the override — nova-ft (9B) burned its budget in `<think>`
+  and returned EMPTY answers / web-searched fictional facts instead of reading the injected lesson.
+  Reasoning category is neutral (6/7 both ways; thinking-on also produced an empty there). Remaining
+  miss is paraphrase **retrieval** — the lessons ChromaDB collection uses the default MiniLM embedder.
+  A naive swap to `nomic-embed-text-v2-moe` was tried 2026-05-30 and **REVERTED**: it regressed the
+  eval 0.83→0.17 (even direct tasks broke). nomic's cosine-distance scale mismatches the MiniLM-tuned
+  `LESSON_VECTOR_MAX_DISTANCE=0.9` gate, and the startup reindex contended with query-time embeds. A
+  real embedding upgrade needs per-embedder gate calibration + an isolated/throttled reindex — not a
+  drop-in. The lesson vector *gate* itself was disproven for MiniLM (0.7==0.95). Consider conditional
+  thinking (on for complex, off for recall) as a separate refinement.
+- **ROOT CAUSE of the memory loop's fragility, found + fixed (2026-05-30):** `MIN_RRF_SCORE=0.015` was
+  filtering out **keyword-only** lesson matches — a single keyword hit blends to ~0.0139 (`0.85 × 1/61`)
+  < 0.015 — so lesson retrieval depended ENTIRELY on the ChromaDB vector index, which was found **empty**
+  (`count=0`; the 175 lessons were never indexed / MiniLM degraded). Net: `get_relevant_lessons` returned
+  `[]` for everything → the memory loop was silently broken (the earlier 0.83 only worked while a
+  freshly-seeded lesson briefly sat in the vector index). Lowered `MIN_RRF_SCORE` 0.015→0.005 (config.py)
+  so keyword retrieval works on its own → `memory_causal_fix_rate` **1.0 (6/6)**, robust without any vector
+  index. **FOLLOW-UP:** reindex the lessons vector collection (`LearningEngine.reindex_lessons`) and verify
+  the MiniLM embedder actually embeds, so vector *augments* keyword for harder paraphrases.
+- **KG retrieval fixed + measured (2026-05-30, new `kg-retrieval` eval category):** `kg.get_relevant_facts`
+  was effectively broken. (1) It loaded candidates with `ORDER BY confidence DESC LIMIT 500` while the KG
+  had 2,734 valid facts (1,863 at conf≥0.95) — so a relevant fact outside that window returned `[]` (the
+  model then hallucinated or said "I don't know", even for direct queries). Fixed: candidate cap → `MAX_KG_FACTS`
+  so every valid fact is a candidate (kg.py:1036). (2) The RRF fusion (keyword+vector+PPR) was computed then
+  OVERWRITTEN by a keyword-overlap-only pass (the fused ranking was discarded). Fixed: the fused result is now
+  authoritative; neighbor-enrichment operates on it (kg.py ~1115-1188). Measured: **0.0 → 0.83**
+  `memory_causal_fix_rate` on `kg-retrieval` — restored direct retrieval AND flipped all 3 single-entity
+  paraphrases to pass (vector/PPR now actually rank). Remaining: paraphrase recall is bounded by MiniLM/PPR
+  quality; one direct flips run-to-run on the model's web-search tool-choice (eval has tool-use variance —
+  run it a few times for a stable mean). **The lessons retrieval (`learning.py:~477`) has the SAME latent
+  `LIMIT 500`** — not biting yet (261 lessons) but fix it the same way before it grows past 500.
 
 ## Architecture (Single Pipeline, No Framework)
 
@@ -53,6 +109,13 @@ No LangChain. No LangGraph. Just async Python and httpx to Ollama.
 | `app/api/chat.py` | POST /chat/stream (SSE) + POST /chat (sync) |
 | `app/api/learning.py` | Lesson/skill/finetune endpoints |
 | `app/api/system.py` | Health, status, export/import |
+| `app/core/agent_loop.py` | Plan→act→critique→synthesize deliberation loop (`AgentLoop.solve()`) |
+| `app/core/agent_workspace.py` | Persistent scratchpads keyed by query signature; survives restarts |
+| `app/core/cross_monitor.py` | Find themes spanning 3+ different monitors; write KG cross_synthesis facts |
+| `app/core/goal_deriver.py` | Mine capability_gap clusters / curiosity / failing skills → mint goals |
+| `app/core/auto_tools.py` | Mine capability_gap clusters → ask LLM to write a Python tool → hot-register with live ToolRegistry (no rebuild) |
+| `app/core/principles.py` | Distill 3+ agreeing lessons into KG facts that survive lesson decay |
+| `app/tools/native_search.py` | Search engine: SearXNG (247 engines) + Wikipedia + DDG with intent-based category routing |
 
 ## Critical Patterns
 
@@ -167,7 +230,7 @@ All query-type monitors auto-extract KG triples. All prompts anchored to "past 2
 2. Never add config flags without approval. Settings are managed in config.py.
 3. Never rate quality without evidence (test output, logs, actual behavior).
 4. If unsure whether something is broken, TEST IT before changing it.
-5. Port patterns from nova/ when they're battle-tested. Don't reinvent.
+5. (Reserved — the pre-rebuild `nova/` repo is no longer referenced; current code is the source of truth.)
 6. No duplicate correction patterns. `learning.py` is the single source of truth.
 7. Lessons must have all fields: `topic`, `correct_answer`, `wrong_answer`, `lesson_text`.
 8. Training pairs: query=original question, chosen=correct, rejected=wrong. Used for SimPO (default) or DPO fine-tuning.
@@ -191,6 +254,26 @@ docker compose stop ollama # Free VRAM for fine-tuning
 
 Services: nova-ollama (11434), nova-app (8000), nova-searxng (8888)
 
+### Container freshness — IMPORTANT
+
+`/app` is **not** bind-mounted; it's baked into the image. After ANY change to
+`app/**.py`, `evals/**.yaml`, or `scripts/__init__.py` you MUST rebuild:
+
+```
+docker compose build nova && docker compose up -d nova
+```
+
+Compose marks the container `read_only: true` so `docker cp` cannot patch files
+in place — a rebuild is the only path. Verify before assuming changes are live:
+
+```
+bash scripts/check_container_freshness.sh
+```
+
+Container staleness was a live bug for weeks (channel formatters, monitor
+runner, KG fixes — all sat on disk while the container ran old code). Always
+rebuild after editing the `app/` tree.
+
 ## Testing
 
 ```bash
@@ -205,6 +288,43 @@ docker cp pytest.ini nova-app:/app/pytest.ini
 Mock pattern: `patch("app.core.brain.llm")` for brain, `patch("app.core.memory.llm")` for memory.
 
 ## Fine-Tuning
+
+### Venv setup
+
+Fine-tuning lives in a dedicated venv (`finetune_env/`) outside the Nova app
+container — Unsloth, torch, and CUDA libs are too heavy for the read-only
+container and need GPU access. Set up once per machine:
+
+```bash
+python -m venv finetune_env
+# Windows
+finetune_env\Scripts\activate
+# Linux
+source finetune_env/bin/activate
+
+# Pinned high-level deps (recommended for normal use)
+pip install -r scripts/requirements-finetune.txt
+
+# OR bit-exact full freeze (119 pkgs; use when reproducing a past run)
+pip install -r scripts/finetune_env.frozen.txt
+```
+
+Why pinned: between March (when nova-ft was trained) and May, library drift
+(unsloth/trl/transformers) produced a -0.14 multi-agent eval regression with
+the *same* data and recipe. Confirmed via baseline-only control train (v19).
+`requirements-finetune.txt` is now exact-version pinned (`==`) so future
+training runs are at least reproducible against each other. See
+`memory/project_v19_clean_ab_2026_05_10.md`.
+
+Two quirks to know about when calling finetune.py directly:
+
+1. **AutoConfig hub-name fails for Qwen3.5-9B**: `AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.5-9B")` raises `Unrecognized model in...` even when fully cached.
+   Workaround: pass the snapshot folder path directly (`...models--Qwen--Qwen3.5-9B/snapshots/<sha>/`, or any local merged-weights dir with a valid `config.json` like `Qwen/Qwen3.5-9B/merged/`).
+
+2. **Unsloth's `save_pretrained_gguf` is broken** — FIXED in `finetune.py` 2026-05-16 (task #48). Two failure modes hit on v9, v10, v17:
+   (a) stale-cache: reuses cached merged shards from a prior run keyed on the snapshot path, producing a "fresh" GGUF that is actually the previous run's weights (symptom: new model's Ollama SHA matches previous run's);
+   (b) dynamic-module loading: downloads a temp script that fails with `ModuleNotFoundError: No module named 'conversion'`.
+   `export_gguf()` now bypasses Unsloth entirely and uses the manual chain: `PeftModel.from_pretrained → merge_and_unload → save_pretrained → ~/.unsloth/llama.cpp/convert_hf_to_gguf.py --outtype q8_0`. CPU-only merge to free GPU for next training run. See `scripts/finetune.py::export_gguf` and `_find_convert_hf_to_gguf`.
 
 ```bash
 # Manual fine-tuning
@@ -226,6 +346,12 @@ Compares base vs fine-tuned model on holdout queries. Uses LLM-as-judge with ran
 
 ### Automated Pipeline (`scripts/finetune_auto.py`)
 8-step pipeline: readiness check → load data → stop Ollama → DPO train → GGUF export → restart Ollama → A/B eval → deploy/reject. Records all runs to `run_history.json`.
+
+### Cadence policy (set 2026-05-14, task #23)
+- **Threshold**: `FINETUNE_MIN_NEW_PAIRS=100`. At ~3.3 organic pairs/day this is roughly a monthly cycle.
+- **Trigger**: the daily Fine-Tune Check heartbeat monitor reports `FINETUNE READY` once 100+ new pairs accumulate since the last deployed run. Inside the read-only nova-app container the auto-fire path is intentionally blocked (no unsloth/CUDA); the monitor emits a notify-only message with the host-run command (see task #42 / `heartbeat_loop._can_auto_finetune`).
+- **Execution**: operator runs `python scripts/finetune_auto.py` from `finetune_env` venv on the host (Python 3.11; see `scripts/finetune_env_compat_patches.py` for the post-install patches required for trl 0.24 + transformers 5.x + llm_blender 0.0.2 to coexist).
+- **A/B**: every cycle MUST A/B against the deployed model (`scripts/eval_harness.py`). Smaller deltas under ~5% of total training-pair count almost always A/B to ties — wait for the next cycle rather than burn a deploy.
 
 ## MCP Server
 
@@ -254,14 +380,39 @@ All channels: phone-number allowlisting (empty = allow all), message splitting f
 
 ## Temporal Knowledge Graph
 
-KG facts now track change over time:
-- `valid_from` / `valid_to` — when a fact was valid
+KG facts now track change over time, **bitemporally** (since 2026-05-16 / task #29 —
+Memento-style):
+
+**Valid time** (when the fact was true in the world):
+- `valid_from` / `valid_to`
+
+**Transaction time** (when WE recorded the fact):
+- `created_at` (explicitly set in `add_fact`, no longer the SQLite default)
+- `superseded_at` (set when the fact's `superseded_by` is set)
+
+Both timelines support independent queries — see `query_as_of` below.
+
+Other fields:
 - `provenance` — which conversation/source created it
 - `superseded_by` — FK to the fact that replaced it
 - Contradicting facts are **superseded** (not deleted), creating a temporal trail
-- `query_at(entity, at_time)` — query facts valid at a point in time
+
+Query API:
+- `query_at(entity, at_time)` — facts world-valid at a point in time (legacy
+  uni-temporal API; kept for back-compat)
+- **`query_as_of(entity, *, valid_at=None, recorded_at=None)`** — bitemporal:
+  - `valid_at=X, recorded_at=Y` → "what records did we have on Y that were
+    world-valid on X" (audit query; ignores supersession-after-Y)
+  - `recorded_at=Y` alone → "what did we believe on Y" (rows existing by Y
+    AND not yet superseded by Y)
+  - `valid_at=X` alone → "facts world-valid on X" including currently
+    superseded ones
+  - neither → currently believed facts (mirrors `query_at(None)`)
 - `get_fact_history(subject, predicate)` — all versions of a fact over time
 - `get_changes_since(since)` — what changed recently
+
+Use case for bitemporal: reflexion auditing ("what did Nova believe about X
+last Tuesday when it made decision Y?") and time-travel debugging.
 
 ## Multi-Agent Structural Decomposition
 
@@ -280,8 +431,9 @@ Structural decomposition is a separate path from `DelegateTool`. `DelegateTool` 
 |----------|---------|---------|
 | `ENABLE_MULTI_AGENT` | `true` | Enable/disable structural decomposition entirely |
 | `MULTI_AGENT_TRIGGER_THRESHOLD` | `4` | Minimum signal score to fire decomposition |
-| `MAX_AGENT_COUNT` | `5` | Maximum sub-agents per decomposition |
-| `AGENT_TASK_TIMEOUT` | `90` | Per-sub-agent timeout in seconds |
+| `MAX_AGENT_COUNT` | `10` | Maximum sub-agents per decomposition |
+| `AGENT_TASK_TIMEOUT` | `300` | Per-sub-agent timeout in seconds (RTX 3090 + 9B Q8) |
+| `MAX_PARALLEL_AGENTS` | `6` | Concurrent sub-agent ceiling (semaphore) |
 
 ### Signal Scoring (threshold = 4)
 
@@ -305,7 +457,7 @@ Structural decomposition is a separate path from `DelegateTool`. `DelegateTool` 
 
 ### Execution Strategies
 
-- **parallel** (default): all sub-agents run concurrently under `asyncio.Semaphore(max_parallel=3)`
+- **parallel** (default): all sub-agents run concurrently under `asyncio.Semaphore(MAX_PARALLEL_AGENTS)` (default 6)
 - **sequential**: sub-agents run in order; each receives prior results in `shared_findings`
 - **map-reduce**: all-but-last tasks run in parallel; last task receives all map results
 
@@ -454,6 +606,196 @@ store.rollback(active.id)
 | `calibration_ok=False` | Candidate inflates reflexion scores | Baseline scorer detected Goodhart loop — reject and quarantine expected |
 | Module stuck in `quarantined` | Expiry defaults to 24h | Wait or manually `UPDATE prompt_modules SET status='candidate', quarantined_until=NULL WHERE id=?` |
 
+## RLVR — Verifiable Signal Collection (`app/core/rlvr.py`)
+
+Records ground-truth-style signals during normal operation so the next
+GRPO/RLVR fine-tune cycle has reward data without re-grading. Distinct from
+reflexion grading (LLM-judged) — these signals come from deterministic checks.
+
+Signal types (hard allow-list): `tool_correct`, `json_valid`, `math_correct`,
+`claim_grounded`, `quiz_correct`, `code_passes_tests`, `schema_match`.
+
+Wired-in collectors:
+- **brain.py tool dispatch** — records `tool_correct` (1.0/0.0) per tool result
+- **brain.py post-validate_claims** — records `claim_grounded` (proportional to strips)
+- **heartbeat_loop._execute_quiz** — records `quiz_correct` per quiz outcome
+
+Public API:
+```python
+from app.core import rlvr
+rlvr.record_signal("tool_correct", 1.0, query=..., response=..., evidence=...)
+rlvr.aggregate(since_iso=None)        # per-type stats
+rlvr.export_grpo_jsonl(path)           # JSONL for GRPO trainer
+rlvr.mark_consumed([id, ...])          # called by trainer
+```
+
+Config: `ENABLE_RLVR_SIGNALS=true` (default on). Recording is fire-and-forget;
+failures degrade silently so production chat is never blocked.
+
+Storage: `verifiable_signals` table (migration 19) with
+`consumed_for_training` flag so trainer passes don't double-count.
+
+## Synthesis Sanitizer (`app/core/agent_loop.sanitize_synthesis`)
+
+Runs after `_synthesize()` in AgentLoop. Strips scaffolding leaks the model
+occasionally writes despite the tightened SYNTHESIZE_PROMPT:
+
+  * "26/174 scenario", "step 3/5"          (plan IDs)
+  * "as indicated by ... search logs"        (retrieval-pipeline refs)
+  * "based on the completed analysis plan"   (scaffold name-drops)
+  * "marked as requiring live configuration" (status-tag leak)
+  * "(not specified here)"                   (parenthetical hedges)
+  * "in the provided search results"         (tool-trace refs)
+
+Two-pass design — phrase-level redaction runs FIRST so parentheticals get
+redacted instead of triggering whole-sentence deletion; sentence-level
+patterns then drop sentences that ARE primarily scaffold. Logs the count
+of redactions so we can see when leaks are happening upstream.
+
+Caught live 2026-05-08 in `deliberation_chain_of_reasoning` outputs;
+17 unit tests + live deliberation probe verified clean.
+
+## GRPO Trainer (`scripts/grpo_train.py` + `app/core/grpo_dataset.py` + `app/core/grpo_verifier.py`)
+
+Closes the RLVR loop: consumes `verifiable_signals` rows into a fresh LoRA
+adapter on the **9B base** (Qwen3.5-9B). Note: only the 9B is fine-tuned —
+the 27B remains as the production inference model unless explicitly
+trained separately.
+
+### Pipeline
+1. `grpo_dataset.build_groups()` reads unconsumed signals, normalizes queries,
+   groups by `(normalized_query, signal_type)`. Computes within-group
+   advantages = `(r_i - mean) / (std + 1e-8)`.
+2. `grpo_train.py` decides:
+   - **GRPO path** if ≥ 8 groups have size ≥ 4 and non-degenerate variance
+   - **DPO fallback** otherwise: take (best, worst) per group → reuse `finetune.py`
+3. Marks signals `consumed_for_training=1` on success.
+4. Optional `--export-gguf` produces an Ollama-loadable GGUF.
+
+### Verifier (`grpo_verifier.py`)
+For online-rollout scoring inside GRPOTrainer. Replayable signal types:
+  - `math_correct` — re-eval arithmetic via safe AST walk
+  - `json_valid` — `json.loads` with embedded-object extraction
+  - `schema_match` — balanced-brace JSON parse + tool-name match
+Non-replayable types (`tool_correct`, `claim_grounded`, `quiz_correct`)
+fall through to the precomputed reward from the dataset row.
+
+### Usage
+```bash
+docker compose stop ollama                                # Free 17 GB VRAM
+python scripts/grpo_train.py --dry-run                    # Show stats only
+python scripts/grpo_train.py                              # Train (auto picks GRPO/DPO)
+python scripts/grpo_train.py --force-grpo --export-gguf   # Insist on GRPO + GGUF
+docker compose start ollama                               # Restart
+```
+
+### Dataset is small at first
+RLVR signal accumulation needs days of normal traffic before there are
+enough multi-rollout groups for true GRPO. Dry-run on 2026-05-08 found
+3 trainable groups out of 88 from 477 signals — expected ramp.
+
+## A-HMAD Style Debate (`app/core/debate.py`)
+
+Role-specialized critics + judge for high-stakes drafts. Three serial critics
+followed by a judge that decides keep/amend/replace/hedge. Beats homogeneous
+parallel decomposition on contested claims (Springer s44443-025-00353-3, 2026).
+
+Roles:
+- **Logic Critic** — reasoning steps, math, internal consistency
+- **Fact Verifier** — unverified claims, KG/web grounding gaps
+- **Strategy Reviewer** — scope, missed edge cases, wrong tool choice
+- **Judge** — synthesizes one of `keep` / `amend` / `replace` / `hedge`
+
+Gated by `ENABLE_DEBATE=false` (default — opt-in due to ~3 extra LLM calls).
+Triggers only when `should_debate()` returns True: high-stakes domain
+(medical/legal/financial/safety) OR strong-claim-with-numbers, AND
+intent="general", AND draft >=200 chars, AND not already heavily hedged.
+
+Sub-agents at `current_depth >= 1` skip debate (no compounded latency).
+
+Public API:
+```python
+from app.core import debate
+if debate.should_debate(query, intent, draft):
+    result = await debate.run_debate(query, draft, evidence=...)
+    if result.action != "keep":
+        final_content = result.final_answer
+```
+
+Wired in `brain.py` after claim validation, before token streaming.
+
+## MAD-MM Memory Masking (`app/core/agent_loop.py::_mask_prior_observations`)
+
+Subjective memory masking for the agent_loop iteration. Based on MAD-MM (ICLR
+2026, arxiv 2603.20215) — "Multi-Agent Debate with Memory Masking". Adapted from
+the paper's multi-agent debate setup to our single-agent multi-step loop: when a
+step is being retried, the original attempt was apparently misled by something in
+its prior-step scratchpad. The masker asks the LLM (one batched call) which prior
+step observations and findings are actually useful for the current step, and the
+scratchpad re-renders without the rejected items.
+
+Two adaptations from the paper:
+1. Batched one-shot mask call instead of MAD-MM's per-item loop (fewer LLM calls
+   on local hardware — one ~3s call vs N×3s).
+2. Subjective strategy only. Objective (perplexity-based) skipped — Ollama
+   doesn't expose per-token logprobs cleanly.
+
+Config flags (default OFF — opt-in due to the extra LLM call):
+- `ENABLE_MAD_MM_MASKING` — master switch
+- `MAD_MM_MIN_PRIOR_STEPS` (default 3) — only fire when there are this many
+  done prior steps; below the threshold there isn't enough to filter
+
+Gates that always apply (even with the flag on):
+- Only fires on step revision (`step.attempts > 0`)
+- Conservative fallback: keep-all on LLM failure, malformed JSON, ambiguous
+  verdict, or pathological all-drop response
+
+Emits `mad_mm_mask` SSE event listing kept step ids + finding keys.
+
+## Procedural Memory Consolidation (`app/core/dream.py::_consolidate_procedural_memory`)
+
+Distinct from `principles.distill` (which only promotes lessons to KG facts).
+This rewrites the lessons themselves: clusters near-duplicate lessons by
+jaccard(topic_tokens) ≥ 0.6 AND jaccard(answer_tokens) ≥ 0.5, asks the LLM
+to write one canonical generalized lesson, demotes the source members so
+retrieval prefers the canonical.
+
+Cap: 3 clusters per dream cycle. Persists `cluster_key` in
+`procedural_clusters` (migration 19) so re-consolidation is skipped within
+7 days.
+
+Config: `ENABLE_PROCEDURAL_CONSOLIDATION=true` (default on).
+
+## Two-Phase Dream Consolidation (`app/core/dream.py::consolidate_nrem`+`consolidate_rem`)
+
+Opt-in SCM/SleepGate-style split of the dream loop's Phase 3 (task #30,
+arxiv 2604.20943 + 2603.14517). Splits the kitchen-sink consolidate() into:
+
+- **NREM (structural / deterministic)**: prune low-quality reflexions,
+  compact KG chains, disable broken skills, handle failed curiosity,
+  refresh stale facts, mine DPO pairs. No LLM calls. Fast (~5s typical).
+- **REM (integrative / LLM-driven)**: promote high-quality reflexions to
+  lessons, resolve lesson contradictions, procedural-memory generalization.
+  All LLM-heavy. Slow (10-60s typical).
+
+Two wins:
+1. **Failure isolation** — if REM dies (LLM unreachable, prompt error),
+   NREM's deterministic structural commits are preserved. Previously a
+   mid-consolidate exception lost everything to Phase 3's single timeout.
+2. **Separate time budgets** — NREM gets `PHASE_TIMEOUT` (15s), REM gets
+   `DREAM_REM_TIMEOUT_SECONDS` (60s default). Each can run to its own
+   ceiling without holding the other hostage.
+
+Config:
+- `ENABLE_TWO_PHASE_DREAM` (default `false`) — master switch
+- `DREAM_REM_TIMEOUT_SECONDS` (default 60) — ceiling for the REM phase
+
+When off, behavior is unchanged (legacy single-phase consolidate()).
+
+`ConsolidationResult` carries `nrem_seconds`, `rem_seconds`, `nrem_completed`,
+`rem_completed` for instrumentation when the flag is on. These stay 0/False
+in the legacy path.
+
 ## Hybrid Retrieval Config
 
 | Variable | Default | Meaning |
@@ -504,7 +846,7 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 
 | File | Purpose |
 |------|---------|
-| `evals/suite.yaml` | 30 evaluation tasks across 6 categories |
+| `evals/suite.yaml` | 40 evaluation tasks across 8 categories (reasoning, tool-use, skill-match, semantic-match, autonomous-tool, reflexion-calibration, multi-agent, retrieval) |
 | `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
 | `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
 | `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
@@ -515,12 +857,14 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 
 | Category | Tasks | What it tests |
 |----------|-------|---------------|
-| `reasoning` | 5 | Arithmetic, logic, definitions — no tools, high reflexion expected |
+| `reasoning` | 7 | Arithmetic, logic, definitions — no tools, high reflexion expected |
 | `tool-use` | 6 | calculator, code_exec, web_search invocation + answer correctness |
 | `skill-match` | 6 | Seeded "Eval: *" skills matched by exact regex (eval-probe: prefix) |
 | `semantic-match` | 5 | Paraphrase queries that must hit same skill via ChromaDB at threshold 0.65 |
 | `autonomous-tool` | 4 | Multi-step queries; metric = fraction using ≥2 tools |
 | `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
+| `multi-agent` | 5 | Decomposition gating + sub-agent merge correctness (incl. no-decompose baseline) |
+| `retrieval` | 3 | BM25 exact-keyword + semantic paraphrase + reranker regression probe |
 
 ### Metrics
 
@@ -536,7 +880,7 @@ Add an entry to `evals/suite.yaml`:
 
 ```yaml
 - id: my_task_001          # unique snake_case id
-  category: reasoning       # one of the 6 categories above
+  category: reasoning       # one of the 8 categories above
   query: "What is 2+2?"
   timeout: 45               # seconds (default 60)
   assertions:

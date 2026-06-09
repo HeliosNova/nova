@@ -59,12 +59,22 @@ _DYNAMIC_TOOL_BLOCKED_DUNDERS = frozenset({
 
 
 def _check_dynamic_tool_safety(code: str) -> str | None:
-    """Check code safety with FORCED sandboxed-level restrictions.
+    """Per owner directive 2026-04-25: no policy filtering on custom tools.
 
-    Unlike _check_code_safety() which respects the system tier, this function
-    ALWAYS applies maximum restrictions. Custom tools created by the autonomous
-    pipeline must never inherit the system's elevated privileges.
+    Nova is sovereign. He owns the box. When he writes a tool, it runs.
+    Only hard-fail on syntax errors so we don't store broken code.
+    The previous tier-conditional / always-blocked logic is removed entirely.
     """
+    try:
+        import ast as _ast
+        _ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+    return None
+
+
+def _legacy_blocklist_disabled(code: str) -> str | None:
+    """Retained only as documentation of what USED to be blocked. Never called."""
     import ast
 
     # --- AST-based analysis ---
@@ -129,9 +139,9 @@ def _check_dynamic_tool_safety_text(code: str) -> str | None:
 
 
 # Runtime sandbox preamble — injected into every dynamic tool script.
-# Defence-in-depth: even if AST check is bypassed, these runtime guards block
-# network access and dangerous filesystem operations.
-_SANDBOX_PREAMBLE = '''\
+# Defence-in-depth for sandboxed/standard tiers. At 'full'/'none' the
+# preamble is replaced with a no-op so tools can hit network and disk freely.
+_SANDBOX_PREAMBLE_STRICT = '''\
 import sys as _sys
 
 # --- Block network access at runtime ---
@@ -180,6 +190,17 @@ except Exception:
 
 del _sys, _BlockedSocket, _FakeSocketModule
 '''
+
+_SANDBOX_PREAMBLE_PERMISSIVE = "# (no runtime sandbox — owner directive)\n"
+
+
+def _sandbox_preamble() -> str:
+    """Per owner directive 2026-04-25: no runtime sandbox. Sovereign machine."""
+    return _SANDBOX_PREAMBLE_PERMISSIVE
+
+
+# Use the no-op preamble at module-level too (DynamicTool.execute reads this)
+_SANDBOX_PREAMBLE = _SANDBOX_PREAMBLE_PERMISSIVE
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +283,24 @@ class CustomToolStore:
         # Size limits
         if len(code) > self.MAX_CODE_LENGTH:
             logger.warning("Tool '%s' code too long: %d chars", name, len(code))
+            return -1
+
+        # Placeholder guard — Nova sometimes proposes tools whose body is
+        # "# Placeholder for X" / "actual tool calls are not permitted in this
+        # function" / hardcoded f-strings masquerading as results. These are
+        # useless and misleading when invoked. Reject before storing.
+        _code_lower = code.lower()
+        _placeholder_markers = (
+            "placeholder for", "placeholder implementation",
+            "actual tool calls are not permitted",
+            "this would invoke", "would be invoked",
+            "not actually execute", "fake implementation",
+        )
+        if any(m in _code_lower for m in _placeholder_markers):
+            logger.warning(
+                "Tool '%s' rejected: body contains placeholder markers (%s)",
+                name, [m for m in _placeholder_markers if m in _code_lower][:2],
+            )
             return -1
 
         # Tool count limit
@@ -393,8 +432,11 @@ class DynamicTool(BaseTool):
                     return ToolResult(output="", success=False,
                         error=f"Unexpected parameters: {unexpected}. Expected: {declared_names}",
                         error_category=ErrorCategory.VALIDATION)
-        except (json.JSONDecodeError, KeyError):
-            pass  # Skip validation if schema is malformed
+        except (json.JSONDecodeError, KeyError) as _schema_err:
+            logger.warning(
+                "[CustomTool %s] malformed parameter schema (%s); proceeding without validation",
+                getattr(self, "name", "?"), _schema_err,
+            )
 
         # Create isolated sandbox directory for this execution
         sandbox_dir = None
@@ -402,9 +444,14 @@ class DynamicTool(BaseTool):
         try:
             sandbox_dir = tempfile.mkdtemp(prefix="nova_tool_")
 
-            # Build script with sandbox preamble + user code + invocation
+            # Build script with sandbox preamble + user code + invocation.
+            # Always emit a UTF-8 BOM/declaration so Python doesn't reject
+            # files containing non-ASCII bytes from user code (Windows cp1252
+            # default + Python's PEP 263 strict-encoding rule was rejecting
+            # any bytes > 0x7f without declaration).
             args_json = json.dumps(kwargs)
             script = (
+                f"# -*- coding: utf-8 -*-\n"
                 f"_SANDBOX_DIR = {repr(sandbox_dir)}\n"
                 f"{_SANDBOX_PREAMBLE}\n"
                 f"# --- User tool code ---\n"
@@ -416,7 +463,7 @@ class DynamicTool(BaseTool):
             )
 
             script_file = os.path.join(sandbox_dir, "_tool.py")
-            with open(script_file, "w") as f:
+            with open(script_file, "w", encoding="utf-8") as f:
                 f.write(script)
             script_path = script_file
 
