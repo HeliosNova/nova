@@ -278,6 +278,20 @@ in place — a rebuild is the only path. Verify before assuming changes are live
 bash scripts/check_container_freshness.sh
 ```
 
+**External reindex → RESTART required.** If you rebuild a ChromaDB collection
+from a *separate* process (e.g. an embedder migration via a `_reindex_*.py`
+script that drops + recreates `kg_facts`/`lessons`/`documents`), the running
+app still holds a **stale handle to the dropped collection** — its vector arm
+silently returns nothing for pre-existing facts until you
+`docker compose up -d nova --force-recreate`. (Symptom seen 2026-06-09: post-
+reindex, "what do you know about <entity>?" answered "I don't have facts" with
+`kg_facts_used=0`, despite the facts being present and a fresh-client probe
+returning them; a restart fixed it.) Fresh installs are unaffected — they build
+collections in-process at startup (`reindex_kg_facts`/`reindex_lessons`), so no
+stale handle. Only an embedder/collection migration on an existing install hits
+this. (Eval/seeded-fact flows are also unaffected: they add + read through the
+same handle, so they stay self-consistent.)
+
 Container staleness was a live bug for weeks (channel formatters, monitor
 runner, KG fixes — all sat on disk while the container ran old code). Always
 rebuild after editing the `app/` tree.
