@@ -104,10 +104,11 @@ services:
       # Voice: Whisper STT + Piper TTS (both already installed in image).
       ENABLE_VOICE: "true"
       ENABLE_TTS: "true"
-      # Eval-suite per-task timeouts were sized for the 9B base. With Qwen
-      # 3.6:27b loaded, each generation is 2-3× slower (especially when KV
-      # cache is cold). 2.5× multiplier gives every task headroom.
-      EVAL_TIMEOUT_MULTIPLIER: "2.5"
+      # Eval-suite per-task timeouts were sized for the 9B base. Production
+      # runs the 9B nova-ft, so 1.5× is enough headroom (nova-ft + tool calls
+      # run a bit slower than the bare 9B). Raise to 2.5 only when a 27B base
+      # is loaded — at 2.5 a runaway task can burn 300s before failing.
+      EVAL_TIMEOUT_MULTIPLIER: "1.5"
     volumes:
       - nova_data:/data
       - ./mcp:/data/mcp:ro
