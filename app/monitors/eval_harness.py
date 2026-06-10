@@ -75,6 +75,11 @@ class TaskResult:
     failed_assertions: list[str]
     error: str | None = None
     decomposed: bool = False  # True when structural multi-agent decomposition fired
+    # True when the run hit its time budget before finishing. A timed-out task
+    # whose partial output still satisfies every assertion counts as a pass
+    # (slow-but-correct); otherwise it is outcome=timeout — excluded from
+    # correctness denominators, never counted as "wrong".
+    timed_out: bool = False
     # memory-learning specific (None for all other categories):
     #   before_correct — did the model answer correctly WITHOUT the seeded lesson
     #   after_correct  — did it answer correctly WITH the lesson in context
@@ -95,6 +100,7 @@ class _Invocation:
     reflexion_score: float | None
     latency_seconds: float
     error: str | None
+    timed_out: bool = False
 
 
 @dataclass
@@ -102,9 +108,10 @@ class CategoryMetrics:
     category: str
     total: int
     passed: int
-    pass_rate: float
+    pass_rate: float          # passed / completed — timeouts excluded from the denominator
     latency_p50: float
     latency_p95: float
+    timeouts: int = 0         # runs that hit the time budget without proving correctness
     reflexion_mean: float | None = None
     reflexion_std: float | None = None
     reflexion_p10: float | None = None
@@ -144,7 +151,7 @@ class EvalReport:
     passed: int
     failed: int
     skipped: int
-    pass_rate: float
+    pass_rate: float  # passed / (total - timeouts): correctness over completed runs
     duration_seconds: float
     categories: dict[str, CategoryMetrics]
     task_results: list[TaskResult]
@@ -152,6 +159,9 @@ class EvalReport:
     baseline_run_id: str | None
     config_snapshot: dict
     timestamp: str
+    # Runs that hit the time budget without proving correctness. Excluded
+    # from the pass_rate denominator — latency is tracked separately.
+    timeouts: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -303,17 +313,24 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
     metrics: dict[str, CategoryMetrics] = {}
     for cat, cat_results in by_cat.items():
         total = len(cat_results)
+        # A timed-out run proves nothing about correctness — it is neither
+        # right nor wrong. All rate denominators use completed runs only;
+        # latency stats keep every run (a timeout IS latency truth).
+        # (passed implies completed: slow-but-correct is a pass, not a timeout.)
+        completed = [r for r in cat_results if r.passed or not r.timed_out]
+        n_completed = len(completed)
         passed = sum(1 for r in cat_results if r.passed)
         latencies = [r.latency_seconds for r in cat_results]
-        scores = [r.reflexion_score for r in cat_results if r.reflexion_score is not None]
+        scores = [r.reflexion_score for r in completed if r.reflexion_score is not None]
 
         cm = CategoryMetrics(
             category=cat,
             total=total,
             passed=passed,
-            pass_rate=passed / total if total else 0.0,
+            pass_rate=passed / n_completed if n_completed else 0.0,
             latency_p50=percentile(latencies, 50),
             latency_p95=percentile(latencies, 95),
+            timeouts=total - n_completed,
         )
 
         if scores:
@@ -322,22 +339,23 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             cm.reflexion_p10 = percentile(scores, 10)
             cm.reflexion_p90 = percentile(scores, 90)
 
-        # Category-specific supplemental metrics
+        # Category-specific supplemental metrics (over completed runs — a cut-off
+        # run never received its DONE event, so skill_used/decomposed are unknown)
         if cat == "skill-match":
-            skill_hits = sum(1 for r in cat_results if r.skill_used is not None)
-            cm.hit_rate = skill_hits / total if total else 0.0
+            skill_hits = sum(1 for r in completed if r.skill_used is not None)
+            cm.hit_rate = skill_hits / n_completed if n_completed else 0.0
 
         if cat == "semantic-match":
-            skill_hits = sum(1 for r in cat_results if r.skill_used is not None)
-            cm.recall_at_threshold = skill_hits / total if total else 0.0
+            skill_hits = sum(1 for r in completed if r.skill_used is not None)
+            cm.recall_at_threshold = skill_hits / n_completed if n_completed else 0.0
 
         if cat == "autonomous-tool":
-            multi_tool = sum(1 for r in cat_results if len(r.tools_invoked) >= 2)
-            cm.multi_tool_rate = multi_tool / total if total else 0.0
+            multi_tool = sum(1 for r in completed if len(r.tools_invoked) >= 2)
+            cm.multi_tool_rate = multi_tool / n_completed if n_completed else 0.0
 
         if cat == "multi-agent":
-            decomposed = sum(1 for r in cat_results if r.decomposed)
-            cm.decomposition_rate = decomposed / total if total else 0.0
+            decomposed = sum(1 for r in completed if r.decomposed)
+            cm.decomposition_rate = decomposed / n_completed if n_completed else 0.0
 
         if cat == "retrieval":
             # retrieval_recall = fraction of tasks where the seeded fact was found
@@ -461,7 +479,8 @@ def render_markdown(report: EvalReport) -> str:
     lines.append(f"| Total tasks | {report.total_tasks} |")
     lines.append(f"| Passed | {report.passed} |")
     lines.append(f"| Failed | {report.failed} |")
-    lines.append(f"| Pass rate | {report.pass_rate:.1%} |")
+    lines.append(f"| Timeouts (excluded from pass rate) | {report.timeouts} |")
+    lines.append(f"| Pass rate (over completed) | {report.pass_rate:.1%} |")
     lines.append(f"| Duration | {report.duration_seconds:.1f}s |")
     lines.append("")
 
@@ -475,12 +494,12 @@ def render_markdown(report: EvalReport) -> str:
         lines.append("")
 
     lines.append("## Per-Category Results")
-    lines.append("| Category | Pass | Total | Rate | Latency P50 | Latency P95 | Reflexion mean |")
-    lines.append("|----------|------|-------|------|-------------|-------------|----------------|")
+    lines.append("| Category | Pass | Timeout | Total | Rate | Latency P50 | Latency P95 | Reflexion mean |")
+    lines.append("|----------|------|---------|-------|------|-------------|-------------|----------------|")
     for cat, cm in report.categories.items():
         ref = f"{cm.reflexion_mean:.2f}" if cm.reflexion_mean is not None else "—"
         lines.append(
-            f"| {cat} | {cm.passed} | {cm.total}"
+            f"| {cat} | {cm.passed} | {cm.timeouts} | {cm.total}"
             f" | {cm.pass_rate:.1%}"
             f" | {cm.latency_p50:.1f}s"
             f" | {cm.latency_p95:.1f}s"
@@ -760,6 +779,7 @@ class EvalHarness:
         decomposed: bool = False
         max_decomposition_depth: int = 0
         error: str | None = None
+        timed_out: bool = False
 
         # Inject shadow-eval module overrides (no-op when empty)
         _token1 = _MODULE_OVERRIDES.set(self._module_overrides)
@@ -781,6 +801,7 @@ class EvalHarness:
                         max_decomposition_depth = int(event.data.get("max_decomposition_depth", 0) or 0)
         except asyncio.TimeoutError:
             error = f"Timeout after {timeout}s"
+            timed_out = True
             logger.warning("[EvalHarness] query timed out after %ss", timeout)
         except Exception as e:
             error = str(e)
@@ -813,6 +834,7 @@ class EvalHarness:
             reflexion_score=reflexion_score,
             latency_seconds=latency,
             error=error,
+            timed_out=timed_out,
         )
 
     def _evaluate_assertions(self, assertions: list[dict], inv: _Invocation) -> list[str]:
@@ -847,6 +869,9 @@ class EvalHarness:
         inv = await self._invoke_brain(task.query, task.timeout)
         failed_assertions = self._evaluate_assertions(task.assertions, inv)
         passed = len(failed_assertions) == 0
+        # Slow-but-correct counts as a pass; a timeout that prevented proving
+        # correctness is outcome=timeout, not a wrong answer.
+        timed_out = inv.timed_out and not passed
 
         # When an eval task fails, write a failure reflexion so the failure
         # injection path has data to retrieve on similar future queries.
@@ -854,8 +879,9 @@ class EvalHarness:
         # post-processing) and failures never surfaced into reflexions —
         # leaving the failure side of the learning loop with 0 records.
         # (memory-learning tasks never reach here — a "before" miss is expected
-        # and must not pollute the reflexion store.)
-        if not passed:
+        # and must not pollute the reflexion store. Timeouts are budget
+        # exhaustion, not quality failures — they must not pollute it either.)
+        if not passed and not timed_out:
             try:
                 from app.core.brain import get_services
                 svc = get_services()
@@ -885,6 +911,7 @@ class EvalHarness:
             failed_assertions=failed_assertions,
             error=inv.error,
             decomposed=inv.decomposed,
+            timed_out=timed_out,
         )
 
     # --- Memory-learning task (before / seed lesson / after) ---
@@ -948,8 +975,43 @@ class EvalHarness:
         # 4. CLEANUP
         self._purge_eval_lessons(learning, marker)
 
-        caused_fix = bool(after_correct and not before_correct)
         latency = time.monotonic() - start
+
+        # A leg that hit its time budget without proving correctness makes the
+        # pair UNTESTABLE — we can't distinguish "lesson didn't fix it" from
+        # "generation got cut off". Exclude it from causal metrics entirely
+        # rather than letting budget exhaustion masquerade as a failed fix.
+        pair_timed_out = (before.timed_out and not before_correct) or (
+            after.timed_out and not after_correct
+        )
+        if pair_timed_out:
+            legs = []
+            if before.timed_out and not before_correct:
+                legs.append("before")
+            if after.timed_out and not after_correct:
+                legs.append("after")
+            return TaskResult(
+                task_id=task.id,
+                category=task.category,
+                query=task.query,
+                passed=False,
+                response_text=after.response_text[:2000],
+                tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+                skill_used=after.skill_used,
+                reflexion_score=after.reflexion_score,
+                latency_seconds=round(latency, 2),
+                failed_assertions=[
+                    f"memory-learning: {'/'.join(legs)} run timed out — pair untestable"
+                ],
+                error=after.error or before.error,
+                decomposed=after.decomposed,
+                timed_out=True,
+                memory_before_correct=None,
+                memory_after_correct=None,
+                memory_caused_fix=None,
+            )
+
+        caused_fix = bool(after_correct and not before_correct)
 
         notes = [
             f"before_correct={before_correct} after_correct={after_correct} "
@@ -1046,8 +1108,41 @@ class EvalHarness:
         # 4. CLEANUP (retire the seeded fact)
         await _clean()
 
-        caused_fix = bool(after_correct and not before_correct)
         latency = time.monotonic() - start
+
+        # Same untestable rule as memory-learning: a timed-out leg means the
+        # pair proves nothing about the seeded fact.
+        pair_timed_out = (before.timed_out and not before_correct) or (
+            after.timed_out and not after_correct
+        )
+        if pair_timed_out:
+            legs = []
+            if before.timed_out and not before_correct:
+                legs.append("before")
+            if after.timed_out and not after_correct:
+                legs.append("after")
+            return TaskResult(
+                task_id=task.id,
+                category=task.category,
+                query=task.query,
+                passed=False,
+                response_text=after.response_text[:2000],
+                tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+                skill_used=after.skill_used,
+                reflexion_score=after.reflexion_score,
+                latency_seconds=round(latency, 2),
+                failed_assertions=[
+                    f"kg-retrieval: {'/'.join(legs)} run timed out — pair untestable"
+                ],
+                error=after.error or before.error,
+                decomposed=after.decomposed,
+                timed_out=True,
+                memory_before_correct=None,
+                memory_after_correct=None,
+                memory_caused_fix=None,
+            )
+
+        caused_fix = bool(after_correct and not before_correct)
         notes = [
             f"before_correct={before_correct} after_correct={after_correct} "
             f"caused_fix={caused_fix}"
@@ -1097,7 +1192,7 @@ class EvalHarness:
             )
             result = await self.run_task(task)
             task_results.append(result)
-            status = "PASS" if result.passed else "FAIL"
+            status = "PASS" if result.passed else ("TIMEOUT" if result.timed_out else "FAIL")
             logger.info(
                 "[EvalHarness] %s %s (score=%.2f, %.1fs)",
                 status, task.id,
@@ -1106,7 +1201,9 @@ class EvalHarness:
 
         duration = time.monotonic() - start_ts
         passed = sum(1 for r in task_results if r.passed)
-        failed = len(task_results) - passed
+        timeouts = sum(1 for r in task_results if r.timed_out and not r.passed)
+        failed = len(task_results) - passed - timeouts
+        completed = len(task_results) - timeouts
 
         categories = compute_category_metrics(task_results)
 
@@ -1146,7 +1243,8 @@ class EvalHarness:
             passed=passed,
             failed=failed,
             skipped=0,
-            pass_rate=passed / len(task_results) if task_results else 0.0,
+            timeouts=timeouts,
+            pass_rate=passed / completed if completed else 0.0,
             duration_seconds=round(duration, 1),
             categories=categories,
             task_results=task_results,
@@ -1215,6 +1313,7 @@ class EvalHarness:
             "pass_rate": report.pass_rate,
             "passed": report.passed,
             "failed": report.failed,
+            "timeouts": report.timeouts,
             "total": report.total_tasks,
             "duration_s": report.duration_seconds,
             "regressions_flagged": flagged,
