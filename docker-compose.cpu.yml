@@ -1,0 +1,16 @@
+# CPU-only override — run Nova without an NVIDIA GPU.
+#
+#   docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
+#
+# Removes the GPU device reservation so compose doesn't fail with
+# "could not select device driver nvidia" on machines without the
+# NVIDIA Container Toolkit. Inference runs on CPU: use a small model
+# (LLM_MODEL=qwen3.5:4b in .env) — a 27B on CPU is unusably slow,
+# a 4B is slow but fully functional.
+#
+# Requires Docker Compose >= 2.24 (for the !reset tag).
+services:
+  ollama:
+    deploy:
+      resources:
+        reservations: !reset {}

@@ -71,7 +71,7 @@ Before deployment, the fine-tuned model is evaluated against the base model usin
 
 ## Intended Use
 
-This model is designed to run as the inference backend for a Nova instance via Ollama. It can also be used as a general-purpose Qwen3.5-27B with improved factual accuracy and reduced verbosity.
+This model is designed to run as the inference backend for a Nova instance via Ollama. It can also be used as a general-purpose Qwen3.5-9B with improved factual accuracy and reduced verbosity.
 
 **Primary use:** Personal AI assistant (question answering, tool use, conversation)
 
@@ -117,7 +117,7 @@ model, tokenizer = FastLanguageModel.from_pretrained(
 
 ## License
 
-This model inherits the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0) from the base Qwen3.5-27B model. The Nova framework that produced the training data is licensed under [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html).
+This model inherits the [Apache 2.0 license](https://www.apache.org/licenses/LICENSE-2.0) from the base Qwen3.5-9B model. The Nova framework that produced the training data is licensed under [AGPL-3.0](https://www.gnu.org/licenses/agpl-3.0.html).
 
 ## Citation
 
@@ -134,5 +134,5 @@ If you use this model or the Nova fine-tuning pipeline:
 ## Links
 
 - [Nova GitHub](https://github.com/HeliosNova/nova)
-- [Base Model: Qwen3.5-27B](https://huggingface.co/Qwen/Qwen3.5-27B)
+- [Base Model: Qwen3.5-9B](https://huggingface.co/Qwen/Qwen3.5-9B)
 - [DPO Paper](https://arxiv.org/abs/2305.18290)

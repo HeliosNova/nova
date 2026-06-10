@@ -4,7 +4,8 @@
 
 | Version | Supported |
 |---------|-----------|
-| 1.0.x   | Yes       |
+| 1.6.x   | Yes       |
+| < 1.6   | No        |
 
 ## Reporting a Vulnerability
 
@@ -30,12 +31,15 @@ Nova implements multiple layers of security:
 - **none**: All restrictions disabled.
 
 ### Prompt Injection Detection
-Heuristic-based detection on external content (web search, HTTP fetch, MCP tools, browser, knowledge base). Suspicious content is flagged, not stripped. Controlled by `ENABLE_INJECTION_DETECTION`.
+Two layers:
+- **User queries** — mandatory, fail-closed detection in the chat pipeline. Not configurable: if the detector errors, the query is blocked rather than passed through.
+- **External content** (web search, HTTP fetch, MCP tools, browser, knowledge base) — heuristic scanning plus always-on sanitization of all tool outputs before they re-enter the prompt. The external-content scan is controlled by `ENABLE_INJECTION_DETECTION`.
 
 ### Authentication
 - Bearer token auth on all API endpoints (`NOVA_API_KEY`)
 - Per-IP rate limiting with lockout on repeated auth failures
 - Channel-specific user allowlisting (Discord, Telegram, WhatsApp, Signal)
+- No cookies or sessions — auth is a request header, so CSRF does not apply (a cross-origin page cannot attach the bearer token, and CORS restricts allowed origins)
 
 ### Skill Signing
 Skills can be signed with HMAC-SHA256. Set `REQUIRE_SIGNED_SKILLS=true` (default) to reject unsigned skill imports.

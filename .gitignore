@@ -27,6 +27,13 @@ Thumbs.db
 # Claude Code
 .claude/
 
+# Local archive of internal/superseded docs — never public
+.archive/
+
+# DPO training data — generated locally from corrections, not repo content
+training_data.jsonl
+training_data.bak.*
+
 # Node
 node_modules/
 

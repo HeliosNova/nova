@@ -56,7 +56,7 @@ Nova is a sovereign personal AI that runs entirely on your hardware with zero cl
 ```bash
 # Clone and start
 git clone https://github.com/HeliosNova/nova.git
-cd nova_
+cd nova
 cp .env.example .env
 docker compose up -d
 
@@ -206,13 +206,9 @@ Nova is both an MCP **client** and **server** — unique in the landscape:
 - `nova_document_search` — search indexed documents
 - `nova_facts_about` — get user profile facts
 
-## Multi-Provider LLM
+## LLM Provider
 
-Switch providers with one env var:
-
-| Provider | Config | Default Model |
-|----------|--------|---------------|
-| **Ollama** (default) | `LLM_PROVIDER=ollama` | qwen3.5:27b |
+Nova runs on **Ollama only** — local inference is the point. Cloud provider configs were removed in v1.5.0; setting `LLM_PROVIDER` to anything else fails loudly at startup instead of silently misbehaving. Any model Ollama can run, Nova can use (`LLM_MODEL` in `.env`).
 
 Model routing *(experimental)*: configurable fast model for greetings, heavy model for complex reasoning, vision model for images. Set via `FAST_MODEL`, `HEAVY_MODEL`, `VISION_MODEL` env vars.
 
@@ -266,14 +262,17 @@ Nova's LLM layer is provider-agnostic — you don't need a 3090.
 | **Quantized local** | 16GB | `qwen3.5:27b-q4_K_M` — set `LLM_MODEL=qwen3.5:27b-q4_K_M` in `.env` |
 | **Smaller model** | 8GB | `qwen3.5:9b` — set `LLM_MODEL=qwen3.5:9b` in `.env` |
 | **Tiny model** | 4GB | `qwen3.5:4b` — set `LLM_MODEL=qwen3.5:4b` in `.env` |
-
+| **No GPU (CPU only)** | — | `qwen3.5:4b` on CPU — slow but fully functional |
 
 ```bash
-
-# Quantized — fits in 16GB VRAM
-# Just change LLM_MODEL in .env, then:
+# Smaller GPU — set LLM_MODEL in .env, then:
 docker compose up -d
+
+# No GPU at all — CPU override skips the NVIDIA device reservation:
+docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d
 ```
+
+Or just run `./install.sh` — it detects your hardware and picks the right tier.
 
 ## Configuration
 
