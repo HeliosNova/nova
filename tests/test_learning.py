@@ -1158,3 +1158,81 @@ class TestAutoSkillCreation:
                 )
 
         assert len(mock_skills.get_all_skills()) == 0
+
+
+class TestParaphraseRetrieval:
+    """Semantic-first lesson retrieval: paraphrases of the ORIGINAL QUERY must
+    retrieve the lesson. The originating query is embedded into the lesson
+    document (query-to-query similarity is the strongest paraphrase signal);
+    internal eval- markers are never embedded.
+    """
+
+    @pytest.fixture
+    def engine(self, db):
+        return LearningEngine(db)
+
+    def test_searchable_includes_original_query(self, engine):
+        """save_lesson embeds the originating query into the vector document."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        correction = Correction(
+            user_message="No - Meucci invented it",
+            previous_answer="Bell invented the telephone",
+            topic="Telephone inventor",
+            correct_answer="Antonio Meucci invented the telephone",
+            wrong_answer="Alexander Graham Bell",
+            original_query="Who invented the telephone?",
+            lesson_text="The telephone was invented by Antonio Meucci",
+        )
+        engine.save_lesson(correction)
+        assert mock_coll.add.called
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "Who invented the telephone?" in doc
+
+    def test_eval_marker_never_embedded(self, engine):
+        """Internal eval- context markers are not language - keep them out of the doc."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        engine.add_knowledge_lesson(
+            topic="scheduler codename",
+            correct_answer="The scheduler codename is Chronos",
+            lesson_text="codename Chronos",
+            context="eval-mem:mem_x",
+        )
+        assert mock_coll.add.called
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "eval-mem" not in doc
+        assert "Chronos" in doc
+
+    def test_natural_context_is_embedded(self, engine):
+        """Real-language context (e.g. curiosity research origin) joins the doc."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        engine.add_knowledge_lesson(
+            topic="pandas groupby",
+            correct_answer="groupby(...).agg() aggregates per group",
+            lesson_text="use agg after groupby",
+            context="researching how to aggregate dataframes by column",
+        )
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "aggregate dataframes" in doc
+
+    def test_paraphrased_query_retrieves_lesson(self, engine):
+        """End-to-end: a paraphrase with near-zero keyword overlap still finds
+        the lesson via the vector path."""
+        correction = Correction(
+            user_message="Actually, the telephone was invented by Antonio Meucci",
+            previous_answer="The telephone was invented by Alexander Graham Bell",
+            topic="Telephone inventor",
+            correct_answer="Antonio Meucci invented the telephone",
+            wrong_answer="Alexander Graham Bell",
+            original_query="Who invented the telephone?",
+            lesson_text="The telephone was invented by Antonio Meucci, not Alexander Graham Bell",
+        )
+        engine.save_lesson(correction)
+        # paraphrase: different wording, same meaning
+        lessons = engine.get_relevant_lessons("who originally came up with the telephone")
+        assert any(
+            "Meucci" in (l.correct_answer or "") or "Meucci" in (l.lesson_text or "")
+            for l in lessons
+        ), "paraphrased query failed to retrieve the lesson"

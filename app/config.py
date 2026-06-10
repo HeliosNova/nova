@@ -66,7 +66,8 @@ _MUTABLE_FIELDS = {
     # Tuning parameters
     "RESPONSE_TOKEN_BUDGET", "RETRIEVAL_RELEVANCE_THRESHOLD",
     "TEMPERATURE_DEFAULT",
-    "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
+    "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "LESSON_VECTOR_STRONG_DISTANCE",
+    "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
     "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
@@ -364,6 +365,13 @@ class Config:
     # surface the relevant lesson — the WS2A "semantic-first" change. The RRF
     # fusion, MIN_RRF_SCORE floor, and 0.40 confidence floor remain as backstops.
     LESSON_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_MAX_DISTANCE", 0.9))
+    # Strong-match bound: a vector hit at or under this distance is a clear
+    # semantic match (e.g. a paraphrase of the lesson's original query) and
+    # bypasses the MIN_RRF_SCORE floor — a paraphrase has no keyword support,
+    # so its single-list RRF score sits near any practical floor. Hits between
+    # STRONG and MAX still enter fusion but must clear the floor like
+    # everything else.
+    LESSON_VECTOR_STRONG_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_STRONG_DISTANCE", 0.55))
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
