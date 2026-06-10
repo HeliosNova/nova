@@ -1624,7 +1624,16 @@ async def _run_generation_loop(
         gen.is_error = True
         yield StreamEvent(type=EventType.ERROR, data={"message": str(e)})
     finally:
-        _amq.reset(_amq_token)
+        try:
+            _amq.reset(_amq_token)
+        except ValueError:
+            # Async-generator cleanup (GeneratorExit on client disconnect or an
+            # upstream error) can run in a different context than where the token
+            # was set — ContextVar.reset() then raises "Token was created in a
+            # different Context". Harmless (the context is torn down regardless),
+            # but if it propagates it masks the REAL error (e.g. an Ollama
+            # timeout) in the logs. Swallow it.
+            pass
 
 
 # ---------------------------------------------------------------------------
