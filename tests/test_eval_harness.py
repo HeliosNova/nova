@@ -47,6 +47,7 @@ def _make_result(
     skill_used=None,
     response_text="The answer is 42.",
     failed_assertions=None,
+    timed_out=False,
 ) -> TaskResult:
     return TaskResult(
         task_id=task_id,
@@ -59,6 +60,7 @@ def _make_result(
         reflexion_score=reflexion_score,
         latency_seconds=latency,
         failed_assertions=failed_assertions or [],
+        timed_out=timed_out,
     )
 
 
@@ -1333,3 +1335,167 @@ class TestMemoryLearningEval:
         mem = [t for t in EvalHarness().load_suite() if t.category == "memory-learning"]
         assert len(mem) >= 5
         assert all(t.seed_lesson and t.seed_lesson.get("correct_answer") for t in mem)
+
+
+class TestTimeoutSeparation:
+    """Timeouts are budget exhaustion, NOT wrong answers.
+
+    A run that hits its time budget without proving correctness is outcome
+    timeout: excluded from every correctness denominator, counted separately,
+    and visible in latency stats. Slow-but-correct still counts as a pass.
+    """
+
+    # --- metrics level -----------------------------------------------------
+
+    def test_timeout_excluded_from_pass_rate(self):
+        rows = [
+            _make_result("a", passed=True),
+            _make_result("b", passed=False),
+            _make_result("c", passed=False, timed_out=True, latency=60.0),
+        ]
+        m = compute_category_metrics(rows)["reasoning"]
+        assert m.total == 3
+        assert m.timeouts == 1
+        # pass_rate over the 2 completed runs, not 3
+        assert m.pass_rate == pytest.approx(0.5)
+
+    def test_all_timeouts_no_correctness_signal(self):
+        rows = [
+            _make_result("a", passed=False, timed_out=True, latency=60.0),
+            _make_result("b", passed=False, timed_out=True, latency=60.0),
+        ]
+        m = compute_category_metrics(rows)["reasoning"]
+        assert m.timeouts == 2
+        assert m.pass_rate == 0.0
+
+    def test_timeout_latency_still_counts(self):
+        """Latency percentiles include timed-out runs — a timeout IS latency truth."""
+        rows = [
+            _make_result("a", passed=True, latency=1.0),
+            _make_result("b", passed=False, timed_out=True, latency=60.0),
+        ]
+        m = compute_category_metrics(rows)["reasoning"]
+        assert m.latency_p95 >= 30.0
+
+    def test_skill_match_hit_rate_over_completed_only(self):
+        rows = [
+            _make_result("a", category="skill-match", passed=True, skill_used="crypto"),
+            _make_result("b", category="skill-match", passed=False, timed_out=True),
+        ]
+        m = compute_category_metrics(rows)["skill-match"]
+        # the timed-out run never got its DONE event — it can't count against hit rate
+        assert m.hit_rate == pytest.approx(1.0)
+
+    def test_untestable_memory_pair_excluded_from_causal_rate(self):
+        def tr(tid, before, after, timed_out=False):
+            return TaskResult(
+                task_id=tid, category="memory-learning", query="q",
+                passed=bool(after), response_text="", tools_invoked=[],
+                skill_used=None, reflexion_score=None, latency_seconds=0.0,
+                failed_assertions=[], timed_out=timed_out,
+                memory_before_correct=before, memory_after_correct=after,
+                memory_caused_fix=(bool(after and not before) if before is not None else None),
+            )
+        rows = [
+            tr("a", False, True),                      # causal fix
+            tr("b", None, None, timed_out=True),       # untestable — leg timed out
+        ]
+        m = compute_category_metrics(rows)["memory-learning"]
+        assert m.memory_testable == 1
+        assert m.memory_causal_fix_rate == pytest.approx(1.0)
+        assert m.timeouts == 1
+
+    # --- run_task level ----------------------------------------------------
+
+    @staticmethod
+    def _inv(text, timed_out=False):
+        from app.monitors.eval_harness import _Invocation
+        return _Invocation(
+            response_text=text, tools_invoked=[], skill_used=None,
+            decomposed=False, max_decomposition_depth=0,
+            reflexion_score=0.8 if text else None,
+            latency_seconds=60.0 if timed_out else 0.01,
+            error="Timeout after 60s" if timed_out else None,
+            timed_out=timed_out,
+        )
+
+    @pytest.mark.asyncio
+    async def test_run_task_timeout_is_not_a_failure(self):
+        task = EvalTask(
+            id="t_slow", category="reasoning", query="hard question",
+            assertions=[{"type": "answer_contains", "value": "42"}],
+        )
+        harness = EvalHarness()
+        svc = MagicMock()
+        with patch("app.core.brain.get_services", return_value=svc):
+            with patch.object(
+                EvalHarness, "_invoke_brain",
+                new=AsyncMock(return_value=self._inv("", timed_out=True)),
+            ):
+                result = await harness.run_task(task)
+        assert result.timed_out is True
+        assert result.passed is False
+        # budget exhaustion must NOT be written to the reflexion store as a failure
+        svc.reflexions.store.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_run_task_slow_but_correct_is_a_pass(self):
+        task = EvalTask(
+            id="t_slow_ok", category="reasoning", query="hard question",
+            assertions=[{"type": "answer_contains", "value": "42"}],
+        )
+        harness = EvalHarness()
+        with patch.object(
+            EvalHarness, "_invoke_brain",
+            new=AsyncMock(return_value=self._inv("The answer is 42.", timed_out=True)),
+        ):
+            result = await harness.run_task(task)
+        assert result.passed is True
+        assert result.timed_out is False  # outcome is pass, not timeout
+
+    @pytest.mark.asyncio
+    async def test_memory_pair_with_timed_out_after_leg_is_untestable(self):
+        task = EvalTask(
+            id="mem_t", category="memory-learning",
+            query="What is the codename of Nova scheduler?",
+            assertions=[{"type": "answer_contains", "value": "Chronos"}],
+            seed_lesson={"topic": "t", "correct_answer": "It is Chronos.",
+                         "lesson_text": "codename Chronos", "confidence": 0.95},
+        )
+        learning = MagicMock()
+        learning.add_knowledge_lesson.return_value = 1
+        learning._db.fetchall.return_value = []
+        svc = MagicMock()
+        svc.learning = learning
+        harness = EvalHarness()
+        with patch("app.core.brain.get_services", return_value=svc):
+            with patch.object(
+                EvalHarness, "_invoke_brain",
+                new=AsyncMock(side_effect=[self._inv("No idea."),
+                                           self._inv("", timed_out=True)]),
+            ):
+                result = await harness._run_memory_task(task)
+        assert result.timed_out is True
+        assert result.passed is False
+        assert result.memory_before_correct is None
+        assert result.memory_caused_fix is None
+
+    # --- report level ------------------------------------------------------
+
+    def test_report_renders_timeout_counts(self):
+        cats = {
+            "reasoning": CategoryMetrics(
+                category="reasoning", total=3, passed=1, pass_rate=0.5,
+                latency_p50=2.0, latency_p95=60.0, timeouts=1,
+            ),
+        }
+        report = EvalReport(
+            run_id="r", suite_path="s", suite_version="1",
+            total_tasks=3, passed=1, failed=1, skipped=0, pass_rate=0.5,
+            duration_seconds=10.0, categories=cats, task_results=[],
+            regressions=[], baseline_run_id=None, config_snapshot={},
+            timestamp="2026-06-10T00:00:00+00:00", timeouts=1,
+        )
+        md = render_markdown(report)
+        assert "Timeouts (excluded from pass rate) | 1" in md
+        assert "Pass rate (over completed)" in md
