@@ -82,9 +82,8 @@ _MUTABLE_FIELDS = {
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
     "ENABLE_PPR_RETRIEVAL", "ENABLE_CONFORMAL_ABSTENTION", "ENABLE_GSW_EPISODIC",
     "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
-    "ENABLE_RLVR_SIGNALS", "ENABLE_DEBATE", "DEBATE_TIMEOUT_SECONDS",
+    "ENABLE_RLVR_SIGNALS",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
-    "ENABLE_MAD_MM_MASKING", "MAD_MM_MIN_PRIOR_STEPS", "MAD_MM_JUDGE_MODEL",
     "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
     "ENABLE_PROMPT_SELF_MOD",
@@ -155,22 +154,6 @@ class Config:
     # RLVR — record verifiable signals (tool/JSON/math/claim/quiz/code outcomes) so a
     # later GRPO/RLVR fine-tune can train on real rewards instead of LLM-judge noise.
     ENABLE_RLVR_SIGNALS: bool = field(default_factory=lambda: _env("ENABLE_RLVR_SIGNALS", "true").lower() == "true")
-    # A-HMAD style debate — role-specialized critics + judge on high-stakes drafts.
-    # Off by default: latency cost is ~3 extra LLM calls; opt in per environment.
-    ENABLE_DEBATE: bool = field(default_factory=lambda: _env("ENABLE_DEBATE", "false").lower() == "true")
-    DEBATE_TIMEOUT_SECONDS: float = field(default_factory=lambda: _env_float("DEBATE_TIMEOUT_SECONDS", 240.0))
-    # MAD-MM (ICLR 2026) subjective memory masking in the agent_loop iteration.
-    # When a step is retried (attempts > 0) AND there are >= MAD_MM_MIN_PRIOR_STEPS
-    # done steps to draw on, ask the LLM which prior step observations and findings
-    # are useful for the current step before re-rendering the scratchpad. The
-    # original attempt apparently got misled — masking drops the most likely
-    # culprits. Opt-in (default off) because it adds 1 batched LLM call per retry.
-    ENABLE_MAD_MM_MASKING: bool = field(default_factory=lambda: _env("ENABLE_MAD_MM_MASKING", "false").lower() == "true")
-    MAD_MM_MIN_PRIOR_STEPS: int = field(default_factory=lambda: _env_int("MAD_MM_MIN_PRIOR_STEPS", 3))
-    # Judge model for MAD-MM mask LLM calls. A stronger third-party model
-    # discriminates better than the production fine-tune (which is conservative
-    # and tends to keep everything). Empty string = use the default LLM_MODEL.
-    MAD_MM_JUDGE_MODEL: str = field(default_factory=lambda: _env("MAD_MM_JUDGE_MODEL", "qwen3.6:27b"))
     # SCM/SleepGate-style two-phase dream consolidation: split the current
     # kitchen-sink Phase 3 into NREM (structural ops: prune/compact/disable —
     # fast, deterministic) and REM (integrative ops: promote/resolve/distill —

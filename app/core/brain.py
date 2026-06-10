@@ -3510,29 +3510,6 @@ async def think(
                         )
             except Exception:
                 pass
-            # A-HMAD style debate — opt-in (ENABLE_DEBATE) and gated to
-            # high-stakes drafts. Replaces final_content if the judge says so.
-            try:
-                from app.core import debate as _debate
-                if (
-                    _debate.is_enabled()
-                    and current_depth == 0
-                    and _debate.should_debate(query, intent, final_content)
-                ):
-                    debate_result = await _debate.run_debate(
-                        query=query,
-                        draft=final_content,
-                        evidence=str(evidence)[:3000] if evidence else "",
-                        timeout_total=float(getattr(config, "DEBATE_TIMEOUT_SECONDS", 240.0)),
-                    )
-                    if debate_result.action != "keep" and debate_result.final_answer:
-                        final_content = debate_result.final_answer
-                        logger.info(
-                            "[debate] action=%s rationale=%r — final_content overridden",
-                            debate_result.action, debate_result.rationale,
-                        )
-            except Exception as e:
-                logger.debug("[debate] failed: %s", e)
             chunk_size = 20
             for i in range(0, len(final_content), chunk_size):
                 yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
