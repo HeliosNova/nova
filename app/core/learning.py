@@ -235,7 +235,9 @@ class LearningEngine:
             topic = row["topic"] or ""
             correct_answer = row["correct_answer"] or ""
             lesson_text = _row_get(row, "lesson_text")
-            searchable = f"{topic} {correct_answer} {lesson_text}".strip()
+            searchable = _lesson_searchable(
+                _row_get(row, "context"), topic, correct_answer, lesson_text
+            )
             if not searchable:
                 continue
             ids.append(str(row["id"]))
@@ -394,11 +396,15 @@ class LearningEngine:
             lesson_id, correction.topic, (lesson_text or "")[:80]
         )
 
-        # Add to ChromaDB for semantic search
+        # Add to ChromaDB for semantic search — embed the original query too,
+        # so paraphrases of it retrieve the lesson (semantic-first, WS2A)
         try:
             collection = self._get_lessons_collection()
             if collection is not None:
-                searchable = f"{topic} {correct_answer} {lesson_text or ''}".strip()
+                searchable = _lesson_searchable(
+                    correction.original_query or correction.user_message,
+                    topic, correct_answer, lesson_text,
+                )
                 if searchable:
                     collection.add(
                         ids=[str(lesson_id)],
@@ -467,11 +473,12 @@ class LearningEngine:
             lesson_id, topic, (lesson_text or "")[:80],
         )
 
-        # Add to ChromaDB for semantic search
+        # Add to ChromaDB for semantic search (context joins the document when
+        # it's real language — internal eval markers are excluded)
         try:
             collection = self._get_lessons_collection()
             if collection is not None:
-                searchable = f"{topic} {correct_answer} {lesson_text or ''}".strip()
+                searchable = _lesson_searchable(context, topic, correct_answer, lesson_text)
                 if searchable:
                     collection.add(
                         ids=[str(lesson_id)],
@@ -505,6 +512,7 @@ class LearningEngine:
 
         # --- Vector search via ChromaDB ---
         vector_ranked: list[int] = []  # lesson IDs in ranked order
+        vector_strong: set[int] = set()  # clear semantic matches (paraphrase-grade)
         try:
             collection = self._get_lessons_collection()
             if collection is not None and collection.count() > 0:
@@ -520,12 +528,15 @@ class LearningEngine:
                         # Threshold is configurable (LESSON_VECTOR_MAX_DISTANCE, default
                         # 0.9) so paraphrased queries with low keyword overlap still
                         # surface the relevant lesson — semantic-first retrieval (WS2A).
-                        if distances and i < len(distances) and distances[i] > config.LESSON_VECTOR_MAX_DISTANCE:
+                        dist = distances[i] if distances and i < len(distances) else None
+                        if dist is not None and dist > config.LESSON_VECTOR_MAX_DISTANCE:
                             continue
                         try:
                             lid = int(id_str)
                             if lid in lesson_by_id:
                                 vector_ranked.append(lid)
+                                if dist is not None and dist <= config.LESSON_VECTOR_STRONG_DISTANCE:
+                                    vector_strong.add(lid)
                         except ValueError:
                             continue
         except Exception as e:
@@ -575,9 +586,18 @@ class LearningEngine:
                 # Scale Q-value to match RRF magnitude, then blend 70/30
                 rrf_scores[lid] = rrf_scores[lid] * 0.7 + (q_val * max_rrf) * 0.3
 
-        # Sort by blended score descending, then filter by minimum relevance
+        # Sort by blended score descending, then filter by minimum relevance.
+        # The MIN_RRF_SCORE floor exists to cut weak keyword-noise matches —
+        # it must NOT veto STRONG vector hits (distance ≤ STRONG bound). A
+        # paraphrased query has zero keyword support by definition, so its
+        # single-list RRF score (~1/(k+1)) sits near any practical floor; for
+        # those, the strong distance gate is the real relevance check. Weak
+        # vector hits (between STRONG and MAX) still need to clear the floor.
         sorted_ids = sorted(rrf_scores, key=lambda lid: rrf_scores[lid], reverse=True)
-        sorted_ids = [lid for lid in sorted_ids if rrf_scores[lid] >= config.MIN_RRF_SCORE]
+        sorted_ids = [
+            lid for lid in sorted_ids
+            if rrf_scores[lid] >= config.MIN_RRF_SCORE or lid in vector_strong
+        ]
 
         lessons = []
         retrieved_ids = []
@@ -1125,6 +1145,22 @@ class LearningEngine:
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _lesson_searchable(
+    query_context: str | None, topic: str, correct_answer: str, lesson_text: str | None
+) -> str:
+    """Build the document embedded for semantic lesson retrieval.
+
+    Includes the originating query when available: a future paraphrase is a
+    paraphrase OF THAT QUERY, so query-to-query similarity is the strongest
+    semantic signal for retrieving the lesson. Internal markers (eval-…)
+    are excluded — they aren't language.
+    """
+    ctx = (query_context or "").strip()
+    if ctx.startswith("eval-"):
+        ctx = ""
+    return f"{ctx} {topic} {correct_answer} {lesson_text or ''}".strip()
+
 
 def _row_get(row, key: str, default: str = "") -> str:
     """Safely get a column from a sqlite3.Row (which has no .get() method)."""
