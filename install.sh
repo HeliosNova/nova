@@ -23,18 +23,22 @@ if ! docker compose version &>/dev/null; then
     exit 1
 fi
 
-# Check GPU
-HAS_GPU=false
+# Detect hardware tier: full GPU (20GB+), small GPU, or CPU-only
+TIER="cpu"
+VRAM=""
 if command -v nvidia-smi &>/dev/null && nvidia-smi &>/dev/null; then
     VRAM=$(nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null | head -1)
     if [ -n "$VRAM" ] && [ "$VRAM" -ge 20000 ] 2>/dev/null; then
-        HAS_GPU=true
-        echo "  GPU detected: ${VRAM}MB VRAM"
+        TIER="gpu_full"
+        echo "  GPU detected: ${VRAM}MB VRAM — full local tier (qwen3.5:27b)"
+    elif [ -n "$VRAM" ] && [ "$VRAM" -ge 7000 ] 2>/dev/null; then
+        TIER="gpu_small"
+        echo "  GPU detected: ${VRAM}MB VRAM — small-model tier (qwen3.5:9b)"
     else
-        echo "  GPU detected but <20GB VRAM (${VRAM:-unknown}MB)"
+        echo "  GPU detected but very low VRAM (${VRAM:-unknown}MB) — CPU tier"
     fi
 else
-    echo "  No NVIDIA GPU detected"
+    echo "  No NVIDIA GPU detected — CPU tier (slow but functional)"
 fi
 
 # Clone
@@ -53,35 +57,53 @@ if [ ! -f .env ]; then
     echo "  Created .env from .env.example"
 fi
 
-# Choose compose file
-if [ "$HAS_GPU" = true ]; then
-    COMPOSE_FILE="docker-compose.yml"
-    echo ""
-    echo "  Starting with LOCAL inference (Ollama + GPU)..."
-    docker compose up -d --build
-
-    echo ""
-    echo "  Pulling models (this may take a few minutes)..."
-    docker exec nova-ollama ollama pull qwen3.5:27b
-    docker exec nova-ollama ollama pull bge-m3
-else
-    echo ""
-    echo "  No GPU — using cloud LLM mode."
-    echo ""
-    echo "  You need to set your LLM provider in .env:"
-    echo "    LLM_PROVIDER=openai    (or anthropic, google)"
-    echo "    OPENAI_API_KEY=sk-..."
-    echo ""
-    read -p "  Have you configured .env? [y/N] " -n 1 -r
-    echo ""
-    if [[ ! $REPLY =~ ^[Yy]$ ]]; then
-        echo "  Edit nova/.env, then run:"
-        echo "    cd nova && docker compose -f docker-compose.cloud.yml up -d --build"
-        exit 0
+# Start the stack for the detected tier. Nova is Ollama-only by design
+# (local inference is the point) — smaller hardware just means a smaller model.
+set_model() {
+    # Set LLM_MODEL in .env unless the user already chose one
+    if grep -qE '^LLM_MODEL=.+' .env 2>/dev/null; then
+        echo "  Keeping existing LLM_MODEL from .env"
+    elif grep -qE '^#? ?LLM_MODEL=' .env 2>/dev/null; then
+        sed -i.bak "s|^#\{0,1\} \{0,1\}LLM_MODEL=.*|LLM_MODEL=$1|" .env && rm -f .env.bak
+        echo "  Set LLM_MODEL=$1 in .env"
+    else
+        echo "LLM_MODEL=$1" >> .env
+        echo "  Set LLM_MODEL=$1 in .env"
     fi
-    COMPOSE_FILE="docker-compose.cloud.yml"
-    docker compose -f "$COMPOSE_FILE" up -d --build
-fi
+}
+
+case "$TIER" in
+    gpu_full)
+        echo ""
+        echo "  Starting with local GPU inference (qwen3.5:27b)..."
+        docker compose up -d --build
+        echo ""
+        echo "  Pulling models (this may take a few minutes)..."
+        docker exec nova-ollama ollama pull qwen3.5:27b
+        docker exec nova-ollama ollama pull bge-m3
+        ;;
+    gpu_small)
+        set_model "qwen3.5:9b"
+        echo ""
+        echo "  Starting with local GPU inference (qwen3.5:9b)..."
+        docker compose up -d --build
+        echo ""
+        echo "  Pulling models (this may take a few minutes)..."
+        docker exec nova-ollama ollama pull qwen3.5:9b
+        docker exec nova-ollama ollama pull bge-m3
+        ;;
+    cpu)
+        set_model "qwen3.5:4b"
+        echo ""
+        echo "  Starting in CPU mode (qwen3.5:4b) — responses will be slow"
+        echo "  but everything works. Add a GPU later for full speed."
+        docker compose -f docker-compose.yml -f docker-compose.cpu.yml up -d --build
+        echo ""
+        echo "  Pulling models (this may take a few minutes)..."
+        docker exec nova-ollama ollama pull qwen3.5:4b
+        docker exec nova-ollama ollama pull bge-m3
+        ;;
+esac
 
 echo ""
 echo "  Nova is starting up..."

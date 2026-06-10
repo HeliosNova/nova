@@ -471,8 +471,7 @@ class Config:
     API_KEY: str = field(default_factory=lambda: _env("NOVA_API_KEY"))
     ALLOWED_ORIGINS: str = field(default_factory=lambda: _env("ALLOWED_ORIGINS", "http://localhost:5173"))
 
-    # Server
-    HOST: str = field(default_factory=lambda: _env("HOST", "0.0.0.0"))
+    # Server (bind address comes from the uvicorn invocation, not config)
     PORT: int = field(default_factory=lambda: _env_int("PORT", 8000))
 
     # Database
