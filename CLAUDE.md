@@ -716,63 +716,13 @@ RLVR signal accumulation needs days of normal traffic before there are
 enough multi-rollout groups for true GRPO. Dry-run on 2026-05-08 found
 3 trainable groups out of 88 from 477 signals — expected ramp.
 
-## A-HMAD Style Debate (`app/core/debate.py`)
+## Removed experiments (v1.6.0)
 
-Role-specialized critics + judge for high-stakes drafts. Three serial critics
-followed by a judge that decides keep/amend/replace/hedge. Beats homogeneous
-parallel decomposition on contested claims (Springer s44443-025-00353-3, 2026).
-
-Roles:
-- **Logic Critic** — reasoning steps, math, internal consistency
-- **Fact Verifier** — unverified claims, KG/web grounding gaps
-- **Strategy Reviewer** — scope, missed edge cases, wrong tool choice
-- **Judge** — synthesizes one of `keep` / `amend` / `replace` / `hedge`
-
-Gated by `ENABLE_DEBATE=false` (default — opt-in due to ~3 extra LLM calls).
-Triggers only when `should_debate()` returns True: high-stakes domain
-(medical/legal/financial/safety) OR strong-claim-with-numbers, AND
-intent="general", AND draft >=200 chars, AND not already heavily hedged.
-
-Sub-agents at `current_depth >= 1` skip debate (no compounded latency).
-
-Public API:
-```python
-from app.core import debate
-if debate.should_debate(query, intent, draft):
-    result = await debate.run_debate(query, draft, evidence=...)
-    if result.action != "keep":
-        final_content = result.final_answer
-```
-
-Wired in `brain.py` after claim validation, before token streaming.
-
-## MAD-MM Memory Masking (`app/core/agent_loop.py::_mask_prior_observations`)
-
-Subjective memory masking for the agent_loop iteration. Based on MAD-MM (ICLR
-2026, arxiv 2603.20215) — "Multi-Agent Debate with Memory Masking". Adapted from
-the paper's multi-agent debate setup to our single-agent multi-step loop: when a
-step is being retried, the original attempt was apparently misled by something in
-its prior-step scratchpad. The masker asks the LLM (one batched call) which prior
-step observations and findings are actually useful for the current step, and the
-scratchpad re-renders without the rejected items.
-
-Two adaptations from the paper:
-1. Batched one-shot mask call instead of MAD-MM's per-item loop (fewer LLM calls
-   on local hardware — one ~3s call vs N×3s).
-2. Subjective strategy only. Objective (perplexity-based) skipped — Ollama
-   doesn't expose per-token logprobs cleanly.
-
-Config flags (default OFF — opt-in due to the extra LLM call):
-- `ENABLE_MAD_MM_MASKING` — master switch
-- `MAD_MM_MIN_PRIOR_STEPS` (default 3) — only fire when there are this many
-  done prior steps; below the threshold there isn't enough to filter
-
-Gates that always apply (even with the flag on):
-- Only fires on step revision (`step.attempts > 0`)
-- Conservative fallback: keep-all on LLM failure, malformed JSON, ambiguous
-  verdict, or pathological all-drop response
-
-Emits `mad_mm_mask` SSE event listing kept step ids + finding keys.
+A-HMAD debate (`app/core/debate.py`) and MAD-MM memory masking
+(`agent_loop._mask_prior_observations`) were removed in v1.6.0: both were
+default-off, never enabled in production, and never showed measured value.
+The code is preserved on the `experiments/pre-v1.6-archive` branch if a
+future eval gives a reason to revisit.
 
 ## Procedural Memory Consolidation (`app/core/dream.py::_consolidate_procedural_memory`)
 

@@ -240,29 +240,18 @@ class Scratchpad:
         self,
         plan: Plan,
         step: Step,
-        *,
-        keep_step_ids: set[int] | None = None,
-        keep_finding_keys: set[str] | None = None,
     ) -> str:
         """Render scratchpad scoped to this step's relevant context.
 
         Includes: goal, prior step summaries (1 line each), key findings,
         and the current step's prior attempts (if revising).
-
-        Optional `keep_step_ids` / `keep_finding_keys` come from MAD-MM
-        memory masking (see `_mask_prior_observations`). When provided,
-        only items in the sets are included. When `None` (default), all
-        items are kept — original behavior.
         """
         lines: list[str] = [f"GOAL: {plan.goal}"]
 
         # Prior step summaries — just the essentials
         prior = [s for s in plan.steps if s.status == STEP_DONE]
         if prior:
-            # Window first, THEN apply mask — keeps "last 5" semantics intact
             window = prior[-5:]
-            if keep_step_ids is not None:
-                window = [s for s in window if s.id in keep_step_ids]
             if window:
                 lines.append("\nPRIOR STEPS:")
                 for s in window:
@@ -272,8 +261,6 @@ class Scratchpad:
         # Findings (free-form)
         if self.findings:
             items = list(self.findings.items())[:10]
-            if keep_finding_keys is not None:
-                items = [(k, v) for k, v in items if k in keep_finding_keys]
             if items:
                 lines.append("\nFINDINGS:")
                 for k, v in items:
@@ -644,150 +631,6 @@ def sanitize_synthesis(text: str) -> tuple[str, int]:
     return out.strip(), changes
 
 
-# ---------------------------------------------------------------------------
-# MAD-MM subjective memory masking (ICLR 2026, arxiv 2603.20215)
-# ---------------------------------------------------------------------------
-#
-# When a step retries, the original attempt got misled — often by an irrelevant
-# or wrong prior step / finding bleeding into the scratchpad. MAD-MM's subjective
-# masking pass asks the LLM, per prior item, whether it's actually useful for
-# the current goal. We batch all items into ONE LLM call (vs MAD-MM's per-item
-# loop) to keep latency tolerable on local hardware — one ~2-5s call vs
-# 10×2-5s. Conservative on parse failure (keep everything).
-
-_MASK_PROMPT = """You will be shown several memory items from prior reasoning steps.
-For the CURRENT STEP below, decide which items are useful and which should be ignored.
-
-Useful = directly informs the current step (a value to reuse, a constraint to honor, a fact to cite).
-Ignore = irrelevant, contradicts the goal, or led the prior attempt astray.
-
-CURRENT STEP: {step_description}
-
-OVERALL GOAL: {goal}
-
-ITEMS (id -> content):
-{items}
-
-Respond with one JSON object mapping each id to "yes" (useful) or "no" (ignore):
-{{"id_1": "yes"|"no", "id_2": "yes"|"no", ...}}
-Only the JSON. Default to "yes" when uncertain — drop only items you're confident are unhelpful."""
-
-
-async def _mask_prior_observations(
-    goal: str,
-    step_description: str,
-    prior_step_items: list[tuple[int, str]],
-    finding_items: list[tuple[str, str]],
-    *,
-    timeout: float = 90.0,
-) -> tuple[set[int], set[str], dict[str, str]]:
-    """Subjective MAD-MM mask on prior step observations + scratchpad findings.
-
-    Args:
-        goal: the plan-level goal text.
-        step_description: the current step's description (what the LLM is about
-            to attempt).
-        prior_step_items: list of (step_id, "description -> observation") pairs
-            already trimmed to the relevant window.
-        finding_items: list of (key, "value") pairs from the scratchpad.
-        timeout: per-call ceiling.
-
-    Returns:
-        (keep_step_ids, keep_finding_keys, decisions_log).
-        On any failure (LLM error, parse error, empty items) returns the
-        all-keep sets so the caller falls back to the unfiltered scratchpad.
-    """
-    if not prior_step_items and not finding_items:
-        return set(), set(), {}
-
-    all_step_ids = {sid for sid, _ in prior_step_items}
-    all_finding_keys = {k for k, _ in finding_items}
-    keep_all = (all_step_ids, all_finding_keys, {})
-
-    # Build labelled item list. Use stable, parseable ids — the LLM keys its
-    # JSON response by these.
-    label_to_kind: dict[str, tuple[str, int | str]] = {}
-    rendered: list[str] = []
-    for sid, content in prior_step_items:
-        label = f"step_{sid}"
-        label_to_kind[label] = ("step", sid)
-        rendered.append(f"  {label}: {content[:240]}")
-    for k, content in finding_items:
-        label = f"finding_{k}"
-        label_to_kind[label] = ("finding", k)
-        rendered.append(f"  {label}: {str(content)[:200]}")
-
-    prompt = _MASK_PROMPT.format(
-        goal=goal[:500],
-        step_description=step_description[:400],
-        items="\n".join(rendered),
-    )
-
-    # Optional stronger judge model — empty string falls through to default.
-    judge_model: str | None = None
-    try:
-        from app.config import config as _cfg
-        jm = (getattr(_cfg, "MAD_MM_JUDGE_MODEL", "") or "").strip()
-        if jm:
-            judge_model = jm
-    except Exception:
-        pass
-
-    try:
-        raw = await asyncio.wait_for(
-            llm.invoke_nothink(
-                [{"role": "user", "content": prompt}],
-                json_mode=True,
-                json_prefix="{",
-                max_tokens=400,
-                temperature=0.1,
-                model=judge_model,
-            ),
-            timeout=timeout,
-        )
-    except Exception as e:
-        logger.warning("[mad-mm] mask LLM failed: %s — keeping all", e)
-        return keep_all
-
-    if not raw:
-        return keep_all
-
-    try:
-        obj = json.loads(raw) if isinstance(raw, str) else raw
-    except Exception:
-        obj = extract_json_object(raw) or {}
-    if not isinstance(obj, dict):
-        return keep_all
-
-    keep_step_ids: set[int] = set()
-    keep_finding_keys: set[str] = set()
-    decisions: dict[str, str] = {}
-    for label, (kind, key) in label_to_kind.items():
-        verdict_raw = obj.get(label, "yes")
-        verdict = str(verdict_raw).strip().lower()
-        if verdict not in ("yes", "no"):
-            verdict = "yes"  # conservative on ambiguous output
-        decisions[label] = verdict
-        if verdict == "yes":
-            if kind == "step":
-                keep_step_ids.add(key)  # type: ignore[arg-type]
-            else:
-                keep_finding_keys.add(key)  # type: ignore[arg-type]
-
-    # Guard against an all-drop pathological response — the LLM may collapse
-    # under prompt confusion and label everything "no". Falling back to keep-all
-    # is safer than rendering an empty scratchpad.
-    if not keep_step_ids and not keep_finding_keys and (all_step_ids or all_finding_keys):
-        logger.warning("[mad-mm] mask collapsed to empty — keeping all instead")
-        return keep_all
-
-    n_dropped = (len(all_step_ids) - len(keep_step_ids)) + (
-        len(all_finding_keys) - len(keep_finding_keys)
-    )
-    if n_dropped:
-        logger.info("[mad-mm] masked %d/%d prior items for step",
-                    n_dropped, len(label_to_kind))
-    return keep_step_ids, keep_finding_keys, decisions
 
 
 # ---------------------------------------------------------------------------
@@ -867,66 +710,7 @@ class AgentLoop:
             step.started_at = time.monotonic()
             await self._emit(on_event, "step_start", {"id": step.id, "description": step.description})
 
-            # MAD-MM subjective memory masking — opt-in. Only fire when the
-            # step is being RETRIED (the original attempt was misled) AND
-            # there are enough rendered items in the scratchpad to meaningfully
-            # change the prompt. Counts both prior DONE steps and free-form
-            # findings — findings get rendered regardless of step status, so
-            # they're what most often need masking after a retry. Adds one
-            # batched LLM call. See _mask_prior_observations.
-            mask_step_ids: set[int] | None = None
-            mask_finding_keys: set[str] | None = None
-            try:
-                from app.config import config as _cfg
-                if (
-                    getattr(_cfg, "ENABLE_MAD_MM_MASKING", False)
-                    and step.attempts > 0
-                ):
-                    prior_done = [s for s in plan.steps if s.status == STEP_DONE]
-                    finding_count = len(scratchpad.findings)
-                    n_renderable = len(prior_done) + finding_count
-                    min_prior = int(getattr(_cfg, "MAD_MM_MIN_PRIOR_STEPS", 3))
-                    if n_renderable >= min_prior:
-                        prior_items = [
-                            (s.id, f"{s.description[:80]} -> {(s.observation or '')[:200]}")
-                            for s in prior_done[-5:]
-                            if s.observation
-                        ]
-                        finding_items = [
-                            (k, str(v)) for k, v in list(scratchpad.findings.items())[:10]
-                        ]
-                        mask_step_ids, mask_finding_keys, _decisions = await _mask_prior_observations(
-                            goal=plan.goal,
-                            step_description=step.description,
-                            prior_step_items=prior_items,
-                            finding_items=finding_items,
-                        )
-                        n_dropped = (
-                            (len([s.id for s in prior_done[-5:] if s.observation]) - len(mask_step_ids))
-                            + (min(finding_count, 10) - len(mask_finding_keys))
-                        )
-                        logger.info(
-                            "[mad-mm] step %d retry attempt=%d: masked %d/%d items "
-                            "(kept %d steps, %d findings)",
-                            step.id, step.attempts, n_dropped, n_renderable,
-                            len(mask_step_ids), len(mask_finding_keys),
-                        )
-                        await self._emit(on_event, "mad_mm_mask", {
-                            "step_id": step.id,
-                            "attempts": step.attempts,
-                            "kept_steps": sorted(mask_step_ids),
-                            "kept_findings": sorted(mask_finding_keys),
-                        })
-            except Exception as e:
-                logger.warning("[mad-mm] mask wrapper failed: %s — proceeding unmasked", e)
-                mask_step_ids = None
-                mask_finding_keys = None
-
-            ctx = scratchpad.render_for_step(
-                plan, step,
-                keep_step_ids=mask_step_ids,
-                keep_finding_keys=mask_finding_keys,
-            )
+            ctx = scratchpad.render_for_step(plan, step)
             try:
                 action = await self._reason_act(step, ctx, sample_n=sample_n)
             except Exception as e:
