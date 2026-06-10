@@ -493,131 +493,101 @@ class HeartbeatLoop:
         self.store.add_result(monitor.id, status, value=new_value[:4000] if new_value else "",
                               message=analysis[:500] if analysis else "")
 
+    # Registry: check_type -> handler. Adding a new check type is one method
+    # plus one entry here — _execute_check never changes. Lambdas adapt the
+    # handlers' real signatures (cfg-only / no-arg / monitor-arg) to a uniform
+    # (self, monitor, cfg) dispatch call.
+    _CHECK_DISPATCH = {
+        "url": lambda self, m, cfg: self._execute_url(cfg),
+        "search": lambda self, m, cfg: self._execute_search(cfg),
+        "command": lambda self, m, cfg: self._execute_command(cfg),
+        "system_health": lambda self, m, cfg: self._execute_system_health(),
+        "query": lambda self, m, cfg: self._execute_query_monitor(m, cfg),
+        "quiz": lambda self, m, cfg: self._execute_quiz(cfg),
+        "skill_test": lambda self, m, cfg: self._execute_skill_test(cfg),
+        "curiosity": lambda self, m, cfg: self._execute_curiosity_research(cfg),
+        "auto_monitor": lambda self, m, cfg: self._execute_auto_monitor_detection(cfg),
+        "maintenance": lambda self, m, cfg: self._execute_maintenance(cfg),
+        "finetune": lambda self, m, cfg: self._execute_finetune_check(cfg),
+        "consolidation": lambda self, m, cfg: self._execute_consolidation(cfg),
+        "capability_review": lambda self, m, cfg: self._execute_capability_review(cfg),
+        "eval": lambda self, m, cfg: self._execute_eval_harness(cfg),
+        "prompt_analyzer": lambda self, m, cfg: self._execute_prompt_analyzer(cfg),
+        "db_size": lambda self, m, cfg: self._execute_db_size_check(),
+        "kg_consistency": lambda self, m, cfg: self._execute_kg_consistency(),
+        "ollama_latency": lambda self, m, cfg: self._execute_ollama_latency_check(),
+        "skill_quality": lambda self, m, cfg: self._execute_skill_quality_check(),
+        "chromadb_integrity": lambda self, m, cfg: self._execute_chromadb_integrity_check(),
+        "kg_health": lambda self, m, cfg: self._execute_kg_health_check(),
+        "training_job": lambda self, m, cfg: self._execute_training_job_check(),
+        "kg_growth": lambda self, m, cfg: self._execute_kg_growth_check(m),
+        "ollama_model": lambda self, m, cfg: self._execute_ollama_model_check(),
+        "goal_derivation": lambda self, m, cfg: self._execute_goal_derivation(),
+        "synthesis": lambda self, m, cfg: self._execute_cross_synthesis(),
+        "auto_tool": lambda self, m, cfg: self._execute_auto_tool_synthesis(),
+        "output_eval": lambda self, m, cfg: self._execute_output_eval(),
+    }
+
     async def _execute_check(self, monitor: Monitor) -> str:
-        """Run the actual check based on monitor type."""
+        """Run the actual check based on monitor type (registry dispatch)."""
+        handler = self._CHECK_DISPATCH.get(monitor.check_type)
+        if handler is None:
+            return f"[Unknown check_type: {monitor.check_type}]"
+        return await handler(self, monitor, monitor.check_config)
+
+    async def _execute_url(self, cfg: dict) -> str:
         from app.core.brain import get_services
-
         svc = get_services()
-        cfg = monitor.check_config
+        url = cfg.get("url", "")
+        if svc.tool_registry:
+            return await svc.tool_registry.execute("http_fetch", {"url": url})
+        return f"[No tool registry — cannot fetch {url}]"
 
-        if monitor.check_type == "url":
-            url = cfg.get("url", "")
-            if svc.tool_registry:
-                return await svc.tool_registry.execute("http_fetch", {"url": url})
-            return f"[No tool registry — cannot fetch {url}]"
+    async def _execute_search(self, cfg: dict) -> str:
+        from app.core.brain import get_services
+        svc = get_services()
+        query = cfg.get("query", "")
+        if svc.tool_registry:
+            return await svc.tool_registry.execute("web_search", {"query": query})
+        return "[No tool registry — cannot search]"
 
-        elif monitor.check_type == "search":
-            query = cfg.get("query", "")
-            if svc.tool_registry:
-                return await svc.tool_registry.execute("web_search", {"query": query})
-            return "[No tool registry — cannot search]"
+    async def _execute_command(self, cfg: dict) -> str:
+        from app.core.brain import get_services
+        svc = get_services()
+        command = cfg.get("command", "")
+        if svc.tool_registry:
+            return await svc.tool_registry.execute("shell_exec", {"command": command})
+        return "[No tool registry — cannot exec]"
 
-        elif monitor.check_type == "command":
-            command = cfg.get("command", "")
-            if svc.tool_registry:
-                return await svc.tool_registry.execute("shell_exec", {"command": command})
-            return "[No tool registry — cannot exec]"
+    async def _execute_query_monitor(self, monitor: Monitor, cfg: dict) -> str:
+        # For Domain Study:* monitors use the direct-fetch runner that
+        # gets dates from the search engine (not from the LLM's belief
+        # about what year it is). nova-ft hedges dates badly and the
+        # citation gate then fails everything; the direct-fetch runner
+        # sidesteps that by handing pre-verified items to the LLM only
+        # for formatting.
+        # Route through the direct-fetch runner if Domain Study:* OR
+        # the monitor has curated RSS feeds (SEC Insider Trading, FOMC,
+        # Hacker News, FDA, etc). brain.think() hallucinates fake
+        # filings and dates for these niche topics — the runner pulls
+        # real items from real RSS sources.
+        from app.monitors.rss_feeds import feeds_for
+        if monitor.name.startswith("Domain Study:") or feeds_for(monitor.name):
+            from app.monitors.domain_study_runner import run_domain_study
+            try:
+                result = await run_domain_study(monitor.name)
+            except Exception as e:
+                logger.exception("[Heartbeat] domain_study_runner failed")
+                result = f"## ⚠️ {monitor.name} — runner error\n\n{e}"
+            return result
+        # Operator/internal queries (Morning Check-in, [Reminder]:* etc)
+        # keep the brain.think() path.
+        query = cfg.get("query", "")
+        return await self._think_query(query)
 
-        elif monitor.check_type == "system_health":
-            return await self._execute_system_health()
-
-        elif monitor.check_type == "query":
-            # For Domain Study:* monitors use the direct-fetch runner that
-            # gets dates from the search engine (not from the LLM's belief
-            # about what year it is). nova-ft hedges dates badly and the
-            # citation gate then fails everything; the direct-fetch runner
-            # sidesteps that by handing pre-verified items to the LLM only
-            # for formatting.
-            # Route through the direct-fetch runner if Domain Study:* OR
-            # the monitor has curated RSS feeds (SEC Insider Trading, FOMC,
-            # Hacker News, FDA, etc). brain.think() hallucinates fake
-            # filings and dates for these niche topics — the runner pulls
-            # real items from real RSS sources.
-            from app.monitors.rss_feeds import feeds_for
-            if monitor.name.startswith("Domain Study:") or feeds_for(monitor.name):
-                from app.monitors.domain_study_runner import run_domain_study
-                try:
-                    result = await run_domain_study(monitor.name)
-                except Exception as e:
-                    logger.exception("[Heartbeat] domain_study_runner failed")
-                    result = f"## ⚠️ {monitor.name} — runner error\n\n{e}"
-                return result
-            # Operator/internal queries (Morning Check-in, [Reminder]:* etc)
-            # keep the brain.think() path.
-            query = cfg.get("query", "")
-            return await self._think_query(query)
-
-        elif monitor.check_type == "quiz":
-            return await self._execute_quiz(cfg)
-
-        elif monitor.check_type == "skill_test":
-            return await self._execute_skill_test(cfg)
-
-        elif monitor.check_type == "curiosity":
-            return await self._execute_curiosity_research(cfg)
-
-        elif monitor.check_type == "auto_monitor":
-            return await self._execute_auto_monitor_detection(cfg)
-
-        elif monitor.check_type == "maintenance":
-            return await self._execute_maintenance(cfg)
-
-        elif monitor.check_type == "finetune":
-            return await self._execute_finetune_check(cfg)
-
-        elif monitor.check_type == "consolidation":
-            return await self._execute_consolidation(cfg)
-
-        elif monitor.check_type == "capability_review":
-            return await self._execute_capability_review(cfg)
-
-        elif monitor.check_type == "eval":
-            return await self._execute_eval_harness(cfg)
-
-        elif monitor.check_type == "prompt_analyzer":
-            return await self._execute_prompt_analyzer(cfg)
-
-        elif monitor.check_type == "db_size":
-            return await self._execute_db_size_check()
-
-        elif monitor.check_type == "kg_consistency":
-            from app.monitors.kg_consistency import run_kg_consistency_check
-            return await run_kg_consistency_check()
-
-        elif monitor.check_type == "ollama_latency":
-            return await self._execute_ollama_latency_check()
-
-        elif monitor.check_type == "skill_quality":
-            return await self._execute_skill_quality_check()
-
-        elif monitor.check_type == "chromadb_integrity":
-            return await self._execute_chromadb_integrity_check()
-
-        elif monitor.check_type == "kg_health":
-            return await self._execute_kg_health_check()
-
-        elif monitor.check_type == "training_job":
-            return await self._execute_training_job_check()
-
-        elif monitor.check_type == "kg_growth":
-            return await self._execute_kg_growth_check(monitor)
-
-        elif monitor.check_type == "ollama_model":
-            return await self._execute_ollama_model_check()
-
-        elif monitor.check_type == "goal_derivation":
-            return await self._execute_goal_derivation()
-
-        elif monitor.check_type == "synthesis":
-            return await self._execute_cross_synthesis()
-
-        elif monitor.check_type == "auto_tool":
-            return await self._execute_auto_tool_synthesis()
-
-        elif monitor.check_type == "output_eval":
-            return await self._execute_output_eval()
-
-        return f"[Unknown check_type: {monitor.check_type}]"
+    async def _execute_kg_consistency(self) -> str:
+        from app.monitors.kg_consistency import run_kg_consistency_check
+        return await run_kg_consistency_check()
 
     async def _execute_goal_derivation(self) -> str:
         """Derive new goals from operational state. The KAIROS executor
