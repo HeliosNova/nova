@@ -349,7 +349,13 @@ class Config:
 
     # Security
     ENABLE_INJECTION_DETECTION: bool = field(default_factory=lambda: _env("ENABLE_INJECTION_DETECTION", "true").lower() == "true")
-    REQUIRE_AUTH: bool = field(default_factory=lambda: _env("REQUIRE_AUTH", "true").lower() == "true")
+    # Default false so a fresh localhost install (ports bound to 127.0.0.1 in
+    # compose) works key-less out of the box. With an empty NOVA_API_KEY and
+    # REQUIRE_AUTH=true, every request fail-closes to 503 — which silently broke
+    # the out-of-box experience (cp .env.example .env -> up -> 503 on all chat).
+    # Setting NOVA_API_KEY enforces auth regardless; set REQUIRE_AUTH=true to
+    # also fail closed when no key is set (do this before any network exposure).
+    REQUIRE_AUTH: bool = field(default_factory=lambda: _env("REQUIRE_AUTH", "false").lower() == "true")
     TRUSTED_PROXY: str = field(default_factory=lambda: _env("TRUSTED_PROXY", ""))
     AUTH_MAX_FAILURES: int = field(default_factory=lambda: _env_int("AUTH_MAX_FAILURES", 10))
     AUTH_LOCKOUT_SECONDS: int = field(default_factory=lambda: _env_int("AUTH_LOCKOUT_SECONDS", 300))

@@ -67,6 +67,8 @@ docker exec nova-ollama ollama pull bge-m3                 # Embeddings (won a p
 
 Open `http://localhost:5173` — that's it.
 
+> **Auth:** all ports bind to `127.0.0.1`, so Nova runs key-less for you on localhost out of the box. **Before exposing it to a network** (changing the port bindings or adding a reverse proxy), set `NOVA_API_KEY` to a long random string and `REQUIRE_AUTH=true` in `.env` — otherwise your instance is open to anyone who can reach it.
+
 ### Optional models for routing
 
 ```bash
