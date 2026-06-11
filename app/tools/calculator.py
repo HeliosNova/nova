@@ -45,6 +45,7 @@ class CalculatorTool(BaseTool):
         "Evaluate mathematical expressions using SymPy. Supports arithmetic, algebra, calculus, and symbolic math. "
         "Returns the expression and its evaluated result. "
         "Use for ANY calculation, even simple ones — never do mental math. "
+        "Pass the ENTIRE expression in ONE call (e.g. '47*89+156', not '47*89' then adding 156 yourself). "
         "Do NOT use for string manipulation or non-math operations."
     )
     parameters = "expression: str"
