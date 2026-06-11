@@ -24,6 +24,10 @@ import httpx
 BASE = "http://localhost:8000"
 TIMEOUT = 120.0  # seconds per query
 
+# Auth: production sets NOVA_API_KEY; pass it via env when running the audit.
+API_KEY = os.environ.get("NOVA_API_KEY", "")
+HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 # Track all results
 results = []
 category_scores = {}
@@ -42,7 +46,7 @@ def query_nova(query: str, conv_id: str = None) -> dict:
         payload["conversation_id"] = conv_id
     start = time.time()
     try:
-        r = httpx.post(f"{BASE}/api/chat", json=payload, timeout=TIMEOUT)
+        r = httpx.post(f"{BASE}/api/chat", json=payload, timeout=TIMEOUT, headers=HEADERS)
         r.raise_for_status()
         data = r.json()
         data["latency_s"] = round(time.time() - start, 2)
@@ -301,7 +305,7 @@ def test_cat3_user_memory():
     # 3.4 — New fact extraction test
     r = query_nova("I just got a dog named Pixel")
     time.sleep(3)  # Give fact extraction time
-    facts_r = httpx.get(f"{BASE}/api/chat/facts").json()
+    facts_r = httpx.get(f"{BASE}/api/chat/facts", headers=HEADERS).json()
     fact_keys = [f["key"] for f in facts_r]
     grade("3_Memory", "3.4", "Extract new fact (dog name)", r, [
         ("No error", no_error(r)),
@@ -556,7 +560,7 @@ def main():
 
     # Verify Nova is up
     try:
-        health = httpx.get(f"{BASE}/api/health", timeout=5).json()
+        health = httpx.get(f"{BASE}/api/health", timeout=30).json()
         print(f"\n   Status: {health.get('status', 'unknown')}")
         print(f"   Model: {health.get('model', 'unknown')}")
         print(f"   Provider: {health.get('provider', 'unknown')}")

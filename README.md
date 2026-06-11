@@ -43,7 +43,7 @@ Nova is a sovereign personal AI that runs entirely on your hardware with zero cl
 | Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No | No |
 | Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
-| Proactive monitors | **50 across 35+ domains** | Automations | No |
+| Proactive monitors | **69 across 35+ domains** | Automations | No |
 | MCP (client + server) | **Both** | No | Client only |
 | Self fine-tune (DPO) | Experimental¹ | No | No |
 
@@ -89,7 +89,7 @@ User query -> brain.think()
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
-Meanwhile, 50 monitors run autonomously:
+Meanwhile, 69 monitors run autonomously:
   -> web search across 35+ domains every 1-24h
   -> extract knowledge graph triples from every result
   -> send alerts via Discord/Telegram when something changes
@@ -167,7 +167,7 @@ All channels support phone-number allowlisting, message splitting, and graceful 
 
 ## Heartbeat Monitors
 
-52 autonomous monitors run on schedule across 35+ domains — Nova works even when you're not talking to it:
+69 monitors are seeded by default (the count is pinned by a test) and run on schedule across 35+ domains — Nova works even when you're not talking to it:
 
 | Category | Monitors | Schedule | What they do |
 |----------|----------|----------|-------------|
@@ -185,7 +185,7 @@ Every query-type monitor auto-extracts knowledge graph triples. All results incl
 
 ## Knowledge Graph
 
-Temporal knowledge graph that grows autonomously from 52 scheduled monitors:
+Temporal knowledge graph that grows autonomously from the scheduled monitors:
 
 - 31 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, `works_at`, `member_of`, etc.)
 - `valid_from` / `valid_to` — when a fact was true
