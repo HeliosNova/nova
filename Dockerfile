@@ -24,8 +24,12 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 RUN playwright install chromium
 
-# Application code
-COPY app/ app/
+# Application code.
+# ORDER MATTERS for build-cache reuse: COPY the rarely-changing trees FIRST and
+# the frequently-edited app/ LAST. A COPY layer invalidates every layer after
+# it, so with app/ first, every app edit re-ran the tests/ and evals/ COPYs too
+# — and on this host the build context lives on a slow 9p mount where each COPY
+# costs 60-85s. App-last keeps the big tests/evals layers cached across app edits.
 COPY tests/ tests/
 COPY evals/ evals/
 COPY pytest.ini .
@@ -40,6 +44,9 @@ COPY scripts/verify_phase_0.py scripts/verify_phase_0.py
 # staging the file via /data each time. The actual training step still
 # requires the full finetune venv outside the container.
 COPY scripts/grpo_train.py scripts/grpo_train.py
+# app/ last: the most frequently edited tree, so its cache miss never cascades
+# into re-copying tests/ or evals/.
+COPY app/ app/
 
 # Data directory + non-root user
 RUN mkdir -p /data /data/screenshots /data/mcp && \
