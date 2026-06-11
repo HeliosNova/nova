@@ -552,6 +552,9 @@ async def run_domain_study(monitor_name: str) -> str:
                 fresh = _collapse_syndication(fresh)
                 _cross_reference(fresh)
                 _picks = _importance_rank(fresh)[:5]
+                # Directed deep-dive on the top stories: trace to a primary
+                # source + find independent corroboration (analyst move).
+                await _deep_dive_top(label, _picks)
                 _insight = await _synthesize_insight(label, _picks)
                 return _render_items_deterministic(label, emoji, _picks, today, insight=_insight)
 
@@ -670,6 +673,7 @@ async def run_domain_study(monitor_name: str) -> str:
     fresh = await _enrich_summaries(label, fresh)
     _cross_reference(fresh)
     fresh = _importance_rank(fresh)
+    await _deep_dive_top(label, fresh)
     _insight = await _synthesize_insight(label, fresh)
     return _render_items_deterministic(label, emoji, fresh, today, insight=_insight)
 
@@ -1015,6 +1019,82 @@ def _cross_reference(items: list[dict]) -> None:
             a["_corroborating"] = sorted(o for o in others if o)
 
 
+async def _directed_followup(label: str, item: dict, *, max_results: int = 10) -> None:
+    """Helios/analyst directed deep-dive on ONE story (the move that separates an
+    analyst from a clipping service). For a top-ranked item: run a focused
+    follow-up search for THAT specific story, then (a) trace to a higher-
+    authority / primary source and (b) find INDEPENDENT corroboration. Annotates
+    the item in place: `_primary_source` and a merged `_corroborating`.
+
+    Bounded to a single follow-up search per item (latency); the caller limits
+    how many top items get this. Stop-on-sufficiency: we already have the
+    primary + independent corroborator after one well-targeted search — no
+    iterative loop needed for a news item. Patterns: query-decomposition (one
+    story = one focused sub-query), corroboration-based stop (FactAgent), and
+    the OSINT primary-source preference. Fails silent — the digest is still good
+    without it."""
+    from app.tools import native_search
+    from app.core.source_authority import authority
+
+    title = (item.get("title") or "").strip()
+    item_tokens = _story_key_tokens(title)
+    if len(item_tokens) < 2:
+        return
+    cur_outlet = (item.get("outlet") or "").lower()
+    cur_auth = authority(cur_outlet)
+    # Focused sub-query: the story's most distinctive tokens.
+    query = " ".join(sorted(item_tokens, key=len, reverse=True)[:8])
+    try:
+        results = await native_search.search(query, max_results=max_results, mode="news")
+    except Exception as e:
+        logger.debug("[DomainRunner] directed follow-up search failed: %s", e)
+        return
+
+    new_corrob = set(item.get("_corroborating") or [])
+    best_primary: tuple[float, str, str] | None = None  # (authority, url, outlet)
+    for r in results:
+        try:
+            host = urlparse(r.url).netloc.lower()
+        except Exception:
+            continue
+        host = host[4:] if host.startswith("www.") else host
+        if not host or host == cur_outlet:
+            continue
+        rt = _story_key_tokens(r.title or "")
+        overlap = len(item_tokens & rt)
+        if not (overlap >= 2 or (overlap and overlap >= 0.5 * min(len(item_tokens), len(rt)))):
+            continue  # not the same story
+        cand = {"title": r.title, "snippet": r.snippet or "", "outlet": host}
+        # Independent corroboration only (skip wire reprints of the same copy).
+        if not _is_syndicated(item, cand):
+            new_corrob.add(host)
+        # Primary / higher-authority source: meaningfully more authoritative.
+        a = authority(host)
+        if a > cur_auth + 0.05 and (best_primary is None or a > best_primary[0]):
+            best_primary = (a, r.url, host)
+
+    if new_corrob:
+        item["_corroborating"] = sorted(o for o in new_corrob if o)
+    if best_primary:
+        item["_primary_source"] = {
+            "url": best_primary[1], "outlet": best_primary[2],
+            "authority": round(best_primary[0], 2),
+        }
+        logger.info("[DomainRunner] %s: deep-dive found a more-authoritative source for '%s': %s (%.2f)",
+                    label, title[:50], best_primary[2], best_primary[0])
+
+
+async def _deep_dive_top(label: str, items: list[dict], *, n: int = 2) -> None:
+    """Directed deep-dive on the top N items (by current order). Bounded extra
+    searches per digest; runs on the background monitor lane (which already
+    defers to interactive chat)."""
+    for it in items[:n]:
+        try:
+            await _directed_followup(label, it)
+        except Exception as e:
+            logger.debug("[DomainRunner] deep-dive skipped for an item: %s", e)
+
+
 async def _synthesize_insight(label: str, items: list[dict]) -> str:
     """One tight LLM pass over the day's items for cross-cutting INSIGHT — the
     connective analysis a headline list can't give: the throughline, what's
@@ -1107,6 +1187,10 @@ def _render_items_deterministic(
             outlet_line += f" _(also {others})_"
         outlet_line += f"  ·  📅 {it['date_str']}  ·  <{clean_url}>"
         lines.append(outlet_line)
+        # Primary / more-authoritative source surfaced by the directed deep-dive.
+        prim = it.get("_primary_source")
+        if prim and (prim.get("outlet") or "").lower() != (it.get("outlet") or "").lower():
+            lines.append(f"   📄 _Primary source:_ **{prim['outlet']}** <{_clean_url(prim['url'])}>")
         # Title-only items: the headline IS the news. No need for a
         # "(no body)" disclaimer — that just makes the grader penalise.
         # Just leave a blank line to separate items.
