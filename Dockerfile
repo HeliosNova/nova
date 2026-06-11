@@ -46,6 +46,13 @@ COPY scripts/verify_phase_0.py scripts/verify_phase_0.py
 COPY scripts/grpo_train.py scripts/grpo_train.py
 # app/ last: the most frequently edited tree, so its cache miss never cascades
 # into re-copying tests/ or evals/.
+# CACHEBUST: Docker Desktop on Windows over the 9p F: mount does not reliably
+# propagate file-content changes to BuildKit's COPY cache key, so edited app/
+# files were silently served from a stale cached layer (the image sat unchanged
+# for hours across "successful" builds). Passing --build-arg CACHEBUST=<epoch>
+# each build forces this layer to re-copy. Cheap: only the small app/ layer.
+ARG CACHEBUST=0
+RUN echo "cachebust=${CACHEBUST}" > /tmp/.cachebust
 COPY app/ app/
 
 # Data directory + non-root user
