@@ -740,3 +740,70 @@ class TestSkillRefinement:
     async def test_refine_nonexistent_skill(self, skill_db):
         result = await skill_db.refine_skill(9999, "failure context")
         assert result is False
+
+
+class TestStructuredInputGuard:
+    """Skills must not pipe the raw natural-language {query} into a structured-
+    input tool. This is the root of the calculator_arithmetic skill that fed
+    "Calculate 47*89+156" to SymPy and templated the resulting algebra soup.
+    """
+
+    def test_bare_query_to_calculator_rejected(self):
+        from app.core.skills import _pipes_raw_query_to_structured_tool
+        steps = [{"tool": "calculator", "args_template": {"expression": "{query}"}}]
+        assert _pipes_raw_query_to_structured_tool(steps) is True
+
+    def test_bare_query_to_code_exec_rejected(self):
+        from app.core.skills import _pipes_raw_query_to_structured_tool
+        steps = [{"tool": "code_exec", "args_template": {"code": "{query}"}}]
+        assert _pipes_raw_query_to_structured_tool(steps) is True
+
+    def test_capture_group_to_calculator_allowed(self):
+        from app.core.skills import _pipes_raw_query_to_structured_tool
+        steps = [{"tool": "calculator", "args_template": {"expression": "{capture_1}"}}]
+        assert _pipes_raw_query_to_structured_tool(steps) is False
+
+    def test_named_group_to_calculator_allowed(self):
+        from app.core.skills import _pipes_raw_query_to_structured_tool
+        steps = [{"tool": "calculator", "args_template": {"expression": "{expr}"}}]
+        assert _pipes_raw_query_to_structured_tool(steps) is False
+
+    def test_query_to_web_search_allowed(self):
+        # web_search legitimately takes the whole natural-language query
+        from app.core.skills import _pipes_raw_query_to_structured_tool
+        steps = [{"tool": "web_search", "args_template": {"query": "{query}"}}]
+        assert _pipes_raw_query_to_structured_tool(steps) is False
+
+    def test_create_skill_rejects_raw_query_calculator(self, skill_db):
+        sid = skill_db.create_skill(
+            name="bad_calc",
+            trigger_pattern=r"\bcompute\s+(?P<expr>[\d+\-*/ ]+)",
+            steps=[{"tool": "calculator", "args_template": {"expression": "{query}"}}],
+            answer_template="The answer is {result}",
+        )
+        assert sid is None
+
+    def test_create_skill_accepts_captured_expression(self, skill_db):
+        sid = skill_db.create_skill(
+            name="good_calc",
+            trigger_pattern=r"\bcompute\s+(?P<expr>[\d+\-*/ ]+)",
+            steps=[{"tool": "calculator", "args_template": {"expression": "{expr}"}}],
+            answer_template="The answer is {result}",
+        )
+        assert sid is not None
+
+    def test_revalidation_disables_legacy_raw_query_skill(self, skill_db):
+        # Insert a legacy skill directly (bypassing create_skill guards), then
+        # revalidate — it must get disabled.
+        import json as _json
+        skill_db._db.execute(
+            "INSERT INTO skills (name, trigger_pattern, steps, answer_template, "
+            "enabled, success_rate, times_used) VALUES (?, ?, ?, ?, 1, 0.7, 0)",
+            ("legacy_calc", r"\b\d+\s*[*]\s*\d+",
+             _json.dumps([{"tool": "calculator", "args_template": {"expression": "{query}"}}]),
+             "{result}"),
+        )
+        n = skill_db.revalidate_enabled_skills()
+        assert n >= 1
+        row = skill_db._db.fetchone("SELECT enabled FROM skills WHERE name = 'legacy_calc'")
+        assert row["enabled"] == 0
