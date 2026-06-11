@@ -544,7 +544,10 @@ async def run_domain_study(monitor_name: str) -> str:
                 if x.get("_title_only") or (x.get("snippet") or "").strip()
             ]
             if len(fresh) >= 2:
-                return _render_items_deterministic(label, emoji, fresh[:5], today)
+                _picks = fresh[:5]
+                _cross_reference(_picks)
+                _insight = await _synthesize_insight(label, _picks)
+                return _render_items_deterministic(label, emoji, _picks, today, insight=_insight)
 
     # 1. Search news category, with retry + general-category fallback. SearXNG
     # has been observed to drop the connection on some queries; retrying once
@@ -656,7 +659,9 @@ async def run_domain_study(monitor_name: str) -> str:
     # 3. Enrich each item with a real LLM-written summary based on the
     # snippet/page text.
     fresh = await _enrich_summaries(label, fresh)
-    return _render_items_deterministic(label, emoji, fresh, today)
+    _cross_reference(fresh)
+    _insight = await _synthesize_insight(label, fresh)
+    return _render_items_deterministic(label, emoji, fresh, today, insight=_insight)
 
 
 async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
@@ -817,8 +822,96 @@ async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
     return await asyncio.gather(*[_one(it) for it in items])
 
 
+# Common words that don't identify a story — excluded from cross-reference keys.
+_STORY_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as",
+    "at", "by", "from", "is", "are", "was", "were", "be", "new", "says", "say",
+    "after", "amid", "over", "into", "its", "his", "her", "their", "this", "that",
+    "report", "reports", "update", "updates", "news", "today", "latest", "more",
+    "will", "has", "have", "had", "but", "not", "you", "your", "how", "why", "what",
+})
+
+
+def _story_key_tokens(title: str) -> set[str]:
+    """Significant tokens identifying a story — lowercased words 4+ chars and any
+    capitalized multi-char tokens (proper nouns), minus generic news words."""
+    toks: set[str] = set()
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9'&-]+", title or ""):
+        lw = w.lower()
+        if lw in _STORY_STOPWORDS:
+            continue
+        if w[:1].isupper() or len(lw) >= 4:
+            toks.add(lw)
+    return toks
+
+
+def _cross_reference(items: list[dict]) -> None:
+    """Mark items that independent outlets cover as the SAME story. Pure Python,
+    runs across the whole set (RSS + search) so search items and cross-outlet
+    matches the RSS merge missed also get corroboration. Two items corroborate
+    when they share >=2 significant tokens (or >=60% of the smaller set) AND come
+    from different outlets. Populates each item's `_corroborating` with the other
+    outlets — the renderer turns that into a 'Confirmed by N outlets' badge."""
+    keys = [(_story_key_tokens(it.get("title", "")), it) for it in items]
+    for i, (ti, a) in enumerate(keys):
+        if not ti:
+            continue
+        a_outlet = (a.get("outlet") or "").lower()
+        others = set(a.get("_corroborating") or [])
+        for j, (tj, b) in enumerate(keys):
+            if i == j or not tj:
+                continue
+            b_outlet = (b.get("outlet") or "").lower()
+            if not b_outlet or b_outlet == a_outlet:
+                continue
+            overlap = len(ti & tj)
+            if overlap >= 2 or (overlap and overlap >= 0.6 * min(len(ti), len(tj))):
+                others.add(b.get("outlet") or "")
+        if others:
+            a["_corroborating"] = sorted(o for o in others if o)
+
+
+async def _synthesize_insight(label: str, items: list[dict]) -> str:
+    """One tight LLM pass over the day's items for cross-cutting INSIGHT — the
+    connective analysis a headline list can't give: the throughline, what's
+    notable or surprising, and the implication. Not a re-summary of each item.
+    Returns '' on any failure (the digest is still useful without it)."""
+    usable = [it for it in items if (it.get("title") or "").strip()][:8]
+    if len(usable) < 3:
+        return ""
+    from app.core.llm import invoke_nothink
+    bullets = "\n".join(
+        f"- {(it.get('title') or '').strip()[:160]}"
+        + (f" [also: {', '.join(it['_corroborating'][:2])}]" if it.get("_corroborating") else "")
+        for it in usable
+    )
+    prompt = (
+        f"You are an intelligence analyst. Below are today's {label} headlines.\n"
+        f"Write 2-3 sentences of ANALYSIS — the connective insight, NOT a summary:\n"
+        f"- The throughline or tension linking these (if any)\n"
+        f"- What is most notable, surprising, or consequential\n"
+        f"- The 'so what' — likely implication or what to watch next\n"
+        f"If the items are unrelated, say so in one line and name the single most "
+        f"important one. Output ONLY the analysis, no preamble, no bullet list, "
+        f"no restating headlines verbatim.\n\nHEADLINES:\n{bullets}"
+    )
+    try:
+        out = await invoke_nothink(
+            [{"role": "user", "content": prompt}],
+            max_tokens=220, temperature=0.4,
+        )
+        out = (out or "").strip()
+        # Guard against the model echoing the instructions or a headline list.
+        if not out or out.lower().startswith(("headline", "- ", "1.")) or len(out) < 40:
+            return ""
+        return out
+    except Exception as e:
+        logger.debug("[DomainRunner] insight synthesis skipped: %s", e)
+        return ""
+
+
 def _render_items_deterministic(
-    label: str, emoji: str, items: list[dict], today: datetime
+    label: str, emoji: str, items: list[dict], today: datetime, insight: str = ""
 ) -> str:
     """Format the verified-fresh items as a Discord-ready Markdown report.
     Drops items where the LLM-summarised snippet is empty or junk-filtered,
@@ -832,6 +925,10 @@ def _render_items_deterministic(
     ]
     if not keepers:
         return f"No significant {label} developments in the past 72 hours."
+
+    # Cross-reference across the whole kept set (RSS + search) so corroboration
+    # reflects every outlet covering each story, not just RSS-merged ones.
+    _cross_reference(keepers)
 
     today_str = today.strftime("%B %d, %Y")
     lines = [
@@ -908,6 +1005,11 @@ def _render_items_deterministic(
         summary_bits.append(f"with **{verified_count}** cross-confirmed by multiple outlets")
     lines.append("─" * 28)
     lines.append("  ·  ".join(summary_bits) + ".")
+    # Insight section — cross-cutting analysis, placed last so the reader gets
+    # the "so what" after the facts.
+    if insight:
+        lines.append("")
+        lines.append(f"💡 **Insight** — {insight.strip()}")
     return "\n".join(lines).strip()
 
 
