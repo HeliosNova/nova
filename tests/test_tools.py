@@ -763,3 +763,54 @@ class TestToolErrorPaths:
         result = await tool.execute(code="import os; os.system('rm -rf /')")
         assert not result.success
         # Should be VALIDATION (blocked code) not generic INTERNAL
+
+
+class TestCalculatorOutputFidelity:
+    """Regression tests for the 2026-06-10 audit failure: the tool returned
+    4339.00000000000 (dead int-formatting branch - SymPy Float.__eq__ vs int
+    is structural, always False) and the 9B mis-copied the digit tail into
+    answers (4329/4325). Integer results must render clean; natural-language
+    words must be rejected, not parsed into letter-product algebra.
+    """
+
+    @pytest.mark.asyncio
+    async def test_integer_result_has_no_decimal_tail(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="47*89+156")
+        assert result.success
+        assert result.output == "47*89+156 = 4339"
+
+    @pytest.mark.asyncio
+    async def test_natural_language_rejected(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="Calculate 47 * 89 + 156")
+        assert not result.success
+        assert "pure math" in (result.error or "").lower() or "words" in (result.error or "").lower()
+
+    @pytest.mark.asyncio
+    async def test_symbolic_math_still_works(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="integrate(x**2, x)")
+        assert result.success
+
+    @pytest.mark.asyncio
+    async def test_math_function_words_allowed(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="sqrt(144) + floor(2.7)")
+        assert result.success
+        assert "14" in result.output  # 12 + 2
+
+    @pytest.mark.asyncio
+    async def test_huge_int_stays_scientific(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="2**1000")
+        assert result.success
+        # 15-digit Float precision must not masquerade as 300 exact digits
+        assert "e+" in result.output.lower()
+
+    @pytest.mark.asyncio
+    async def test_non_integer_unchanged(self):
+        tool = CalculatorTool()
+        result = await tool.execute(expression="100/3")
+        assert result.success
+        assert "33.3" in result.output

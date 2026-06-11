@@ -21,6 +21,23 @@ _UNSAFE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Math words SymPy legitimately understands. Any OTHER alphabetic token of 3+
+# letters is natural language leaking into the expression — with implicit
+# multiplication enabled, SymPy happily parses "Calculate 47*89" into
+# C*a*l*c*u*l*a*t*e * 47*89 and returns algebra soup with success=True.
+# Reject it up front with an error that tells the model what to do instead.
+_MATH_WORDS = {
+    "sqrt", "cbrt", "root", "abs", "sign", "exp", "log", "ln",
+    "sin", "cos", "tan", "asin", "acos", "atan", "atan2",
+    "sinh", "cosh", "tanh", "asinh", "acosh", "atanh",
+    "pi", "oo", "inf", "infinity", "nan",
+    "integrate", "diff", "solve", "limit", "summation", "product",
+    "factorial", "binomial", "gamma", "floor", "ceiling", "mod",
+    "min", "max", "rational", "simplify", "expand", "factor",
+}
+
+_WORD_RE = re.compile(r"[A-Za-z]{3,}")
+
 
 class CalculatorTool(BaseTool):
     name = "calculator"
@@ -55,6 +72,19 @@ class CalculatorTool(BaseTool):
                 error_category=ErrorCategory.VALIDATION,
             )
 
+        # Reject natural-language words before SymPy turns them into symbols
+        stray = [w for w in _WORD_RE.findall(expression) if w.lower() not in _MATH_WORDS]
+        if stray:
+            return ToolResult(
+                output="",
+                success=False,
+                error=(
+                    f"Not a pure math expression (found words: {', '.join(stray[:3])}). "
+                    "Pass only the math itself, e.g. '47*89+156'."
+                ),
+                error_category=ErrorCategory.VALIDATION,
+            )
+
         try:
             from sympy.parsing.sympy_parser import (
                 parse_expr,
@@ -71,9 +101,21 @@ class CalculatorTool(BaseTool):
             # Format nicely
             output = f"{expression} = {result}"
 
-            # If it's a real integer result, show without decimals
-            if result.is_real and result == int(result):
-                output = f"{expression} = {int(result)}"
+            # If it's a real integer result, show without decimals.
+            # NOTE: SymPy's Float.__eq__ against a Python int is STRUCTURAL
+            # equality — Float(4339.0) == 4339 is False — so the old
+            # `result == int(result)` branch never fired and every integer
+            # shipped with a 15-digit decimal tail ("4339.00000000000").
+            # The production 9B then mis-copied that tail into answers
+            # (live audit 2026-06-10: answered 4329/4325 for 4339).
+            # `.equals()` compares mathematically. The magnitude guard keeps
+            # huge results (2**1000) in scientific notation instead of
+            # printing 300 digits of false precision from a 15-digit Float.
+            try:
+                if result.is_real and abs(result) < 10**15 and result.equals(int(result)):
+                    output = f"{expression} = {int(result)}"
+            except (TypeError, ValueError, OverflowError):
+                pass
 
             return ToolResult(output=output, success=True)
 
