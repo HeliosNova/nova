@@ -214,11 +214,31 @@ class HeartbeatLoop:
                         # the next tick once chat goes quiet.
                         from app.core import llm as _llm
                         if slow and _llm.interactive_active():
-                            logger.info(
-                                "[Heartbeat] owner is chatting — deferring %d LLM monitor(s) to keep the GPU free",
-                                len(slow),
-                            )
-                            slow = []
+                            # Escape hatch against indefinite starvation: a
+                            # never-run monitor (no baseline) or one already past
+                            # 2x its schedule still runs even while chatting, so a
+                            # continuously-active owner can't permanently block
+                            # background intelligence. Everything else defers.
+                            _now = datetime.now(timezone.utc).replace(tzinfo=None)
+
+                            def _badly_overdue(m) -> bool:
+                                if not m.last_check_at:
+                                    return True
+                                try:
+                                    last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
+                                except Exception:
+                                    return True
+                                return (_now - last).total_seconds() >= 2 * max(m.schedule_seconds, 1)
+
+                            overdue = [m for m in slow if _badly_overdue(m)]
+                            deferred = [m for m in slow if not _badly_overdue(m)]
+                            if deferred:
+                                logger.info(
+                                    "[Heartbeat] owner is chatting — deferring %d LLM monitor(s); "
+                                    "running %d badly-overdue to avoid starvation",
+                                    len(deferred), len(overdue),
+                                )
+                            slow = overdue
 
                         # LLM monitors with bounded concurrency
                         if slow:
