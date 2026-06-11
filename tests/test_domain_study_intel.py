@@ -60,3 +60,26 @@ class TestInsightGating:
     def test_too_few_items_returns_empty(self):
         items = [{"title": "Only one thing happened"}, {"title": "Second thing"}]
         assert asyncio.run(_synthesize_insight("AI", items)) == ""
+
+
+class TestNewsworthiness:
+    def test_drops_coupon_and_deal_content(self):
+        from app.monitors.domain_study_runner import _is_newsworthy
+        for title, url in [
+            ("Dell Coupon Codes: 20% Off for June 2026", "https://wired.com/story/dell-coupon-code/"),
+            ("The best time-tracking software of 2026: Expert tested", "https://zdnet.com/article/best-time-tracking-software/"),
+            ("Today's best deals: 4K TVs and more", "https://engadget.com/deals/x"),
+            ("Save $600 off Alienware laptops with this promo code", "https://x.com/a"),
+            ("Father's Day gift guide 2026", "https://x.com/buying-guide/g"),
+        ]:
+            assert _is_newsworthy({"title": title, "url": url}) is False, title
+
+    def test_keeps_real_news_including_ma_deal(self):
+        from app.monitors.domain_study_runner import _is_newsworthy
+        for title, url in [
+            ("OpenAI signs $10B compute deal with Oracle", "https://reuters.com/tech/x"),
+            ("US and EU reach trade deal on semiconductors", "https://bloomberg.com/y"),
+            ("Deezer launches an AI music detector", "https://theverge.com/ai/z"),
+            ("Fed holds rates steady amid inflation data", "https://wsj.com/econ/w"),
+        ]:
+            assert _is_newsworthy({"title": title, "url": url}) is True, title

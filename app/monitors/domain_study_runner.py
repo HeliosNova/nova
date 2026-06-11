@@ -471,6 +471,7 @@ async def run_domain_study(monitor_name: str) -> str:
         except Exception as e:
             logger.warning("[DomainRunner] RSS pass failed for '%s': %s", monitor_name, e)
             rss_items = []
+        rss_items = _drop_non_news(rss_items, label)
         if len(rss_items) >= 2:
             # When RSS gave us only a title (Coindesk/Cointelegraph commonly
             # do this), try to enrich via page-fetch BUT keep the item even
@@ -657,7 +658,9 @@ async def run_domain_study(monitor_name: str) -> str:
         return f"No significant {label} developments in the past 72 hours."
 
     # 3. Enrich each item with a real LLM-written summary based on the
-    # snippet/page text.
+    # snippet/page text. Drop promotional/affiliate items first so we never
+    # spend an enrichment call on a coupon page.
+    fresh = _drop_non_news(fresh, label)
     fresh = await _enrich_summaries(label, fresh)
     _cross_reference(fresh)
     _insight = await _synthesize_insight(label, fresh)
@@ -820,6 +823,59 @@ async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
         return item
 
     return await asyncio.gather(*[_one(it) for it in items])
+
+
+# Newsworthiness gate. Consumer-tech outlets (Wired/Engadget/ZDNet/CNET) mix
+# affiliate commerce — coupon codes, deal roundups, "best X of YEAR" buying
+# guides — into their feeds. That's shopping content, not intelligence, and it
+# must never reach a digest (the owner flagged "coupons in my digest = dumb").
+# This is the missing RELEVANCE gate, not a keyword band-aid: it classifies an
+# item's TYPE (promotional/affiliate vs news) from the strongest, least-ambiguous
+# signals in the title and URL. "deal" in the M&A/diplomacy sense (singular, no
+# commerce qualifier) stays — only commerce-shaped uses are dropped.
+_COMMERCE_TITLE_RE = re.compile(
+    # Plural "deals" with a commerce qualifier — NOT singular "trade deal on X"
+    r"coupon|promo\s*code|discount\s*code"
+    r"|best\s+.{0,40}\bdeals\b|(?:today's|daily|weekly)\s+(?:best\s+)?deals"
+    r"|\bdeals\b\s+(?:of\s+the\s+(?:day|week)|under\s+\$)"
+    r"|\d+%\s*off|\$\d+\s*off|\bon\s+sale\b|lowest\s+price"
+    r"|black\s+friday|cyber\s+monday|prime\s+day"
+    r"|buying\s+guide|gift\s+guide|\bgiveaways?\b"
+    r"|best\s+.{0,40}\b(?:of|in)\s+20\d\d\b",  # "best time-tracking software of 2026" listicles
+    re.IGNORECASE,
+)
+_COMMERCE_URL_RE = re.compile(
+    r"/(?:coupon|coupons|deal|deals|promo|promo-code|discount|offers?|shop|"
+    r"buying-guide|best-)", re.IGNORECASE,
+)
+
+
+def _newsworthy_title_url(title: str, url: str) -> bool:
+    """False for promotional/affiliate/listicle content that isn't news."""
+    if _COMMERCE_TITLE_RE.search(title or ""):
+        return False
+    if _COMMERCE_URL_RE.search(url or ""):
+        return False
+    return True
+
+
+def _is_newsworthy(item) -> bool:
+    """Accepts a dict (search items) or an RSS item object (.title/.url)."""
+    if isinstance(item, dict):
+        return _newsworthy_title_url(item.get("title", ""), item.get("url", ""))
+    return _newsworthy_title_url(getattr(item, "title", ""), getattr(item, "url", ""))
+
+
+def _drop_non_news(items: list, label: str) -> list:
+    kept, dropped = [], []
+    for it in items:
+        (kept if _is_newsworthy(it) else dropped).append(it)
+    if dropped:
+        def _t(x):
+            return (x.get("title", "") if isinstance(x, dict) else getattr(x, "title", ""))[:50]
+        logger.info("[DomainRunner] %s: dropped %d non-news item(s): %s",
+                    label, len(dropped), [_t(d) for d in dropped[:3]])
+    return kept
 
 
 # Common words that don't identify a story — excluded from cross-reference keys.
