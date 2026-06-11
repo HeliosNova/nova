@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-2%2C387-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2%2C392-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
