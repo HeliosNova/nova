@@ -205,6 +205,21 @@ class HeartbeatLoop:
                                 self.store.record_check(monitor.id, f"error: {e}")
                                 self.store.add_result(monitor.id, "error", message=str(e))
 
+                        # Interactive-priority: if the owner is actively chatting,
+                        # defer the LLM-heavy monitors this cycle so chat keeps the
+                        # GPU (measured 2026-06-11: monitor generations are what
+                        # push interactive latency from ~13s to 60-85s). The fast,
+                        # no-LLM monitors above still ran. Due monitors aren't lost
+                        # — last_check_at isn't advanced, so they're picked up on
+                        # the next tick once chat goes quiet.
+                        from app.core import llm as _llm
+                        if slow and _llm.interactive_active():
+                            logger.info(
+                                "[Heartbeat] owner is chatting — deferring %d LLM monitor(s) to keep the GPU free",
+                                len(slow),
+                            )
+                            slow = []
+
                         # LLM monitors with bounded concurrency
                         if slow:
                             sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_MONITORS)
