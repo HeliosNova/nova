@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import pytest
+
+# Windows: the C runtime caps stdio handles at 512. A full-suite run (~2,400
+# tests opening SQLite, ChromaDB, and socket handles) exhausts the cap late in
+# the run and unrelated tests start dying with OSError errno 24 (Too many
+# open files) inside ssl/certifi. Raise the cap to the CRT maximum once.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.cdll.msvcrt._setmaxstdio(8192)
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
