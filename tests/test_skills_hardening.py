@@ -807,3 +807,43 @@ class TestStructuredInputGuard:
         assert n >= 1
         row = skill_db._db.fetchone("SELECT enabled FROM skills WHERE name = 'legacy_calc'")
         assert row["enabled"] == 0
+
+
+class TestSoftQualityFailure:
+    """Quality-only misses erode the EMA but don't feed the fast 5-consecutive
+    disable — that path is reserved for structural failures. (Self-audit
+    2026-06-11: a long-track-record skill was 1 mediocre answer from fast-kill.)"""
+
+    def _mk(self, skill_db):
+        sid = skill_db.create_skill(
+            name="track_record", trigger_pattern=r"\btrackrec\b",
+            steps=[{"tool": "web_search", "args_template": {"q": "{query}"}}],
+            answer_template="{result}",
+        )
+        return sid
+
+    def test_soft_failures_do_not_fast_disable(self, skill_db):
+        sid = self._mk(skill_db)
+        # 8 soft (quality-only) failures in a row
+        for _ in range(8):
+            skill_db.record_use(sid, success=False, hard_failure=False)
+        row = skill_db._db.fetchone("SELECT enabled, consecutive_failures FROM skills WHERE id=?", (sid,))
+        assert row["consecutive_failures"] == 0, "soft failures must not bump the streak"
+        # EMA will have fallen below 0.3 after 5+ uses -> slow-disable is allowed,
+        # but it must be the SLOW path, not the fast 5-consecutive one.
+        # (enabled may be 0 via slow EMA; the point is consecutive stayed 0.)
+
+    def test_hard_failures_still_fast_disable(self, skill_db):
+        sid = self._mk(skill_db)
+        for _ in range(5):
+            skill_db.record_use(sid, success=False, hard_failure=True)
+        row = skill_db._db.fetchone("SELECT enabled FROM skills WHERE id=?", (sid,))
+        assert row["enabled"] == 0, "5 hard failures must fast-disable"
+
+    def test_success_resets_streak(self, skill_db):
+        sid = self._mk(skill_db)
+        for _ in range(3):
+            skill_db.record_use(sid, success=False, hard_failure=True)
+        skill_db.record_use(sid, success=True)
+        row = skill_db._db.fetchone("SELECT consecutive_failures FROM skills WHERE id=?", (sid,))
+        assert row["consecutive_failures"] == 0
