@@ -597,16 +597,25 @@ class SkillStore:
 
         return skill_id
 
-    def record_use(self, skill_id: int, success: bool) -> None:
+    def record_use(self, skill_id: int, success: bool, hard_failure: bool = True) -> None:
         """Record a skill execution. Updates times_used, success_rate, and quality counters.
 
-        Fast demotion: 5 consecutive failures disables the skill immediately
+        Fast demotion: 5 consecutive HARD failures disables the skill immediately
         (in addition to the slow EMA-based auto-disable at success_rate < 0.3).
-        Threshold was raised from 3 — 3 is too aggressive when a skill hits a
-        transient upstream issue (SearXNG rate-limited, Ollama briefly down).
+
+        `hard_failure` distinguishes a structural failure (tool errored, no
+        output) from a merely-low-QUALITY answer. A string of mediocre-but-
+        working answers should only erode the slow EMA — it must NOT fast-kill a
+        skill with a long successful track record (found in self-audit 2026-06-11:
+        the quality gate had project_helios_info, 45 uses, at 4 consecutive
+        "failures", one short of fast-disable). Quality-only failures therefore
+        leave consecutive_failures untouched; only hard failures increment it.
         """
         success_val = 1.0 if success else 0.0
         alpha = config.SKILL_EMA_ALPHA
+        # A quality-only (soft) failure updates the EMA but not the fast-disable
+        # streak counter.
+        bump_consecutive = (not success) and hard_failure
 
         import sqlite3 as _sqlite3
         if success:
@@ -627,12 +636,15 @@ class SkillStore:
                     (alpha, success_val, alpha, skill_id),
                 )
         else:
+            # Soft (quality-only) failures erode the EMA but leave the
+            # consecutive-failure streak alone, so they can't fast-disable.
+            _consec_clause = "consecutive_failures = consecutive_failures + 1, " if bump_consecutive else ""
             try:
                 self._db.execute(
                     "UPDATE skills SET "
                     "times_used = times_used + 1, "
                     "success_rate = ? * ? + (1 - ?) * success_rate, "
-                    "consecutive_failures = consecutive_failures + 1, "
+                    f"{_consec_clause}"
                     "last_used_at = CURRENT_TIMESTAMP "
                     "WHERE id = ?",
                     (alpha, success_val, alpha, skill_id),

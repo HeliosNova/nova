@@ -3591,7 +3591,15 @@ async def think(
                 # No quality verdict (e.g. depth-restricted leaf): fall back to
                 # the structural check alone.
                 skill_success = structural_ok
-            await asyncio.to_thread(svc.skills.record_use, ctx.matched_skill.id, skill_success)
+            # A quality-only miss (ran fine, answer just wasn't good enough) is a
+            # SOFT failure: it erodes the slow EMA but must not feed the fast
+            # 5-consecutive disable, which stays reserved for structural failures
+            # (so a long-track-record skill isn't fast-killed by a mediocre streak).
+            _hard_failure = not structural_ok
+            await asyncio.to_thread(
+                svc.skills.record_use, ctx.matched_skill.id, skill_success,
+                hard_failure=_hard_failure,
+            )
 
         if is_new_conversation and final_content:
             # Fire-and-forget. Title gen takes 5-30s on a busy Ollama; don't make
