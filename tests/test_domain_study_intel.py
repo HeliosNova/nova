@@ -156,3 +156,49 @@ class TestImportanceRanking:
         ranked = _importance_rank(items)
         assert ranked[0]["outlet"] == "reuters.com"  # authority + corroboration
         assert ranked[-1]["outlet"] == "random-blog.xyz"
+
+
+class TestDirectedDeepDive:
+    """Helios analyst pattern: directed per-story follow-up → primary source +
+    independent corroboration. The jump from clipping service to analyst."""
+
+    def _run(self, item, fake_results):
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        import app.tools.native_search as ns
+        import app.monitors.domain_study_runner as dr
+        with patch.object(ns, "search", new=AsyncMock(return_value=fake_results)):
+            asyncio.run(dr._directed_followup("Finance", item))
+
+    def test_traces_to_primary_source(self):
+        from types import SimpleNamespace
+        item = {"title": "Federal Reserve holds interest rates steady at June meeting",
+                "outlet": "randomblog.xyz", "snippet": "The Fed kept rates unchanged."}
+        fake = [SimpleNamespace(
+            url="https://federalreserve.gov/newsevents/pressreleases/monetary20260611a.htm",
+            title="Federal Reserve issues FOMC statement holding interest rates steady",
+            snippet="The Committee decided to maintain the target range.", engine="x", published_date="")]
+        self._run(item, fake)
+        assert item.get("_primary_source", {}).get("outlet") == "federalreserve.gov"
+        assert item["_primary_source"]["authority"] == 1.0
+
+    def test_adds_independent_corroboration(self):
+        from types import SimpleNamespace
+        item = {"title": "OpenAI signs ten billion Oracle compute deal",
+                "outlet": "techblog.example", "snippet": "OpenAI and Oracle struck a deal."}
+        fake = [SimpleNamespace(
+            url="https://reuters.com/x", title="OpenAI signs Oracle ten billion compute deal",
+            snippet="Reuters' own reporting on the Oracle compute agreement and its market impact across the cloud sector.",
+            engine="x", published_date="")]
+        self._run(item, fake)
+        assert "reuters.com" in (item.get("_corroborating") or [])
+
+    def test_search_failure_is_silent(self):
+        import asyncio
+        from unittest.mock import patch, AsyncMock
+        import app.tools.native_search as ns
+        import app.monitors.domain_study_runner as dr
+        item = {"title": "Some major story about a thing", "outlet": "x.com", "snippet": "body"}
+        with patch.object(ns, "search", new=AsyncMock(side_effect=RuntimeError("searxng down"))):
+            asyncio.run(dr._directed_followup("Finance", item))  # must not raise
+        assert "_primary_source" not in item
