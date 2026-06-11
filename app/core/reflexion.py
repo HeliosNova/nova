@@ -477,15 +477,34 @@ class ReflexionStore:
         if self._collection is None:
             try:
                 import chromadb
+                from .embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._collection = client.get_or_create_collection(
-                    name="reflexions",
-                    metadata={"hnsw:space": "cosine"},
+                self._collection = open_collection(
+                    client, "reflexions", reindex=self._backfill_collection,
                 )
             except Exception as e:
                 logger.warning("Failed to init reflexions ChromaDB collection: %s", e)
                 return None
         return self._collection
+
+    def _backfill_collection(self, collection) -> int:
+        """Populate `collection` from the reflexions table, unconditionally.
+        Shared by reindex_reflexions (guarded) and the embedder-rebuild path."""
+        all_rows = self._db.fetchall("SELECT * FROM reflexions LIMIT 200")
+        if not all_rows:
+            return 0
+        ids, documents, metadatas = [], [], []
+        for row in all_rows:
+            searchable = f"{row['task_summary']} {row['reflection']}".strip()
+            if not searchable:
+                continue
+            ids.append(str(row["id"]))
+            documents.append(searchable)
+            metadatas.append({"outcome": row["outcome"], "quality_score": row["quality_score"]})
+        if ids:
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info("Reindexed %d reflexions into ChromaDB", len(ids))
+        return len(ids)
 
     def reindex_reflexions(self) -> int:
         """One-time backfill of existing reflexions into ChromaDB. Returns count indexed."""
@@ -495,24 +514,7 @@ class ReflexionStore:
         if collection.count() > 0:
             logger.info("Reflexions collection already has %d entries, skipping reindex", collection.count())
             return 0
-
-        all_rows = self._db.fetchall("SELECT * FROM reflexions LIMIT 200")
-        if not all_rows:
-            return 0
-
-        ids, documents, metadatas = [], [], []
-        for row in all_rows:
-            searchable = f"{row['task_summary']} {row['reflection']}".strip()
-            if not searchable:
-                continue
-            ids.append(str(row["id"]))
-            documents.append(searchable)
-            metadatas.append({"outcome": row["outcome"], "quality_score": row["quality_score"]})
-
-        if ids:
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-            logger.info("Reindexed %d reflexions into ChromaDB", len(ids))
-        return len(ids)
+        return self._backfill_collection(collection)
 
     def _add_to_vector(self, reflexion_id: int, task_summary: str, reflection: str, outcome: str, quality_score: float) -> None:
         """Add a single reflexion to the vector collection."""

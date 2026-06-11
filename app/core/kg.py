@@ -412,17 +412,34 @@ class KnowledgeGraph:
             try:
                 import chromadb
                 from ..config import config
-                from .embedding import get_embedding_function
+                from .embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                _kw = {"name": "kg_facts", "metadata": {"hnsw:space": "cosine"}}
-                _ef = get_embedding_function()
-                if _ef is not None:
-                    _kw["embedding_function"] = _ef
-                self._collection = client.get_or_create_collection(**_kw)
+                self._collection = open_collection(
+                    client, "kg_facts", reindex=self._backfill_collection,
+                )
             except Exception as e:
                 logger.warning("Failed to init kg_facts ChromaDB collection: %s", e)
                 return None
         return self._collection
+
+    def _backfill_collection(self, collection) -> int:
+        """Populate `collection` from current KG facts, unconditionally.
+        Shared by reindex_kg_facts (guarded) and the embedder-rebuild path."""
+        all_rows = self._db.fetchall(
+            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
+        )
+        if not all_rows:
+            return 0
+        ids, documents, metadatas = [], [], []
+        for row in all_rows:
+            searchable = f"{row['subject']} {row['predicate'].replace('_', ' ')} {row['object']}"
+            ids.append(str(row["id"]))
+            documents.append(searchable)
+            metadatas.append({"subject": row["subject"], "predicate": row["predicate"]})
+        if ids:
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info("Reindexed %d KG facts into ChromaDB", len(ids))
+        return len(ids)
 
     def reindex_kg_facts(self) -> int:
         """One-time backfill of existing KG facts into ChromaDB. Returns count indexed."""
@@ -432,24 +449,7 @@ class KnowledgeGraph:
         if collection.count() > 0:
             logger.info("KG facts collection already has %d entries, skipping reindex", collection.count())
             return 0
-
-        all_rows = self._db.fetchall(
-            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
-        )
-        if not all_rows:
-            return 0
-
-        ids, documents, metadatas = [], [], []
-        for row in all_rows:
-            searchable = f"{row['subject']} {row['predicate'].replace('_', ' ')} {row['object']}"
-            ids.append(str(row["id"]))
-            documents.append(searchable)
-            metadatas.append({"subject": row["subject"], "predicate": row["predicate"]})
-
-        if ids:
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-            logger.info("Reindexed %d KG facts into ChromaDB", len(ids))
-        return len(ids)
+        return self._backfill_collection(collection)
 
     def _add_to_vector(self, fact_id: int, subject: str, predicate: str, object_: str) -> None:
         """Add a single fact to the vector collection."""

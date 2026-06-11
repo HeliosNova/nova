@@ -81,12 +81,30 @@ class SkillStore:
         with self._chroma_lock:
             if self._chroma_collection is None:
                 import chromadb
+                from .embedding import open_collection
                 self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._chroma_collection = self._chroma_client.get_or_create_collection(
-                    name="skills",
-                    metadata={"hnsw:space": "cosine"},
+                self._chroma_collection = open_collection(
+                    self._chroma_client, "skills", reindex=self._backfill_collection,
                 )
         return self._chroma_collection
+
+    def _backfill_collection(self, collection) -> int:
+        """Repopulate `collection` from enabled skills — used by the
+        embedder-rebuild path so a dimension change doesn't lose skill vectors.
+
+        Writes straight to the passed collection (NOT via _embed_skill, which
+        re-enters _get_skill_collection — this runs while that's mid-init and
+        holding the lock).
+        """
+        rows = self._db.fetchall("SELECT id, name, trigger_pattern FROM skills WHERE enabled = 1")
+        ids, docs, metas = [], [], []
+        for row in rows:
+            ids.append(f"skill_{row['id']}")
+            docs.append(f"{row['name']}: {row['trigger_pattern']}")
+            metas.append({"skill_id": str(row["id"]), "name": row["name"]})
+        if ids:
+            collection.upsert(ids=ids, documents=docs, metadatas=metas)
+        return len(ids)
 
     # Keep backward-compat alias used by HEAD's _index_skill / refine_skill / toggle_skill
     def _get_skills_collection(self):
@@ -181,6 +199,42 @@ class SkillStore:
             collection.delete(ids=[f"skill_{skill_id}"])
         except Exception as e:
             logger.debug("Failed to unembed skill #%d: %s", skill_id, e)
+
+    def revalidate_enabled_skills(self) -> int:
+        """Disable already-stored skills that fail the CURRENT creation guards.
+
+        Guards tighten over time (e.g. the structured-input rule added after the
+        calculator_arithmetic skill was found feeding English to SymPy). New
+        skills are screened at create_skill, but pre-existing ones linger until
+        they rack up live failures. This enforces the policy on the back catalog
+        at startup. Returns the number disabled.
+        """
+        import json as _json
+        rows = self._db.fetchall(
+            "SELECT id, name, trigger_pattern, steps, answer_template FROM skills WHERE enabled = 1"
+        )
+        disabled = 0
+        for row in rows:
+            try:
+                steps = _json.loads(row["steps"]) if row["steps"] else []
+            except Exception:
+                steps = []
+            reason = None
+            if _is_redos_risk(row["trigger_pattern"]):
+                reason = "ReDoS-risk trigger"
+            elif _has_capture_group_mismatch(row["trigger_pattern"], steps, row["answer_template"]):
+                reason = "undefined-placeholder args_template"
+            elif _pipes_raw_query_to_structured_tool(steps):
+                reason = "raw {query} into a structured-input tool"
+            if reason:
+                self._db.execute("UPDATE skills SET enabled = 0 WHERE id = ?", (row["id"],))
+                self._unembed_skill(row["id"])
+                disabled += 1
+                logger.warning("Revalidation disabled skill #%d '%s': %s",
+                               row["id"], row["name"], reason)
+        if disabled:
+            logger.info("Skill revalidation disabled %d skill(s) failing current guards", disabled)
+        return disabled
 
     def sync_embeddings(self) -> int:
         """Sync all enabled DB skills into ChromaDB. Safe to call at startup.
@@ -424,6 +478,17 @@ class SkillStore:
             logger.warning(
                 "Skill '%s' rejected: args_template references undefined placeholder "
                 "(add (?P<name>…) groups or use {query}/{output_key})",
+                name,
+            )
+            return None
+
+        # Guard: reject skills that pipe the raw natural-language query into a
+        # structured-input tool (calculator/code_exec). The query is prose; the
+        # tool needs the extracted expression via a capture group.
+        if _pipes_raw_query_to_structured_tool(steps):
+            logger.warning(
+                "Skill '%s' rejected: passes raw {query} to a structured-input tool "
+                "(calculator/code_exec) — extract the expression with a capture group",
                 name,
             )
             return None
@@ -1143,6 +1208,31 @@ def _is_too_broad(pattern: str) -> bool:
         return True
     matches = sum(1 for q in _BROADNESS_TEST_QUERIES if regex.search(q))
     return matches >= 2
+
+
+# Tools whose input is a STRUCTURED expression, not natural language. Piping the
+# raw {query} ("Calculate 47*89+156") into these means the tool receives prose
+# it can't use — the source of the calculator_arithmetic skill that fed English
+# to SymPy and templated the garbage. Such a step must extract the operand via a
+# capture group, not pass the whole query.
+_STRUCTURED_INPUT_TOOLS = frozenset({"calculator", "code_exec"})
+
+
+def _pipes_raw_query_to_structured_tool(steps: list[dict]) -> bool:
+    """True if any step sends a bare {query} (the whole NL query) into a tool
+    that needs a structured expression. Capture groups / output_keys are fine."""
+    for step in steps:
+        if step.get("tool") not in _STRUCTURED_INPUT_TOOLS:
+            continue
+        args = step.get("args_template", {})
+        values = args.values() if isinstance(args, dict) else [args]
+        for v in values:
+            s = str(v).strip()
+            # Bare {query}, or {query} with only surrounding whitespace/words —
+            # i.e. no capture group / output_key supplying the actual operand.
+            if "{query}" in s and not re.search(r"\{(?:capture_\d+|[A-Za-z_]\w*)\}", s.replace("{query}", "")):
+                return True
+    return False
 
 
 def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template: str | None) -> bool:

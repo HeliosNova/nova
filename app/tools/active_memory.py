@@ -108,11 +108,13 @@ class ActiveMemoryTool(BaseTool):
         if self._collection is None:
             try:
                 import chromadb
+                from app.core.embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._collection = client.get_or_create_collection(
-                    name="active_memory",
-                    metadata={"hnsw:space": "cosine"},
-                )
+                # No reindex callable: active memory is ephemeral session state,
+                # not re-derivable from SQLite. On a (rare) embedder-dimension
+                # change the collection rebuilds empty — acceptable, and far
+                # better than crashing every active_memory call.
+                self._collection = open_collection(client, "active_memory")
             except Exception as e:
                 logger.warning("Failed to init active_memory ChromaDB collection: %s", e)
                 return None
