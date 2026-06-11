@@ -83,3 +83,76 @@ class TestNewsworthiness:
             ("Fed holds rates steady amid inflation data", "https://wsj.com/econ/w"),
         ]:
             assert _is_newsworthy({"title": title, "url": url}) is True, title
+
+
+class TestSourceAuthority:
+    """Dataset-backed authority (Lin et al. PNAS Nexus 2023) + primary-source rules."""
+    def test_wire_and_primary_top(self):
+        from app.core.source_authority import authority
+        assert authority("reuters.com") >= 0.97
+        assert authority("apnews.com") >= 0.95
+        assert authority("sec.gov") == 1.0
+        assert authority("fda.gov") == 1.0
+        assert authority("anytown.courts.gov") == 1.0  # .gov suffix rule
+
+    def test_reputable_vs_lowcred(self):
+        from app.core.source_authority import authority
+        assert authority("nytimes.com") > 0.7
+        assert authority("infowars.com") < 0.2
+        assert authority("breitbart.com") < 0.4
+
+    def test_unknown_is_neutral(self):
+        from app.core.source_authority import authority
+        assert authority("some-unknown-blog-xyz123.net") == 0.5
+
+    def test_subdomain_and_cctld_resolve(self):
+        from app.core.source_authority import authority
+        assert authority("www.theverge.com") > 0.7
+        assert authority("https://www.bbc.co.uk/news") > 0.5  # registrable cctld
+
+
+class TestSyndicationCollapse:
+    """Wire reprints = ONE source, not N (the corroboration correctness fix)."""
+    def _wire(self, outlet):
+        return {"title": "OpenAI Oracle ten billion compute deal", "outlet": outlet,
+                "snippet": "(Reuters) OpenAI agreed a multiyear cloud compute deal with Oracle worth ten billion dollars, sources said Thursday."}
+
+    def test_reprints_detected(self):
+        from app.monitors.domain_study_runner import _is_syndicated
+        assert _is_syndicated(self._wire("yahoo.com"), self._wire("msn.com")) is True
+
+    def test_independent_not_syndicated(self):
+        from app.monitors.domain_study_runner import _is_syndicated
+        indep = {"title": "OpenAI signs Oracle cloud compute agreement", "outlet": "bloomberg.com",
+                 "snippet": "Bloomberg analysis finds the Oracle pact reshapes the compute market and pressures rivals to lock in scarce capacity ahead of the next training cycle."}
+        assert _is_syndicated(self._wire("yahoo.com"), indep) is False
+
+    def test_collapse_keeps_one_highest_authority(self):
+        from app.monitors.domain_study_runner import _collapse_syndication
+        items = [self._wire("yahoo.com"), self._wire("msn.com"), self._wire("reuters.com")]
+        out = _collapse_syndication(items)
+        assert len(out) == 1
+        assert out[0]["outlet"] == "reuters.com"  # highest authority survives
+
+    def test_corroboration_counts_independent_only(self):
+        from app.monitors.domain_study_runner import _collapse_syndication, _cross_reference
+        indep = {"title": "OpenAI Oracle compute agreement reshapes market", "outlet": "bloomberg.com",
+                 "snippet": "Bloomberg's independent analysis of the Oracle pact and its market consequences for compute-hungry rivals."}
+        items = _collapse_syndication([self._wire("yahoo.com"), self._wire("msn.com"), indep])
+        _cross_reference(items)
+        # after collapse: 1 wire + 1 independent = the wire is corroborated by exactly 1 independent outlet
+        wire = [i for i in items if "reuters" in (i.get("snippet","").lower())][0]
+        assert len(wire.get("_corroborating") or []) == 1
+
+
+class TestImportanceRanking:
+    def test_authority_and_corroboration_win(self):
+        from app.monitors.domain_study_runner import _importance_rank
+        items = [
+            {"title": "minor blog item", "outlet": "random-blog.xyz", "_corroborating": []},
+            {"title": "big story", "outlet": "reuters.com", "_corroborating": ["bbc.com", "nytimes.com"]},
+            {"title": "mid", "outlet": "theverge.com", "_corroborating": []},
+        ]
+        ranked = _importance_rank(items)
+        assert ranked[0]["outlet"] == "reuters.com"  # authority + corroboration
+        assert ranked[-1]["outlet"] == "random-blog.xyz"
