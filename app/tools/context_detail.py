@@ -7,6 +7,7 @@ Read-only, safe to cache.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from app.tools.base import BaseTool, ToolResult, ErrorCategory
@@ -84,7 +85,8 @@ class ContextDetailTool(BaseTool):
         if not svc.learning:
             return ToolResult(output="No learning engine available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
 
-        row = svc.learning._db.fetchone(
+        row = await asyncio.to_thread(
+            svc.learning._db.fetchone,
             "SELECT id, topic, wrong_answer, correct_answer, lesson_text, context, "
             "confidence, times_retrieved, times_helpful, created_at "
             "FROM lessons WHERE id = ?", (item_id,)
@@ -115,7 +117,8 @@ class ContextDetailTool(BaseTool):
         if not svc.kg:
             return ToolResult(output="No knowledge graph available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
 
-        row = svc.kg._db.fetchone(
+        row = await asyncio.to_thread(
+            svc.kg._db.fetchone,
             "SELECT id, subject, predicate, object, confidence, source, "
             "created_at, valid_from, valid_to, provenance, superseded_by "
             "FROM kg_facts WHERE id = ?", (item_id,)
@@ -141,7 +144,8 @@ class ContextDetailTool(BaseTool):
             lines.append(f"**Superseded by:** fact #{row['superseded_by']}")
 
         # Related facts (1-hop)
-        related = svc.kg._db.fetchall(
+        related = await asyncio.to_thread(
+            svc.kg._db.fetchall,
             "SELECT id, subject, predicate, object FROM kg_facts "
             "WHERE (LOWER(subject) = LOWER(?) OR LOWER(object) = LOWER(?)) "
             "AND id != ? AND valid_to IS NULL LIMIT 5",
@@ -160,7 +164,8 @@ class ContextDetailTool(BaseTool):
         if not svc.user_facts:
             return ToolResult(output="No user facts available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
 
-        row = svc.user_facts._db.fetchone(
+        row = await asyncio.to_thread(
+            svc.user_facts._db.fetchone,
             "SELECT * FROM user_facts WHERE id = ?", (item_id,)
         )
         if not row:
@@ -187,7 +192,8 @@ class ContextDetailTool(BaseTool):
             return ToolResult(output="No retriever available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
 
         # item_id is the chunk row id from documents table
-        row = svc.retriever._db.fetchone(
+        row = await asyncio.to_thread(
+            svc.retriever._db.fetchone,
             "SELECT id, title, source, content, created_at FROM documents WHERE id = ?",
             (item_id,),
         )
@@ -213,7 +219,8 @@ class ContextDetailTool(BaseTool):
         if not svc.reflexions:
             return ToolResult(output="No reflexion store available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
 
-        row = svc.reflexions._db.fetchone(
+        row = await asyncio.to_thread(
+            svc.reflexions._db.fetchone,
             "SELECT id, task_summary, outcome, reflection, quality_score, "
             "tools_used, revision_count, created_at "
             "FROM reflexions WHERE id = ?", (item_id,)

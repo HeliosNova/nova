@@ -1252,7 +1252,7 @@ class TestContextBudget:
 
         system_prompt = "You are Nova." * 100
 
-        with patch("app.core.brain.llm") as mock_llm:
+        with patch("app.core.brain_context_manager.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(return_value="Summary of conversation")
 
             messages, summary = await _manage_context(system_prompt, history, "new query")

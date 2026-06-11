@@ -405,6 +405,182 @@ class TestRateLimiting:
             resp = client.get("/api/health")
             assert resp.status_code == 200
 
+    def test_ratelimit_headers_present_on_normal_request(self, client):
+        """Normal requests must include X-RateLimit-Limit/Remaining/Reset headers."""
+        resp = client.get("/api/status")
+        assert "X-RateLimit-Limit" in resp.headers
+        assert "X-RateLimit-Remaining" in resp.headers
+        assert "X-RateLimit-Reset" in resp.headers
+        assert int(resp.headers["X-RateLimit-Limit"]) >= 1
+
+    def test_ratelimit_headers_present_on_429(self, client):
+        """429 response must also carry rate-limit headers with Remaining=0."""
+        resp = None
+        for _ in range(65):
+            resp = client.get("/api/status")
+            if resp.status_code == 429:
+                break
+        assert resp is not None and resp.status_code == 429
+        assert resp.headers.get("X-RateLimit-Remaining") == "0"
+        assert "X-RateLimit-Limit" in resp.headers
+        assert "X-RateLimit-Reset" in resp.headers
+
+    def test_remaining_decrements(self, client):
+        """X-RateLimit-Remaining should decrease with each request."""
+        remaining_values = []
+        for _ in range(3):
+            r = client.get("/api/status")
+            if r.status_code == 200:
+                remaining_values.append(int(r.headers.get("X-RateLimit-Remaining", -1)))
+        assert len(remaining_values) >= 2
+        assert remaining_values[0] > remaining_values[-1]
+
+    def test_custom_limit_respected(self, db, monkeypatch):
+        """RATE_LIMIT_RPM config drives the effective per-IP limit."""
+        monkeypatch.setenv("RATE_LIMIT_RPM", "3")
+        import importlib, app.config, app.auth
+        importlib.reload(app.config)
+        importlib.reload(app.auth)
+
+        from fastapi.testclient import TestClient
+        from app.main import app, _rate_limit_requests
+        _rate_limit_requests.clear()
+
+        from app.core.brain import Services, set_services
+        from app.core.memory import ConversationStore, UserFactStore
+        svc = Services(conversations=ConversationStore(db), user_facts=UserFactStore(db))
+        set_services(svc)
+
+        with patch("app.main.config") as mock_cfg:
+            mock_cfg.RATE_LIMIT_RPM = 3
+            mock_cfg.API_KEY = ""
+            mock_cfg.REQUIRE_AUTH = False
+            mock_cfg.TRUSTED_PROXY = None
+            client_low = TestClient(app)
+            statuses = [client_low.get("/api/status").status_code for _ in range(6)]
+
+        assert 429 in statuses, "Low limit (3 rpm) should trigger 429 within 6 requests"
+
+
+# ---------------------------------------------------------------------------
+# Auth failure dict eviction (bounded growth)
+# ---------------------------------------------------------------------------
+
+class TestAuthFailureEviction:
+    """Verify auth failure tracking dicts are bounded and evict properly."""
+
+    @pytest.fixture(autouse=True)
+    def _clear_auth_state(self):
+        """Reset auth state between tests."""
+        import app.auth as auth_mod
+        auth_mod._auth_failures.clear()
+        auth_mod._lockouts.clear()
+        yield
+        auth_mod._auth_failures.clear()
+        auth_mod._lockouts.clear()
+
+    def test_failures_dict_is_regular_dict(self):
+        """_auth_failures must be a regular dict, not defaultdict."""
+        import app.auth as auth_mod
+        from collections import defaultdict
+        assert type(auth_mod._auth_failures) is dict
+        assert not isinstance(auth_mod._auth_failures, defaultdict)
+
+    def test_check_rate_limit_no_phantom_entries(self):
+        """_check_rate_limit should not create entries for IPs with no failures."""
+        import app.auth as auth_mod
+        auth_mod._check_rate_limit("192.168.1.100")
+        # IP with no failures should not appear in the dict
+        assert "192.168.1.100" not in auth_mod._auth_failures
+
+    def test_record_failure_creates_entry(self):
+        """_record_failure should create an entry for the IP."""
+        import app.auth as auth_mod
+        auth_mod._record_failure("10.0.0.1")
+        assert "10.0.0.1" in auth_mod._auth_failures
+
+    def test_eviction_under_max_cap(self):
+        """When dict exceeds max IPs, oldest entries are evicted."""
+        import app.auth as auth_mod
+        import time
+
+        max_ips = 5
+        now = time.time()
+
+        # Fill with max_ips + 3 entries
+        for i in range(max_ips + 3):
+            ip = f"10.0.0.{i}"
+            auth_mod._auth_failures[ip] = [now]
+
+        assert len(auth_mod._auth_failures) == max_ips + 3
+
+        # Eviction should trim to max_ips
+        auth_mod._evict_oldest(auth_mod._auth_failures, max_ips)
+        assert len(auth_mod._auth_failures) <= max_ips
+
+        # The oldest entries (lowest IPs) should have been evicted
+        assert "10.0.0.0" not in auth_mod._auth_failures
+        assert "10.0.0.1" not in auth_mod._auth_failures
+        assert "10.0.0.2" not in auth_mod._auth_failures
+
+    def test_eviction_runs_on_every_auth_check(self):
+        """_check_rate_limit calls _evict_oldest to cap dict size."""
+        import app.auth as auth_mod
+        import time
+
+        now = time.time()
+        # Add many entries, simulating many failing IPs
+        for i in range(20):
+            auth_mod._auth_failures[f"10.0.0.{i}"] = [now]
+
+        # Temporarily lower the cap by patching the config module in auth
+        with patch("app.auth.config") as mock_cfg:
+            mock_cfg.AUTH_MAX_TRACKED_IPS = 10
+            mock_cfg.AUTH_LOCKOUT_SECONDS = 300
+            auth_mod._check_rate_limit("192.168.1.1")
+
+        assert len(auth_mod._auth_failures) <= 10
+
+    def test_lockouts_dict_also_evicted(self):
+        """Lockout dict is also bounded by _evict_oldest."""
+        import app.auth as auth_mod
+        import time
+
+        now = time.time()
+        for i in range(15):
+            auth_mod._lockouts[f"10.0.0.{i}"] = now + 600  # locked for 10 min
+
+        auth_mod._evict_oldest(auth_mod._lockouts, 5)
+        assert len(auth_mod._lockouts) <= 5
+
+    def test_expired_entries_cleaned_up(self):
+        """_cleanup_expired_entries removes stale failure entries."""
+        import app.auth as auth_mod
+        import time
+
+        old = time.time() - 1000  # Way past the lockout window
+        auth_mod._auth_failures["stale_ip"] = [old]
+        auth_mod._lockouts["expired_ip"] = old  # Already expired
+
+        auth_mod._cleanup_expired_entries()
+
+        assert "stale_ip" not in auth_mod._auth_failures
+        assert "expired_ip" not in auth_mod._lockouts
+
+    def test_record_failure_triggers_lockout(self):
+        """After enough failures, IP gets locked out and failures cleared."""
+        import app.auth as auth_mod
+        from app.config import config as app_config
+
+        max_failures = app_config.AUTH_MAX_FAILURES
+        for _ in range(max_failures):
+            auth_mod._record_failure("attacker")
+
+        # Should be locked out
+        assert "attacker" in auth_mod._lockouts
+        # Failures should be cleared (not in dict anymore)
+        assert "attacker" not in auth_mod._auth_failures
+
 
 # ---------------------------------------------------------------------------
 # Access Tiers (from test_access_tiers)
@@ -560,3 +736,58 @@ class TestAccessTierConfigValidation:
             blocked = get_blocked_shell_commands()
             # Falls back to sandboxed, which blocks interpreters
             assert "python" in blocked
+
+
+# ---------------------------------------------------------------------------
+# Finding #10: Config orphan cleanup / unimplemented-provider warning
+# ---------------------------------------------------------------------------
+
+class TestConfigOrphansAndValidation:
+    """Verify removed orphan fields are gone and validate() catches silent failures."""
+
+    def test_temperature_internal_removed(self):
+        """TEMPERATURE_INTERNAL was unused (llm.py hard-codes defaults) — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "TEMPERATURE_INTERNAL"), (
+            "TEMPERATURE_INTERNAL is an orphan — llm.py never reads it. Remove from Config."
+        )
+
+    def test_temperature_reflexion_removed(self):
+        """TEMPERATURE_REFLEXION was unused — must not exist."""
+        from app.config import Config
+        assert not hasattr(Config(), "TEMPERATURE_REFLEXION")
+
+    def test_cloud_provider_fields_removed(self):
+        """All cloud provider config fields must be gone (Ollama-only architecture)."""
+        from app.config import Config
+        cfg = Config()
+        for f in (
+            "OPENAI_USE_COMPLETION_TOKENS", "ANTHROPIC_API_VERSION", "ANTHROPIC_BETA_HEADER",
+            "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GOOGLE_API_KEY",
+            "OPENAI_MODEL", "ANTHROPIC_MODEL", "GOOGLE_MODEL",
+            "OPENAI_BASE_URL", "ANTHROPIC_BASE_URL", "GOOGLE_BASE_URL",
+        ):
+            assert not hasattr(cfg, f), f"Cloud field {f!r} should be removed"
+
+    def test_validate_warns_on_non_ollama_provider(self):
+        """validate() must warn when LLM_PROVIDER is anything other than ollama."""
+        from app.config import Config
+        for prov in ("anthropic", "openai", "google"):
+            cfg = Config(LLM_PROVIDER=prov)
+            warnings = cfg.validate()
+            assert any("ollama" in w.lower() for w in warnings), (
+                f"Expected warning for {prov}. Got: {warnings}"
+            )
+
+    def test_validate_no_warning_for_ollama(self):
+        """validate() must NOT warn about provider when LLM_PROVIDER=ollama."""
+        from app.config import Config
+        cfg = Config(LLM_PROVIDER="ollama")
+        warnings = cfg.validate()
+        assert not any("ollama" in w.lower() and "must" in w.lower() for w in warnings)
+
+    def test_ollama_url_still_present(self):
+        """OLLAMA_URL must remain — it's the only LLM provider."""
+        from app.config import Config
+        cfg = Config()
+        assert hasattr(cfg, "OLLAMA_URL")

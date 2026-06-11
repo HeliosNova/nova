@@ -178,63 +178,116 @@ class TelegramBot:
         return chunks
 
     async def send_alert(self, message: str):
-        """Send a message to the default chat."""
+        """Send a message to the default chat. Converts Discord-style markdown
+        to Telegram HTML so **bold**, *italic*, `code`, and <URL> render
+        correctly instead of showing as raw asterisks/brackets."""
         if not self.default_chat_id or not self._app:
             return
         try:
-            for chunk in self._split_message(message):
-                await self._app.bot.send_message(chat_id=int(self.default_chat_id), text=chunk)
+            from app.channels.format_for_channel import to_telegram_html
+            html_message = to_telegram_html(message)
+            for chunk in self._split_message(html_message):
+                try:
+                    await self._app.bot.send_message(
+                        chat_id=int(self.default_chat_id),
+                        text=chunk,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                except Exception as html_err:
+                    # If HTML parsing fails (e.g. rare escaping edge case),
+                    # fall back to plain text so the alert still goes through.
+                    logger.warning("[Telegram] HTML send failed (%s) — sending plain", html_err)
+                    await self._app.bot.send_message(
+                        chat_id=int(self.default_chat_id), text=chunk,
+                    )
         except Exception as e:
             logger.error("[Telegram] Alert send failed: %s", e)
 
     async def start(self):
-        """Start the Telegram bot (polling mode)."""
+        """Start the Telegram bot (polling mode) with outer reconnect loop."""
         if not self.token:
             logger.warning("[Telegram] No token configured, skipping")
             return
 
-        try:
-            self._app = Application.builder().token(self.token).build()
-            self._app.add_handler(CommandHandler("start", self._handle_start))
-            self._app.add_handler(CommandHandler("status", self._handle_status))
-            self._app.add_handler(CommandHandler("help", self._handle_help))
-            self._app.add_handler(
-                MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
-            )
+        import time
+        _INITIAL_BACKOFF = 5.0
+        _MAX_BACKOFF = 60.0
+        _STABLE_UPTIME_S = 300.0
+        backoff = _INITIAL_BACKOFF
 
-            await self._app.initialize()
-            await self._app.start()
-            await self._app.updater.start_polling(drop_pending_updates=True)
-            logger.info("[Telegram] Bot started, polling for messages")
+        while not self._stop_event.is_set():
+            connect_started = time.monotonic()
+            try:
+                self._app = Application.builder().token(self.token).build()
+                self._app.add_handler(CommandHandler("start", self._handle_start))
+                self._app.add_handler(CommandHandler("status", self._handle_status))
+                self._app.add_handler(CommandHandler("help", self._handle_help))
+                self._app.add_handler(
+                    MessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_message)
+                )
 
-            # Validate default chat_id at startup so bad config surfaces immediately
-            if self.default_chat_id:
-                try:
-                    chat = await self._app.bot.get_chat(chat_id=int(self.default_chat_id))
-                    logger.info("[Telegram] Alert chat validated: %s (type=%s)", chat.title or chat.first_name or chat.id, chat.type)
-                except Exception as e:
-                    logger.error(
-                        "[Telegram] TELEGRAM_CHAT_ID=%s is invalid (%s). "
-                        "Send /start to the bot, then check logs or use: "
-                        "curl https://api.telegram.org/bot<TOKEN>/getUpdates",
-                        self.default_chat_id, e,
+                await self._app.initialize()
+                await self._app.start()
+                await self._app.updater.start_polling(drop_pending_updates=True)
+                logger.info("[Telegram] Bot started, polling for messages")
+
+                if self.default_chat_id:
+                    try:
+                        chat = await self._app.bot.get_chat(chat_id=int(self.default_chat_id))
+                        logger.info("[Telegram] Alert chat validated: %s (type=%s)", chat.title or chat.first_name or chat.id, chat.type)
+                    except Exception as e:
+                        logger.error(
+                            "[Telegram] TELEGRAM_CHAT_ID=%s is invalid (%s). "
+                            "Send /start to the bot, then check logs or use: "
+                            "curl https://api.telegram.org/bot<TOKEN>/getUpdates",
+                            self.default_chat_id, e,
+                        )
+
+                # Block until stop event — clean shutdown path
+                await self._stop_event.wait()
+                return  # clean exit
+
+            except asyncio.CancelledError:
+                logger.info("[Telegram] Bot shutting down")
+                return
+            except Exception as e:
+                # Reset backoff if the connection was stable for ≥5 min so a
+                # long-running bot's occasional polling blip doesn't compound
+                # to MAX_BACKOFF permanently.
+                uptime = time.monotonic() - connect_started
+                if uptime >= _STABLE_UPTIME_S and backoff > _INITIAL_BACKOFF:
+                    logger.info(
+                        "[Telegram] Stable for %.0fs before failure — resetting backoff %.0f → %.0fs",
+                        uptime, backoff, _INITIAL_BACKOFF,
                     )
+                    backoff = _INITIAL_BACKOFF
+                logger.error(
+                    "[Telegram] Bot failed after %.0fs uptime: %s — reconnecting in %.0fs",
+                    uptime, e, backoff,
+                )
+                # Best-effort tear-down of the half-initialized Application
+                # before retry; ignore errors since the connection may already
+                # be unrecoverable.
+                if self._app:
+                    try:
+                        await self._app.updater.stop()
+                        await self._app.stop()
+                        await self._app.shutdown()
+                    except Exception:
+                        pass
+                    self._app = None
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
 
-            # Keep running until stop event is set or task is cancelled
-            await self._stop_event.wait()
-
-        except asyncio.CancelledError:
-            logger.info("[Telegram] Bot shutting down")
-        except Exception as e:
-            logger.error("[Telegram] Bot failed: %s", e, exc_info=True)
-        finally:
-            if self._app:
-                try:
-                    await self._app.updater.stop()
-                    await self._app.stop()
-                    await self._app.shutdown()
-                except Exception:
-                    pass
+        # _stop_event tripped before entering the retry loop body
+        if self._app:
+            try:
+                await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+            except Exception:
+                pass
 
     async def close(self):
         """Gracefully close the Telegram bot."""

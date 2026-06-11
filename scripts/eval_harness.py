@@ -1,7 +1,9 @@
 """A/B Evaluation Harness — compare base model vs fine-tuned model.
 
 Takes a set of held-out queries and runs each through both models via
-Ollama API. Uses a judge prompt (the same LLM) to compare responses.
+Ollama API. An independent judge model (cross-family recommended — set
+EVAL_JUDGE_MODEL) compares responses, scoring both A/B orders and requiring
+agreement (position-swap) across four independent dimensions.
 Returns structured results with win rates and preference scores.
 
 USAGE:
@@ -36,7 +38,26 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
 JUDGE_TEMPERATURE = 0.1
-GENERATION_TIMEOUT = 120  # seconds per query
+# Per-call timeout. 600s is generous to cover cold-load of large models (e.g.,
+# 27B Q4 = 17 GB; on a 24 GB GPU it swaps in/out between base/candidate/judge
+# calls, so each generate may pay a disk-load cost before producing tokens).
+GENERATION_TIMEOUT = int(os.getenv("EVAL_GENERATION_TIMEOUT", "600"))
+# Tie threshold for the derived winner. |preference_score| below this counts as
+# a tie. 0.15 catches obvious wins while keeping noise out — earlier "winner"
+# field was self-inconsistent with score ~47% of the time on Qwen3.5:9b judge,
+# so we treat score as the single source of truth and derive winner here.
+JUDGE_TIE_THRESHOLD = float(os.getenv("EVAL_JUDGE_TIE_THRESHOLD", "0.15"))
+# Position-swapped judging: score BOTH orders (base-first and candidate-first)
+# and only declare a decisive winner when the orders agree — a flip means the
+# judge is position-biased, which we score as a tie. Default on; set
+# EVAL_JUDGE_SWAP=false for legacy single-order behavior.
+JUDGE_SWAP = os.getenv("EVAL_JUDGE_SWAP", "true").strip().lower() not in (
+    "0", "false", "no", "off", "",
+)
+# Independent (cross-family) judge model. Self-judging (judge == a model under
+# test) inflates scores via self-preference bias — point this at a DIFFERENT
+# model family running locally in Ollama (e.g. a Llama or Gemma).
+DEFAULT_JUDGE_MODEL = os.getenv("EVAL_JUDGE_MODEL") or os.getenv("JUDGE_MODEL") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +135,10 @@ async def _generate(
         "model": model,
         "prompt": prompt,
         "stream": False,
+        # Disable Qwen3.x thinking mode — without this the model emits everything
+        # inside <think>...</think> and Ollama returns an empty `response`. The
+        # eval harness needs the raw answer, not chain-of-thought.
+        "think": False,
         "options": {
             "temperature": temperature,
             "num_predict": max_tokens,
@@ -152,17 +177,117 @@ RESPONSE A:
 RESPONSE B:
 {response_b}
 
-Compare Response A and Response B. Consider:
-1. Accuracy and correctness
-2. Helpfulness and completeness
-3. Clarity and natural tone
-4. Relevance to the query
+Score Response A vs Response B on FOUR dimensions independently. For each, use
+a float from -1.0 to 1.0:
+  -1.0 = A much better,  0.0 = equivalent,  +1.0 = B much better.
 
-Respond with a single JSON object:
-{{"winner": "A" or "B" or "tie", "score": <float from -1.0 to 1.0>, "reasoning": "<brief explanation>"}}
+Respond with a single JSON object — no other text:
+{{"accuracy": <float>, "completeness": <float>, "clarity": <float>, "relevance": <float>, "reasoning": "<brief explanation>"}}
 
-score: -1.0 means A is much better, 0.0 means equal, 1.0 means B is much better.
-Only output the JSON object, nothing else."""
+Judge each dimension independently — do not let one strong dimension dominate
+the others. Each score must reflect the magnitude of the difference you describe."""
+
+
+# Dimensions averaged into the overall preference. Decomposing the judgment into
+# independent dimensions measurably reduces self-preference bias (2026 studies).
+_JUDGE_DIMENSIONS = ("accuracy", "completeness", "clarity", "relevance")
+
+
+def _derive_winner(preference_score: float, threshold: float = JUDGE_TIE_THRESHOLD) -> str:
+    """Map a continuous preference score (positive = candidate better) to
+    a discrete winner label using a tie threshold.
+
+    The judge is asked only for dimension scores; `winner` is derived here from
+    the (sign-corrected) overall so the two are consistent by construction.
+    """
+    if preference_score > threshold:
+        return "candidate"
+    if preference_score < -threshold:
+        return "base"
+    return "tie"
+
+
+def _parse_judge(raw: str) -> tuple[float | None, str]:
+    """Parse a judge response into (overall_score, reasoning).
+
+    overall_score is in [-1, 1] where positive means RESPONSE B is better.
+    Accepts the multi-dimensional schema (dimensions averaged) and the legacy
+    single `score` field. Returns (None, diagnostic) when no numeric score is
+    present, so the caller can treat the judgment as missing rather than a tie
+    with a fabricated 0.0.
+    """
+    result: dict | None = None
+    try:
+        result = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        # Judge sometimes wraps JSON in prose despite format=json — extract it.
+        import re
+        match = re.search(r'\{[^{}]*"(?:score|accuracy)"[^{}]*\}', raw or "")
+        if match:
+            try:
+                result = json.loads(match.group())
+            except json.JSONDecodeError:
+                result = None
+
+    if not isinstance(result, dict):
+        return None, f"Could not parse judge response: {(raw or '')[:200]}"
+
+    # Multi-dimensional: average whichever named dimensions are present.
+    dim_vals: list[float] = []
+    for d in _JUDGE_DIMENSIONS:
+        if d in result:
+            try:
+                dim_vals.append(float(result[d]))
+            except (TypeError, ValueError):
+                return None, f"Non-numeric {d} from judge: {(raw or '')[:200]}"
+    reasoning = str(result.get("reasoning", ""))
+    if dim_vals:
+        return sum(dim_vals) / len(dim_vals), reasoning
+
+    # Legacy single-score schema.
+    if "score" in result:
+        try:
+            return float(result["score"]), reasoning
+        except (TypeError, ValueError):
+            return None, f"Non-numeric score from judge: {(raw or '')[:200]}"
+
+    return None, f"Judge response missing score fields: {(raw or '')[:200]}"
+
+
+async def _judge_once_directed(
+    client: httpx.AsyncClient,
+    ollama_url: str,
+    judge_model: str,
+    query: str,
+    base_response: str,
+    candidate_response: str,
+    base_first: bool,
+) -> tuple[float | None, str]:
+    """One directed judge call with a fixed A/B order.
+
+    Returns (preference, reasoning) where preference is in [-1, 1], positive =
+    CANDIDATE better; None on parse failure.
+    """
+    if base_first:
+        response_a, response_b = base_response, candidate_response
+    else:
+        response_a, response_b = candidate_response, base_response
+
+    prompt = JUDGE_PROMPT.format(
+        query=query, response_a=response_a[:1500], response_b=response_b[:1500],
+    )
+    raw = await _generate(
+        client, ollama_url, judge_model, prompt,
+        temperature=JUDGE_TEMPERATURE, max_tokens=300, json_mode=True,
+    )
+    score, reasoning = _parse_judge(raw)
+    if score is None:
+        return None, reasoning
+    # score is "B better positive". Convert to "candidate better positive":
+    #   base_first  → B is candidate → pref = +score
+    #   !base_first → B is base      → pref = -score
+    pref = score if base_first else -score
+    return max(-1.0, min(1.0, pref)), reasoning
 
 
 async def _judge_pair(
@@ -173,69 +298,45 @@ async def _judge_pair(
     base_response: str,
     candidate_response: str,
 ) -> tuple[str, float, str]:
-    """Judge a pair of responses. Returns (winner, score, reasoning).
+    """Judge a pair of responses. Returns (winner, preference, reasoning),
+    preference positive = candidate better.
 
-    Randomizes A/B assignment to avoid position bias.
+    Default (EVAL_JUDGE_SWAP): score BOTH orders and only declare a decisive
+    winner when they agree — a decisive flip between orders is position bias and
+    is scored a tie. With swap disabled, falls back to one randomized-order call.
     """
-    # Randomize which response is A vs B to avoid position bias
-    if random.random() < 0.5:
-        response_a = base_response
-        response_b = candidate_response
-        a_is_base = True
-    else:
-        response_a = candidate_response
-        response_b = base_response
-        a_is_base = False
+    if not JUDGE_SWAP:
+        base_first = random.random() < 0.5
+        pref, reasoning = await _judge_once_directed(
+            client, ollama_url, judge_model, query,
+            base_response, candidate_response, base_first,
+        )
+        if pref is None:
+            return "tie", 0.0, reasoning
+        return _derive_winner(pref), pref, reasoning
 
-    prompt = JUDGE_PROMPT.format(
-        query=query,
-        response_a=response_a[:1500],
-        response_b=response_b[:1500],
+    pref1, r1 = await _judge_once_directed(
+        client, ollama_url, judge_model, query, base_response, candidate_response, True,
+    )
+    pref2, r2 = await _judge_once_directed(
+        client, ollama_url, judge_model, query, base_response, candidate_response, False,
     )
 
-    raw = await _generate(
-        client, ollama_url, judge_model, prompt,
-        temperature=JUDGE_TEMPERATURE, max_tokens=300, json_mode=True,
-    )
+    valid = [p for p in (pref1, pref2) if p is not None]
+    if not valid:
+        return "tie", 0.0, f"Could not parse judge response (both orders): {r1}"
+    if len(valid) == 1:
+        p = valid[0]
+        return _derive_winner(p), round(p, 4), (r1 if pref1 is not None else r2)
 
-    # Parse judge response
-    try:
-        # Try to extract JSON from the response
-        result = json.loads(raw)
-    except json.JSONDecodeError:
-        # Fallback: try to find JSON in the response
-        import re
-        match = re.search(r'\{[^{}]*"winner"[^{}]*\}', raw)
-        if match:
-            try:
-                result = json.loads(match.group())
-            except json.JSONDecodeError:
-                return "tie", 0.0, f"Could not parse judge response: {raw[:200]}"
-        else:
-            return "tie", 0.0, f"Could not parse judge response: {raw[:200]}"
-
-    raw_winner = result.get("winner", "tie").upper()
-    raw_score = float(result.get("score", 0.0))
-    reasoning = result.get("reasoning", "")
-
-    # Map back from A/B to base/candidate
-    if raw_winner == "A":
-        winner = "base" if a_is_base else "candidate"
-    elif raw_winner == "B":
-        winner = "candidate" if a_is_base else "base"
-    else:
-        winner = "tie"
-
-    # Adjust score direction: positive = candidate better
-    if a_is_base:
-        preference_score = raw_score  # A=base, B=candidate, positive = B better = candidate better
-    else:
-        preference_score = -raw_score  # A=candidate, B=base, positive = B better = base better, so flip
-
-    # Clamp
-    preference_score = max(-1.0, min(1.0, preference_score))
-
-    return winner, preference_score, reasoning
+    avg = (pref1 + pref2) / 2.0
+    w1, w2 = _derive_winner(pref1), _derive_winner(pref2)
+    if {w1, w2} == {"base", "candidate"}:
+        # Orders disagree decisively → position bias → tie.
+        return "tie", round(avg, 4), (
+            f"position-bias: order1={w1}({pref1:+.2f}) order2={w2}({pref2:+.2f})"
+        )
+    return _derive_winner(avg), round(avg, 4), (r1 or r2)
 
 
 # ---------------------------------------------------------------------------
@@ -262,16 +363,23 @@ async def run_eval(
         EvalResults with detailed comparison data.
     """
     if not judge_model:
-        judge_model = base_model
+        judge_model = DEFAULT_JUDGE_MODEL or base_model
+    if judge_model in (base_model, candidate_model):
+        logger.warning(
+            "Judge model %r is one of the models under test — self-preference "
+            "bias is likely. Set EVAL_JUDGE_MODEL to an independent "
+            "(different-family) local model for a credible result.",
+            judge_model,
+        )
 
     logger.info(
-        "Starting A/B evaluation: %s vs %s (%d queries, judge=%s)",
-        base_model, candidate_model, len(queries), judge_model,
+        "Starting A/B evaluation: %s vs %s (%d queries, judge=%s, swap=%s)",
+        base_model, candidate_model, len(queries), judge_model, JUDGE_SWAP,
     )
 
     comparisons: list[ComparisonResult] = []
 
-    async with httpx.AsyncClient(timeout=httpx.Timeout(120.0)) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(float(GENERATION_TIMEOUT))) as client:
         for i, query in enumerate(queries, 1):
             logger.info("  [%d/%d] Evaluating: %s", i, len(queries), query[:80])
 

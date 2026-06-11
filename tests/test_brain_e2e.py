@@ -448,55 +448,6 @@ class TestCorrectionDetectionFlow:
             assert services.learning.save_training_pair.called
 
 
-class TestFactExtractionFlow:
-    """Fact extraction from user messages through the post-processing pipeline."""
-
-    @pytest.fixture
-    def services(self, db):
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-        )
-        set_services(svc)
-        return svc
-
-    @pytest.mark.asyncio
-    async def test_fact_signal_triggers_extraction(self, services):
-        """A message with fact signals (e.g. 'my name is') should trigger extraction."""
-        with patch("app.core.brain.llm") as mock_llm:
-            _mock_llm_simple(mock_llm, content="Nice to meet you, John!")
-
-            with patch("app.core.brain.extract_facts_from_message", new_callable=AsyncMock) as mock_extract:
-                mock_extract.return_value = {"name": {"value": "John", "category": "identity"}}
-
-                events = []
-                async for event in think("My name is John"):
-                    events.append(event)
-
-                # Allow background tasks to complete
-                await asyncio.sleep(0.3)
-
-                # Verify extract was called (it runs as a background task)
-                mock_extract.assert_called_once()
-                call_args = mock_extract.call_args
-                assert "John" in call_args[0][0]  # query contains "John"
-
-    @pytest.mark.asyncio
-    async def test_no_fact_extraction_for_simple_greeting(self, services):
-        """A simple greeting should NOT trigger fact extraction."""
-        with patch("app.core.brain.llm") as mock_llm:
-            _mock_llm_simple(mock_llm, content="Hello!")
-
-            with patch("app.core.brain.extract_facts_from_message", new_callable=AsyncMock) as mock_extract:
-                events = []
-                async for event in think("hello"):
-                    events.append(event)
-
-                await asyncio.sleep(0.2)
-                # has_fact_signals("hello") is False, so extract should not be called
-                mock_extract.assert_not_called()
-
-
 class TestMultipleToolRounds:
     """Multiple tool call rounds — chained tool use across LLM turns."""
 

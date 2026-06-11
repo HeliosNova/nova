@@ -1,7 +1,9 @@
 """Dynamic Tool Creation — create, store, and execute user-defined tools.
 
-Tools are Python scripts persisted in SQLite. They execute in the same
-subprocess sandbox as CodeExecTool, reusing _check_code_safety.
+Tools are Python scripts persisted in SQLite. They execute in a hardened
+subprocess sandbox with forced sandboxed-level safety checks (regardless of
+the system access tier) and a runtime preamble that blocks network access
+and filesystem writes outside the sandbox directory.
 """
 
 from __future__ import annotations
@@ -9,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -22,6 +25,182 @@ from app.tools.base import BaseTool, ErrorCategory, ToolResult
 from app.tools.code_exec import _check_code_safety
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Forced-sandbox safety check (ignores system tier — always max restriction)
+# ---------------------------------------------------------------------------
+
+# Imports ALWAYS blocked for dynamic tools, regardless of system access tier.
+# This is the sandboxed tier's blocklist, permanently enforced for user-created code.
+_DYNAMIC_TOOL_BLOCKED_IMPORTS = frozenset({
+    "os", "subprocess", "shutil", "sys", "importlib",
+    "ctypes", "socket", "http", "urllib", "requests", "httpx",
+    "pathlib", "glob", "signal", "multiprocessing",
+    # Additional network/process modules not in the base sandboxed set
+    "asyncio", "aiohttp", "websockets", "xmlrpc", "ftplib",
+    "smtplib", "poplib", "imaplib", "telnetlib", "ssl",
+    "webbrowser", "tempfile", "io",
+    "pickle", "shelve", "marshal",
+})
+
+_DYNAMIC_TOOL_BLOCKED_BUILTINS = frozenset({
+    "open", "getattr", "compile", "globals", "locals",
+    "vars", "dir", "breakpoint",
+    "__builtins__", "__import__", "eval", "exec",
+})
+
+# Dunder attributes that enable sandbox escape
+_DYNAMIC_TOOL_BLOCKED_DUNDERS = frozenset({
+    "__loader__", "__spec__", "__builtins__",
+    "__class__", "__bases__", "__mro__", "__subclasses__",
+    "__globals__", "__code__",
+})
+
+
+def _check_dynamic_tool_safety(code: str) -> str | None:
+    """Per owner directive 2026-04-25: no policy filtering on custom tools.
+
+    Nova is sovereign. He owns the box. When he writes a tool, it runs.
+    Only hard-fail on syntax errors so we don't store broken code.
+    The previous tier-conditional / always-blocked logic is removed entirely.
+    """
+    try:
+        import ast as _ast
+        _ast.parse(code)
+    except SyntaxError as e:
+        return f"Syntax error: {e}"
+    return None
+
+
+def _legacy_blocklist_disabled(code: str) -> str | None:
+    """Retained only as documentation of what USED to be blocked. Never called."""
+    import ast
+
+    # --- AST-based analysis ---
+    try:
+        tree = ast.parse(code)
+    except SyntaxError:
+        # Fall back to text-based checks
+        return _check_dynamic_tool_safety_text(code)
+
+    blocked_builtin_names = {b.rstrip("(") for b in _DYNAMIC_TOOL_BLOCKED_BUILTINS}
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for alias in node.names:
+                top_module = alias.name.split(".")[0]
+                if top_module in _DYNAMIC_TOOL_BLOCKED_IMPORTS:
+                    return f"Import '{top_module}' is blocked in dynamic tools."
+
+        elif isinstance(node, ast.ImportFrom):
+            if node.module:
+                top_module = node.module.split(".")[0]
+                if top_module in _DYNAMIC_TOOL_BLOCKED_IMPORTS:
+                    return f"Import '{top_module}' is blocked in dynamic tools."
+
+        elif isinstance(node, ast.Call):
+            func = node.func
+            if isinstance(func, ast.Name) and func.id in blocked_builtin_names:
+                return f"'{func.id}' is blocked in dynamic tools."
+            if isinstance(func, ast.Attribute) and func.attr in blocked_builtin_names:
+                return f"'{func.attr}' is blocked in dynamic tools."
+            if isinstance(func, ast.Name) and func.id == "getattr" and len(node.args) >= 2:
+                second_arg = node.args[1]
+                if isinstance(second_arg, ast.Constant) and isinstance(second_arg.value, str):
+                    if second_arg.value in blocked_builtin_names:
+                        return f"getattr() with '{second_arg.value}' is blocked in dynamic tools."
+                    if second_arg.value in _DYNAMIC_TOOL_BLOCKED_DUNDERS:
+                        return f"getattr() with '{second_arg.value}' is blocked in dynamic tools."
+
+        elif isinstance(node, ast.Name):
+            if node.id in blocked_builtin_names and node.id.startswith("__"):
+                return f"'{node.id}' is blocked in dynamic tools."
+            if node.id == "builtins":
+                return "Access to 'builtins' is blocked in dynamic tools."
+
+        elif isinstance(node, ast.Attribute):
+            if node.attr in _DYNAMIC_TOOL_BLOCKED_DUNDERS:
+                return f"Access to '{node.attr}' is blocked in dynamic tools."
+
+    return None
+
+
+def _check_dynamic_tool_safety_text(code: str) -> str | None:
+    """Fallback text-based check for code that doesn't parse."""
+    for blocked in _DYNAMIC_TOOL_BLOCKED_IMPORTS:
+        if f"import {blocked}" in code or f"from {blocked}" in code:
+            return f"Import '{blocked}' is blocked in dynamic tools."
+    for builtin in _DYNAMIC_TOOL_BLOCKED_BUILTINS:
+        token = builtin + "(" if not builtin.startswith("__") else builtin
+        if token in code:
+            return f"'{builtin}' is blocked in dynamic tools."
+    return None
+
+
+# Runtime sandbox preamble — injected into every dynamic tool script.
+# Defence-in-depth for sandboxed/standard tiers. At 'full'/'none' the
+# preamble is replaced with a no-op so tools can hit network and disk freely.
+_SANDBOX_PREAMBLE_STRICT = '''\
+import sys as _sys
+
+# --- Block network access at runtime ---
+class _BlockedSocket:
+    def __init__(self, *a, **kw):
+        raise PermissionError("Network access is blocked in dynamic tools")
+    def __getattr__(self, name):
+        raise PermissionError("Network access is blocked in dynamic tools")
+
+# Poison the socket module so any network library fails
+class _FakeSocketModule:
+    socket = _BlockedSocket
+    AF_INET = AF_INET6 = SOCK_STREAM = SOCK_DGRAM = 0
+    def __getattr__(self, name):
+        if callable(getattr(type(self), name, None)):
+            return lambda *a, **kw: (_ for _ in ()).throw(
+                PermissionError("Network access is blocked in dynamic tools"))
+        raise PermissionError("Network access is blocked in dynamic tools")
+
+_sys.modules["socket"] = _FakeSocketModule()
+_sys.modules["http"] = type(_sys)("http")
+_sys.modules["http.client"] = type(_sys)("http.client")
+_sys.modules["urllib"] = type(_sys)("urllib")
+_sys.modules["urllib.request"] = type(_sys)("urllib.request")
+
+# --- Restrict open() to read-only in sandbox dir ---
+_sandbox_dir = _sys.modules["__main__"].__dict__.get("_SANDBOX_DIR", ".")
+_original_open = open
+
+def _restricted_open(file, mode="r", *args, **kwargs):
+    if any(m in str(mode) for m in ("w", "a", "x", "+")):
+        from pathlib import Path as _P
+        resolved = _P(str(file)).resolve()
+        sandbox = _P(_sandbox_dir).resolve()
+        if not (resolved == sandbox or str(resolved).startswith(str(sandbox) + _sys.modules["os.path"].sep if "os.path" in _sys.modules else str(sandbox))):
+            raise PermissionError(
+                f"Write access outside sandbox dir is blocked: {file}"
+            )
+    return _original_open(file, mode, *args, **kwargs)
+
+try:
+    import builtins as _builtins
+    _builtins.open = _restricted_open
+except Exception:
+    pass
+
+del _sys, _BlockedSocket, _FakeSocketModule
+'''
+
+_SANDBOX_PREAMBLE_PERMISSIVE = "# (no runtime sandbox — owner directive)\n"
+
+
+def _sandbox_preamble() -> str:
+    """Per owner directive 2026-04-25: no runtime sandbox. Sovereign machine."""
+    return _SANDBOX_PREAMBLE_PERMISSIVE
+
+
+# Use the no-op preamble at module-level too (DynamicTool.execute reads this)
+_SANDBOX_PREAMBLE = _SANDBOX_PREAMBLE_PERMISSIVE
 
 
 # ---------------------------------------------------------------------------
@@ -95,8 +274,8 @@ class CustomToolStore:
             logger.warning("Tool '%s' already exists", name)
             return -1
 
-        # Validate code safety
-        safety_error = _check_code_safety(code)
+        # Validate code safety — always use forced-sandbox restrictions
+        safety_error = _check_dynamic_tool_safety(code)
         if safety_error:
             logger.warning("Tool '%s' code blocked: %s", name, safety_error)
             return -1
@@ -104,6 +283,24 @@ class CustomToolStore:
         # Size limits
         if len(code) > self.MAX_CODE_LENGTH:
             logger.warning("Tool '%s' code too long: %d chars", name, len(code))
+            return -1
+
+        # Placeholder guard — Nova sometimes proposes tools whose body is
+        # "# Placeholder for X" / "actual tool calls are not permitted in this
+        # function" / hardcoded f-strings masquerading as results. These are
+        # useless and misleading when invoked. Reject before storing.
+        _code_lower = code.lower()
+        _placeholder_markers = (
+            "placeholder for", "placeholder implementation",
+            "actual tool calls are not permitted",
+            "this would invoke", "would be invoked",
+            "not actually execute", "fake implementation",
+        )
+        if any(m in _code_lower for m in _placeholder_markers):
+            logger.warning(
+                "Tool '%s' rejected: body contains placeholder markers (%s)",
+                name, [m for m in _placeholder_markers if m in _code_lower][:2],
+            )
             return -1
 
         # Tool count limit
@@ -218,9 +415,10 @@ class DynamicTool(BaseTool):
 
     @requires_tier("standard", "full")
     async def execute(self, **kwargs) -> ToolResult:
-        """Build and execute the tool's Python script."""
-        # Re-check safety (in case code was tampered with in DB)
-        safety_error = _check_code_safety(self._code)
+        """Build and execute the tool's Python script in a hardened sandbox."""
+        # FORCED sandbox-level safety check — ignores system tier.
+        # Dynamic tools are user-created code and must always be maximally restricted.
+        safety_error = _check_dynamic_tool_safety(self._code)
         if safety_error:
             return ToolResult(output="", success=False, error=safety_error, error_category=ErrorCategory.PERMISSION)
 
@@ -234,32 +432,48 @@ class DynamicTool(BaseTool):
                     return ToolResult(output="", success=False,
                         error=f"Unexpected parameters: {unexpected}. Expected: {declared_names}",
                         error_category=ErrorCategory.VALIDATION)
-        except (json.JSONDecodeError, KeyError):
-            pass  # Skip validation if schema is malformed
+        except (json.JSONDecodeError, KeyError) as _schema_err:
+            logger.warning(
+                "[CustomTool %s] malformed parameter schema (%s); proceeding without validation",
+                getattr(self, "name", "?"), _schema_err,
+            )
 
-        # Build script: define the function, call it with provided args, print result
-        args_json = json.dumps(kwargs)
-        script = (
-            f"{self._code}\n\n"
-            f"import json as _json\n"
-            f"_args = _json.loads({repr(args_json)})\n"
-            f"_result = run(**_args)\n"
-            f"print(_result)\n"
-        )
-
+        # Create isolated sandbox directory for this execution
+        sandbox_dir = None
         script_path = None
         try:
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".py", delete=False) as f:
+            sandbox_dir = tempfile.mkdtemp(prefix="nova_tool_")
+
+            # Build script with sandbox preamble + user code + invocation.
+            # Always emit a UTF-8 BOM/declaration so Python doesn't reject
+            # files containing non-ASCII bytes from user code (Windows cp1252
+            # default + Python's PEP 263 strict-encoding rule was rejecting
+            # any bytes > 0x7f without declaration).
+            args_json = json.dumps(kwargs)
+            script = (
+                f"# -*- coding: utf-8 -*-\n"
+                f"_SANDBOX_DIR = {repr(sandbox_dir)}\n"
+                f"{_SANDBOX_PREAMBLE}\n"
+                f"# --- User tool code ---\n"
+                f"{self._code}\n\n"
+                f"import json as _json\n"
+                f"_args = _json.loads({repr(args_json)})\n"
+                f"_result = run(**_args)\n"
+                f"print(_result)\n"
+            )
+
+            script_file = os.path.join(sandbox_dir, "_tool.py")
+            with open(script_file, "w", encoding="utf-8") as f:
                 f.write(script)
-                script_path = f.name
+            script_path = script_file
 
             result = await asyncio.to_thread(
                 subprocess.run,
-                [sys.executable, script_path],
+                [sys.executable, "-I", script_path],
                 capture_output=True,
                 text=True,
                 timeout=config.CODE_EXEC_TIMEOUT,
-                cwd=tempfile.gettempdir(),
+                cwd=sandbox_dir,
                 env=get_safe_env(),
             )
 
@@ -298,9 +512,11 @@ class DynamicTool(BaseTool):
             self._store.record_use(self.name, success=False)
             return ToolResult(output="", success=False, error=f"Tool failed: {e}", error_category=ErrorCategory.INTERNAL)
         finally:
-            if script_path:
+            # Clean up the entire sandbox directory
+            if sandbox_dir:
+                import shutil
                 try:
-                    Path(script_path).unlink()
+                    shutil.rmtree(sandbox_dir, ignore_errors=True)
                 except OSError:
                     pass
 

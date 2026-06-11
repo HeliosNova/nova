@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any  # noqa: F401 — re-exported for type annotations
 
@@ -41,6 +41,79 @@ class Monitor:
     last_alert_at: str | None
     last_result: str | None
     created_at: str
+    category: str = "content"  # 'system' (telegram-only, internal health) or
+                               # 'content' (domain/news feeds, all channels)
+    # Event-trigger fields (used by EventTrigger to fire monitors on emit_event())
+    trigger_events: list[str] = field(default_factory=list)  # ["internal:lesson_saved", "webhook:*"]
+    trigger_mode: str = "schedule"  # "schedule" | "event" | "both"
+    # Per-monitor channel override. CSV of channel names: "discord,signal".
+    # When NULL/empty, the category-default routing applies (system→telegram,
+    # content→all). When set, ONLY the listed channels receive alerts.
+    channels: str | None = None
+
+
+# Monitors whose output is about Nova itself (health, meta, internal state).
+# These route to Telegram only — Discord has confused users who don't want
+# internal telemetry.  Matched by monitor name OR by check_type so new
+# health-style monitors are classified correctly by default.
+_SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
+    "DB Size Monitor",
+    "Ollama Latency Monitor",
+    "Skill Quality Monitor",
+    "ChromaDB Integrity",
+    "KG Health Monitor",
+    "Dream Consolidation",
+    "Capability Review",
+    "Quality Eval Harness",
+    "Prompt Optimizer",
+    "System Health",
+    "System Maintenance",
+    "Fine-Tune Check",
+    "Skill Validation",
+    "Lesson Quiz",
+    "Auto-Monitor Detector",
+    "Training Job Watch",
+    "KG Growth Rate",
+    "Ollama Model Loaded",
+    "Goal Derivation",
+    "Cross-Monitor Synthesis",
+    "Auto-Tool Synthesis",
+    "Output Quality Eval",
+})
+
+_SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
+    "system_health",
+    "db_size",
+    "ollama_latency",
+    "skill_quality",
+    "chromadb_integrity",
+    "kg_health",
+    "maintenance",
+    "finetune",
+    "consolidation",
+    "capability_review",
+    "eval",
+    "prompt_analyzer",
+    "quiz",
+    "skill_test",
+    "auto_monitor",
+    "training_job",
+    "kg_growth",
+    "ollama_model",
+    "goal_derivation",
+    "synthesis",
+    "auto_tool",
+    "output_eval",
+})
+
+
+def classify_category(name: str, check_type: str) -> str:
+    """Classify a monitor into 'system' or 'content' for channel routing."""
+    if name in _SYSTEM_CATEGORY_NAMES:
+        return "system"
+    if check_type in _SYSTEM_CATEGORY_CHECK_TYPES:
+        return "system"
+    return "content"
 
 
 @dataclass
@@ -85,15 +158,18 @@ class MonitorStore:
         schedule_seconds: int = 300,
         cooldown_minutes: int = 60,
         notify_condition: str = "on_change",
+        category: str | None = None,
+        enabled: bool = True,
     ) -> int:
         """Create a monitor. Returns its ID, or -1 if name exists."""
+        cat = category or classify_category(name, check_type)
         try:
             cursor = self._db.execute(
                 """INSERT INTO monitors (name, check_type, check_config, schedule_seconds,
-                   cooldown_minutes, notify_condition)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   cooldown_minutes, notify_condition, category, enabled)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
                 (name, check_type, json.dumps(check_config), schedule_seconds,
-                 cooldown_minutes, notify_condition),
+                 cooldown_minutes, notify_condition, cat, 1 if enabled else 0),
             )
             return cursor.lastrowid
         except Exception as e:
@@ -114,7 +190,8 @@ class MonitorStore:
 
     def update(self, monitor_id: int, **kwargs) -> bool:
         allowed = {"name", "check_type", "check_config", "schedule_seconds",
-                    "enabled", "cooldown_minutes", "notify_condition", "last_check_at"}
+                    "enabled", "cooldown_minutes", "notify_condition", "last_check_at",
+                    "category", "channels"}
         updates = {k: v for k, v in kwargs.items() if k in allowed}
         if not updates:
             return False
@@ -188,12 +265,63 @@ class MonitorStore:
         )
         return [self._row_to_result(r) for r in rows]
 
+    @staticmethod
+    def _event_matches(event_type: str, pattern: str) -> bool:
+        """Match an event type against a pattern (exact or wildcard suffix '*')."""
+        if pattern.endswith("*"):
+            return event_type.startswith(pattern[:-1])
+        return event_type == pattern
+
+    def get_event_monitors(self, event_type: str) -> list[Monitor]:
+        """Return enabled monitors whose trigger_events match the given event_type.
+
+        trigger_events is a JSON array stored on the monitor row (may be missing in
+        older schemas — those monitors never match).
+        """
+        # Migration may not have added trigger_events column on all DBs; guard.
+        try:
+            rows = self._db.fetchall(
+                "SELECT * FROM monitors WHERE enabled=1 AND trigger_events IS NOT NULL"
+            )
+        except Exception:
+            return []
+        matched: list[Monitor] = []
+        for row in rows:
+            try:
+                patterns = json.loads(row["trigger_events"]) if row["trigger_events"] else []
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if any(self._event_matches(event_type, p) for p in patterns):
+                matched.append(self._row_to_monitor(row))
+        return matched
+
     def _row_to_monitor(self, row) -> Monitor:
         cfg = row["check_config"]
         try:
             parsed = json.loads(cfg) if isinstance(cfg, str) else cfg
         except (json.JSONDecodeError, TypeError):
             parsed = {}
+        # category column may not exist on databases predating migration 13
+        try:
+            category = row["category"] if "category" in row.keys() else None
+        except (KeyError, TypeError):
+            category = None
+        if not category:
+            category = classify_category(row["name"], row["check_type"])
+        # trigger_events / trigger_mode may not exist on older schemas
+        try:
+            te_raw = row["trigger_events"] if "trigger_events" in row.keys() else None
+            trigger_events = json.loads(te_raw) if te_raw else []
+        except (KeyError, TypeError, json.JSONDecodeError):
+            trigger_events = []
+        try:
+            trigger_mode = row["trigger_mode"] if "trigger_mode" in row.keys() else "schedule"
+        except (KeyError, TypeError):
+            trigger_mode = "schedule"
+        try:
+            channels = row["channels"] if "channels" in row.keys() else None
+        except (KeyError, TypeError):
+            channels = None
         return Monitor(
             id=row["id"],
             name=row["name"],
@@ -207,6 +335,10 @@ class MonitorStore:
             last_alert_at=row["last_alert_at"],
             last_result=row["last_result"],
             created_at=row["created_at"],
+            category=category,
+            trigger_events=trigger_events,
+            trigger_mode=trigger_mode,
+            channels=channels,
         )
 
     def _row_to_result(self, row) -> MonitorResult:
@@ -274,6 +406,50 @@ class MonitorStore:
         return None
 
     # --- Seed monitors ---
+
+    # Core monitors enabled out-of-the-box. Everything else in the seed list
+    # below is created with enabled=False so users can flip on what they
+    # actually want without losing the catalog. Reversible via:
+    #   UPDATE monitors SET enabled=1 WHERE name='Domain Study: AI and ML';
+    _CORE_ENABLED: frozenset[str] = frozenset({
+        # System health (telegram-only)
+        "DB Size Monitor",
+        "Ollama Latency Monitor",
+        "Skill Quality Monitor",
+        "ChromaDB Integrity",
+        "KG Health Monitor",
+        "System Health",
+        "Ollama Model Loaded",
+        "Training Job Watch",
+        "KG Growth Rate",
+        # Meta / self-improvement (telegram-only)
+        "Dream Consolidation",
+        "Capability Review",
+        "Quality Eval Harness",
+        # Content (Discord + others)
+        "Morning Check-in",
+        "World Awareness",
+        "Curiosity Research",
+        # Background loops
+        "System Maintenance",
+        # Phase-0 ambient restoration (low-cost, broad-signal, proven-stable).
+        # Four are internal-state-only (no network). The fifth is a single
+        # cheap web_search against a curated high-signal source. Collectively
+        # they exercise learning, validate skills, propose new monitors, pulse
+        # training readiness, and give ambient "what's happening" awareness.
+        # See _migrate_existing_monitors V4 for the one-shot re-enable on
+        # existing DBs where these were previously culled.
+        "Lesson Quiz",
+        "Skill Validation",
+        "Auto-Monitor Detector",
+        "Fine-Tune Check",
+        "Hacker News Top Stories",
+        # Self-improvement loop closers (added 2026-04-25)
+        "Goal Derivation",
+        "Cross-Monitor Synthesis",
+        "Auto-Tool Synthesis",
+        "Output Quality Eval",
+    })
 
     def seed_defaults(self) -> int:
         """Create default seed monitors, skipping any that already exist by name."""
@@ -438,6 +614,38 @@ class MonitorStore:
                 "notify_condition": "on_change",
             },
             {
+                "name": "Goal Derivation",
+                "check_type": "goal_derivation",
+                "check_config": {},
+                "schedule_seconds": 21600,   # every 6h — gives KAIROS a fresh queue
+                "cooldown_minutes": 300,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Cross-Monitor Synthesis",
+                "check_type": "synthesis",
+                "check_config": {},
+                "schedule_seconds": 43200,   # every 12h — cross-cuts last 36h
+                "cooldown_minutes": 660,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Auto-Tool Synthesis",
+                "check_type": "auto_tool",
+                "check_config": {},
+                "schedule_seconds": 43200,   # every 12h — close persistent gaps
+                "cooldown_minutes": 660,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Output Quality Eval",
+                "check_type": "output_eval",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily — grade a sample of outputs
+                "cooldown_minutes": 1380,
+                "notify_condition": "on_change",
+            },
+            {
                 "name": "Dream Consolidation",
                 "check_type": "consolidation",
                 "check_config": {
@@ -447,6 +655,17 @@ class MonitorStore:
                 "cooldown_minutes": 60,
                 "notify_condition": "on_change",
             },
+            # --- System Health Monitors ---
+            {"name": "DB Size Monitor", "check_type": "db_size", "schedule_seconds": 14400, "cooldown_minutes": 240, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 20}},
+            {"name": "Ollama Latency Monitor", "check_type": "ollama_latency", "schedule_seconds": 7200, "cooldown_minutes": 120, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 50}},
+            {"name": "Skill Quality Monitor", "check_type": "skill_quality", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "ChromaDB Integrity", "check_type": "chromadb_integrity", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
+            {"name": "KG Health Monitor", "check_type": "kg_health", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
+             "check_config": {"threshold_pct": 10}},
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 3 notable AI/ML developments from TODAY or the past 24-48 hours: new model releases, research breakthroughs, benchmark results, or major company announcements. For each: what happened, who did it, the date, and why it matters.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
@@ -530,15 +749,86 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find recent GitHub security advisories and critical CVEs from the past 24-48 hours. Search for \"github security advisory critical\" and \"CVE critical\". Report: CVE ID, affected software, severity, and description. Focus on widely-used packages.\n• CVE 1: [ID] [software] [severity] - [description]\n• CVE 2: ...\n• CVE 3: ..."}},
             {"name": "Government Contract Awards", "check_type": "query", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find major US government contract awards from the past 48 hours. Search for \"government contract award today\" and \"defense contract awarded\". Report: contractor, agency, dollar amount, and purpose. Focus on tech, defense, and AI contracts over $10M.\n• Contract 1: [contractor] [agency] [$amount] - [purpose]\n• Contract 2: ...\n• Contract 3: ..."}},
+            # --- Eval & Prompt Optimization ---
+            {
+                "name": "Quality Eval Harness",
+                "check_type": "eval",
+                "check_config": {},
+                "schedule_seconds": 86400,   # nightly
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Prompt Optimizer",
+                "check_type": "prompt_analyzer",
+                "check_config": {},
+                "schedule_seconds": 90000,   # 25h -- runs after Quality Eval Harness
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            # --- KG Consistency Check (#184) ---
+            # Daily batched cross-check of recent answers vs KG facts.
+            # Surfaces "I told you X but my KG says Y" contradictions for
+            # resolution. Inline per-response checks would tax every chat
+            # call by 200-500ms — nightly batch is the right trade.
+            {
+                "name": "KG Consistency Check",
+                "check_type": "kg_consistency",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily
+                "cooldown_minutes": 1380,    # 23 hours
+                "notify_condition": "on_change",
+            },
+            # --- System health monitors added alongside the cull ---
+            # Detect failed fine-tune runs, unusual KG growth, and
+            # whether the expected Ollama model is actually loaded.
+            {
+                "name": "Training Job Watch",
+                "check_type": "training_job",
+                "check_config": {},
+                "schedule_seconds": 3600,   # hourly
+                "cooldown_minutes": 55,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "KG Growth Rate",
+                "check_type": "kg_growth",
+                "check_config": {"spike_threshold_pct": 25.0},
+                "schedule_seconds": 21600,  # every 6h
+                "cooldown_minutes": 300,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Ollama Model Loaded",
+                "check_type": "ollama_model",
+                "check_config": {},
+                "schedule_seconds": 7200,   # every 2h
+                "cooldown_minutes": 120,
+                "notify_condition": "on_change",
+            },
         ]
 
         count = 0
         for seed in seeds:
             if seed["name"] in existing_names:
                 continue
+            # Only enable core monitors by default. Everything else is seeded
+            # disabled and reversible — user flips on what they want.
+            seed["enabled"] = seed["name"] in self._CORE_ENABLED
             mid = self.create(**seed)
             if mid > 0:
                 count += 1
+
+        # Prompt Optimizer starts disabled -- user must set ENABLE_PROMPT_SELF_MOD=true
+        # and manually enable it. The handler also guards internally at runtime.
+        prompt_opt_row = self._db.fetchone(
+            "SELECT id FROM monitors WHERE name='Prompt Optimizer'"
+        )
+        if prompt_opt_row:
+            self._db.execute(
+                "UPDATE monitors SET enabled=0 WHERE id=? AND enabled=1",
+                (prompt_opt_row["id"],),
+            )
 
         # Migrate existing monitors: update domain study queries + fix check_types
         self._migrate_existing_monitors()
@@ -547,11 +837,21 @@ class MonitorStore:
 
     def _migrate_existing_monitors(self) -> None:
         """Update existing domain study queries to multi-topic format and fix check_types."""
+        # Back-populate category on existing rows where it's empty/NULL.
+        # Safe: classify_category is deterministic from (name, check_type).
+        try:
+            for m in self.list_all():
+                if not m.category:
+                    self.update(m.id, category=classify_category(m.name, m.check_type))
+        except Exception as e:
+            logger.warning("[MonitorStore] Category back-fill failed: %s", e)
+
         # Check if migration already applied
-        _MIGRATION_VERSION = 3
+        _MIGRATION_VERSION = 4
         self._db.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
         row = self._db.fetchone("SELECT value FROM meta WHERE key = 'monitor_migration_version'")
-        if row and int(row["value"]) >= _MIGRATION_VERSION:
+        current_version = int(row["value"]) if row else 0
+        if current_version >= _MIGRATION_VERSION:
             return
 
         # V3: Update ALL query-type monitor prompts for temporal freshness
@@ -621,6 +921,26 @@ class MonitorStore:
                 if not CuriosityQueue._is_valid_topic(topic):
                     self.delete(m.id)
                     logger.info("[MonitorStore] Deleted garbage auto-monitor: %s", m.name)
+
+        # V4: Phase-0 ambient restoration — re-enable 5 low-cost, broad-signal
+        # monitors that were previously culled. Idempotent: only flips rows that
+        # exist AND are currently disabled. User may disable again at will; this
+        # migration will not flip them back on subsequent startups.
+        if current_version < 4:
+            _phase_0_restore = (
+                "Lesson Quiz",
+                "Skill Validation",
+                "Auto-Monitor Detector",
+                "Fine-Tune Check",
+                "Hacker News Top Stories",
+            )
+            for name in _phase_0_restore:
+                m = self.get_by_name(name)
+                if m and not m.enabled:
+                    self.update(m.id, enabled=True)
+                    logger.info(
+                        "[MonitorStore] V4 Phase-0 restore: re-enabled '%s'", name
+                    )
 
         # Mark migration as applied
         self._db.execute(

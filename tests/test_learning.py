@@ -370,7 +370,8 @@ class TestSkillStore:
     def test_create_skill(self, store):
         skill_id = store.create_skill(
             name="crypto_price",
-            trigger_pattern=r"(?i)price of \w+",
+            # Named capture group so {entity} in args_template is a valid binding.
+            trigger_pattern=r"(?i)price of (?P<entity>\w+)",
             steps=[{"tool": "web_search", "args_template": {"query": "current price of {entity}"}}],
             answer_template="The current price is {result}.",
         )
@@ -448,9 +449,10 @@ class TestSkillStore:
         assert "active2" not in names
 
     def test_skill_steps_stored_as_json(self, store):
+        # Test is about JSON round-trip; use {query} (always exempt) and literal values.
         steps = [
-            {"tool": "web_search", "args_template": {"query": "price of {entity}"}},
-            {"tool": "calculator", "args_template": {"expression": "{price} * 100"}},
+            {"tool": "web_search", "args_template": {"query": "{query}"}},
+            {"tool": "calculator", "args_template": {"expression": "42 * 100"}},
         ]
         skill_id = store.create_skill("multi_step", r"test", steps)
         skill = store.get_skill(skill_id)
@@ -705,7 +707,8 @@ class TestReflexionCritiqueFacts:
         assert "user_facts" in params
         assert "kg_facts" in params
 
-    def test_facts_in_prompt(self):
+    @pytest.mark.asyncio
+    async def test_facts_in_prompt(self):
         from app.core.reflexion import critique_response
         captured = []
 
@@ -715,15 +718,14 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.9, "critique": "good"}):
-                asyncio.get_event_loop().run_until_complete(
-                    critique_response("q", "a", [], user_facts="name: X", kg_facts="X works_at Y")
-                )
+                await critique_response("q", "a", [], user_facts="name: X", kg_facts="X works_at Y")
 
         assert captured
         assert "Owner facts" in captured[0]
         assert "Knowledge graph facts" in captured[0]
 
-    def test_empty_facts_no_section(self):
+    @pytest.mark.asyncio
+    async def test_empty_facts_no_section(self):
         from app.core.reflexion import critique_response
         captured = []
 
@@ -733,9 +735,7 @@ class TestReflexionCritiqueFacts:
 
         with patch("app.core.llm.invoke_nothink", side_effect=mock_invoke):
             with patch("app.core.llm.extract_json_object", return_value={"score": 0.8, "critique": "ok"}):
-                asyncio.get_event_loop().run_until_complete(
-                    critique_response("q", "a", [])
-                )
+                await critique_response("q", "a", [])
 
         assert "Owner facts" not in captured[0]
 
@@ -746,9 +746,15 @@ class TestReflexionCritiqueFacts:
 
 class TestShouldUseLLMCritique:
 
-    def test_clean_tools_skip(self):
+    def test_clean_tools_with_long_answer_triggers(self):
+        """Substantial answers (>200 chars) now always get LLM critique even
+        with clean tools — heuristic starts at 1.0 and misses generation artifacts."""
         from app.core.reflexion import should_use_llm_critique
-        assert should_use_llm_critique("general", "x" * 600, [{"tool": "t", "output": "ok"}]) is False
+        assert should_use_llm_critique("general", "x" * 600, [{"tool": "t", "output": "ok"}]) is True
+
+    def test_clean_tools_short_answer_skips(self):
+        from app.core.reflexion import should_use_llm_critique
+        assert should_use_llm_critique("general", "x" * 50, [{"tool": "t", "output": "ok"}]) is False
 
     def test_failed_tools_trigger(self):
         from app.core.reflexion import should_use_llm_critique
@@ -993,8 +999,16 @@ class TestReflexionBrowserScoring:
             {"output": "", "error": "Selector 'button.fake' not found. Available elements:\n..."},
         ]
         score, reason = assess_quality("I clicked the button", tool_results, 5)
-        # Browser selector miss = -0.05, not -0.15
-        assert score >= 0.9, f"Score too low for browser selector miss: {score}"
+        # New scoring model (2026-04-21) starts at 0.6 baseline, not 1.0.
+        # Browser selector miss = -0.05 (mild) vs hard failure = -0.15.
+        # Compare against what a hard failure would produce (0.45).
+        hard_tool_results = [
+            {"output": "", "error": "Database query failed: connection refused"},
+        ]
+        hard_score, _ = assess_quality("I clicked the button", hard_tool_results, 5)
+        assert score > hard_score, (
+            f"Selector miss ({score}) should score higher than hard failure ({hard_score})"
+        )
         assert "selector miss" in reason.lower()
 
     def test_hard_tool_failure_still_penalized(self):
@@ -1144,3 +1158,81 @@ class TestAutoSkillCreation:
                 )
 
         assert len(mock_skills.get_all_skills()) == 0
+
+
+class TestParaphraseRetrieval:
+    """Semantic-first lesson retrieval: paraphrases of the ORIGINAL QUERY must
+    retrieve the lesson. The originating query is embedded into the lesson
+    document (query-to-query similarity is the strongest paraphrase signal);
+    internal eval- markers are never embedded.
+    """
+
+    @pytest.fixture
+    def engine(self, db):
+        return LearningEngine(db)
+
+    def test_searchable_includes_original_query(self, engine):
+        """save_lesson embeds the originating query into the vector document."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        correction = Correction(
+            user_message="No - Meucci invented it",
+            previous_answer="Bell invented the telephone",
+            topic="Telephone inventor",
+            correct_answer="Antonio Meucci invented the telephone",
+            wrong_answer="Alexander Graham Bell",
+            original_query="Who invented the telephone?",
+            lesson_text="The telephone was invented by Antonio Meucci",
+        )
+        engine.save_lesson(correction)
+        assert mock_coll.add.called
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "Who invented the telephone?" in doc
+
+    def test_eval_marker_never_embedded(self, engine):
+        """Internal eval- context markers are not language - keep them out of the doc."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        engine.add_knowledge_lesson(
+            topic="scheduler codename",
+            correct_answer="The scheduler codename is Chronos",
+            lesson_text="codename Chronos",
+            context="eval-mem:mem_x",
+        )
+        assert mock_coll.add.called
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "eval-mem" not in doc
+        assert "Chronos" in doc
+
+    def test_natural_context_is_embedded(self, engine):
+        """Real-language context (e.g. curiosity research origin) joins the doc."""
+        mock_coll = MagicMock()
+        engine._lessons_collection = mock_coll
+        engine.add_knowledge_lesson(
+            topic="pandas groupby",
+            correct_answer="groupby(...).agg() aggregates per group",
+            lesson_text="use agg after groupby",
+            context="researching how to aggregate dataframes by column",
+        )
+        doc = mock_coll.add.call_args.kwargs["documents"][0]
+        assert "aggregate dataframes" in doc
+
+    def test_paraphrased_query_retrieves_lesson(self, engine):
+        """End-to-end: a paraphrase with near-zero keyword overlap still finds
+        the lesson via the vector path."""
+        correction = Correction(
+            user_message="Actually, the telephone was invented by Antonio Meucci",
+            previous_answer="The telephone was invented by Alexander Graham Bell",
+            topic="Telephone inventor",
+            correct_answer="Antonio Meucci invented the telephone",
+            wrong_answer="Alexander Graham Bell",
+            original_query="Who invented the telephone?",
+            lesson_text="The telephone was invented by Antonio Meucci, not Alexander Graham Bell",
+        )
+        engine.save_lesson(correction)
+        # paraphrase: different wording, same meaning
+        lessons = engine.get_relevant_lessons("who originally came up with the telephone")
+        assert any(
+            "Meucci" in (l.correct_answer or "") or "Meucci" in (l.lesson_text or "")
+            for l in lessons
+        ), "paraphrased query failed to retrieve the lesson"

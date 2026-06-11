@@ -102,8 +102,8 @@ class AuditLogHook:
             from app.tools.action_logging import log_action
             output = (result.output or result.error or "")[:500]
             log_action(f"tool:{tool_name}", args, output, result.success)
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning("Tool audit log failed for '%s': %s", tool_name, e)
 
 
 class ToolRegistry:
@@ -118,7 +118,16 @@ class ToolRegistry:
         self._hooks.append(hook)
 
     def register(self, tool: BaseTool) -> None:
-        """Register a tool."""
+        """Register a tool. Rejects non-tool values defensively — extensions
+        and tests have poisoned the registry by assigning strings/dicts here
+        in the past, breaking get_tool_list() across the whole app."""
+        if not hasattr(tool, "name") or not hasattr(tool, "description"):
+            logger.error(
+                "Refusing to register non-tool value (type=%s) — registry "
+                "requires BaseTool-shaped objects with .name and .description",
+                type(tool).__name__,
+            )
+            return
         if tool.name in self._tools:
             logger.warning("Tool '%s' already registered — overwriting", tool.name)
         self._tools[tool.name] = tool
@@ -200,19 +209,22 @@ class ToolRegistry:
                     await hook.post_execute(name, args, result)
                 except Exception:
                     pass
-            # Record trust outcome — only for infrastructure failures, not bad model input
-            # 404/403 from hallucinated URLs is the model's fault, not the tool's
+            # Record trust outcome — only count meaningful outcomes.
+            # NOT_FOUND (empty search, hallucinated URL, missing ID) and VALIDATION
+            # (bad args) are neutral — they reflect model/query quality, not the tool.
+            # Only successes that produced output and infrastructure failures move trust.
             if trust_mgr is not None:
                 try:
-                    is_infrastructure_failure = (
+                    is_neutral = (
                         not result.success
-                        and result.error_category not in (ErrorCategory.NOT_FOUND, ErrorCategory.VALIDATION)
+                        and result.error_category in (ErrorCategory.NOT_FOUND, ErrorCategory.VALIDATION)
                     )
-                    trust_mgr.record_outcome(
-                        name,
-                        result.success or not is_infrastructure_failure,
-                        action=str(args)[:100],
-                    )
+                    if not is_neutral:
+                        trust_mgr.record_outcome(
+                            name,
+                            result.success,
+                            action=str(args)[:100],
+                        )
                 except Exception:
                     pass
             if result.success:
@@ -237,15 +249,28 @@ class ToolRegistry:
         """Generate tool descriptions for the system prompt."""
         lines = []
         for tool in self._tools.values():
-            lines.append(f"{tool.name}({tool.parameters}) — {tool.description}")
+            if not hasattr(tool, "name") or not hasattr(tool, "description"):
+                continue
+            params = getattr(tool, "parameters", "") or ""
+            lines.append(f"{tool.name}({params}) — {tool.description}")
         return "\n".join(lines)
 
     def get_tool_list(self) -> list[dict]:
-        """Get tool metadata for cloud provider tool calling."""
+        """Get tool metadata for cloud provider tool calling.
+
+        Skips entries that aren't proper tool objects — defensive in case an
+        extension or test poisoned the registry with a string/dict.
+        """
         result = []
-        for t in self._tools.values():
+        for key, t in self._tools.items():
+            if not hasattr(t, "name") or not hasattr(t, "description"):
+                logger.warning(
+                    "ToolRegistry: skipping non-tool entry %r (type=%s)",
+                    key, type(t).__name__,
+                )
+                continue
             entry: dict = {"name": t.name, "description": t.description}
-            if t.input_schema is not None:
+            if getattr(t, "input_schema", None) is not None:
                 entry["parameters"] = t.input_schema
             result.append(entry)
         return result

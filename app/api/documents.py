@@ -1,6 +1,7 @@
 """Documents API — ingest, list, delete documents.
 
 POST /api/documents/ingest — Ingest text or URL
+POST /api/documents/upload — Upload a file (txt/md/pdf/docx) for indexing
 GET  /api/documents — List all documents
 GET  /api/documents/{id} — Get document details
 DELETE /api/documents/{id} — Delete a document
@@ -10,8 +11,9 @@ POST /api/documents/search — Search documents
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, HTTPException, Query, UploadFile
 from pydantic import BaseModel, Field
 
 from app.auth import require_auth
@@ -22,6 +24,69 @@ from app.tools.http_fetch import _is_safe_url, _safe_url_with_pinned_ip
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/documents", tags=["documents"], dependencies=[Depends(require_auth)])
+
+# Upload limits — keep small enough not to block the worker, big enough for real PDFs
+MAX_UPLOAD_BYTES = 50 * 1024 * 1024  # 50 MB
+SUPPORTED_UPLOAD_EXTS = {".txt", ".md", ".markdown", ".rst", ".log",
+                          ".pdf", ".docx", ".html", ".htm", ".json", ".csv"}
+
+
+def _extract_text(filename: str, raw: bytes) -> str:
+    """Extract plain text from an uploaded file. Returns "" on unsupported.
+
+    PDFs use pypdf, DOCX uses python-docx, HTML strips tags via stdlib.
+    Plain text formats are decoded directly.
+    """
+    ext = Path(filename).suffix.lower()
+    if ext in {".txt", ".md", ".markdown", ".rst", ".log", ".json", ".csv"}:
+        return raw.decode("utf-8", errors="replace")
+    if ext in {".html", ".htm"}:
+        try:
+            from html.parser import HTMLParser
+
+            class _Stripper(HTMLParser):
+                def __init__(self):
+                    super().__init__()
+                    self.parts: list[str] = []
+
+                def handle_data(self, data):
+                    self.parts.append(data)
+
+            stripper = _Stripper()
+            stripper.feed(raw.decode("utf-8", errors="replace"))
+            return " ".join(s.strip() for s in stripper.parts if s.strip())
+        except Exception as e:
+            logger.warning("HTML extract failed: %s", e)
+            return raw.decode("utf-8", errors="replace")
+    if ext == ".pdf":
+        try:
+            import io
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw))
+            return "\n\n".join((p.extract_text() or "") for p in reader.pages)
+        except ImportError:
+            raise HTTPException(
+                status_code=503,
+                detail="PDF support requires pypdf. Install with: pip install pypdf",
+            )
+        except Exception as e:
+            logger.warning("PDF extract failed: %s", e)
+            raise HTTPException(status_code=400, detail=f"PDF extraction failed: {e}")
+    if ext == ".docx":
+        try:
+            import io
+            from docx import Document as _DocxDocument
+            doc = _DocxDocument(io.BytesIO(raw))
+            return "\n\n".join(p.text for p in doc.paragraphs if p.text.strip())
+        except ImportError:
+            raise HTTPException(
+                status_code=503,
+                detail="DOCX support requires python-docx. Install with: pip install python-docx",
+            )
+        except Exception as e:
+            logger.warning("DOCX extract failed: %s", e)
+            raise HTTPException(status_code=400, detail=f"DOCX extraction failed: {e}")
+    return ""
 
 
 @router.post("/ingest")
@@ -84,6 +149,67 @@ async def ingest_document(request: IngestRequest):
         "document_id": doc_id,
         "chunk_count": chunk_count,
         "title": request.title or source,
+    }
+
+
+@router.post("/upload")
+async def upload_document(
+    file: UploadFile = File(...),
+    title: str = Query(default="", max_length=300),
+):
+    """Upload a file (txt/md/pdf/docx/html) and index it into ChromaDB + FTS5.
+
+    Personal RAG ingestion path. The retriever already supports search; this
+    endpoint adds the missing piece: getting your own files into the index.
+    """
+    svc = get_services()
+    if not svc.retriever:
+        raise HTTPException(status_code=503, detail="Retriever not initialized")
+
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="Missing filename")
+    ext = Path(file.filename).suffix.lower()
+    if ext not in SUPPORTED_UPLOAD_EXTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported file type {ext}. Supported: {sorted(SUPPORTED_UPLOAD_EXTS)}",
+        )
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"File too large ({len(raw)} bytes, max {MAX_UPLOAD_BYTES})",
+        )
+
+    try:
+        text = _extract_text(file.filename, raw)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Text extraction failed for %s", file.filename)
+        raise HTTPException(status_code=400, detail=f"Text extraction failed: {e}")
+
+    text = (text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="No text could be extracted from this file")
+
+    doc_title = (title or file.filename).strip()[:300]
+    doc_id, chunk_count = await svc.retriever.ingest(
+        text,
+        source=f"upload:{file.filename}",
+        title=doc_title,
+    )
+
+    return {
+        "status": "ok",
+        "document_id": doc_id,
+        "chunk_count": chunk_count,
+        "title": doc_title,
+        "filename": file.filename,
+        "bytes": len(raw),
     }
 
 

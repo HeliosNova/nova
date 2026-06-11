@@ -60,6 +60,23 @@ class MonitorUpdate(BaseModel):
     cooldown_minutes: int | None = Field(None, ge=0, le=10_080)
     notify_condition: str | None = Field(None, max_length=50)
     enabled: bool | None = None
+    # CSV of channel names: "discord,signal" → only those channels.
+    # Empty string clears override (falls back to category default).
+    channels: str | None = Field(None, max_length=200)
+
+    @field_validator("channels")
+    @classmethod
+    def validate_channels(cls, v: str | None) -> str | None:
+        if v is None:
+            return v
+        valid = {"discord", "telegram", "whatsapp", "signal"}
+        if v.strip() == "":
+            return ""  # explicit empty = clear override
+        parts = [p.strip().lower() for p in v.split(",") if p.strip()]
+        bad = [p for p in parts if p not in valid]
+        if bad:
+            raise ValueError(f"Unknown channel(s) {bad}. Valid: {sorted(valid)}")
+        return ",".join(parts)
 
     @field_validator("name")
     @classmethod
@@ -150,6 +167,8 @@ def _monitor_to_dict(m) -> dict:
         "last_alert_at": m.last_alert_at,
         "last_result": m.last_result,
         "created_at": m.created_at,
+        "category": getattr(m, "category", "content"),
+        "channels": getattr(m, "channels", None),
     }
 
 
@@ -290,6 +309,93 @@ async def delete_monitor(monitor_id: int):
     return {"deleted": True, "id": monitor_id, "name": monitor.name}
 
 
+# Convenience endpoints for per-monitor channel routing
+@router.get("/monitors/{monitor_id}/channels")
+async def get_monitor_channels(monitor_id: int):
+    store = _get_store()
+    monitor = store.get(monitor_id)
+    if not monitor:
+        raise HTTPException(status_code=404, detail="Monitor not found")
+    return {
+        "id": monitor_id,
+        "name": monitor.name,
+        "category": monitor.category,
+        "channels": monitor.channels,  # None or CSV
+        "effective": (
+            [c.strip() for c in monitor.channels.split(",") if c.strip()]
+            if monitor.channels
+            else (["telegram"] if monitor.category == "system" else ["discord", "telegram", "whatsapp", "signal"])
+        ),
+    }
+
+
+@router.put("/monitors/{monitor_id}/channels")
+async def set_monitor_channels(monitor_id: int, body: MonitorUpdate):
+    """Set per-monitor channel routing. Body: {"channels": "discord,signal"} or empty string to clear."""
+    if body.channels is None:
+        raise HTTPException(status_code=400, detail="Body must include 'channels' field")
+    store = _get_store()
+    monitor = store.get(monitor_id)
+    if not monitor:
+        raise HTTPException(status_code=404, detail="Monitor not found")
+    # Empty string → clear override (revert to category default)
+    new_channels = body.channels if body.channels else None
+    store.update(monitor_id, channels=new_channels)
+    refreshed = store.get(monitor_id)
+    return _monitor_to_dict(refreshed)
+
+
+@router.put("/monitors/channels/bulk")
+async def bulk_set_channels(body: dict):
+    """Set channels for many monitors at once.
+
+    Body: {"updates": [{"id": 5, "channels": "signal"}, {"id": 35, "channels": "discord"}]}
+    Or by-pattern: {"name_match": "Domain Study:", "channels": "discord"}
+    """
+    store = _get_store()
+    valid = {"discord", "telegram", "whatsapp", "signal"}
+    updated = []
+    if "updates" in body:
+        for u in body["updates"]:
+            mid = u.get("id")
+            ch = u.get("channels")
+            if mid is None or ch is None:
+                continue
+            ch = ch.strip()
+            if ch:
+                parts = [p.strip().lower() for p in ch.split(",") if p.strip()]
+                if any(p not in valid for p in parts):
+                    raise HTTPException(status_code=422, detail=f"Invalid channel in: {ch}")
+                ch = ",".join(parts)
+            else:
+                ch = None
+            if store.get(mid):
+                store.update(mid, channels=ch)
+                updated.append(mid)
+    elif "name_match" in body and "channels" in body:
+        ch = body["channels"].strip()
+        if ch:
+            parts = [p.strip().lower() for p in ch.split(",") if p.strip()]
+            if any(p not in valid for p in parts):
+                raise HTTPException(status_code=422, detail=f"Invalid channel in: {ch}")
+            ch = ",".join(parts)
+        else:
+            ch = None
+        pattern = body["name_match"]
+        from app.database import get_db
+        db = get_db()
+        rows = db.fetchall(
+            "SELECT id FROM monitors WHERE name LIKE ?",
+            (f"%{pattern}%",),
+        )
+        for row in rows:
+            store.update(row["id"], channels=ch)
+            updated.append(row["id"])
+    else:
+        raise HTTPException(status_code=400, detail="Body must have 'updates' or 'name_match'+'channels'")
+    return {"updated_count": len(updated), "ids": updated}
+
+
 @router.post("/monitors/{monitor_id}/trigger")
 async def trigger_monitor(monitor_id: int):
     store = _get_store()
@@ -299,6 +405,40 @@ async def trigger_monitor(monitor_id: int):
     heartbeat = _get_heartbeat()
     result = await heartbeat.trigger_monitor(monitor_id)
     return result
+
+
+@router.post("/eval/run")
+async def run_eval_categories(categories: str = Query("memory-learning,kg-retrieval")):
+    """Run selected eval categories on demand, in-process (full service fidelity).
+
+    Faster than triggering the full Quality Eval Harness monitor when you only
+    need the causal-fix categories. Returns per-category causal_fix_rate plus
+    per-task before/after correctness.
+    """
+    from app.monitors.eval_harness import EvalHarness
+    cats = {c.strip() for c in categories.split(",") if c.strip()}
+    harness = EvalHarness()
+    tasks = [t for t in harness.load_suite() if t.category in cats]
+    if not tasks:
+        raise HTTPException(status_code=400, detail=f"No tasks for categories {cats}")
+    report = await harness.run_all(tasks)
+    return {
+        "categories": {
+            cat: {
+                "pass_rate": cm.pass_rate,
+                "causal_fix_rate": cm.memory_causal_fix_rate,
+                "testable": cm.memory_testable,
+                "total": cm.total,
+            }
+            for cat, cm in (report.categories or {}).items()
+        },
+        "tasks": [
+            {"id": r.task_id, "passed": r.passed,
+             "before_correct": r.memory_before_correct,
+             "after_correct": r.memory_after_correct}
+            for r in report.task_results
+        ],
+    }
 
 
 class InstructionCreate(BaseModel):

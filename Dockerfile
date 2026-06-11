@@ -27,7 +27,19 @@ RUN playwright install chromium
 # Application code
 COPY app/ app/
 COPY tests/ tests/
+COPY evals/ evals/
 COPY pytest.ini .
+# Phase-0: include the bootstrap verification script so it can be run via
+# `docker exec nova-app python -m scripts.verify_phase_0`. We copy a single
+# file rather than the whole scripts/ directory because most other scripts
+# are heavyweight training pipelines that don't belong in the runtime image.
+COPY scripts/__init__.py scripts/__init__.py
+COPY scripts/verify_phase_0.py scripts/verify_phase_0.py
+# GRPO trainer — small, no torch import at module load. Lets us run
+# `docker exec nova-app python -m scripts.grpo_train --dry-run` without
+# staging the file via /data each time. The actual training step still
+# requires the full finetune venv outside the container.
+COPY scripts/grpo_train.py scripts/grpo_train.py
 
 # Data directory + non-root user
 RUN mkdir -p /data /data/screenshots /data/mcp && \

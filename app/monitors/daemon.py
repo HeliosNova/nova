@@ -27,6 +27,53 @@ BUDGET_FULL = "full"       # Dream mode, heavy research, bulk operations
 DAEMON_TICK = 300  # 5 minutes
 
 
+def _snapshot_goal_metric(db, ctx: dict) -> tuple[int | None, str]:
+    """Read the underlying metric a goal is supposed to fix.
+
+    Returns (count_or_none, human_label). count=None means we don't know how
+    to verify this goal kind — caller will fall back to the old behavior
+    (any non-empty output = success).
+
+    Verifiable goal kinds today:
+      - capability_gap_cluster: count unreviewed capability_gaps for the keyword
+      - skill_repair: count of consecutive_failures on the named skill
+      - tool_trust_regression: trust score (negative = bad) for the tool
+      - recurring_curiosity: count of pending curiosity items for the topic
+    """
+    if not isinstance(ctx, dict):
+        return None, ""
+    src = ctx.get("source") or ""
+    try:
+        if src == "capability_gap_cluster":
+            kw = (ctx.get("keyword") or "").strip().lower()
+            if not kw:
+                return None, ""
+            row = db.fetchone(
+                "SELECT COUNT(*) AS c FROM capability_gaps "
+                "WHERE LOWER(query) LIKE ? AND reviewed = 0",
+                (f"%{kw}%",),
+            )
+            return (int(row["c"]) if row else 0), f"unreviewed capability_gaps matching '{kw}'"
+        if src == "skill_repair":
+            sn = ctx.get("skill_name") or ""
+            row = db.fetchone(
+                "SELECT consecutive_failures FROM skills WHERE name = ?", (sn,)
+            )
+            return (int(row["consecutive_failures"]) if row else 0), f"consecutive_failures for skill '{sn}'"
+        if src == "recurring_curiosity":
+            topic = ctx.get("topic") or ""
+            row = db.fetchone(
+                "SELECT COUNT(*) AS c FROM curiosity_queue "
+                "WHERE topic = ? AND status = 'pending'",
+                (topic,),
+            )
+            return (int(row["c"]) if row else 0), f"pending curiosity items for '{topic[:40]}'"
+        # tool_trust_regression: hard to verify quickly (trust scores update lazily) — skip.
+    except Exception as e:
+        logger.debug("[Goals] _snapshot_goal_metric failed: %s", e)
+    return None, ""
+
+
 class DaemonOrchestrator:
     """Proactive daemon that decides what to do on each tick."""
 
@@ -136,6 +183,12 @@ class DaemonOrchestrator:
         )
         critical_curiosity = row["c"] if row else 0
 
+        # Pending goals (will-module)
+        row = self._db.fetchone(
+            "SELECT COUNT(*) as c FROM goals WHERE status='pending'"
+        )
+        pending_goals = row["c"] if row else 0
+
         # Unsent alerts (events with high priority)
         alerts_unsent = 0
         if pending_events:
@@ -152,6 +205,7 @@ class DaemonOrchestrator:
             "recent_log": recent_log,
             "recent_failures": recent_failures,
             "critical_curiosity": critical_curiosity,
+            "pending_goals": pending_goals,
             "now": now.isoformat(),
         }
 
@@ -200,6 +254,10 @@ class DaemonOrchestrator:
         if context["pending_events"] > 0 and budget != BUDGET_BRIEF:
             return {"action": "process_events"}
 
+        # Pursue next goal — only when idle with budget for it (avoid competing with user).
+        if budget == BUDGET_FULL and context.get("pending_goals", 0) > 0:
+            return {"action": "pursue_goal"}
+
         # Monitor degradation — log observation
         if context["recent_failures"] >= 3:
             return {
@@ -228,6 +286,9 @@ class DaemonOrchestrator:
 
         elif action == "process_events":
             await self._process_events()
+
+        elif action == "pursue_goal":
+            await self._pursue_goal()
 
         elif action == "observe":
             self._log("observation", decision.get("content", ""), "daemon")
@@ -297,6 +358,71 @@ class DaemonOrchestrator:
                     row["event_type"], row["id"],
                 )
                 self._log("error", f"Alert delivery failed: {row['event_type']}", "daemon")
+
+    async def _pursue_goal(self):
+        """Pick the next pending goal and execute it via the will-module."""
+        from app.core.goals import GoalStore, execute_goal
+
+        store = GoalStore(self._db)
+        goal = store.get_next_pending()
+        if not goal:
+            return
+
+        self._log("decision", f"Pursuing goal #{goal.id}: {goal.goal[:120]}", "daemon")
+        store.mark_in_progress(goal.id)
+
+        # Snapshot the underlying metric so we can verify the goal actually
+        # moved the needle — not just produced text. Without this, every goal
+        # was being marked "completed" because Nova returned >40 chars,
+        # regardless of whether the gap/skill/tool problem was actually fixed.
+        ctx = goal.context if isinstance(goal.context, dict) else {}
+        before_metric, metric_query = _snapshot_goal_metric(self._db, ctx)
+
+        try:
+            ok, output = await execute_goal(goal)
+        except Exception as e:
+            store.mark_failed(goal.id, f"unhandled: {e}")
+            self._log("error", f"Goal #{goal.id} crashed: {e}", "daemon")
+            return
+
+        store.attach_output(goal.id, output)
+
+        if not ok:
+            store.mark_failed(goal.id, output[:200])
+            self._log(
+                "goal_execution",
+                f"Goal #{goal.id} failed: {output[:400]}",
+                "will_module",
+            )
+            return
+
+        # Verify the action actually moved the underlying metric. If the goal
+        # was about a capability gap and the gap count didn't decrease, this
+        # was cosmetic — mark failed so it doesn't pollute the "completed"
+        # bucket and so the deriver can re-attempt with a better strategy.
+        after_metric, _ = _snapshot_goal_metric(self._db, ctx)
+        if before_metric is not None and after_metric is not None and after_metric >= before_metric:
+            reason = (
+                f"verification: {metric_query} did not improve "
+                f"(before={before_metric} after={after_metric})"
+            )
+            store.mark_failed(goal.id, reason)
+            self._log(
+                "goal_execution",
+                f"Goal #{goal.id} produced output but no metric improvement. {reason}",
+                "will_module",
+            )
+            return
+
+        store.mark_completed(goal.id)
+        improvement = ""
+        if before_metric is not None and after_metric is not None:
+            improvement = f" (metric: {before_metric} → {after_metric})"
+        self._log(
+            "goal_execution",
+            f"Goal #{goal.id} completed{improvement}. Output: {output[:300]}",
+            "will_module",
+        )
 
     async def _research_curiosity(self):
         """Research top critical curiosity items."""

@@ -116,6 +116,50 @@ async def get_daemon_log(hours: int = 24, category: str | None = None, limit: in
 # Dream trigger
 # ---------------------------------------------------------------------------
 
+@router.post("/daemon/pursue-goal")
+async def trigger_pursue_goal():
+    """Manually trigger the will-module: pursue next pending goal."""
+    from app.core.brain import get_services
+    from app.core.goals import GoalStore, execute_goal
+    from app.monitors.daemon import DaemonOrchestrator
+
+    svc = get_services()
+    if not svc.monitor_store:
+        raise HTTPException(503, "Monitor store not initialized")
+
+    db = svc.monitor_store.db
+    store = GoalStore(db)
+    goal = store.get_next_pending()
+    if not goal:
+        return {"status": "skipped", "reason": "no pending goals"}
+
+    # Use the daemon's own _pursue_goal so we exercise the real code path
+    # (logging categories, failure handling, etc.).
+    daemon = DaemonOrchestrator(db)
+    await daemon._pursue_goal()
+
+    # Return the updated goal + last log entry + full output from context
+    updated = store.get(goal.id)
+    last_log = db.fetchone(
+        "SELECT category, content, created_at FROM daemon_log "
+        "WHERE source='will_module' ORDER BY id DESC LIMIT 1"
+    )
+    full_output = ""
+    if updated and updated.context:
+        full_output = updated.context.get("last_output", "")
+    return {
+        "status": "executed",
+        "goal_id": goal.id,
+        "final_status": updated.status if updated else None,
+        "full_output": full_output,
+        "log": {
+            "category": last_log["category"],
+            "content": last_log["content"],
+            "created_at": last_log["created_at"],
+        } if last_log else None,
+    }
+
+
 @router.post("/daemon/dream")
 async def trigger_dream(req: DreamTrigger | None = None):
     """Manually trigger a dream consolidation cycle."""

@@ -166,11 +166,14 @@ class WhatsAppBot:
             logger.error("[WhatsApp] Send failed: %s", e)
 
     async def send_alert(self, message: str) -> None:
-        """Send a message to the default chat."""
+        """Send a message to the default chat. Converts Discord markdown to
+        WhatsApp's variant (*bold* uses single asterisk; bare URLs auto-link)."""
         if not self.default_chat_id:
             return
         try:
-            for chunk in self._split_message(message):
+            from app.channels.format_for_channel import to_whatsapp
+            wa_message = to_whatsapp(message)
+            for chunk in self._split_message(wa_message):
                 await self._send_message(self.default_chat_id, chunk)
         except Exception as e:
             logger.error("[WhatsApp] Alert send failed: %s", e)

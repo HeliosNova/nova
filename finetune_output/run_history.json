@@ -21,5 +21,21 @@
     "total_pairs": 356,
     "epochs": 3,
     "error": "Command '['C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\finetune_env\\\\Scripts\\\\python.exe', 'C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\scripts\\\\finetune.py', '--data', 'C:\\\\Users\\\\sysadmin\\\\Desktop\\\\Helios Project\\\\nova_\\\\training_data.jsonl', '--model', 'Qwen/Qwen3.5-9B', '--epochs', '3']' timed out after 3600 seconds"
+  },
+  {
+    "started_at": "2026-04-20T08:28:04.599883+00:00",
+    "status": "convert_failed",
+    "base_model": "Qwen/Qwen3.5-9B",
+    "ft_model": "nova-ft-v9",
+    "total_pairs": 545,
+    "epochs": 3
+  },
+  {
+    "started_at": "2026-04-21T07:19:49.145758+00:00",
+    "status": "convert_failed",
+    "base_model": "Qwen/Qwen3.5-9B",
+    "ft_model": "nova-ft-v10",
+    "total_pairs": 649,
+    "epochs": 3
   }
 ]

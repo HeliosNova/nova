@@ -24,28 +24,83 @@ import httpx
 BASE = "http://localhost:8000"
 TIMEOUT = 120.0  # seconds per query
 
+# Auth: production sets NOVA_API_KEY; pass it via env when running the audit.
+API_KEY = os.environ.get("NOVA_API_KEY", "")
+HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 # Track all results
 results = []
 category_scores = {}
+latencies = []  # per-query wall time, completed AND timed-out runs
 
 
 def query_nova(query: str, conv_id: str = None) -> dict:
-    """Send a query to Nova and return the full response."""
+    """Send a query to Nova and return the full response.
+
+    A timeout is reported as timed_out=True, NOT as a wrong answer — the
+    scorecard excludes it from correctness and counts it separately.
+    Latency is attached to every response as latency_s.
+    """
     payload = {"query": query}
     if conv_id:
         payload["conversation_id"] = conv_id
+    start = time.time()
     try:
-        r = httpx.post(f"{BASE}/api/chat", json=payload, timeout=TIMEOUT)
+        r = httpx.post(f"{BASE}/api/chat", json=payload, timeout=TIMEOUT, headers=HEADERS)
         r.raise_for_status()
-        return r.json()
+        data = r.json()
+        data["latency_s"] = round(time.time() - start, 2)
+        return data
+    except httpx.TimeoutException:
+        return {
+            "answer": "",
+            "error": True,
+            "timed_out": True,
+            "latency_s": round(time.time() - start, 2),
+        }
     except Exception as e:
-        return {"answer": f"[ERROR: {e}]", "error": True}
+        return {"answer": f"[ERROR: {e}]", "error": True,
+                "latency_s": round(time.time() - start, 2)}
 
 
 def grade(category: str, test_id: str, query: str, response: dict,
           checks: list[tuple[str, bool]], max_score: int = 10):
-    """Grade a response against check criteria. Each check is (description, passed)."""
+    """Grade a response against check criteria. Each check is (description, passed).
+
+    A timed-out response is outcome TIMEOUT: its checks are not counted as
+    wrong (the budget ran out before correctness could be proven). It is
+    tracked separately so latency problems can't masquerade as quality ones.
+    """
     answer = response.get("answer", "")
+    timed_out = bool(response.get("timed_out"))
+    latency_s = response.get("latency_s")
+    if latency_s is not None:
+        latencies.append(latency_s)
+
+    if category not in category_scores:
+        category_scores[category] = {"earned": 0, "possible": 0, "tests": 0, "timeouts": 0}
+
+    if timed_out:
+        result = {
+            "category": category,
+            "test_id": test_id,
+            "query": query[:80],
+            "score": 0,
+            "max": max_score,
+            "letter": "T",
+            "passed": 0,
+            "total": len(checks),
+            "timed_out": True,
+            "latency_s": latency_s,
+            "checks": [(desc, "NOT-RUN") for desc, _ in checks],
+            "answer_preview": "[timeout]",
+        }
+        results.append(result)
+        print(f"  [T] {test_id}: TIMEOUT after {latency_s}s — excluded from score")
+        category_scores[category]["timeouts"] += 1
+        category_scores[category]["tests"] += 1
+        return result
+
     passed = sum(1 for _, p in checks if p)
     total = len(checks)
     score = round((passed / total) * max_score) if total > 0 else 0
@@ -72,6 +127,8 @@ def grade(category: str, test_id: str, query: str, response: dict,
         "letter": letter,
         "passed": passed,
         "total": total,
+        "timed_out": False,
+        "latency_s": latency_s,
         "checks": [(desc, "PASS" if p else "FAIL") for desc, p in checks],
         "answer_preview": answer[:200] if answer else "[empty]",
     }
@@ -87,8 +144,6 @@ def grade(category: str, test_id: str, query: str, response: dict,
         print(f"      Answer: {answer[:150]}...")
 
     # Accumulate category scores
-    if category not in category_scores:
-        category_scores[category] = {"earned": 0, "possible": 0, "tests": 0}
     category_scores[category]["earned"] += passed
     category_scores[category]["possible"] += total
     category_scores[category]["tests"] += 1
@@ -250,7 +305,7 @@ def test_cat3_user_memory():
     # 3.4 — New fact extraction test
     r = query_nova("I just got a dog named Pixel")
     time.sleep(3)  # Give fact extraction time
-    facts_r = httpx.get(f"{BASE}/api/chat/facts").json()
+    facts_r = httpx.get(f"{BASE}/api/chat/facts", headers=HEADERS).json()
     fact_keys = [f["key"] for f in facts_r]
     grade("3_Memory", "3.4", "Extract new fact (dog name)", r, [
         ("No error", no_error(r)),
@@ -505,7 +560,7 @@ def main():
 
     # Verify Nova is up
     try:
-        health = httpx.get(f"{BASE}/api/health", timeout=5).json()
+        health = httpx.get(f"{BASE}/api/health", timeout=30).json()
         print(f"\n   Status: {health.get('status', 'unknown')}")
         print(f"   Model: {health.get('model', 'unknown')}")
         print(f"   Provider: {health.get('provider', 'unknown')}")
@@ -539,11 +594,15 @@ def main():
 
     total_earned = 0
     total_possible = 0
+    total_timeouts = 0
     category_grades = {}
 
     for cat, data in sorted(category_scores.items()):
         pct = data["earned"] / data["possible"] if data["possible"] > 0 else 0
-        if pct >= 0.9:
+        n_timeouts = data.get("timeouts", 0)
+        if data["possible"] == 0 and n_timeouts > 0:
+            letter = "T"  # every test in the category timed out — no correctness signal
+        elif pct >= 0.9:
             letter = "A"
         elif pct >= 0.8:
             letter = "B"
@@ -557,8 +616,10 @@ def main():
         category_grades[cat] = letter
         total_earned += data["earned"]
         total_possible += data["possible"]
+        total_timeouts += n_timeouts
 
-        print(f"   {cat:<25s}  {data['earned']:>2}/{data['possible']:<2}  ({pct:.0%})  {letter}   [{data['tests']} tests]")
+        timeout_note = f"  {n_timeouts} timeout" if n_timeouts else ""
+        print(f"   {cat:<25s}  {data['earned']:>2}/{data['possible']:<2}  ({pct:.0%})  {letter}   [{data['tests']} tests]{timeout_note}")
 
     print("   " + "-" * 55)
     overall_pct = total_earned / total_possible if total_possible > 0 else 0
@@ -576,11 +637,19 @@ def main():
     overall_score = round(overall_pct * 10, 1)
 
     print(f"   {'OVERALL':<25s}  {total_earned:>2}/{total_possible:<2}  ({overall_pct:.0%})  {overall_letter}")
-    print(f"\n   Final Grade: {overall_letter} ({overall_score}/10)")
-    print(f"   Tests run: {len(results)}")
+    print(f"\n   Final Grade: {overall_letter} ({overall_score}/10) — correctness over completed checks")
+    print(f"   Tests run: {len(results)}  (timeouts: {total_timeouts}, excluded from grade)")
+
+    # Latency is its own metric — never folded into correctness
+    lat_mean = lat_p95 = None
+    if latencies:
+        _sorted = sorted(latencies)
+        lat_mean = round(sum(_sorted) / len(_sorted), 1)
+        lat_p95 = _sorted[min(len(_sorted) - 1, int(0.95 * len(_sorted)))]
+        print(f"   Latency: mean {lat_mean}s, p95 {lat_p95}s over {len(latencies)} queries")
     print(f"   Time: {elapsed:.1f}s")
 
-    # Failures summary
+    # Failures summary (real failures only — timeouts listed separately)
     failures = [r for r in results if r["letter"] in ("D", "F")]
     if failures:
         print(f"\n   FAILURES ({len(failures)}):")
@@ -591,13 +660,29 @@ def main():
                     print(f"       ✗ {desc}")
             print(f"       Answer: {f['answer_preview'][:120]}...")
 
+    timeouts_list = [r for r in results if r.get("timed_out")]
+    if timeouts_list:
+        print(f"\n   TIMEOUTS ({len(timeouts_list)}) — fix latency, then re-grade:")
+        for t in timeouts_list:
+            print(f"     • {t['test_id']}: {t['query']} ({t['latency_s']}s)")
+
     # Save full results
     report = {
         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "overall_score": overall_score,
         "overall_grade": overall_letter,
         "total_checks": f"{total_earned}/{total_possible}",
-        "categories": {cat: {"score": f"{d['earned']}/{d['possible']}", "grade": category_grades[cat]} for cat, d in category_scores.items()},
+        "timeouts": total_timeouts,
+        "latency_mean_s": lat_mean,
+        "latency_p95_s": lat_p95,
+        "categories": {
+            cat: {
+                "score": f"{d['earned']}/{d['possible']}",
+                "grade": category_grades[cat],
+                "timeouts": d.get("timeouts", 0),
+            }
+            for cat, d in category_scores.items()
+        },
         "tests": results,
     }
     with open("tests/live_audit_results.json", "w") as f:

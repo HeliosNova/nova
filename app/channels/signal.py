@@ -218,11 +218,14 @@ class SignalBot:
             logger.error("[Signal] Send failed to %s: %s", recipient, e)
 
     async def send_alert(self, message: str) -> None:
-        """Send a message to the default recipient."""
+        """Send a message to the default recipient. Strips Discord markdown
+        since Signal doesn't reliably render it."""
         if not self.default_recipient or not self._client:
             return
         try:
-            for chunk in self._split_message(message):
+            from app.channels.format_for_channel import to_signal
+            sig_message = to_signal(message)
+            for chunk in self._split_message(sig_message):
                 await self._send_message(self.default_recipient, chunk)
         except Exception as e:
             logger.error("[Signal] Alert send failed: %s", e)

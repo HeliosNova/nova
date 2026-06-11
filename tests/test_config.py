@@ -24,7 +24,9 @@ class TestConfigDefaults:
     def test_default_max_history_messages(self):
         from app.config import Config
         cfg = Config()
-        assert cfg.MAX_HISTORY_MESSAGES == 20
+        # Default bumped from 20 → 50 in earlier session for longer
+        # conversation continuity. Recent-message keep is still 12.
+        assert cfg.MAX_HISTORY_MESSAGES == 50
 
     def test_default_booleans(self):
         from app.config import Config
@@ -113,13 +115,12 @@ class TestConfigValidate:
         warnings = cfg.validate()
         assert warnings == []
 
-    def test_cloud_provider_without_key(self):
+    def test_non_ollama_provider_warns(self):
         from app.config import Config
         cfg = Config()
         object.__setattr__(cfg, "LLM_PROVIDER", "openai")
-        object.__setattr__(cfg, "OPENAI_API_KEY", "")
         warnings = cfg.validate()
-        assert any("OPENAI_API_KEY" in w for w in warnings)
+        assert any("ollama" in w.lower() for w in warnings)
 
     def test_invalid_system_access_level(self):
         from app.config import Config
@@ -179,30 +180,30 @@ class TestConfigRedaction:
     def test_to_dict_redacts_sensitive(self):
         from app.config import Config
         cfg = Config()
-        object.__setattr__(cfg, "OPENAI_API_KEY", "sk-secret-key-12345")
+        object.__setattr__(cfg, "DISCORD_TOKEN", "secret-token-12345")
         d = cfg.to_dict(redact_sensitive=True)
-        assert d["OPENAI_API_KEY"] == "***"
+        assert d["DISCORD_TOKEN"] == "***"
 
     def test_to_dict_no_redact(self):
         from app.config import Config
         cfg = Config()
-        object.__setattr__(cfg, "OPENAI_API_KEY", "sk-secret-key-12345")
+        object.__setattr__(cfg, "DISCORD_TOKEN", "secret-token-12345")
         d = cfg.to_dict(redact_sensitive=False)
-        assert d["OPENAI_API_KEY"] == "sk-secret-key-12345"
+        assert d["DISCORD_TOKEN"] == "secret-token-12345"
 
     def test_empty_sensitive_field_not_redacted(self):
         from app.config import Config
         cfg = Config()
-        object.__setattr__(cfg, "OPENAI_API_KEY", "")
+        object.__setattr__(cfg, "DISCORD_TOKEN", "")
         d = cfg.to_dict(redact_sensitive=True)
-        assert d["OPENAI_API_KEY"] == ""
+        assert d["DISCORD_TOKEN"] == ""
 
     def test_repr_redacts_sensitive(self):
         from app.config import Config
         cfg = Config()
-        object.__setattr__(cfg, "OPENAI_API_KEY", "sk-secret-key-12345")
+        object.__setattr__(cfg, "DISCORD_TOKEN", "secret-token-12345")
         r = repr(cfg)
-        assert "sk-secret-key-12345" not in r
+        assert "secret-token-12345" not in r
         assert "***" in r
 
 

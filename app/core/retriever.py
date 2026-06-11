@@ -1,7 +1,15 @@
 """Hybrid retrieval — ChromaDB vector search + SQLite FTS5 BM25 + RRF fusion.
 
-Simple and effective: two signals, reciprocal rank fusion, done.
-No reranker until we have evidence retrieval quality is bad.
+Pipeline:
+  vector_search (top_k*2) ──┐
+                             ├─ RRF(k=60) → merged candidates
+  fts5_search  (top_k*2) ──┘
+                             │
+                  _score_rerank() — composite (0.55·vec + 0.30·bm25 + 0.15·cov)
+                             │     (skipped when ENABLE_RERANKER=false)
+                     entity_filter() → lexical guard
+                             │
+                        top_k Chunks
 """
 
 from __future__ import annotations
@@ -24,9 +32,11 @@ class Chunk:
     chunk_id: str
     document_id: str
     content: str
-    score: float = 0.0
+    score: float = 0.0        # composite score (post-rerank) or RRF score
     source: str = ""
     title: str = ""
+    vector_score: float = 0.0  # raw ChromaDB cosine similarity (0-1)
+    bm25_score: float = 0.0    # raw FTS5 BM25 normalized score (0-1)
 
 
 class Retriever:
@@ -46,11 +56,13 @@ class Retriever:
             if self._collection is None:
                 try:
                     import chromadb
+                    from .embedding import get_embedding_function
                     self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                    self._collection = self._chroma_client.get_or_create_collection(
-                        name="documents",
-                        metadata={"hnsw:space": "cosine"},
-                    )
+                    _kw = {"name": "documents", "metadata": {"hnsw:space": "cosine"}}
+                    _ef = get_embedding_function()
+                    if _ef is not None:
+                        _kw["embedding_function"] = _ef
+                    self._collection = self._chroma_client.get_or_create_collection(**_kw)
                 except Exception as e:
                     logger.error("Failed to init ChromaDB: %s", e)
                     raise
@@ -87,7 +99,14 @@ class Retriever:
             return []
 
         # Reciprocal Rank Fusion
-        fused = _reciprocal_rank_fusion(vector_results, fts_results, k=config.RRF_K)
+        fused = _reciprocal_rank_fusion(vector_results, fts_results, k=config.RETRIEVAL_RRF_K)
+
+        # Rerank: composite score (vec + bm25 + coverage) when enabled
+        if config.ENABLE_RERANKER:
+            try:
+                fused = _score_rerank(query, fused)
+            except Exception as e:
+                logger.warning("Reranker (composite) failed, falling back to RRF order: %s", e)
 
         # Entity relevance guard — drop chunks where query entities don't appear
         fused = _entity_relevance_filter(query, fused[:top_k])
@@ -122,6 +141,7 @@ class Retriever:
                         score=score,
                         source=metadata.get("source", ""),
                         title=metadata.get("title", ""),
+                        vector_score=score,
                     ))
             return chunks
 
@@ -157,6 +177,7 @@ class Retriever:
                     document_id=row["document_id"],
                     content=row["content"],
                     score=score,
+                    bm25_score=score,
                 ))
             return chunks
 
@@ -223,7 +244,96 @@ class Retriever:
         except Exception as e:
             logger.error("ChromaDB ingest failed: %s", e)
 
+        # Post-write verification: both stores must have the same chunk count.
+        # Catches silent drift (future regressions in either write path) so we
+        # don't end up with a half-populated FTS5 index that kills BM25 recall.
+        try:
+            fts_count_row = self._db.fetchone(
+                "SELECT count(*) AS c FROM chunks_fts WHERE document_id = ?", (doc_id,)
+            )
+            fts_n = int(fts_count_row["c"]) if fts_count_row else 0
+            if fts_n != len(chunks):
+                logger.error(
+                    "Ingest verification failed: doc %s expected %d FTS5 chunks, got %d",
+                    doc_id, len(chunks), fts_n,
+                )
+        except Exception as e:
+            logger.debug("Ingest verification skipped: %s", e)
+
         return doc_id, len(chunks)
+
+    def backfill_fts5(self, *, batch_size: int = 500) -> dict:
+        """Reconcile FTS5 with ChromaDB — re-insert any chunks missing from FTS5.
+
+        Used as a one-off fixer when FTS5 drifted out of sync with ChromaDB
+        (e.g. after a prior ingest bug or manual ChromaDB edits). Idempotent.
+
+        Returns {"chromadb_chunks": N, "fts5_before": N, "fts5_after": N,
+                 "inserted": N, "skipped": N}.
+        """
+        try:
+            collection = self._get_collection()
+        except Exception as e:
+            logger.error("backfill_fts5: ChromaDB unavailable: %s", e)
+            return {"error": f"ChromaDB unavailable: {e}"}
+
+        total = collection.count()
+        before = self._db.fetchone("SELECT count(*) AS c FROM chunks_fts")
+        before_n = int(before["c"]) if before else 0
+
+        inserted = 0
+        skipped = 0
+        offset = 0
+        while offset < total:
+            got = collection.get(
+                limit=batch_size,
+                offset=offset,
+                include=["documents", "metadatas"],
+            )
+            ids = got.get("ids") or []
+            docs = got.get("documents") or []
+            metas = got.get("metadatas") or []
+            if not ids:
+                break
+
+            existing_rows = self._db.fetchall(
+                "SELECT chunk_id FROM chunks_fts WHERE chunk_id IN ({})".format(
+                    ",".join("?" * len(ids))
+                ),
+                tuple(ids),
+            )
+            existing = {r["chunk_id"] for r in existing_rows}
+
+            rows_to_insert = []
+            for chunk_id, content, meta in zip(ids, docs, metas):
+                if chunk_id in existing:
+                    skipped += 1
+                    continue
+                if not content:
+                    skipped += 1
+                    continue
+                doc_id = (meta or {}).get("document_id") or chunk_id.rsplit("_chunk_", 1)[0]
+                rows_to_insert.append((chunk_id, doc_id, content))
+
+            if rows_to_insert:
+                with self._db.transaction() as tx:
+                    tx.executemany(
+                        "INSERT INTO chunks_fts (chunk_id, document_id, content) VALUES (?, ?, ?)",
+                        rows_to_insert,
+                    )
+                inserted += len(rows_to_insert)
+
+            offset += len(ids)
+
+        after = self._db.fetchone("SELECT count(*) AS c FROM chunks_fts")
+        after_n = int(after["c"]) if after else 0
+        return {
+            "chromadb_chunks": total,
+            "fts5_before": before_n,
+            "fts5_after": after_n,
+            "inserted": inserted,
+            "skipped": skipped,
+        }
 
     def get_document(self, doc_id: str) -> dict | None:
         """Get document metadata."""
@@ -275,26 +385,72 @@ def _reciprocal_rank_fusion(
 
     RRF score = sum(1 / (k + rank_i)) for each list the doc appears in.
     k=60 is the standard constant from the original RRF paper.
+
+    Preserves vector_score and bm25_score from source lists so the downstream
+    score-level reranker can restore magnitude signal that RRF discards.
     """
-    scores: dict[str, float] = {}
+    rrf_scores: dict[str, float] = {}
     chunk_map: dict[str, Chunk] = {}
 
     for results in result_lists:
         for rank, chunk in enumerate(results):
-            scores[chunk.chunk_id] = scores.get(chunk.chunk_id, 0) + 1.0 / (k + rank + 1)
+            rrf_scores[chunk.chunk_id] = rrf_scores.get(chunk.chunk_id, 0) + 1.0 / (k + rank + 1)
             if chunk.chunk_id not in chunk_map:
                 chunk_map[chunk.chunk_id] = chunk
+            else:
+                # Accumulate per-source scores so both vector_score and bm25_score
+                # end up on the merged chunk regardless of which list saw it first.
+                existing = chunk_map[chunk.chunk_id]
+                if chunk.vector_score > 0:
+                    existing.vector_score = chunk.vector_score
+                if chunk.bm25_score > 0:
+                    existing.bm25_score = chunk.bm25_score
 
     # Sort by fused score descending
-    sorted_ids = sorted(scores, key=lambda cid: scores[cid], reverse=True)
+    sorted_ids = sorted(rrf_scores, key=lambda cid: rrf_scores[cid], reverse=True)
 
     result = []
     for cid in sorted_ids:
         chunk = chunk_map[cid]
-        chunk.score = scores[cid]
+        chunk.score = rrf_scores[cid]
         result.append(chunk)
 
     return result
+
+
+def _score_rerank(query: str, chunks: list[Chunk]) -> list[Chunk]:
+    """Re-score RRF candidates using weighted combination of signals.
+
+    composite = 0.55 * vector_score + 0.30 * bm25_score + 0.15 * coverage_score
+
+    Why better than pure RRF:
+    RRF only uses ranks (1/(k+rank)). It treats rank-1 from a 0.99-cosine result
+    the same as rank-1 from a 0.51-cosine result. Score-level fusion restores
+    magnitude signal — a chunk at 0.95 vector + 0.8 BM25 legitimately outranks
+    one at 0.52 vector + 0.1 BM25 even if both ranked #1 in their source lists.
+
+    Coverage score: |query_content_words ∩ chunk_content_words| / |query_content_words|
+    Latency: O(k) pure Python, ~1-3ms at k=10. Always on.
+    """
+    if not chunks:
+        return chunks
+
+    query_words = _content_words(query)
+
+    for chunk in chunks:
+        if query_words:
+            chunk_words = _content_words(chunk.content)
+            coverage = len(query_words & chunk_words) / len(query_words)
+        else:
+            coverage = 0.0
+
+        chunk.score = (
+            0.55 * chunk.vector_score
+            + 0.30 * chunk.bm25_score
+            + 0.15 * coverage
+        )
+
+    return sorted(chunks, key=lambda c: c.score, reverse=True)
 
 
 def _recursive_split(text: str, chunk_size: int, overlap: int) -> list[str]:

@@ -146,7 +146,11 @@ CREATE TABLE IF NOT EXISTS monitors (
     last_check_at TEXT,
     last_alert_at TEXT,
     last_result TEXT,
-    created_at TEXT DEFAULT (datetime('now'))
+    created_at TEXT DEFAULT (datetime('now')),
+    -- category: 'system' = internal/health (telegram only);
+    --          'content' = news/domain feeds (all channels).
+    -- See app/monitors/monitor_store.classify_category.
+    category TEXT DEFAULT 'content'
 );
 
 CREATE TABLE IF NOT EXISTS monitor_results (
@@ -205,6 +209,49 @@ CREATE TABLE IF NOT EXISTS capability_gaps (
     created_at TEXT DEFAULT (datetime('now'))
 );
 
+-- Prompt self-modification module registry
+-- Immutable baseline rows (is_baseline=1) are never touched by the optimizer.
+-- Only module_names in _SELF_MOD_ALLOWED_MODULES (prompt_optimizer.py) are writable.
+CREATE TABLE IF NOT EXISTS prompt_modules (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    module_name             TEXT NOT NULL,
+    version                 INTEGER NOT NULL,
+    content                 TEXT NOT NULL,
+    is_baseline             INTEGER DEFAULT 0,
+    status                  TEXT NOT NULL DEFAULT 'candidate',
+    parent_version          INTEGER,
+    delta_description       TEXT,
+    promoted_at             TEXT,
+    promoted_eval_run_id    TEXT,
+    rolled_back_at          TEXT,
+    quarantined_until       TEXT,
+    shadow_eval_metrics     TEXT,
+    created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version
+    ON prompt_modules (module_name, version);
+CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status
+    ON prompt_modules (module_name, status);
+
+-- GSW (Generative Semantic Workspace) — episodic memory for cross-session recall.
+-- Stores rolling per-conversation narratives anchored to entities + time. Distinct
+-- from kg_facts (atomic triples) and lessons (correction-derived patterns) — this
+-- is "what happened in our recent sessions" so Nova can pick up where we left off.
+CREATE TABLE IF NOT EXISTS conversation_summaries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    summary TEXT NOT NULL,           -- 1-2 sentence high-level summary
+    narrative TEXT,                  -- expanded space-time-anchored narrative
+    key_entities TEXT,               -- JSON array of lower-case entity strings
+    message_count INTEGER DEFAULT 0,
+    last_message_id TEXT,            -- so we can extend without re-summarizing
+    valid_from TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    valid_to TIMESTAMP,              -- NULL = current; populated on supersede
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
 CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
@@ -217,6 +264,7 @@ CREATE INDEX IF NOT EXISTS idx_kg_valid_from ON kg_facts(valid_from);
 CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 CREATE INDEX IF NOT EXISTS idx_monitor_results_monitor ON monitor_results(monitor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_log_type ON action_log(action_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_conv_summaries_conv ON conversation_summaries(conversation_id, valid_to);
 """
 
 
@@ -479,6 +527,358 @@ class SafeDB:
                     )"""
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (11,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 12: prompt_modules table ---
+        if 12 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "prompt_modules" not in tables:
+                    conn.execute("""
+                        CREATE TABLE prompt_modules (
+                            id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+                            module_name             TEXT NOT NULL,
+                            version                 INTEGER NOT NULL,
+                            content                 TEXT NOT NULL,
+                            is_baseline             INTEGER DEFAULT 0,
+                            status                  TEXT NOT NULL DEFAULT 'candidate',
+                            parent_version          INTEGER,
+                            delta_description       TEXT,
+                            promoted_at             TEXT,
+                            promoted_eval_run_id    TEXT,
+                            rolled_back_at          TEXT,
+                            quarantined_until       TEXT,
+                            shadow_eval_metrics     TEXT,
+                            created_at              TEXT NOT NULL DEFAULT (datetime('now'))
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE UNIQUE INDEX IF NOT EXISTS idx_prompt_modules_name_version "
+                        "ON prompt_modules (module_name, version)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_prompt_modules_name_status "
+                        "ON prompt_modules (module_name, status)"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (12,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 13: monitors.category column for channel routing ---
+        if 13 not in applied:
+            conn.execute("BEGIN")
+            try:
+                mcols = {row[1] for row in conn.execute("PRAGMA table_info(monitors)").fetchall()}
+                if "category" not in mcols:
+                    conn.execute(
+                        "ALTER TABLE monitors ADD COLUMN category TEXT DEFAULT 'content'"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (13,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 14: daemon_log + event_queue tables ---
+        # These tables are referenced throughout app/monitors/daemon.py,
+        # app/api/daemon.py, app/api/events.py, app/core/dream.py, and
+        # app/monitors/event_trigger.py, but were never created by any prior
+        # schema step — so the DaemonOrchestrator would silently swallow
+        # "no such table" errors on every tick. Phase-0 bootstrap fix.
+        if 14 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "daemon_log" not in tables:
+                    conn.execute("""
+                        CREATE TABLE daemon_log (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            category TEXT NOT NULL,
+                            content TEXT NOT NULL DEFAULT '',
+                            source TEXT DEFAULT '',
+                            created_at TEXT DEFAULT (datetime('now'))
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_daemon_log_created "
+                        "ON daemon_log (created_at)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_daemon_log_category "
+                        "ON daemon_log (category, created_at)"
+                    )
+                if "event_queue" not in tables:
+                    conn.execute("""
+                        CREATE TABLE event_queue (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            event_type TEXT NOT NULL,
+                            payload TEXT DEFAULT '',
+                            priority REAL DEFAULT 0.5,
+                            status TEXT DEFAULT 'pending',
+                            created_at TEXT DEFAULT (datetime('now')),
+                            processed_at TEXT
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_event_queue_status "
+                        "ON event_queue (status, priority DESC, created_at ASC)"
+                    )
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_event_queue_type "
+                        "ON event_queue (event_type, status)"
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (14,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 15: goals table + Phase-0 bootstrap seed ---
+        # Minimal will-module scaffold so Nova has somewhere to read its
+        # intended next action from. The schema is intentionally bare —
+        # the bootstrap goal's purpose is to write app/core/goals.py with
+        # a proper GoalStore, which will then own this table.
+        if 15 not in applied:
+            conn.execute("BEGIN")
+            try:
+                tables = {row[0] for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if "goals" not in tables:
+                    conn.execute("""
+                        CREATE TABLE goals (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            goal TEXT NOT NULL,
+                            priority REAL DEFAULT 0.5,
+                            status TEXT DEFAULT 'pending',
+                            source TEXT DEFAULT 'user',
+                            context TEXT DEFAULT '{}',
+                            created_at TEXT DEFAULT (datetime('now')),
+                            updated_at TEXT DEFAULT (datetime('now')),
+                            completed_at TEXT
+                        )
+                    """)
+                    conn.execute(
+                        "CREATE INDEX IF NOT EXISTS idx_goals_status_priority "
+                        "ON goals (status, priority DESC, created_at ASC)"
+                    )
+
+                # Seed Phase-0 bootstrap goal exactly once. Idempotent on
+                # (source='phase_0_bootstrap') so this migration is safe to
+                # re-run on DBs that already contain it.
+                seed_text = (
+                    "write app/core/goals.py with GoalStore, "
+                    "derive_goals_from_state(), and execute_goal(); "
+                    "wire pursue_goal into DaemonOrchestrator._decide"
+                )
+                existing = conn.execute(
+                    "SELECT id FROM goals WHERE source='phase_0_bootstrap' LIMIT 1"
+                ).fetchone()
+                if not existing:
+                    conn.execute(
+                        "INSERT INTO goals (goal, priority, status, source, context) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            seed_text,
+                            1.0,                    # priority high
+                            "pending",
+                            "phase_0_bootstrap",
+                            '{"phase": 0, "seeded_by": "phase-0-bootstrap migration"}',
+                        ),
+                    )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (15,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 16: lessons.retrieval_score (Q-value), monitors.trigger_events ---
+        # retrieval_score: blended into RRF ranking (MemRL pattern). Code referenced
+        # the column but no migration created it; production DB had it via manual
+        # backfill, fresh DBs (tests, new installs) crashed on first use.
+        # trigger_events / trigger_mode: EventTrigger uses these to fire monitors
+        # on internal events (e.g. internal:lesson_saved) bypassing the schedule.
+        if 16 not in applied:
+            conn.execute("BEGIN")
+            try:
+                lesson_cols = {row[1] for row in conn.execute("PRAGMA table_info(lessons)").fetchall()}
+                if "retrieval_score" not in lesson_cols:
+                    conn.execute("ALTER TABLE lessons ADD COLUMN retrieval_score REAL DEFAULT 0.5")
+                monitor_cols = {row[1] for row in conn.execute("PRAGMA table_info(monitors)").fetchall()}
+                if "trigger_events" not in monitor_cols:
+                    conn.execute("ALTER TABLE monitors ADD COLUMN trigger_events TEXT")
+                if "trigger_mode" not in monitor_cols:
+                    conn.execute("ALTER TABLE monitors ADD COLUMN trigger_mode TEXT DEFAULT 'schedule'")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (16,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 17: monitors.channels (per-monitor channel routing) ---
+        # NULL = use category default (system→telegram, content→all). Set to
+        # a CSV like "discord,signal" to route only to those channels.
+        if 17 not in applied:
+            conn.execute("BEGIN")
+            try:
+                monitor_cols = {row[1] for row in conn.execute("PRAGMA table_info(monitors)").fetchall()}
+                if "channels" not in monitor_cols:
+                    conn.execute("ALTER TABLE monitors ADD COLUMN channels TEXT")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (17,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 18: agent_workspace (persistent scratchpads) ---
+        # Each AgentLoop run keyed by its query signature. Future runs of
+        # similar queries inherit prior findings/answer instead of starting
+        # fresh. Lets multi-step research compound across sessions.
+        if 18 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS agent_workspace (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        query_signature TEXT NOT NULL UNIQUE,
+                        last_query TEXT NOT NULL,
+                        findings_json TEXT,
+                        last_answer TEXT,
+                        run_count INTEGER NOT NULL DEFAULT 0,
+                        success_count INTEGER NOT NULL DEFAULT 0,
+                        fail_count INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_workspace_sig "
+                    "ON agent_workspace(query_signature)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_agent_workspace_updated "
+                    "ON agent_workspace(updated_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (18,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 19: RLVR verifiable_signals + procedural_clusters ---
+        # verifiable_signals: stores ground-truth-style signals (tool ran clean,
+        # JSON parsed, math correct, claim grounded, quiz right) so the next
+        # GRPO/RLVR fine-tune cycle has reward data without re-grading.
+        # procedural_clusters: tracks lesson clusters dream consolidates each
+        # cycle so we don't re-consolidate the same group every run.
+        if 19 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS verifiable_signals (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        conversation_id TEXT,
+                        query TEXT,
+                        response TEXT,
+                        signal_type TEXT NOT NULL,
+                        signal_value REAL NOT NULL,
+                        evidence TEXT,
+                        consumed_for_training INTEGER NOT NULL DEFAULT 0,
+                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_verifiable_signals_type_created "
+                    "ON verifiable_signals (signal_type, created_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_verifiable_signals_unconsumed "
+                    "ON verifiable_signals (consumed_for_training, signal_type)"
+                )
+                conn.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS procedural_clusters (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        cluster_key TEXT NOT NULL UNIQUE,
+                        member_lesson_ids TEXT NOT NULL,
+                        canonical_lesson_id INTEGER,
+                        member_count INTEGER NOT NULL DEFAULT 0,
+                        last_consolidated_at TEXT NOT NULL DEFAULT (datetime('now')),
+                        created_at TEXT NOT NULL DEFAULT (datetime('now'))
+                    )
+                    """
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_procedural_clusters_key "
+                    "ON procedural_clusters (cluster_key)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (19,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 20: reflexions.is_eval flag ---
+        # Stop eval-derived reflexions from being promoted to lessons. The
+        # deliberation_chain_of_reasoning task creates a reflexion every run;
+        # those got promoted by dream's _promote_reflexions and accumulated as
+        # lessons that contaminated retrieval, biasing future eval runs into
+        # summary-shaped answers (root cause of the 0.20 ↔ 0.85 bimodal pattern
+        # observed across 11 eval runs in 2026-05-09).
+        if 20 not in applied:
+            conn.execute("BEGIN")
+            try:
+                cols = {row[1] for row in conn.execute("PRAGMA table_info(reflexions)").fetchall()}
+                if "is_eval" not in cols:
+                    conn.execute("ALTER TABLE reflexions ADD COLUMN is_eval INTEGER DEFAULT 0")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_reflexions_is_eval "
+                    "ON reflexions (is_eval, quality_score)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (20,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 21: dedup_decisions instrumentation table ---
+        # Captures every Jaccard-based dedup comparison (lesson / curiosity /
+        # reflexion) with the score that drove the decision. Lets the operator
+        # empirically revisit the hand-tuned thresholds (0.55 / 0.6 / 0.85)
+        # that were originally set by symptom rather than measurement.
+        # Audit 2026-05-13.
+        if 21 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS dedup_decisions ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  entity_type TEXT NOT NULL,"
+                    "  jaccard_score REAL NOT NULL,"
+                    "  threshold REAL NOT NULL,"
+                    "  decision TEXT NOT NULL,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dedup_decisions_type_time "
+                    "ON dedup_decisions (entity_type, created_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (21,))
                 conn.commit()
             except Exception:
                 conn.rollback()

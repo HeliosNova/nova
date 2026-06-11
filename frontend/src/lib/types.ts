@@ -22,7 +22,43 @@ export interface ToolResult {
 
 // ── SSE Events ──
 
-export type EventType = "thinking" | "token" | "tool_use" | "sources" | "lesson_used" | "lesson_learned" | "warning" | "done" | "error";
+export type EventType =
+  | "thinking"
+  | "token"
+  | "tool_use"
+  | "sources"
+  | "lesson_used"
+  | "lesson_learned"
+  | "warning"
+  | "done"
+  | "error"
+  | "agent_meta"
+  | "agent_start"
+  | "agent_done"
+  | "agent_merge";
+
+export interface SSEAgentMetaData {
+  strategy?: string;
+  agent_count?: number;
+  tasks?: { id?: string; goal?: string }[];
+}
+
+export interface SSEAgentStartData {
+  task_id?: string;
+  goal?: string;
+  index?: number;
+}
+
+export interface SSEAgentDoneData {
+  task_id?: string;
+  goal?: string;
+  index?: number;
+  ok?: boolean;
+}
+
+export interface SSEAgentMergeData {
+  strategy?: string;
+}
 
 export interface SSEThinkingData {
   stage?: string;
@@ -68,7 +104,17 @@ export interface SSELessonLearnedData {
 
 export interface StreamEvent {
   type: EventType;
-  data: SSEThinkingData | SSETokenData | SSEToolUseData | SSESourcesData | SSEDoneData | SSEErrorData;
+  data:
+    | SSEThinkingData
+    | SSETokenData
+    | SSEToolUseData
+    | SSESourcesData
+    | SSEDoneData
+    | SSEErrorData
+    | SSEAgentMetaData
+    | SSEAgentStartData
+    | SSEAgentDoneData
+    | SSEAgentMergeData;
 }
 
 // ── Conversations ──

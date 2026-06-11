@@ -23,14 +23,14 @@ def test_safe_env_has_path():
 def test_safe_env_no_secrets():
     """Safe env never includes sensitive variables."""
     os.environ["SECRET_KEY"] = "top-secret"
-    os.environ["OPENAI_API_KEY"] = "sk-test"
+    os.environ["DISCORD_TOKEN"] = "discord-test"
     try:
         env = get_safe_env()
         assert "SECRET_KEY" not in env
-        assert "OPENAI_API_KEY" not in env
+        assert "DISCORD_TOKEN" not in env
     finally:
         del os.environ["SECRET_KEY"]
-        del os.environ["OPENAI_API_KEY"]
+        del os.environ["DISCORD_TOKEN"]
 
 
 def test_safe_env_has_lang():

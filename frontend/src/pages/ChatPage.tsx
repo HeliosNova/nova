@@ -5,7 +5,7 @@ import { useChatStore } from "../lib/store";
 import { getConversation, getConversations } from "../lib/api";
 import { streamChat } from "../lib/sse";
 import { uid } from "../lib/utils";
-import type { StreamEvent, SSETokenData, SSEToolUseData, SSESourcesData, SSEDoneData, SSEErrorData, SSEThinkingData, SSELessonUsedData, SSELessonLearnedData } from "../lib/types";
+import type { StreamEvent, SSETokenData, SSEToolUseData, SSESourcesData, SSEDoneData, SSEErrorData, SSEThinkingData, SSELessonUsedData, SSELessonLearnedData, SSEAgentMetaData, SSEAgentStartData, SSEAgentDoneData } from "../lib/types";
 import ChatSidebar from "../components/ChatSidebar";
 import ChatMessage from "../components/ChatMessage";
 import ChatInput from "../components/ChatInput";
@@ -158,6 +158,28 @@ export default function ChatPage() {
           case "error": {
             const d = event.data as SSEErrorData;
             a.setError(d.message);
+            break;
+          }
+          case "agent_meta": {
+            const d = event.data as SSEAgentMetaData;
+            const n = d.agent_count ?? d.tasks?.length ?? 0;
+            a.setThinkingStage(`spawning ${n} sub-agents (${d.strategy ?? "parallel"})`);
+            break;
+          }
+          case "agent_start": {
+            const d = event.data as SSEAgentStartData;
+            const goal = (d.goal || "task").slice(0, 60);
+            a.setThinkingStage(`agent ${d.index ?? "?"}: ${goal}`);
+            break;
+          }
+          case "agent_done": {
+            const d = event.data as SSEAgentDoneData;
+            const ok = d.ok === false ? "failed" : "done";
+            a.setThinkingStage(`agent ${d.index ?? "?"} ${ok}`);
+            break;
+          }
+          case "agent_merge": {
+            a.setThinkingStage("merging sub-agent results");
             break;
           }
         }

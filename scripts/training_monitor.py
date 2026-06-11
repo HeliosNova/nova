@@ -10,31 +10,41 @@ LOG = Path(__file__).resolve().parent.parent / "finetune_progress.log"
 INTERVAL = 900  # 15 minutes
 
 
+import re
+
+_STEP_RE = re.compile(r"Step (\d+)/(\d+)\s*\((\d+)%\)\s*\|\s*loss=([\d.eE+-]+)\s*\|\s*ETA:\s*(\d+)m")
+
+
 def get_last_step():
-    """Parse the last training step from the progress log."""
+    """Parse the last training step from the progress log.
+
+    Total step count is parsed from the log itself (not hard-coded), so the
+    monitor works across training runs with different dataset sizes / epochs.
+    """
     if not LOG.exists():
         return None
+    last_match = None
     with open(LOG, encoding="utf-8") as f:
-        lines = [l.strip() for l in f if "Step " in l and "/534" in l]
-    if not lines:
+        for line in f:
+            m = _STEP_RE.search(line)
+            if m:
+                last_match = m
+    if not last_match:
         return None
-    last = lines[-1]
-    # Parse: "2026-04-02 06:07:16 [INFO] Step 126/534 (24%) | loss=0.001 | ETA: 815m"
-    parts = {}
+    step, total, pct, loss_s, eta_m = last_match.groups()
     try:
-        parts["raw"] = last
-        step_part = last.split("Step ")[1].split("/")[0]
-        parts["step"] = int(step_part)
-        parts["total"] = 534
-        parts["pct"] = round(parts["step"] / parts["total"] * 100, 1)
-        if "loss=" in last:
-            parts["loss"] = float(last.split("loss=")[1].split(" |")[0].split("\n")[0])
-        if "ETA:" in last:
-            parts["eta_min"] = int(last.split("ETA: ")[1].split("m")[0])
-            parts["eta_hr"] = round(parts["eta_min"] / 60, 1)
-    except (IndexError, ValueError):
-        pass
-    return parts
+        loss = float(loss_s)
+    except ValueError:
+        loss = float("nan")
+    step_i, total_i, eta_i = int(step), int(total), int(eta_m)
+    return {
+        "step": step_i,
+        "total": total_i,
+        "pct": round(step_i / total_i * 100, 1) if total_i else 0.0,
+        "loss": loss,
+        "eta_min": eta_i,
+        "eta_hr": round(eta_i / 60, 1),
+    }
 
 
 def get_gpu():

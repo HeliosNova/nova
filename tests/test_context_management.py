@@ -47,7 +47,7 @@ class TestManageContext:
         ]
         query = "What did we discuss?"
 
-        with patch("app.core.brain.llm") as mock_llm:
+        with patch("app.core.brain_context_manager.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(return_value="Discussed various topics in 20 messages.")
 
             result_history, summary = await _manage_context(system_prompt, history, query)
@@ -73,7 +73,7 @@ class TestManageContext:
         ]
         query = "Summarize"
 
-        with patch("app.core.brain.llm") as mock_llm:
+        with patch("app.core.brain_context_manager.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(return_value="Summary of previous discussion.")
 
             result_history, summary = await _manage_context(system_prompt, history, query)
@@ -97,7 +97,7 @@ class TestManageContext:
         ]
         query = "What's next?"
 
-        with patch("app.core.brain.llm") as mock_llm:
+        with patch("app.core.brain_context_manager.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(return_value="Earlier discussion summary.")
 
             result_history, summary = await _manage_context(system_prompt, history, query)
@@ -121,7 +121,7 @@ class TestManageContext:
         ]
         query = "Continue"
 
-        with patch("app.core.brain.llm") as mock_llm:
+        with patch("app.core.brain_context_manager.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(side_effect=Exception("LLM unreachable"))
 
             result_history, summary = await _manage_context(system_prompt, history, query)

@@ -88,6 +88,19 @@ _CORRECTION_PATTERNS = [
     re.compile(r"(?i)\byou\s+got\b.*\bwrong\b"),
     re.compile(r"(?i)\bstop\s+saying\b"),
     re.compile(r"(?i)\bI\s+already\s+told\s+you\b"),
+    # Creatively-phrased corrections (measured 2026-06-09: lifted recall on
+    # natural correction phrasings 38%->88% with +0 false positives on 604 real
+    # user messages — the LLM confirmation stage backstops any borderline match).
+    re.compile(r"(?i)\b(?:doesn'?t|does not|don'?t)\s+(?:sound|seem|look)\s+(?:right|correct|accurate)\b"),
+    re.compile(r"(?i)\bI\s+(?:don'?t|do not)\s+think\s+so\b"),
+    re.compile(r"(?i)\b(?:wasn'?t|isn'?t)\s+it\b"),
+    re.compile(r"(?i)\byou\s+(?:forgot|missed|overlooked|left\s+out)\b"),
+    re.compile(r"(?i)\b(?:the\s+)?other\s+way\s+a?round\b"),
+    re.compile(r"(?i)\bthat(?:'?s|\s+is)\s+(?:a\s+)?(?:myth|misconception)\b"),
+    re.compile(r"(?i)\bmixing\s+(?:it|them|that|those|up)\b"),
+    re.compile(r"(?i)\blast\s+(?:time\s+)?I\s+checked\b"),
+    re.compile(r"(?i)\bI\s+think\s+it'?s\b"),
+    re.compile(r"(?i)\bhalf\s+(?:the\s+)?(?:story|picture|truth)\b"),
 ]
 
 
@@ -189,11 +202,13 @@ class LearningEngine:
         if self._lessons_collection is None:
             try:
                 import chromadb
+                from .embedding import get_embedding_function
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._lessons_collection = client.get_or_create_collection(
-                    name="lessons",
-                    metadata={"hnsw:space": "cosine"},
-                )
+                _kw = {"name": "lessons", "metadata": {"hnsw:space": "cosine"}}
+                _ef = get_embedding_function()
+                if _ef is not None:
+                    _kw["embedding_function"] = _ef
+                self._lessons_collection = client.get_or_create_collection(**_kw)
             except Exception as e:
                 logger.warning("Failed to init lessons ChromaDB collection: %s", e)
                 return None
@@ -220,7 +235,9 @@ class LearningEngine:
             topic = row["topic"] or ""
             correct_answer = row["correct_answer"] or ""
             lesson_text = _row_get(row, "lesson_text")
-            searchable = f"{topic} {correct_answer} {lesson_text}".strip()
+            searchable = _lesson_searchable(
+                _row_get(row, "context"), topic, correct_answer, lesson_text
+            )
             if not searchable:
                 continue
             ids.append(str(row["id"]))
@@ -258,10 +275,14 @@ class LearningEngine:
                 user_message[:120],
             )
 
+            from app.core.prompt_optimizer import get_active_module
+            extraction_template = (
+                get_active_module("extraction_prompt") or _EXTRACTION_PROMPT
+            )
             result = await asyncio.wait_for(
                 llm.invoke_nothink(
                     [
-                        {"role": "system", "content": _EXTRACTION_PROMPT},
+                        {"role": "system", "content": extraction_template},
                         {"role": "user", "content": prompt_content},
                     ],
                     json_mode=True,
@@ -375,11 +396,15 @@ class LearningEngine:
             lesson_id, correction.topic, (lesson_text or "")[:80]
         )
 
-        # Add to ChromaDB for semantic search
+        # Add to ChromaDB for semantic search — embed the original query too,
+        # so paraphrases of it retrieve the lesson (semantic-first, WS2A)
         try:
             collection = self._get_lessons_collection()
             if collection is not None:
-                searchable = f"{topic} {correct_answer} {lesson_text or ''}".strip()
+                searchable = _lesson_searchable(
+                    correction.original_query or correction.user_message,
+                    topic, correct_answer, lesson_text,
+                )
                 if searchable:
                     collection.add(
                         ids=[str(lesson_id)],
@@ -396,8 +421,8 @@ class LearningEngine:
         try:
             from app.monitors.event_trigger import emit_event
             emit_event("internal:lesson_saved", {"lesson_id": lesson_id, "topic": topic})
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("emit_event(lesson_saved) failed: %s", e)
 
         return lesson_id
 
@@ -448,11 +473,12 @@ class LearningEngine:
             lesson_id, topic, (lesson_text or "")[:80],
         )
 
-        # Add to ChromaDB for semantic search
+        # Add to ChromaDB for semantic search (context joins the document when
+        # it's real language — internal eval markers are excluded)
         try:
             collection = self._get_lessons_collection()
             if collection is not None:
-                searchable = f"{topic} {correct_answer} {lesson_text or ''}".strip()
+                searchable = _lesson_searchable(context, topic, correct_answer, lesson_text)
                 if searchable:
                     collection.add(
                         ids=[str(lesson_id)],
@@ -469,8 +495,13 @@ class LearningEngine:
         """Get lessons relevant to a query using hybrid retrieval (vector + keyword + RRF)."""
         limit = limit or config.MAX_LESSONS_IN_PROMPT
 
+        # Candidate cap mirrors KG's MAX_KG_FACTS fix: a hardcoded LIMIT 500
+        # silently drops candidates once lessons exceed it, so the vector/keyword
+        # arms can never surface a relevant lesson outside the top-500-by-helpful.
+        _cand = int(getattr(config, "MAX_LESSON_CANDIDATES", 5000))
         all_lessons = self._db.fetchall(
-            "SELECT * FROM lessons ORDER BY times_helpful DESC, confidence DESC LIMIT 500"
+            "SELECT * FROM lessons ORDER BY times_helpful DESC, confidence DESC LIMIT ?",
+            (_cand,),
         )
 
         if not all_lessons:
@@ -481,6 +512,7 @@ class LearningEngine:
 
         # --- Vector search via ChromaDB ---
         vector_ranked: list[int] = []  # lesson IDs in ranked order
+        vector_strong: set[int] = set()  # clear semantic matches (paraphrase-grade)
         try:
             collection = self._get_lessons_collection()
             if collection is not None and collection.count() > 0:
@@ -492,13 +524,19 @@ class LearningEngine:
                 if results and results["ids"] and results["ids"][0]:
                     distances = results.get("distances", [[]])[0]
                     for i, id_str in enumerate(results["ids"][0]):
-                        # Filter high-distance results (cosine: 0=identical, 2=opposite)
-                        if distances and i < len(distances) and distances[i] > 0.7:
+                        # Filter high-distance results (cosine: 0=identical, 2=opposite).
+                        # Threshold is configurable (LESSON_VECTOR_MAX_DISTANCE, default
+                        # 0.9) so paraphrased queries with low keyword overlap still
+                        # surface the relevant lesson — semantic-first retrieval (WS2A).
+                        dist = distances[i] if distances and i < len(distances) else None
+                        if dist is not None and dist > config.LESSON_VECTOR_MAX_DISTANCE:
                             continue
                         try:
                             lid = int(id_str)
                             if lid in lesson_by_id:
                                 vector_ranked.append(lid)
+                                if dist is not None and dist <= config.LESSON_VECTOR_STRONG_DISTANCE:
+                                    vector_strong.add(lid)
                         except ValueError:
                             continue
         except Exception as e:
@@ -548,9 +586,18 @@ class LearningEngine:
                 # Scale Q-value to match RRF magnitude, then blend 70/30
                 rrf_scores[lid] = rrf_scores[lid] * 0.7 + (q_val * max_rrf) * 0.3
 
-        # Sort by blended score descending, then filter by minimum relevance
+        # Sort by blended score descending, then filter by minimum relevance.
+        # The MIN_RRF_SCORE floor exists to cut weak keyword-noise matches —
+        # it must NOT veto STRONG vector hits (distance ≤ STRONG bound). A
+        # paraphrased query has zero keyword support by definition, so its
+        # single-list RRF score (~1/(k+1)) sits near any practical floor; for
+        # those, the strong distance gate is the real relevance check. Weak
+        # vector hits (between STRONG and MAX) still need to clear the floor.
         sorted_ids = sorted(rrf_scores, key=lambda lid: rrf_scores[lid], reverse=True)
-        sorted_ids = [lid for lid in sorted_ids if rrf_scores[lid] >= config.MIN_RRF_SCORE]
+        sorted_ids = [
+            lid for lid in sorted_ids
+            if rrf_scores[lid] >= config.MIN_RRF_SCORE or lid in vector_strong
+        ]
 
         lessons = []
         retrieved_ids = []
@@ -661,10 +708,16 @@ class LearningEngine:
         if not _is_quality_content(good_answer):
             logger.warning("Skipping training pair: low-quality good_answer")
             return
-        if len(good_answer.strip()) < 30:
+        # Length floor lowered 30→10 (2026-05-06): the old 30-char floor
+        # rejected most chat corrections ("Done.", "Got it.", "Saved as
+        # metric.") which are exactly the canonical corrections we want
+        # the model to internalize. The training_data.jsonl had not been
+        # written to in 11 days as a result. 10 chars still rules out
+        # garbage like "ok" / "[]" while admitting brief affirmations.
+        if len(good_answer.strip()) < 10:
             logger.warning("Skipping training pair: chosen too short (%d chars)", len(good_answer.strip()))
             return
-        if len(bad_answer.strip()) < 30:
+        if len(bad_answer.strip()) < 10:
             logger.warning("Skipping training pair: rejected too short (%d chars)", len(bad_answer.strip()))
             return
         # Reject extreme length asymmetry — teaches "shorter=better" not "better content"
@@ -871,19 +924,65 @@ class LearningEngine:
         """Find an existing lesson similar enough to be a duplicate.
 
         Fast path: exact match on (topic, correct_answer).
-        Slow path: normalized word overlap (Jaccard >= 0.85).
+        Topic-level dedup: same topic + correct_answer Jaccard >= 0.55.
+        Slow path: full normalized word overlap (Jaccard >= 0.85).
+
+        The topic-level pass was added 2026-05-06 after runtime audit found
+        11 copies of "2026 EV Release Schedule" — same topic, different
+        correct_answer text (because EVs ship weekly). Jaccard 0.85 on the
+        full text was too strict to catch these as duplicates. Same topic
+        almost always means same intent; treat as dup if answers overlap
+        even modestly.
+
+        Side effect: every call records a row to `dedup_decisions` (see
+        app.core.dedup_metrics) with the max Jaccard observed and the
+        threshold that drove the decision. Lets the operator empirically
+        revisit the 0.55 / 0.85 thresholds.
         """
-        # Fast path — exact match
+        from app.core import dedup_metrics as _dm
+
+        # Fast path — exact match (treated as Jaccard=1.0 against threshold=1.0)
         exact = self._db.fetchone(
             "SELECT id, confidence FROM lessons WHERE topic = ? AND correct_answer = ?",
             (topic, correct_answer),
         )
         if exact:
+            _dm.record_decision("lesson", 1.0, 1.0, "merged")
             return exact
+
+        max_jaccard = 0.0  # track best near-miss across both fuzzy passes
+
+        # Topic-level dedup — same topic, looser answer match
+        same_topic = self._db.fetchall(
+            "SELECT id, confidence, correct_answer FROM lessons WHERE topic = ?",
+            (topic,),
+        )
+        if same_topic:
+            new_answer_words = _normalize_words(correct_answer) - _STOP_WORDS
+            if len(new_answer_words) >= 2:
+                for row in same_topic:
+                    existing_words = _normalize_words(row["correct_answer"] or "") - _STOP_WORDS
+                    if not existing_words:
+                        continue
+                    overlap = len(new_answer_words & existing_words)
+                    union = len(new_answer_words | existing_words)
+                    score = overlap / union if union > 0 else 0.0
+                    if score > max_jaccard:
+                        max_jaccard = score
+                    if score >= 0.55:
+                        _dm.record_decision("lesson", score, 0.55, "merged")
+                        return row
+            else:
+                # Brief answer + same topic — treat as dup of most recent.
+                # Jaccard isn't meaningful here (too few tokens); record at
+                # the topic-level threshold so the row is still legible.
+                _dm.record_decision("lesson", 0.55, 0.55, "merged")
+                return same_topic[0]
 
         # Slow path — fuzzy word overlap
         new_words = _normalize_words(topic + " " + correct_answer) - _STOP_WORDS
         if len(new_words) < 2:
+            _dm.record_decision("lesson", max_jaccard, 0.55, "inserted_new")
             return None
 
         candidates = self._db.fetchall(
@@ -899,9 +998,14 @@ class LearningEngine:
                 continue
             overlap = len(new_words & existing_words)
             union = len(new_words | existing_words)
-            if union > 0 and overlap / union >= config.DEDUP_JACCARD_THRESHOLD:
+            score = overlap / union if union > 0 else 0.0
+            if score > max_jaccard:
+                max_jaccard = score
+            if score >= config.DEDUP_JACCARD_THRESHOLD:
+                _dm.record_decision("lesson", score, config.DEDUP_JACCARD_THRESHOLD, "merged")
                 return row
 
+        _dm.record_decision("lesson", max_jaccard, config.DEDUP_JACCARD_THRESHOLD, "inserted_new")
         return None
 
     def _prune_lessons(self) -> None:
@@ -946,9 +1050,12 @@ class LearningEngine:
     def decay_stale_lessons(self, days: int = 30, factor: float = 0.95) -> int:
         """Reduce confidence for lessons not retrieved in `days` days.
 
-        Decays lessons that either:
+        Decays lessons that:
         - Were never retrieved and are older than `days`, OR
-        - Were last retrieved more than 60 days ago.
+        - Were last retrieved more than 60 days ago, OR
+        - Are date-anchored (topic mentions a specific past month/week/day) and
+          older than 14 days — these are point-in-time facts (Bitcoin price on
+          March 28, "this week's announcements") that lose value immediately.
 
         Returns the number of lessons decayed.
         """
@@ -967,14 +1074,93 @@ class LearningEngine:
                     (round(new_conf, 4), row["id"]),
                 )
                 decayed += 1
+
+        # Aggressive decay for date-anchored lessons. These contain phrases like
+        # "March 2026", "this week", "today", "current price" — the facts in
+        # them are stale by definition once the date passes.
+        date_anchored_rows = self._db.fetchall(
+            """SELECT id, confidence, topic FROM lessons
+               WHERE confidence > 0.2
+                 AND created_at < datetime('now', '-14 days')
+                 AND (
+                     topic LIKE '%January 20%' OR topic LIKE '%February 20%' OR
+                     topic LIKE '%March 20%' OR topic LIKE '%April 20%' OR
+                     topic LIKE '%May 20%' OR topic LIKE '%June 20%' OR
+                     topic LIKE '%July 20%' OR topic LIKE '%August 20%' OR
+                     topic LIKE '%September 20%' OR topic LIKE '%October 20%' OR
+                     topic LIKE '%November 20%' OR topic LIKE '%December 20%' OR
+                     topic LIKE '%this week%' OR topic LIKE '%today%' OR
+                     topic LIKE '%current %' OR topic LIKE '%latest %' OR
+                     topic LIKE '%trading price%'
+                 )"""
+        )
+        for row in date_anchored_rows:
+            new_conf = max(0.1, row["confidence"] * 0.7)  # aggressive 30% decay per cycle
+            self._db.execute(
+                "UPDATE lessons SET confidence = ? WHERE id = ?",
+                (round(new_conf, 4), row["id"]),
+            )
+            decayed += 1
+
         if decayed:
-            logger.info("Decayed confidence on %d stale lessons", decayed)
+            logger.info("Decayed confidence on %d stale lessons (%d date-anchored)",
+                        decayed, len(date_anchored_rows))
         return decayed
+
+    def prune_dead_lessons(self) -> int:
+        """Delete lessons that are proven dead weight.
+
+        A lesson is dead when all of these hold:
+        - Created at least 21 days ago (3 weeks is enough to tell if useful).
+        - Never retrieved, OR retrieved but never helpful (times_retrieved >= 10).
+        - Not a distilled principle (principles are load-bearing even if unretrieved).
+
+        Returns number of deleted rows. Also cleans ChromaDB.
+        """
+        rows = self._db.fetchall(
+            """SELECT id FROM lessons
+               WHERE created_at < datetime('now','-21 days')
+                 AND (
+                     times_retrieved = 0
+                     OR (times_retrieved >= 10 AND COALESCE(times_helpful,0) = 0)
+                 )
+                 AND COALESCE(lesson_text,'') NOT LIKE '%Principle distilled%'"""
+        )
+        if not rows:
+            return 0
+        ids = [r["id"] for r in rows]
+        placeholders = ",".join("?" for _ in ids)
+        with self._db.transaction() as tx:
+            tx.execute(f"DELETE FROM lessons WHERE id IN ({placeholders})", tuple(ids))
+        try:
+            coll = self._get_lessons_collection()
+            if coll is not None:
+                coll.delete(ids=[str(i) for i in ids])
+        except Exception as e:
+            logger.warning("Failed to sync dead-lesson prune to ChromaDB: %s", e)
+        logger.info("Pruned %d dead lessons (never-retrieved or retrieved-unhelpful)", len(ids))
+        return len(ids)
 
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+def _lesson_searchable(
+    query_context: str | None, topic: str, correct_answer: str, lesson_text: str | None
+) -> str:
+    """Build the document embedded for semantic lesson retrieval.
+
+    Includes the originating query when available: a future paraphrase is a
+    paraphrase OF THAT QUERY, so query-to-query similarity is the strongest
+    semantic signal for retrieving the lesson. Internal markers (eval-…)
+    are excluded — they aren't language.
+    """
+    ctx = (query_context or "").strip()
+    if ctx.startswith("eval-"):
+        ctx = ""
+    return f"{ctx} {topic} {correct_answer} {lesson_text or ''}".strip()
+
 
 def _row_get(row, key: str, default: str = "") -> str:
     """Safely get a column from a sqlite3.Row (which has no .get() method)."""

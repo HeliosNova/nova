@@ -91,7 +91,7 @@ class LLMProvider(Protocol):
         json_mode: bool = False,
         json_prefix: str = "[{",
         json_schema: dict | None = None,
-        max_tokens: int = 1000,
+        max_tokens: int = 8000,
         temperature: float = 0.1,
         model: str | None = None,
     ) -> str:
@@ -105,7 +105,7 @@ class LLMProvider(Protocol):
         *,
         model: str | None = None,
         temperature: float = 0.5,
-        max_tokens: int = 2000,
+        max_tokens: int = 8000,
         images: list[str] | None = None,
         tool_choice: str | None = None,
     ) -> GenerationResult:
@@ -119,7 +119,7 @@ class LLMProvider(Protocol):
         *,
         model: str | None = None,
         temperature: float = 0.6,
-        max_tokens: int = 4000,
+        max_tokens: int = 8000,
         tool_choice: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         """Stream a response with thinking enabled. Yields incremental chunks."""
@@ -179,7 +179,7 @@ async def invoke_nothink(
     json_mode: bool = False,
     json_prefix: str = "[{",
     json_schema: dict | None = None,
-    max_tokens: int = 1000,
+    max_tokens: int = 8000,
     temperature: float = 0.1,
     model: str | None = None,
 ) -> str:
@@ -201,7 +201,7 @@ async def generate_with_tools(
     *,
     model: str | None = None,
     temperature: float = 0.5,
-    max_tokens: int = 2000,
+    max_tokens: int = 8000,
     images: list[str] | None = None,
     tool_choice: str | None = None,
 ) -> GenerationResult:
@@ -223,7 +223,7 @@ async def stream_with_thinking(
     *,
     model: str | None = None,
     temperature: float = 0.6,
-    max_tokens: int = 4000,
+    max_tokens: int = 8000,
     tool_choice: str | None = None,
 ) -> AsyncGenerator[StreamChunk, None]:
     """Stream a response with thinking enabled. Yields incremental chunks."""

@@ -1,4 +1,9 @@
-"""Background task manager — runs async tasks without blocking the main conversation."""
+"""Background task manager — runs async tasks without blocking the main conversation.
+
+Tasks are tracked in memory (live coroutines) AND mirrored to SQLite so a
+container restart leaves an audit trail. Restarting marks any in-flight tasks
+as failed (the coroutine is gone) so the user can see what was interrupted.
+"""
 
 from __future__ import annotations
 
@@ -27,14 +32,97 @@ class BackgroundTask:
     _task: asyncio.Task | None = field(default=None, repr=False)
 
 
-class TaskManager:
-    """Manages background async tasks with concurrency limits."""
+_PERSIST_SCHEMA = """
+CREATE TABLE IF NOT EXISTS background_tasks (
+    id TEXT PRIMARY KEY,
+    description TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result TEXT,
+    error TEXT,
+    partial_result TEXT,
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_bg_tasks_status ON background_tasks(status);
+"""
 
-    def __init__(self, max_concurrent: int = 5, task_timeout: int = 300):
+
+def _persist_init(db) -> None:
+    """Create the persistence table on first init."""
+    if db is None:
+        return
+    try:
+        for stmt in _PERSIST_SCHEMA.strip().split(";"):
+            stmt = stmt.strip()
+            if stmt:
+                db.execute(stmt)
+    except Exception as e:
+        logger.warning("[TaskManager] persist table init failed: %s", e)
+
+
+def _persist_upsert(db, bg: BackgroundTask) -> None:
+    """Mirror task state to SQLite. Best-effort — never fails the task."""
+    if db is None:
+        return
+    try:
+        db.execute(
+            "INSERT INTO background_tasks "
+            "(id, description, status, result, error, partial_result, created_at, completed_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "  status=excluded.status, result=excluded.result, error=excluded.error, "
+            "  partial_result=excluded.partial_result, completed_at=excluded.completed_at",
+            (bg.id, bg.description[:500], bg.status, bg.result, bg.error,
+             bg.partial_result, bg.created_at, bg.completed_at),
+        )
+    except Exception as e:
+        logger.debug("[TaskManager] persist upsert failed for %s: %s", bg.id, e)
+
+
+def _persist_hydrate_on_startup(db) -> int:
+    """On startup, mark any task left in pending/running as failed (coroutine is gone).
+
+    Returns count of tasks marked failed. Their rows remain queryable so the
+    user can see what was interrupted by the restart.
+    """
+    if db is None:
+        return 0
+    try:
+        cursor = db.execute(
+            "UPDATE background_tasks SET status='failed', "
+            "  error=COALESCE(error, '') || '[interrupted by container restart]', "
+            "  completed_at=? "
+            "WHERE status IN ('pending', 'running')",
+            (datetime.now(timezone.utc).isoformat(),),
+        )
+        return cursor.rowcount
+    except Exception as e:
+        logger.warning("[TaskManager] startup hydrate failed: %s", e)
+        return 0
+
+
+class TaskManager:
+    """Manages background async tasks with concurrency limits.
+
+    Persists state to SQLite so restarts leave an auditable trail rather than
+    silent task loss. Live coroutines themselves do NOT survive restart —
+    that requires a queue worker model and is out of scope here.
+    """
+
+    def __init__(self, max_concurrent: int = 5, task_timeout: int = 300, db=None):
         self.max_concurrent = max_concurrent
         self.task_timeout = task_timeout
         self._tasks: dict[str, BackgroundTask] = {}
         self._semaphore = asyncio.Semaphore(max_concurrent)
+        self._db = db
+        if db is not None:
+            _persist_init(db)
+            interrupted = _persist_hydrate_on_startup(db)
+            if interrupted:
+                logger.info(
+                    "[TaskManager] Marked %d task(s) as failed (interrupted by restart)",
+                    interrupted,
+                )
 
     def submit(
         self,
@@ -86,9 +174,11 @@ class TaskManager:
                     bg.completed_at = datetime.now(timezone.utc).isoformat()
                     # Release coroutine frame to free memory (Phase 5.9)
                     bg._task = None
+                    _persist_upsert(self._db, bg)
 
         bg._task = asyncio.create_task(_run())
         self._tasks[task_id] = bg
+        _persist_upsert(self._db, bg)
 
         # Prune old completed tasks (keep last 50)
         completed = [t for t in self._tasks.values() if t.status in ("complete", "failed", "cancelled")]
@@ -137,9 +227,11 @@ class TaskManager:
                 bg.status = "failed"
             bg.completed_at = datetime.now(timezone.utc).isoformat()
             bg._task = None
+            _persist_upsert(self._db, bg)
 
         task.add_done_callback(_on_done)
         self._tasks[task_id] = bg
+        _persist_upsert(self._db, bg)
 
         # Prune old completed tasks (keep last 50)
         completed = [t for t in self._tasks.values() if t.status in ("complete", "failed", "cancelled")]
@@ -165,6 +257,7 @@ class TaskManager:
             bg._task.cancel()
         bg.status = "cancelled"
         bg.completed_at = datetime.now(timezone.utc).isoformat()
+        _persist_upsert(self._db, bg)
         return True
 
     async def cancel_all(self):

@@ -238,3 +238,44 @@ class TestImportEndpoint:
         )
         assert resp.status_code == 200
         assert resp.json()["stats"]["conversations"] == 0
+
+
+class TestConfigUpdateMultiAgent:
+    """PATCH /api/config should accept multi-agent fields.
+
+    Regression: MAX_AGENT_COUNT, AGENT_TASK_TIMEOUT, ENABLE_MULTI_AGENT, and
+    MULTI_AGENT_TRIGGER_THRESHOLD were in _MUTABLE_FIELDS but not in the
+    pydantic ConfigUpdateRequest, so the API silently dropped them. Added
+    2026-04-24 so ops can tune these at runtime without a restart.
+    """
+
+    def test_update_max_agent_count(self, client):
+        resp = client.patch("/api/config", json={"MAX_AGENT_COUNT": 8})
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "MAX_AGENT_COUNT" in body.get("updated", [])
+
+    def test_update_agent_task_timeout(self, client):
+        resp = client.patch("/api/config", json={"AGENT_TASK_TIMEOUT": 240})
+        assert resp.status_code == 200
+        assert "AGENT_TASK_TIMEOUT" in resp.json().get("updated", [])
+
+    def test_update_multi_agent_enable_and_threshold(self, client):
+        resp = client.patch(
+            "/api/config",
+            json={"ENABLE_MULTI_AGENT": True, "MULTI_AGENT_TRIGGER_THRESHOLD": 2},
+        )
+        assert resp.status_code == 200
+        updated = resp.json().get("updated", [])
+        assert "ENABLE_MULTI_AGENT" in updated
+        assert "MULTI_AGENT_TRIGGER_THRESHOLD" in updated
+
+    def test_max_agent_count_bounds_enforced(self, client):
+        # Field has ge=1, le=20 — values outside must 422.
+        resp = client.patch("/api/config", json={"MAX_AGENT_COUNT": 50})
+        assert resp.status_code == 422
+
+    def test_agent_task_timeout_bounds_enforced(self, client):
+        # le=600
+        resp = client.patch("/api/config", json={"AGENT_TASK_TIMEOUT": 9999})
+        assert resp.status_code == 422
