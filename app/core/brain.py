@@ -3199,7 +3199,10 @@ async def think(
                         f"Query blocked: prompt injection detected "
                         f"({_inj_result.score:.0%} confidence). "
                         "Rephrase your request without instruction-override patterns."
-                    )
+                    ),
+                    # Policy refusal, not a server fault — the chat API must
+                    # surface this as a normal (200) refusal answer, not a 500.
+                    "code": "blocked",
                 },
             )
             return
@@ -3207,7 +3210,8 @@ async def think(
         logger.warning("Injection detection failed — blocking as fail-safe: %s", e)
         yield StreamEvent(
             type=EventType.ERROR,
-            data={"message": "Query blocked: injection pre-check failed. Please try again."},
+            data={"message": "Query blocked: injection pre-check failed. Please try again.",
+                  "code": "blocked"},
         )
         return
 
@@ -3524,18 +3528,27 @@ async def think(
         )
 
         if ctx.matched_skill and svc.skills:
+            # Skill success means the answer was actually GOOD, not merely that
+            # it rendered. The old `not gen.is_error` counted confidently-wrong
+            # output as success, so a skill that fed a bad expression to a tool
+            # and templated the garbage survived indefinitely (e.g. the
+            # calculator_arithmetic skill at 32.9% "success", poisoning
+            # arithmetic). When the quality judge has a verdict, it decides;
+            # the structural checks only act as a hard floor (a real tool/error
+            # failure is never a success regardless of score).
+            structural_ok = not gen.is_error
             if ctx.matched_skill.steps:
-                skill_success = (
-                    len(gen.tool_results) > 0
-                    and not gen.is_error
-                    and not any(
-                        isinstance(tr.get("output", ""), str)
-                        and tr["output"].startswith("[Tool") and "failed" in tr["output"]
-                        for tr in gen.tool_results
-                    )
+                structural_ok = structural_ok and len(gen.tool_results) > 0 and not any(
+                    isinstance(tr.get("output", ""), str)
+                    and tr["output"].startswith("[Tool") and "failed" in tr["output"]
+                    for tr in gen.tool_results
                 )
+            if reflexion_quality is not None:
+                skill_success = structural_ok and reflexion_quality >= config.SKILL_SUCCESS_QUALITY
             else:
-                skill_success = not gen.is_error
+                # No quality verdict (e.g. depth-restricted leaf): fall back to
+                # the structural check alone.
+                skill_success = structural_ok
             await asyncio.to_thread(svc.skills.record_use, ctx.matched_skill.id, skill_success)
 
         if is_new_conversation and final_content:

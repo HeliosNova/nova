@@ -147,6 +147,13 @@ async def chat_sync(request: ChatRequest):
             elif event.type == EventType.SOURCES:
                 sources = event.data.get("sources", [])
             elif event.type == EventType.ERROR:
+                # Policy blocks (e.g. prompt-injection refusals) are correct
+                # outcomes — return them as a normal refusal answer. Only
+                # genuine faults become 500s. Reproduced by the live audit
+                # (10.2): the injection block was surfacing as a server error.
+                if event.data.get("code") == "blocked":
+                    tokens.append(event.data.get("message", "Query blocked."))
+                    break
                 raise HTTPException(status_code=500, detail=event.data.get("message", "Unknown error"))
     except HTTPException:
         raise
