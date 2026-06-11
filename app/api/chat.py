@@ -123,6 +123,7 @@ async def chat_sync(request: ChatRequest):
     kg_facts_used = 0
     reflexions_used = 0
     skill_used = None
+    latency_breakdown = None
 
     try:
         async for event in think(
@@ -139,6 +140,7 @@ async def chat_sync(request: ChatRequest):
                 kg_facts_used = event.data.get("kg_facts_used", 0)
                 reflexions_used = event.data.get("reflexions_used", 0)
                 skill_used = event.data.get("skill_used")
+                latency_breakdown = event.data.get("latency_breakdown")
             elif event.type == EventType.TOOL_USE and event.data.get("status") == "complete":
                 tool_results.append({
                     "tool": event.data.get("tool"),
@@ -178,6 +180,7 @@ async def chat_sync(request: ChatRequest):
         kg_facts_used=kg_facts_used,
         reflexions_used=reflexions_used,
         skill_used=skill_used,
+        latency_breakdown=latency_breakdown,
     )
 
 
