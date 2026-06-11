@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, TYPE_CHECKING
 
@@ -3157,6 +3158,36 @@ async def _run_multi_agent_path(
 
 
 # ---------------------------------------------------------------------------
+# Per-stage latency instrumentation (always on — microsecond cost)
+# ---------------------------------------------------------------------------
+
+class _StageTimer:
+    """Records wall-clock per pipeline stage so every query self-reports where
+    its time went. The audit's 122s timeouts were uniform (the client ceiling),
+    which told us nothing about WHICH stage was slow — this closes that gap.
+    Emits one INFO line at the end; stages over 1s are the ones worth chasing.
+    """
+    __slots__ = ("_marks", "_t0", "_last")
+
+    def __init__(self) -> None:
+        self._marks: list[tuple[str, float]] = []
+        self._t0 = time.monotonic()
+        self._last = self._t0
+
+    def mark(self, stage: str) -> None:
+        now = time.monotonic()
+        self._marks.append((stage, now - self._last))
+        self._last = now
+
+    def total(self) -> float:
+        return time.monotonic() - self._t0
+
+    def summary(self) -> str:
+        parts = [f"{s}={d:.1f}s" for s, d in self._marks if d >= 0.05]
+        return f"total={self.total():.1f}s | " + " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
 # The Brain — think()
 # ---------------------------------------------------------------------------
 
@@ -3218,6 +3249,7 @@ async def think(
     svc = get_services()
 
     # --- Step 1: Conversation setup ---
+    _timer = _StageTimer()
     yield StreamEvent(type=EventType.THINKING, data={"stage": "loading_context"})
 
     if ephemeral:
@@ -3279,6 +3311,7 @@ async def think(
 
         # --- Step 4: Gather all context ---
         ctx = await _gather_context(svc, query, intent, conversation_id=conversation_id or "")
+        _timer.mark("context")
 
         # --- Step 5: Emit LESSON_USED events ---
         if ctx.used_lesson_ids and ctx.lessons:
@@ -3395,6 +3428,7 @@ async def think(
             was_planned, ephemeral, gen, query=query,
         ):
             yield event
+        _timer.mark(f"generation({len(gen.tool_results)}tools)")
 
         # --- Step 8: Ephemeral early return ---
         if ephemeral:
@@ -3466,6 +3500,7 @@ async def think(
                 user_facts_text=ctx.user_facts_text,
                 kg_facts_text=ctx.kg_facts_text,
             )
+        _timer.mark("refine")
 
         # --- Step 10: Emit sources + stream tokens ---
         # Guard against None content from LLM (would cause IntegrityError on NOT NULL column)
@@ -3711,6 +3746,15 @@ async def think(
                 logger.warning("Workspace save failed: %s", e)
 
         # --- Step 12: Done event ---
+        _timer.mark("stream")
+        # Always-on latency breakdown. A slow query now says WHERE it was slow
+        # (context vs generation vs refine) instead of just "122s". WARNING when
+        # the total crosses 30s so slow queries surface in normal log scans.
+        _summary = _timer.summary()
+        if _timer.total() >= 30:
+            logger.warning("[LATENCY] slow query (%s): %s", intent, _summary)
+        else:
+            logger.info("[LATENCY] %s: %s", intent, _summary)
         yield StreamEvent(
             type=EventType.DONE,
             data={
@@ -3721,6 +3765,7 @@ async def think(
                 "kg_facts_used": ctx.kg_facts_count,
                 "reflexions_used": ctx.reflexions_count,
                 "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
+                "latency_breakdown": _summary,
             },
         )
 
