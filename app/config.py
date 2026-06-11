@@ -241,6 +241,12 @@ class Config:
     FAST_MODEL: str = field(default_factory=lambda: _env("FAST_MODEL", "qwen3.5:4b"))
     HEAVY_MODEL: str = field(default_factory=lambda: _env("HEAVY_MODEL", ""))
     ENABLE_MODEL_ROUTING: bool = field(default_factory=lambda: _env("ENABLE_MODEL_ROUTING", "true").lower() == "true")
+    # Independent judge for quality grading (reflexion critique, monitor output
+    # eval). MUST be a different model family from LLM_MODEL — a model grading
+    # its own output inherits its own blind spots (self-preference bias).
+    # Empty = disabled (legacy self-critique). Deliberately NOT in
+    # _MUTABLE_FIELDS: a self-improving system must not pick its own judge.
+    JUDGE_MODEL: str = field(default_factory=lambda: _env("JUDGE_MODEL", ""))
 
     # Critique
     MAX_CRITIQUE_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_CRITIQUE_ROUNDS", 3))

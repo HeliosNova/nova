@@ -98,11 +98,17 @@ async def _grade_one(monitor_name: str, output: str) -> dict | None:
         cutoff_human=cutoff.strftime("%B %d, %Y"),
         year=now.year,
     )
+    # Grade with the independent judge when configured — a monitor output
+    # graded by the model that wrote it inherits self-preference bias.
+    from app.config import config as _config
+    _judge = (_config.JUDGE_MODEL or "").strip() or None
     try:
         resp = await invoke_nothink(
             [{"role": "user", "content": prompt}],
             json_mode=True, json_prefix="{",
             max_tokens=300, temperature=0.0,
+            model=_judge,
+            num_ctx=8192 if _judge else None,
         )
     except Exception as e:
         logger.warning("[OutputEval] grade LLM failed: %s", e)

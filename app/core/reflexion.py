@@ -307,6 +307,101 @@ Score guidelines (high level):
 Return JSON: {{"score": 0.0-1.0, "critique": "one sentence summary"}}"""
 
 
+# ---------------------------------------------------------------------------
+# Grounded critique — independent judge with the actual tool evidence.
+#
+# The legacy _CRITIQUE_PROMPT above asks "any unsupported claims?" but the
+# judge never sees what the tools returned — only tool NAMES — so
+# "unsupported" is judged from the same parametric memory that wrote the
+# answer. This prompt puts the evidence in front of the judge and grades
+# claims against it. It is used ONLY with config.JUDGE_MODEL (a different
+# model family) and is deliberately NOT routed through prompt_optimizer:
+# a self-improving system must not be able to soften its own judge.
+# Rubric validated empirically against gemma3:4b and llama3.1:8b probes
+# (2026-06-11): supported answers score high, fabricated specifics get
+# flagged + capped, honest uncertainty is not punished, timeless knowledge
+# needs no evidence.
+# ---------------------------------------------------------------------------
+
+_GROUNDED_CRITIQUE_PROMPT = """You are a strict, impartial grader of an AI assistant's answer. You are NOT the assistant that wrote it. Be strict — the average answer is 0.65, not 0.85.
+
+{date_context}
+
+Question: {query}
+
+Answer to grade: {answer}
+
+Tools the assistant ran: {tools}
+
+Evidence the assistant gathered from its tools (the ONLY verified sources for volatile facts):
+{evidence_section}
+{context_section}
+
+Grade two things:
+
+1. GROUNDED (0.0-1.0): What fraction of the answer's specific factual claims (numbers, dates, names, events) are supported by the evidence or verified context above? Claims appearing nowhere in them are UNSUPPORTED even if they sound plausible. If the answer contradicts the evidence, grounded is 0.0-0.2.
+   EXCEPTION: stable general knowledge (definitions, established facts, arithmetic) needs NO evidence — if the answer is correct timeless knowledge, set grounded to 1.0. Only volatile claims (news, prices, statistics, counts, recent events) require evidence support.
+
+2. SCORE (0.0-1.0): Overall answer quality.
+   - A confident specific claim about current events, prices, statistics, or recent news that no evidence supports is a CRITICAL flaw: cap score at 0.3.
+   - An answer that honestly says a value is unknowable (when evidence cannot settle it) and gives what the evidence DOES support earns 0.7-0.9 — honesty is not a defect.
+   - Refusing or failing to answer when the evidence was sufficient: cap at 0.3.
+   - Leaked internal reasoning ("[PLAN]", "step 1/2/3", "as planned", meta-commentary about the response itself, fabricated prior turns): cap at 0.2.
+   - Length proportionality: a 2,000-char dump on a trivial question, or a one-liner on a complex one, loses 0.1-0.2.
+   - Direct, complete, calibrated answers with appropriate length score 0.8-0.95.
+
+Return ONLY JSON:
+{{"score": 0.0, "grounded": 0.0, "unsupported_claims": ["..."], "critique": "one sentence"}}"""
+
+
+# Enforced via Ollama structured outputs (0.17+) — the judge cannot return
+# a malformed shape, removing the parse-failure class entirely.
+_JUDGE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "score": {"type": "number"},
+        "grounded": {"type": "number"},
+        "unsupported_claims": {"type": "array", "items": {"type": "string"}},
+        "critique": {"type": "string"},
+    },
+    "required": ["score", "grounded", "unsupported_claims", "critique"],
+}
+
+_EVIDENCE_PER_TOOL = 700
+_EVIDENCE_TOTAL = 2800
+
+
+def _build_evidence_section(tool_results: list[dict]) -> str:
+    """Render tool outputs as numbered evidence excerpts for the judge.
+
+    Budgeted so the full judge prompt stays well inside an 8K context:
+    per-tool excerpts cut at a fixed length, whole section capped, and the
+    omission made explicit so the judge never mistakes truncation for
+    absence of evidence.
+    """
+    if not tool_results:
+        return "(none — no tools were used this turn)"
+    parts: list[str] = []
+    used = 0
+    for i, tr in enumerate(tool_results, 1):
+        name = str(tr.get("tool", "?"))
+        err = str(tr.get("error", "") or "").strip()
+        out = str(tr.get("output", "") or "").strip()
+        body = out if out else (f"TOOL ERROR: {err}" if err else "(empty output)")
+        excerpt = body[:_EVIDENCE_PER_TOOL]
+        if len(body) > _EVIDENCE_PER_TOOL:
+            excerpt += " …[truncated]"
+        entry = f"[{i}] {name}: {excerpt}"
+        if used + len(entry) > _EVIDENCE_TOTAL:
+            parts.append(
+                f"[…{len(tool_results) - i + 1} more tool result(s) omitted for length]"
+            )
+            break
+        parts.append(entry)
+        used += len(entry)
+    return "\n".join(parts)
+
+
 from app.core.quality import all_tools_clean as _all_tools_clean  # noqa: F401
 
 
@@ -375,6 +470,67 @@ async def critique_response(
         truncated_answer += "\n\n[…answer continues; this excerpt is the first part]"
     else:
         truncated_answer = answer
+
+    # --- Independent grounded judge (preferred path) ---
+    # A different model family grades the answer WITH the tool evidence in
+    # front of it. Falls back to the legacy self-critique below on any
+    # failure, so behavior with JUDGE_MODEL unset is byte-identical.
+    judge_model = (config.JUDGE_MODEL or "").strip()
+    if judge_model:
+        judge_prompt = _GROUNDED_CRITIQUE_PROMPT.format(
+            date_context=date_context,
+            query=query[:500],
+            answer=truncated_answer,
+            tools=tools_desc,
+            evidence_section=_build_evidence_section(tool_results),
+            context_section=context_section,
+        )
+        try:
+            raw = await asyncio.wait_for(
+                llm.invoke_nothink(
+                    [{"role": "user", "content": judge_prompt}],
+                    json_mode=True,
+                    json_prefix="{",
+                    json_schema=_JUDGE_SCHEMA,
+                    max_tokens=300,
+                    temperature=0.1,
+                    model=judge_model,
+                    num_ctx=8192,
+                ),
+                timeout=min(30, config.INTERNAL_LLM_TIMEOUT),
+            )
+            obj = llm.extract_json_object(raw)
+            if obj and "score" in obj:
+                score = max(0.0, min(1.0, float(obj["score"])))
+                grounded = obj.get("grounded")
+                claims = obj.get("unsupported_claims") or []
+                critique = str(obj.get("critique", "")).strip()[:200]
+                reason = f"[judge:{judge_model}] {critique}"
+                if isinstance(grounded, (int, float)):
+                    grounded = max(0.0, min(1.0, float(grounded)))
+                    reason = (
+                        f"[judge:{judge_model}] grounded={grounded:.2f}; {critique}"
+                    )
+                    # Belt-and-braces fusion: when tools ran and the judge
+                    # found the claims mostly unsupported, a high style score
+                    # must not survive — that is exactly the confident-
+                    # fabrication case this path exists to kill.
+                    if grounded <= 0.3 and tool_results:
+                        score = min(score, 0.4)
+                if claims:
+                    flagged = "; ".join(str(c)[:80] for c in claims[:3])
+                    reason += f" | unsupported: {flagged}"
+                return round(score, 2), reason[:400]
+            logger.warning(
+                "Grounded judge (%s) returned unusable JSON — falling back to self-critique",
+                judge_model,
+            )
+        except Exception as e:
+            logger.warning(
+                "Grounded judge (%s) failed, falling back to self-critique: %s",
+                judge_model, e,
+            )
+
     prompt = critique_template.format(
         query=query[:500],
         answer=truncated_answer,

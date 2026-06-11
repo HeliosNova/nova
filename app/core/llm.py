@@ -94,6 +94,7 @@ class LLMProvider(Protocol):
         max_tokens: int = 8000,
         temperature: float = 0.1,
         model: str | None = None,
+        num_ctx: int | None = None,
     ) -> str:
         """Generate text with thinking disabled. Used for background tasks."""
         ...
@@ -212,6 +213,7 @@ async def invoke_nothink(
     max_tokens: int = 8000,
     temperature: float = 0.1,
     model: str | None = None,
+    num_ctx: int | None = None,
 ) -> str:
     """Call LLM with thinking disabled. Used for background tasks."""
     return await get_provider().invoke_nothink(
@@ -222,6 +224,7 @@ async def invoke_nothink(
         max_tokens=max_tokens,
         temperature=temperature,
         model=model,
+        num_ctx=num_ctx,
     )
 
 
