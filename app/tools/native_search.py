@@ -615,21 +615,70 @@ async def search(
             except Exception as e:
                 logger.warning("native_search: %s failed: %s", name, e)
 
-    return merged
+    return _demote_low_credibility(merged)
+
+
+def _result_host(url: str) -> str:
+    try:
+        host = urlparse(url).netloc.lower()
+    except Exception:
+        return ""
+    return host[4:] if host.startswith("www.") else host
+
+
+def _demote_low_credibility(results: list[SearchResult]) -> list[SearchResult]:
+    """Stable-partition: results from low-credibility domains (dataset score
+    < 0.3 — content farms, known misinformation hosts) move to the BOTTOM.
+    Visible-but-last, never silently dropped: the model and user can still see
+    them, but trustworthy sources lead. Relevance order is preserved within
+    each partition. Same source-authority backbone as the monitor digests
+    (Lin et al. PNAS Nexus 2023 consensus ratings)."""
+    try:
+        from app.core.source_authority import authority
+    except Exception:
+        return results
+    trusted = [r for r in results if authority(_result_host(r.url)) >= 0.3]
+    lowcred = [r for r in results if authority(_result_host(r.url)) < 0.3]
+    if lowcred:
+        logger.info("native_search: demoted %d low-credibility result(s): %s",
+                    len(lowcred), [_result_host(r.url) for r in lowcred[:3]])
+    return trusted + lowcred
 
 
 def format_results(results: list[SearchResult]) -> str:
-    """Format results as a numbered list, naming the source engine.
+    """Format results as a numbered list with engine, host, and a RELIABILITY
+    tier per result (primary/wire, reputable, general, mixed, low-credibility —
+    from the same 11,520-domain consensus dataset the monitor digests use).
 
-    Showing the engine makes source diversity visible to both the LLM and the
-    user — they can tell if results all came from one place or were merged
-    across multiple search backends.
+    Annotating reliability lets the model weigh conflicting results and cite
+    by credibility instead of treating a content farm and Reuters as equals.
+    Low-credibility results carry an explicit warning tag.
     """
     if not results:
         return "No results found."
+    try:
+        from app.core.source_authority import authority, tier
+    except Exception:
+        def authority(h):  # degrade gracefully if module unavailable
+            return 0.5
+
+        def tier(h):
+            return "general"
     lines = []
+    any_lowcred = False
     for i, r in enumerate(results, 1):
         snippet = r.snippet[:800] if r.snippet else ""
         engine = r.engine or "?"
-        lines.append(f"[{i}] ({engine}) {r.title}\n    {r.url}\n    {snippet}")
-    return "\n\n".join(lines)
+        host = _result_host(r.url)
+        t = tier(host) if host else "general"
+        warn = ""
+        if host and authority(host) < 0.3:
+            warn = " ⚠ treat as unverified"
+            any_lowcred = True
+        lines.append(f"[{i}] ({engine} · {host or '?'} — {t}{warn}) {r.title}\n    {r.url}\n    {snippet}")
+    out = "\n\n".join(lines)
+    if any_lowcred:
+        out += ("\n\nNOTE: results tagged low-credibility come from sources with poor "
+                "factual-reliability ratings. Do not state their claims as fact; prefer "
+                "the primary/wire and reputable sources above, or flag the claim as unverified.")
+    return out

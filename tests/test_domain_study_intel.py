@@ -202,3 +202,46 @@ class TestDirectedDeepDive:
         with patch.object(ns, "search", new=AsyncMock(side_effect=RuntimeError("searxng down"))):
             asyncio.run(dr._directed_followup("Finance", item))  # must not raise
         assert "_primary_source" not in item
+
+
+class TestChatSearchAuthority:
+    """The elite-sourcing layer extended to CHAT web-search: low-credibility
+    results demoted (visible-but-last) and every result annotated with a
+    reliability tier so the model cites by credibility."""
+
+    def _r(self, url, title="t", snippet="s"):
+        from app.tools.native_search import SearchResult
+        return SearchResult(title=title, url=url, snippet=snippet, engine="ddg")
+
+    def test_lowcred_demoted_not_dropped(self):
+        from app.tools.native_search import _demote_low_credibility
+        results = [
+            self._r("https://infowars.com/a", "conspiracy take"),
+            self._r("https://reuters.com/b", "wire report"),
+            self._r("https://someblog-unknown.xyz/c", "unknown blog"),
+        ]
+        out = _demote_low_credibility(results)
+        assert len(out) == 3  # nothing dropped
+        assert "reuters.com" in out[0].url
+        assert "infowars.com" in out[-1].url  # demoted to bottom
+
+    def test_relevance_preserved_within_partition(self):
+        from app.tools.native_search import _demote_low_credibility
+        results = [self._r("https://nytimes.com/1"), self._r("https://theverge.com/2")]
+        out = _demote_low_credibility(results)
+        assert [r.url for r in out] == [r.url for r in results]
+
+    def test_format_annotates_tier_and_warns(self):
+        from app.tools.native_search import format_results
+        out = format_results([
+            self._r("https://reuters.com/b", "wire report"),
+            self._r("https://infowars.com/a", "conspiracy take"),
+        ])
+        assert "reuters.com — primary/wire" in out
+        assert "low-credibility" in out and "treat as unverified" in out
+        assert "Do not state their claims as fact" in out
+
+    def test_no_warning_note_when_all_clean(self):
+        from app.tools.native_search import format_results
+        out = format_results([self._r("https://reuters.com/b")])
+        assert "Do not state" not in out
