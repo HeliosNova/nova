@@ -202,35 +202,23 @@ class LearningEngine:
         if self._lessons_collection is None:
             try:
                 import chromadb
-                from .embedding import get_embedding_function
+                from .embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                _kw = {"name": "lessons", "metadata": {"hnsw:space": "cosine"}}
-                _ef = get_embedding_function()
-                if _ef is not None:
-                    _kw["embedding_function"] = _ef
-                self._lessons_collection = client.get_or_create_collection(**_kw)
+                self._lessons_collection = open_collection(
+                    client, "lessons", reindex=self._backfill_collection,
+                )
             except Exception as e:
                 logger.warning("Failed to init lessons ChromaDB collection: %s", e)
                 return None
         return self._lessons_collection
 
-    def reindex_lessons(self) -> int:
-        """One-time backfill of existing lessons into ChromaDB. Returns count indexed."""
-        collection = self._get_lessons_collection()
-        if collection is None:
-            return 0
-        # Skip if collection already has data
-        if collection.count() > 0:
-            logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
-            return 0
-
+    def _backfill_collection(self, collection) -> int:
+        """Populate `collection` from the lessons table, unconditionally.
+        Shared by reindex_lessons (guarded) and the embedder-rebuild path."""
         all_lessons = self._db.fetchall("SELECT * FROM lessons")
         if not all_lessons:
             return 0
-
-        ids = []
-        documents = []
-        metadatas = []
+        ids, documents, metadatas = [], [], []
         for row in all_lessons:
             topic = row["topic"] or ""
             correct_answer = row["correct_answer"] or ""
@@ -243,11 +231,21 @@ class LearningEngine:
             ids.append(str(row["id"]))
             documents.append(searchable)
             metadatas.append({"topic": topic, "confidence": row["confidence"]})
-
         if ids:
             collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
             logger.info("Reindexed %d lessons into ChromaDB", len(ids))
         return len(ids)
+
+    def reindex_lessons(self) -> int:
+        """One-time backfill of existing lessons into ChromaDB. Returns count indexed."""
+        collection = self._get_lessons_collection()
+        if collection is None:
+            return 0
+        # Skip if collection already has data
+        if collection.count() > 0:
+            logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
+            return 0
+        return self._backfill_collection(collection)
 
     async def detect_correction(
         self,

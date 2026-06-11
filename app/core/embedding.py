@@ -131,3 +131,49 @@ def get_embedding_function(force: bool = False):
             "ChromaDB default (all-MiniLM-L6-v2)", model, e)
         _CACHED = None
     return _CACHED
+
+
+def open_collection(client, name: str, *, reindex=None, metadata=None):
+    """get_or_create a Chroma collection wired to the configured embedder,
+    reconciling a dimension mismatch from a previously-defaulted collection.
+
+    Every collection MUST go through here so the whole store uses ONE embedder.
+    Collections created before the embedder upgrade persist as 384-dim MiniLM;
+    attaching the 1024-dim bge-m3 function then throws InvalidDimension on the
+    first query. When that happens we drop and recreate the collection under
+    the new embedder and (if a `reindex` callable is supplied) repopulate it
+    from the SQLite source of truth — the vectors are always re-derivable.
+
+    `reindex(collection)` should backfill rows; it's only called after a
+    rebuild, so it must NOT early-return on `count()>0`.
+    """
+    md = metadata or {"hnsw:space": "cosine"}
+    ef = get_embedding_function()
+    kw = {"name": name, "metadata": md}
+    if ef is not None:
+        kw["embedding_function"] = ef
+    coll = client.get_or_create_collection(**kw)
+
+    if ef is None:
+        return coll
+
+    # Detect a stale-dimension collection by probing a query. A fresh/empty
+    # collection can't mismatch, so skip the probe when it's empty.
+    try:
+        if coll.count() > 0:
+            coll.query(query_texts=["__dim_probe__"], n_results=1)
+    except Exception as e:
+        if "dimension" not in str(e).lower() and "InvalidDimension" not in type(e).__name__:
+            raise
+        logger.warning(
+            "Collection %r has a stale embedding dimension — rebuilding under %s",
+            name, getattr(config, "EMBEDDING_MODEL", "?"))
+        client.delete_collection(name)
+        coll = client.get_or_create_collection(**kw)
+        if reindex is not None:
+            try:
+                n = reindex(coll)
+                logger.info("Rebuilt %r: reindexed %s items under the new embedder", name, n)
+            except Exception as re:
+                logger.error("Reindex of rebuilt collection %r failed: %s", name, re)
+    return coll
