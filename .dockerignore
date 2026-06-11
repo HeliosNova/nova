@@ -1,0 +1,33 @@
+# Keep the build context tiny — the Dockerfile only COPYs app/, tests/,
+# evals/, and two scripts. Without this file the context shipped multiple
+# virtualenvs and model artifacts (gigabytes) to the daemon per build.
+.git
+.venv
+venv
+finetune_env
+finetune_env_py313_BROKEN
+finetune
+finetune_output
+finetune_output_27b
+hf_cache
+unsloth_compiled_cache
+Qwen
+node_modules
+frontend/node_modules
+.pytest_cache
+__pycache__
+**/__pycache__
+*.pyc
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.log
+.tmp
+.archive
+chromadb
+data
+local_train_data
+training_data.jsonl
+training_data.bak.*
+*.db
