@@ -234,11 +234,11 @@ def test_cat2_tool_usage():
     print("CATEGORY 2: Tool Usage")
     print("=" * 70)
 
-    # 2.1 — Calculator usage
+    # 2.1 — Calculator usage (thousands separators are valid formatting: 4,339)
     r = query_nova("Calculate 47 * 89 + 156")
     grade("2_Tools", "2.1", "Calculator: 47*89+156", r, [
         ("No error", no_error(r)),
-        ("Correct answer (4339)", answer_contains(r, "4339")),
+        ("Correct answer (4339)", "4339" in (r.get("answer") or "").replace(",", "")),
         ("Doesn't say 'I can't calculate'", answer_not_contains(r, "cannot calculate", "i can't")),
     ])
 
