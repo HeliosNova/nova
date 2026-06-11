@@ -161,6 +161,36 @@ def get_provider() -> LLMProvider:
     return _provider
 
 
+# ---------------------------------------------------------------------------
+# Interactive-priority GPU coordination
+# ---------------------------------------------------------------------------
+# Measured 2026-06-11: interactive chat is fast (~13s) when the GPU is idle but
+# 60-85s when the 79 background monitors are firing 19K-token generations — the
+# models are co-resident (~23/24GB) so Ollama can't truly run NUM_PARALLEL=4 and
+# a monitor generation holds a slot 10-40s, serializing interactive work. We
+# can't preempt a running generation, but we CAN stop STARTING new background
+# LLM work while the owner is actively chatting. Monitors are scheduled every
+# 6-24h; deferring a cycle by a couple minutes costs nothing and gives the owner
+# the idle-GPU latency. No new config flag (Rule 2): the window is a constant.
+
+import time as _time
+
+INTERACTIVE_PRIORITY_WINDOW_S = 45.0  # background LLM monitors defer if a chat happened within this long
+_last_interactive_monotonic: float = -1e9
+
+
+def note_interactive_activity() -> None:
+    """Call at the start of every interactive (owner-facing) chat request."""
+    global _last_interactive_monotonic
+    _last_interactive_monotonic = _time.monotonic()
+
+
+def interactive_active() -> bool:
+    """True if an interactive chat happened within the priority window — used by
+    the heartbeat loop to defer background LLM monitors so chat keeps the GPU."""
+    return (_time.monotonic() - _last_interactive_monotonic) < INTERACTIVE_PRIORITY_WINDOW_S
+
+
 def get_capabilities() -> ProviderCapabilities:
     """Get the current provider's capabilities."""
     return get_provider().capabilities

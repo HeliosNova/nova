@@ -47,6 +47,9 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_auth)])
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
     """Stream a chat response via Server-Sent Events."""
+    # Mark interactive activity so background LLM monitors yield the GPU to chat.
+    from app.core import llm as _llm
+    _llm.note_interactive_activity()
 
     _KEEPALIVE_INTERVAL = 15.0
     _SENTINEL = object()
@@ -115,6 +118,10 @@ async def chat_stream(request: ChatRequest):
 @router.post("/chat", response_model=ChatResponse)
 async def chat_sync(request: ChatRequest):
     """Synchronous chat — collects the full response and returns it."""
+    # Mark interactive activity so background LLM monitors yield the GPU to chat.
+    from app.core import llm as _llm
+    _llm.note_interactive_activity()
+
     tokens: list[str] = []
     conversation_id = request.conversation_id
     tool_results: list[dict] = []
