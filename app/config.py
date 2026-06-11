@@ -70,7 +70,7 @@ _MUTABLE_FIELDS = {
     "KG_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
-    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
+    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS", "SKILL_SUCCESS_QUALITY",
     "INJECTION_SUSPICIOUS_THRESHOLD",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
@@ -380,6 +380,11 @@ class Config:
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
     ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
+    # Minimum answer quality (reflexion score) for a skill execution to count as
+    # a success. Below this, the skill rendered something but it wasn't good —
+    # which feeds the EMA success_rate and the auto-disable path. 0.6 matches
+    # the "vouched-good" bar used for lesson-helpful and workspace persistence.
+    SKILL_SUCCESS_QUALITY: float = field(default_factory=lambda: _env_float("SKILL_SUCCESS_QUALITY", 0.6))
     # Cosine similarity threshold for semantic skill matching (higher = stricter)
     SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.55))
     # Days without use before a skill is considered stale for decay/pruning
