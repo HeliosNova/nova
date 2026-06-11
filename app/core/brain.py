@@ -515,8 +515,13 @@ async def _run_context_io(name: str, awaitable, default):
     degrade gracefully by returning `default` and logging the loss.
     The pipeline continues with whatever context succeeded.
     """
+    _t0 = time.monotonic()
     try:
-        return await asyncio.wait_for(awaitable, timeout=_CONTEXT_GATHER_TIMEOUT_S)
+        result = await asyncio.wait_for(awaitable, timeout=_CONTEXT_GATHER_TIMEOUT_S)
+        _dt = time.monotonic() - _t0
+        if _dt >= 1.0:
+            logger.info("[context-gather] %s took %.1fs", name, _dt)
+        return result
     except asyncio.TimeoutError:
         logger.warning(
             "[context-gather] %s timed out after %.1fs — degrading without it",
@@ -3552,6 +3557,7 @@ async def think(
             chunk_size = 20
             for i in range(0, len(final_content), chunk_size):
                 yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
+        _timer.mark("validate+emit")
         saved_msg_id = await asyncio.to_thread(
             lambda: svc.conversations.add_message(
                 conversation_id,
@@ -3561,6 +3567,7 @@ async def think(
                 sources=ctx.retrieved_sources or None,
             )
         )
+        _timer.mark("save_msg")
 
         if ctx.matched_skill and svc.skills:
             # Skill success means the answer was actually GOOD, not merely that
