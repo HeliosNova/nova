@@ -545,8 +545,13 @@ async def run_domain_study(monitor_name: str) -> str:
                 if x.get("_title_only") or (x.get("snippet") or "").strip()
             ]
             if len(fresh) >= 2:
-                _picks = fresh[:5]
-                _cross_reference(_picks)
+                # Collapse wire reprints to one source, cross-reference the FULL
+                # set (so corroboration counts every INDEPENDENT outlet), then
+                # select the most important — authority + corroboration — not the
+                # freshest 5.
+                fresh = _collapse_syndication(fresh)
+                _cross_reference(fresh)
+                _picks = _importance_rank(fresh)[:5]
                 _insight = await _synthesize_insight(label, _picks)
                 return _render_items_deterministic(label, emoji, _picks, today, insight=_insight)
 
@@ -661,8 +666,10 @@ async def run_domain_study(monitor_name: str) -> str:
     # snippet/page text. Drop promotional/affiliate items first so we never
     # spend an enrichment call on a coupon page.
     fresh = _drop_non_news(fresh, label)
+    fresh = _collapse_syndication(fresh)
     fresh = await _enrich_summaries(label, fresh)
     _cross_reference(fresh)
+    fresh = _importance_rank(fresh)
     _insight = await _synthesize_insight(label, fresh)
     return _render_items_deterministic(label, emoji, fresh, today, insight=_insight)
 
@@ -850,6 +857,24 @@ _COMMERCE_URL_RE = re.compile(
 )
 
 
+def _importance_rank(items: list[dict]) -> list[dict]:
+    """Order items by importance, not recency: dataset-backed source authority
+    (app/core/source_authority) + a strong INDEPENDENT-corroboration bonus.
+    Per the research, corroboration breadth must count independent outlets, so
+    `_corroborating` is already syndication-collapsed by _cross_reference. Stable
+    sort keeps feed order on ties. Call AFTER _cross_reference."""
+    from app.core.source_authority import authority as _authority
+
+    def _score(it: dict) -> float:
+        auth = _authority(it.get("outlet", ""))
+        corrob = len(it.get("_corroborating") or [])
+        # Independent corroboration dominates significance; capped so one
+        # mega-covered story can't bury everything else.
+        corrob_bonus = min(corrob, 4) * 0.35
+        return auth + corrob_bonus
+    return sorted(items, key=_score, reverse=True)
+
+
 def _newsworthy_title_url(title: str, url: str) -> bool:
     """False for promotional/affiliate/listicle content that isn't news."""
     if _COMMERCE_TITLE_RE.search(title or ""):
@@ -901,13 +926,75 @@ def _story_key_tokens(title: str) -> set[str]:
     return toks
 
 
+_WIRE_ATTRIB_RE = re.compile(
+    r"\(\s*(reuters|ap|associated press|afp|bloomberg|pa media|dpa)\s*\)"
+    r"|—\s*(reuters|associated press|afp)\b", re.IGNORECASE,
+)
+
+
+def _content_tokens(item: dict) -> frozenset:
+    """Word set of an item's body (snippet), for near-duplicate detection."""
+    text = (item.get("snippet") or item.get("title") or "")
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 4)
+
+
+def _is_syndicated(a: dict, b: dict) -> bool:
+    """True if two same-story items are the SAME underlying source — a wire
+    reprint — rather than independent reporting. Per the research, corroboration
+    must count INDEPENDENT sources; N outlets reprinting one AP story = 1 source.
+    Signal: near-verbatim body (token Jaccard >= 0.7) OR both carry an explicit
+    wire attribution ((Reuters)/(AP)/...)."""
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if ta and tb:
+        inter = len(ta & tb)
+        union = len(ta | tb)
+        if union and inter / union >= 0.7:
+            return True
+    a_wire = bool(_WIRE_ATTRIB_RE.search((a.get("snippet") or "") + " " + (a.get("title") or "")))
+    b_wire = bool(_WIRE_ATTRIB_RE.search((b.get("snippet") or "") + " " + (b.get("title") or "")))
+    # Both attributed to a wire AND same story → same origin.
+    return a_wire and b_wire
+
+
+def _collapse_syndication(items: list[dict]) -> list[dict]:
+    """Drop wire reprints, keeping ONE representative per syndication group (the
+    highest-authority outlet). Two items collapse when they're the same story
+    AND syndicated (near-verbatim / shared wire attribution). This stops the
+    digest showing five copies of one AP story and keeps corroboration counts
+    honest (independent sources only). Order-preserving for the survivors."""
+    from app.core.source_authority import authority as _authority
+    survivors: list[dict] = []
+    for it in items:
+        it_tokens = _story_key_tokens(it.get("title", ""))
+        merged = False
+        for s in survivors:
+            s_tokens = _story_key_tokens(s.get("title", ""))
+            overlap = len(it_tokens & s_tokens)
+            same_story = it_tokens and s_tokens and (
+                overlap >= 2 or overlap >= 0.6 * min(len(it_tokens), len(s_tokens))
+            )
+            if same_story and _is_syndicated(it, s):
+                # Same underlying source — keep the higher-authority outlet.
+                if _authority(it.get("outlet", "")) > _authority(s.get("outlet", "")):
+                    survivors[survivors.index(s)] = it
+                merged = True
+                break
+        if not merged:
+            survivors.append(it)
+    if len(survivors) < len(items):
+        logger.info("[DomainRunner] collapsed %d wire reprint(s) -> %d independent items",
+                    len(items) - len(survivors), len(survivors))
+    return survivors
+
+
 def _cross_reference(items: list[dict]) -> None:
-    """Mark items that independent outlets cover as the SAME story. Pure Python,
-    runs across the whole set (RSS + search) so search items and cross-outlet
-    matches the RSS merge missed also get corroboration. Two items corroborate
-    when they share >=2 significant tokens (or >=60% of the smaller set) AND come
-    from different outlets. Populates each item's `_corroborating` with the other
-    outlets — the renderer turns that into a 'Confirmed by N outlets' badge."""
+    """Mark items that INDEPENDENT outlets cover as the SAME story, across the
+    whole set (RSS + search). Two items corroborate when they share >=2
+    significant title tokens (or >=60% of the smaller set), come from different
+    outlets, AND are not syndication of one wire story (_is_syndicated). The
+    syndication collapse is the key correctness fix: counting 10 reprints of one
+    AP story as "10 outlets" is false corroboration. Populates `_corroborating`
+    with the independent outlets; the renderer shows 'Confirmed by N outlets'."""
     keys = [(_story_key_tokens(it.get("title", "")), it) for it in items]
     for i, (ti, a) in enumerate(keys):
         if not ti:
@@ -921,7 +1008,8 @@ def _cross_reference(items: list[dict]) -> None:
             if not b_outlet or b_outlet == a_outlet:
                 continue
             overlap = len(ti & tj)
-            if overlap >= 2 or (overlap and overlap >= 0.6 * min(len(ti), len(tj))):
+            same_story = overlap >= 2 or (overlap and overlap >= 0.6 * min(len(ti), len(tj)))
+            if same_story and not _is_syndicated(a, b):
                 others.add(b.get("outlet") or "")
         if others:
             a["_corroborating"] = sorted(o for o in others if o)
@@ -982,9 +1070,11 @@ def _render_items_deterministic(
     if not keepers:
         return f"No significant {label} developments in the past 72 hours."
 
-    # Cross-reference across the whole kept set (RSS + search) so corroboration
-    # reflects every outlet covering each story, not just RSS-merged ones.
-    _cross_reference(keepers)
+    # Corroboration is computed by the caller on the FULL pre-selection set (so
+    # it counts every independent outlet, not just the rendered top-N). If a
+    # caller passed un-cross-referenced items, do it now as a fallback.
+    if not any("_corroborating" in it for it in keepers):
+        _cross_reference(keepers)
 
     today_str = today.strftime("%B %d, %Y")
     lines = [
