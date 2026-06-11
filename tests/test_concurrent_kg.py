@@ -368,7 +368,7 @@ class TestSupersessionConcurrency:
         current = kg.query("earth")
         current_objects = [f["object"] for f in current if f["predicate"] == "capital_of"]
         assert len(current_objects) == 1
-        assert current_objects[0] == "Moscow"  # normalize_entity title-cases
+        assert current_objects[0] == "moscow"  # casing preserved since 2026-06-09
 
         # History should show all 5
         history = kg.get_fact_history("earth", "capital_of")
