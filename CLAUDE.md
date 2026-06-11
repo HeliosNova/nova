@@ -26,7 +26,7 @@ files in `app/`. Learning is the product.
 - **Config override gotcha:** `/data/config_overrides.json` overrides `.env`. A stale
   `LLM_MODEL=nova-ft-v18-q8` (a fine-tune that never built) sat there and **404'd every generation**;
   fixed to `nova-ft` on 2026-05-30. Keep `LLM_MODEL` pointed at a tag that exists in Ollama.
-- Do **not** re-inflate README / MODEL_CARD / docs/launch_posts back to "fine-tunes itself into a
+- Do **not** re-inflate README / MODEL_CARD / launch copy back to "fine-tunes itself into a
   smarter model" — that claim is disproven and was realigned 2026-05-30.
 - **Memory-loop quality (WS2, 2026-05-30):** two fixes raised `memory_causal_fix_rate` 0.67→0.83:
   (1) `claim_validator.build_evidence` now includes `lessons_text` — lesson-grounded answers were

@@ -1,5 +1,41 @@
 # Changelog
 
+## [1.6.0] - 2026-06-10
+
+Polish pass: measurement honesty, paraphrase-robust memory retrieval, onboarding repair, experiment pruning.
+
+### Eval scoring — timeouts are not wrong answers
+- **Outcome `timeout` separated from `fail` everywhere.** A run that hits its time budget without proving correctness no longer counts as incorrect — it's excluded from every correctness denominator and tracked as its own metric. The 2026-03-18 live audit scored 4.5/10 largely because whole categories timed out and were graded as wrong; correctness and latency are now measured independently so neither can hide the other. Slow-but-correct still counts as a pass.
+- **memory-learning / kg-retrieval pairs with a timed-out leg are UNTESTABLE** — excluded from `memory_causal_fix_rate` instead of recorded as failed fixes
+- **Timeouts no longer write failure reflexions** — budget exhaustion must not pollute the failure-learning store
+- **`tests/live_audit.py`**: timeout → `[T]`, excluded from grade, listed separately; per-query latency captured; scorecard reports mean + p95
+- 9 new tests (`TestTimeoutSeparation`)
+
+### Lesson retrieval — paraphrase-robust (semantic-first completed)
+- **The originating query is now embedded into the lesson vector document.** A future paraphrase is a paraphrase *of that query* — query-to-query similarity is the strongest semantic signal. The query was already persisted and used by the keyword path; the vector path (the one paraphrases depend on) never saw it.
+- **`MIN_RRF_SCORE` no longer vetoes strong vector matches.** A vector-only hit (the paraphrase case by definition) scores ~1/(k+1) in RRF — near any practical floor. Hits at distance ≤ `LESSON_VECTOR_STRONG_DISTANCE` (new, default 0.55) bypass the floor; weak hits (0.55–0.9) still must clear it, so single-word-overlap noise stays rejected.
+- **`.env.example` shipped the old floor (0.015)** that config.py had already lowered to 0.005 — fresh installs would have silently re-broken paraphrase retrieval. Fixed.
+- 4 new tests (`TestParaphraseRetrieval`) including an end-to-end paraphrase roundtrip with real embeddings
+
+### Onboarding repair
+- README quick start: `cd nova_` → `cd nova` (the clone directory was wrong)
+- `install.sh`: three hardware tiers — 20GB+ GPU → 27b, 8GB+ GPU → 9b, CPU-only → 4b. The old no-GPU path pointed at cloud providers removed in v1.5.0 and a `docker-compose.cloud.yml` that never existed
+- New `docker-compose.cpu.yml` override drops the NVIDIA device reservation so CPU-only machines can start the stack
+- README: "Multi-Provider LLM" section replaced with an honest Ollama-only statement; CPU row added to the low-VRAM table; monitor counts aligned to the test-pinned seeded count (69)
+
+### Pruned (preserved on `experiments/pre-v1.6-archive`)
+- **A-HMAD debate** (`app/core/debate.py`, brain hook, 2 config keys) and **MAD-MM memory masking** (`agent_loop._mask_prior_observations`, retry-mask plumbing, 3 config keys): both default-off, never enabled in production, never showed measured value. ~600 lines removed
+- Kept deliberately: fine-tune complex (explicit decision), `ENABLE_PROMPT_SELF_MOD` (live since v1.5.0), `ENABLE_TWO_PHASE_DREAM` (current architectural rationale)
+- Dead `HOST` config key removed (never read — bind address comes from the uvicorn invocation)
+
+### Repo hygiene
+- `training_data.jsonl` + backup untracked (the honest-reposition commit said training data was excluded; now it actually is)
+- Internal docs moved out of the public repo (patent claims draft, launch posts, competitive landscape, capability gap analysis, ecosystem audit) → local archive
+- Self-judged degenerate e2e report and synthetic drift-sim report archived; `baselines/README.md` now states the receipts policy: claimed numbers need committed, cross-family-judged eval artifacts
+- Monitor dispatch refactored from a 27-branch if-elif chain to a registry (`_CHECK_DISPATCH`)
+- `SECURITY.md` updated: mandatory fail-closed query injection detection, always-on tool-output sanitization, CSRF non-applicability (header-token auth, no cookies)
+- `MODEL_CARD.md`: three stale 27B references fixed (the FT base is 9B)
+
 ## [1.5.1] - 2026-04-24
 
 ### Fixed (Multi-agent ceiling)

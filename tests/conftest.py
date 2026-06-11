@@ -23,8 +23,13 @@ def _test_env(tmp_path, monkeypatch):
     # Also patch the module-level constant so _load_overrides picks it up via
     # the env-var fallback path.
     monkeypatch.setattr(_config_mod, "_OVERRIDES_PATH", _Path(tmp_path / "no_overrides.json"))
-    monkeypatch.setenv("OLLAMA_URL", "http://localhost:11434")
-    monkeypatch.setenv("SEARXNG_URL", "http://localhost:8888")
+    # Guaranteed-dead ports (TCP discard) — NOT the real service ports. If the
+    # production Docker stack is running on this machine, tests pointed at
+    # localhost:11434/8888 would silently reach a REAL Ollama/SearXNG and
+    # change behavior (4 tests failed exactly this way on 2026-06-10). Tests
+    # must get instant connection-refused unless they explicitly mock.
+    monkeypatch.setenv("OLLAMA_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("SEARXNG_URL", "http://127.0.0.1:9")
     monkeypatch.setenv("LLM_MODEL", "qwen3.5:27b")
     monkeypatch.setenv("EMBEDDING_MODEL", "nomic-embed-text-v2-moe")
     monkeypatch.setenv("ENABLE_EXTENDED_THINKING", "false")
