@@ -3263,6 +3263,38 @@ class _StageTimer:
 
 
 # ---------------------------------------------------------------------------
+# Ephemeral multi-turn history (eval harness only)
+# ---------------------------------------------------------------------------
+# ephemeral=True keeps eval traffic out of every persistent store, but it
+# also meant history was always empty — so multi-turn behavior (cross-turn
+# recall, pronoun resolution, consistency) was untestable. An explicit
+# conversation_id passed WITH ephemeral=True opts into this bounded
+# in-process history instead. The caller records completed turns via
+# record_ephemeral_turn(); nothing here touches SQLite.
+
+_EPHEMERAL_HISTORIES: dict[str, list[dict]] = {}
+_EPHEMERAL_MAX_CONVS = 50
+_EPHEMERAL_MAX_MESSAGES = 40  # user+assistant messages kept per conversation
+
+
+def record_ephemeral_turn(conversation_id: str, query: str, answer: str) -> None:
+    """Record one completed ephemeral turn so later turns can see it."""
+    if not conversation_id or conversation_id == "ephemeral":
+        return
+    hist = _EPHEMERAL_HISTORIES.setdefault(conversation_id, [])
+    hist.append({"role": "user", "content": query})
+    hist.append({"role": "assistant", "content": answer})
+    del hist[:-_EPHEMERAL_MAX_MESSAGES]
+    while len(_EPHEMERAL_HISTORIES) > _EPHEMERAL_MAX_CONVS:
+        _EPHEMERAL_HISTORIES.pop(next(iter(_EPHEMERAL_HISTORIES)))
+
+
+def clear_ephemeral_history(conversation_id: str) -> None:
+    """Drop the in-process history for one ephemeral conversation."""
+    _EPHEMERAL_HISTORIES.pop(conversation_id, None)
+
+
+# ---------------------------------------------------------------------------
 # The Brain — think()
 # ---------------------------------------------------------------------------
 
@@ -3329,8 +3361,10 @@ async def think(
 
     if ephemeral:
         is_new_conversation = False
+        # An explicit conversation_id opts into the bounded in-process
+        # history (multi-turn eval) — persistent stores stay untouched.
+        history = list(_EPHEMERAL_HISTORIES.get(conversation_id, [])) if conversation_id else []
         conversation_id = conversation_id or "ephemeral"
-        history = []
     else:
         is_new_conversation = conversation_id is None
         if is_new_conversation:
