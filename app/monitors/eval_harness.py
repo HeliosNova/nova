@@ -112,6 +112,11 @@ class CategoryMetrics:
     latency_p50: float
     latency_p95: float
     timeouts: int = 0         # runs that hit the time budget without proving correctness
+    # completed / total. The dual of the timeout count: pass_rate excludes
+    # timeouts from its denominator, so without this a build that times out
+    # on every task would look perfect to regression detection. A drop here
+    # IS a regression (latency ate correctness coverage) and is flagged.
+    completion_rate: float = 1.0
     reflexion_mean: float | None = None
     reflexion_std: float | None = None
     reflexion_p10: float | None = None
@@ -331,6 +336,7 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             latency_p50=percentile(latencies, 50),
             latency_p95=percentile(latencies, 95),
             timeouts=total - n_completed,
+            completion_rate=n_completed / total if total else 0.0,
         )
 
         if scores:
@@ -414,6 +420,11 @@ def detect_regressions(
         ("retrieval_recall", "retrieval_recall"),
         ("memory_causal_fix_rate", "memory_causal_fix_rate"),
         ("reflexion_mean", "reflexion_mean"),
+        # Timeout visibility: completion_rate dropping means timeouts rose —
+        # without it, a build that times out everywhere flags no regressions
+        # because every other rate excludes timeouts from its denominator.
+        # (Old baselines lack this key; it activates on the next baseline write.)
+        ("completion_rate", "completion_rate"),
     ]
 
     def _tol_for(cat: str) -> float:

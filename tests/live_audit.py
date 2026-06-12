@@ -270,12 +270,35 @@ def test_cat2_tool_usage():
 
 
 def test_cat3_user_memory():
-    """Category 3: User Fact Memory & Personalization"""
+    """Category 3: User Fact Memory & Personalization
+
+    3.0-3.2 test the full store→recall round-trip: facts are seeded through
+    the chat path (explicit memory intent → active_memory tool), recalled in
+    later turns, then cleaned up. Earlier audit versions asserted recall of
+    facts that were never seeded — Nova's honest "I don't know" was graded F,
+    so the instrument couldn't distinguish honest-unknown from broken-memory.
+    Cleanup is diff-based (only keys this test created are deleted) so the
+    owner's real fact store is never polluted by the fictional persona.
+    """
     print("\n" + "=" * 70)
     print("CATEGORY 3: User Fact Memory & Personalization")
     print("=" * 70)
 
-    # 3.1 — Does it know the user's name?
+    # Snapshot pre-existing fact keys — cleanup must only touch what we add.
+    try:
+        before_keys = {f["key"] for f in httpx.get(f"{BASE}/api/chat/facts", headers=HEADERS).json()}
+    except Exception:
+        before_keys = set()
+
+    # 3.0 — Seed via the chat path (explicit memory intent → active_memory)
+    r_seed_name = query_nova("Remember this: my name is Marcus.")
+    r_seed_work = query_nova("Remember that I work at Boston Dynamics.")
+    grade("3_Memory", "3.0", "Store facts on request", r_seed_name, [
+        ("Name store turn ok", no_error(r_seed_name)),
+        ("Employer store turn ok", no_error(r_seed_work)),
+    ])
+
+    # 3.1 — Round-trip: recall the seeded name in a fresh turn
     r = query_nova("What is my name?")
     grade("3_Memory", "3.1", "Recall user name", r, [
         ("No error", no_error(r)),
@@ -283,7 +306,7 @@ def test_cat3_user_memory():
         ("Doesn't say 'I don't know'", answer_not_contains(r, "don't know your name", "haven't told me")),
     ])
 
-    # 3.2 — Does it know employer?
+    # 3.2 — Round-trip: recall the seeded employer
     r = query_nova("Where do I work?")
     grade("3_Memory", "3.2", "Recall employer", r, [
         ("No error", no_error(r)),
@@ -312,6 +335,19 @@ def test_cat3_user_memory():
         ("Responds naturally", answer_length_between(r, 10, 2000)),
         ("No 'error' key in facts", "error" not in fact_keys or True),  # Already fixed
     ])
+
+    # Cleanup — delete only the facts this test created (diff vs snapshot),
+    # so the fictional persona never lingers in the owner's real store.
+    try:
+        after = httpx.get(f"{BASE}/api/chat/facts", headers=HEADERS).json()
+        for f in after:
+            if f["key"] not in before_keys:
+                try:
+                    httpx.delete(f"{BASE}/api/chat/facts/{f['key']}", headers=HEADERS)
+                except Exception:
+                    pass
+    except Exception:
+        pass
 
 
 def test_cat4_kg_retrieval():
