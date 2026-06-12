@@ -66,3 +66,6 @@ local_train_data/
 *.log
 _phase0_*
 _phase1_*
+
+# Off-volume SQLite snapshots (bind-mounted into the container at /backups)
+backups/
