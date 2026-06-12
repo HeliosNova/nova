@@ -1215,7 +1215,7 @@ class HeartbeatLoop:
         if not svc.skills:
             return "[No skill store — skill test skipped]"
 
-        skills = svc.skills.get_active_skills()
+        skills = await asyncio.to_thread(svc.skills.get_active_skills)
         if not skills:
             return "[No active skills — skipped]"
 
@@ -1351,7 +1351,7 @@ class HeartbeatLoop:
         if not svc.curiosity:
             return "[Curiosity engine not initialized — skipped]"
 
-        item = svc.curiosity.get_next()
+        item = await asyncio.to_thread(svc.curiosity.get_next)
         if not item:
             return "[No pending curiosity items — skipped]"
 
@@ -1385,7 +1385,7 @@ class HeartbeatLoop:
                 # the rest. Failed closure → requeue (fail() bumps attempts).
                 _resolved_ok = await self._curiosity_closure_check(item.topic, result)
                 if not _resolved_ok:
-                    svc.curiosity.fail(item.id)
+                    await asyncio.to_thread(svc.curiosity.fail, item.id)
                     logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
                     return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
 
@@ -1397,7 +1397,7 @@ class HeartbeatLoop:
                     except Exception:
                         pass
 
-                svc.curiosity.resolve(item.id, result[:2000])
+                await asyncio.to_thread(svc.curiosity.resolve, item.id, result[:2000])
 
                 # --- Convert research findings into a lesson ---
                 # Gate: only create a lesson when the research result LOOKS LIKE actual
@@ -1428,7 +1428,8 @@ class HeartbeatLoop:
                         obj = llm_mod.extract_json_object(raw)
                         lesson_text = (obj.get("lesson", "") if obj else "").strip()
                         if obj and lesson_text and len(lesson_text) >= 20:
-                            svc.learning.add_knowledge_lesson(
+                            await asyncio.to_thread(
+                                svc.learning.add_knowledge_lesson,
                                 topic=obj.get("topic", item.topic[:100]),
                                 correct_answer=lesson_text,
                                 lesson_text=lesson_text,
@@ -1442,10 +1443,10 @@ class HeartbeatLoop:
 
                 return f"CURIOSITY RESOLVED | topic={item.topic[:80]} | findings={result[:200]}"
             else:
-                svc.curiosity.fail(item.id)
+                await asyncio.to_thread(svc.curiosity.fail, item.id)
                 return f"CURIOSITY FAILED | topic={item.topic[:80]} | result={result[:100]}"
         except Exception as e:
-            svc.curiosity.fail(item.id)
+            await asyncio.to_thread(svc.curiosity.fail, item.id)
             return f"CURIOSITY ERROR | topic={item.topic[:80]} | error={e}"
 
     async def _curiosity_closure_check(self, topic: str, result: str) -> bool:
@@ -1556,7 +1557,7 @@ class HeartbeatLoop:
         if not svc.topic_tracker:
             return "[Topic tracker not initialized — skipped]"
 
-        candidates = svc.topic_tracker.get_monitor_candidates(min_count=3, days=7)
+        candidates = await asyncio.to_thread(svc.topic_tracker.get_monitor_candidates, min_count=3, days=7)
         if not candidates:
             return "[No monitor candidates found — skipped]"
 
@@ -2476,7 +2477,7 @@ class HeartbeatLoop:
             )
             try:
                 from app.tools.action_logging import log_action
-                log_action("alert", {"monitor": monitor.name}, message[:500], True)
+                await asyncio.to_thread(log_action, "alert", {"monitor": monitor.name}, message[:500], True)
             except Exception:
                 pass
         elif is_system and not self._telegram:

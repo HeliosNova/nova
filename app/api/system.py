@@ -482,7 +482,7 @@ async def get_custom_tools():
     svc = get_services()
     if not svc.custom_tools:
         return []
-    tools = svc.custom_tools.get_all_tools()
+    tools = await asyncio.to_thread(svc.custom_tools.get_all_tools)
     return [{"id": t.id, "name": t.name, "description": t.description,
              "parameters": t.parameters, "times_used": t.times_used,
              "success_rate": t.success_rate, "enabled": t.enabled} for t in tools]

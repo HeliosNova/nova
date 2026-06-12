@@ -219,9 +219,9 @@ class DailyDigest:
             from app.core.brain import get_services
             svc = get_services()
             if svc.curiosity:
-                resolved = svc.curiosity.get_resolved_since(hours=24)
-                failed = svc.curiosity.get_failed_exhausted(hours=24)
-                stats = svc.curiosity.get_stats()
+                resolved = await asyncio.to_thread(svc.curiosity.get_resolved_since, hours=24)
+                failed = await asyncio.to_thread(svc.curiosity.get_failed_exhausted, hours=24)
+                stats = await asyncio.to_thread(svc.curiosity.get_stats)
                 curiosity_lines = []
                 if resolved:
                     curiosity_lines.append(f"Topics researched: {len(resolved)}")
