@@ -273,3 +273,82 @@ class TestSchemaCreation:
         db.init_schema()  # second call (first was in fixture)
         row = db.fetchone("SELECT count(*) as cnt FROM conversations")
         assert row["cnt"] == 0  # still empty, no error
+
+
+class TestMigration22MonitorResultsIndex:
+    """Migration 22: created_at index for time-window monitor_results queries."""
+
+    def test_created_at_index_exists(self, db):
+        rows = db.fetchall(
+            "SELECT name FROM sqlite_master WHERE type='index' AND name=?",
+            ("idx_monitor_results_created",),
+        )
+        assert rows, "idx_monitor_results_created missing after init_schema"
+
+    def test_time_window_query_uses_index(self, db):
+        plan = db.fetchall(
+            "EXPLAIN QUERY PLAN SELECT * FROM monitor_results "
+            "WHERE created_at > datetime('now', '-24 hours') "
+            "ORDER BY created_at DESC LIMIT 50"
+        )
+        plan_text = " ".join(str(tuple(r)) for r in plan)
+        assert "idx_monitor_results_created" in plan_text, (
+            f"time-window query not using the created_at index: {plan_text}"
+        )
+
+
+class TestEventLoopGuardrail:
+    """SafeDB warns (once per statement) when a sync call runs on the event loop."""
+
+    def setup_method(self):
+        SafeDB._loop_thread_warned.clear()
+
+    def teardown_method(self):
+        SafeDB._loop_thread_warned.clear()
+
+    def test_warns_on_event_loop(self, db, caplog):
+        import asyncio
+        import logging
+
+        async def _call():
+            with caplog.at_level(logging.WARNING, logger="app.database"):
+                db.fetchone("SELECT 1 AS one")
+
+        asyncio.run(_call())
+        warnings = [r for r in caplog.records if "event-loop thread" in r.message]
+        assert len(warnings) == 1
+
+    def test_warns_once_per_statement(self, db, caplog):
+        import asyncio
+        import logging
+
+        async def _call():
+            with caplog.at_level(logging.WARNING, logger="app.database"):
+                db.fetchone("SELECT 2 AS two")
+                db.fetchone("SELECT 2 AS two")
+                db.fetchone("SELECT 3 AS three")
+
+        asyncio.run(_call())
+        warnings = [r for r in caplog.records if "event-loop thread" in r.message]
+        assert len(warnings) == 2  # one per distinct statement, not per call
+
+    def test_no_warning_off_loop(self, db, caplog):
+        import logging
+
+        with caplog.at_level(logging.WARNING, logger="app.database"):
+            db.fetchone("SELECT 4 AS four")
+            db.execute("CREATE TABLE IF NOT EXISTS _guardrail_probe (id INTEGER)")
+        warnings = [r for r in caplog.records if "event-loop thread" in r.message]
+        assert warnings == []
+
+    def test_no_warning_via_to_thread(self, db, caplog):
+        import asyncio
+        import logging
+
+        async def _call():
+            with caplog.at_level(logging.WARNING, logger="app.database"):
+                await asyncio.to_thread(db.fetchone, "SELECT 5 AS five")
+
+        asyncio.run(_call())
+        warnings = [r for r in caplog.records if "event-loop thread" in r.message]
+        assert warnings == []

@@ -6,10 +6,13 @@ Ported from Nova's battle-tested SafeDB pattern.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _instances: dict[str, "SafeDB"] = {}
 _instance_lock = threading.Lock()
@@ -884,7 +887,51 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 22: index for time-window monitor_results queries ---
+        # get_recent_results filters on created_at alone; the existing
+        # idx_monitor_results_monitor(monitor_id, created_at) can't serve it,
+        # so every call was a full table scan over rows with multi-KB TEXT
+        # columns — one of the contributors to the 2026-06-11 event-loop
+        # blocking incident.
+        if 22 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_monitor_results_created "
+                    "ON monitor_results (created_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (22,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    # Statements already reported by _warn_if_event_loop — warn once per
+    # statement, capped so a pathological caller can't grow this unbounded.
+    _loop_thread_warned: set[str] = set()
+
+    def _warn_if_event_loop(self, sql: str) -> None:
+        """Flag sync DB calls running on the event-loop thread.
+
+        Such a call blocks every coroutine for the full lock-acquire +
+        query duration (incident 2026-06-11: heartbeat blocked the loop
+        >60s under lock convoy → container unhealthy). Route async-context
+        calls through AsyncSafeDB or asyncio.to_thread instead.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        key = sql[:120]
+        if key not in SafeDB._loop_thread_warned and len(SafeDB._loop_thread_warned) < 256:
+            SafeDB._loop_thread_warned.add(key)
+            logger.warning(
+                "Sync DB call on event-loop thread (blocks asyncio; use "
+                "AsyncSafeDB or asyncio.to_thread): %s", key
+            )
+
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
+        self._warn_if_event_loop(sql)
         with self._lock:
             conn = self._get_conn()
             cursor = conn.execute(sql, params)
@@ -892,6 +939,7 @@ class SafeDB:
             return cursor
 
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
+        self._warn_if_event_loop(sql)
         with self._lock:
             conn = self._get_conn()
             cursor = conn.executemany(sql, params_list)
@@ -932,11 +980,13 @@ class SafeDB:
         return self._Transaction(self)
 
     def fetchone(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Row | None:
+        self._warn_if_event_loop(sql)
         with self._lock:
             conn = self._get_conn()
             return conn.execute(sql, params).fetchone()
 
     def fetchall(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> list[sqlite3.Row]:
+        self._warn_if_event_loop(sql)
         with self._lock:
             conn = self._get_conn()
             return conn.execute(sql, params).fetchall()
