@@ -1925,13 +1925,44 @@ async def _run_deliberation_path(
         },
     )
 
+    # Grounded reflexion critique on the deliberated answer. AgentLoop
+    # critiques per-step, but the final synthesis shipped unscored — the
+    # judge score here feeds reflexion storage and learning stats in
+    # post-processing. Runs AFTER the DONE event so it adds zero perceived
+    # latency; evidence = the steps' actual observations.
+    deliberation_quality: float | None = None
+    deliberation_reason = ""
+    if not ephemeral and final_content and intent == "general":
+        try:
+            from app.core.reflexion import critique_response, should_use_llm_critique
+            step_evidence = [
+                {
+                    "tool": str((s.action or {}).get("tool") or f"step-{s.id}"),
+                    "output": s.observation or "",
+                }
+                for s in result.plan.steps
+                if s.observation
+            ]
+            if should_use_llm_critique(intent, final_content, step_evidence):
+                deliberation_quality, deliberation_reason = await critique_response(
+                    query, final_content, step_evidence,
+                    user_facts=ctx.user_facts_text,
+                    kg_facts=ctx.kg_facts_text,
+                )
+                logger.info(
+                    "[QUALITY] path=deliberation score=%.2f reason=%s",
+                    deliberation_quality, deliberation_reason[:100],
+                )
+        except Exception as e:
+            logger.debug("[Deliberation] reflexion critique failed: %s", e)
+
     # Lightweight post-processing — fact extraction, etc. Skip on ephemeral.
     if not ephemeral:
         try:
             async for event in _run_post_processing(
                 svc, query, final_content, intent, conversation_id,
                 [], None, ctx.used_lesson_ids,  # no tool_results, no skill
-                False, None, "",  # not error, no reflexion_quality computed yet
+                False, deliberation_quality, deliberation_reason,
                 had_kg=bool(ctx.kg_facts_text),
                 had_docs=bool(ctx.retrieved_context),
                 channel=channel,
@@ -3146,13 +3177,40 @@ async def _run_multi_agent_path(
 
     # --- Post-processing on merged response (non-ephemeral only) ---
     if not ephemeral:
+        # Grounded reflexion critique on the MERGE. Sub-agents are judged
+        # individually inside their own think() runs; this catches
+        # merge-stage fabrication — claims in the merged text that no
+        # sub-agent actually produced. Runs after DONE: zero perceived
+        # latency. Evidence = the sub-agents' answers.
+        merge_quality: float | None = None
+        merge_reason = ""
+        if final_content and intent == "general" and not is_error:
+            try:
+                from app.core.reflexion import critique_response, should_use_llm_critique
+                merge_evidence = [
+                    {"tool": f"sub-agent:{r.role}", "output": r.response or ""}
+                    for r in results
+                    if r.response and not r.error
+                ]
+                if should_use_llm_critique(intent, final_content, merge_evidence):
+                    merge_quality, merge_reason = await critique_response(
+                        query, final_content, merge_evidence,
+                        user_facts=ctx.user_facts_text,
+                        kg_facts=ctx.kg_facts_text,
+                    )
+                    logger.info(
+                        "[QUALITY] path=multi-agent score=%.2f reason=%s",
+                        merge_quality, merge_reason[:100],
+                    )
+            except Exception as e:
+                logger.debug("[Multi-agent] merge reflexion critique failed: %s", e)
         tool_results_for_pp = [
             {"tool": t, "args": {}, "output": ""} for t in list(dict.fromkeys(all_tools))
         ]
         async for event in _run_post_processing(
             svc, query, final_content, intent, conversation_id,
             tool_results_for_pp, None, ctx.used_lesson_ids,
-            is_error, None, "",
+            is_error, merge_quality, merge_reason,
             had_kg=bool(ctx.kg_facts_text),
             had_docs=bool(ctx.retrieved_context),
             channel=channel,
