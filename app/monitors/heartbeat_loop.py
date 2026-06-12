@@ -188,7 +188,7 @@ class HeartbeatLoop:
 
             while self._running:
                 try:
-                    due = self.store.get_due()
+                    due = await asyncio.to_thread(self.store.get_due)
                     if due:
                         logger.info("[Heartbeat] %d monitor(s) due", len(due))
 
@@ -202,8 +202,8 @@ class HeartbeatLoop:
                                 await self._check_monitor(monitor)
                             except Exception as e:
                                 logger.error("[Heartbeat] Monitor '%s' failed: %s", monitor.name, e)
-                                self.store.record_check(monitor.id, f"error: {e}")
-                                self.store.add_result(monitor.id, "error", message=str(e))
+                                await asyncio.to_thread(self.store.record_check, monitor.id, f"error: {e}")
+                                await asyncio.to_thread(self.store.add_result, monitor.id, "error", message=str(e))
 
                         # Interactive-priority: if the owner is actively chatting,
                         # defer the LLM-heavy monitors this cycle so chat keeps the
@@ -253,7 +253,8 @@ class HeartbeatLoop:
                                         # Exponential backoff: count recent consecutive errors
                                         _recent_errors = 0
                                         try:
-                                            _rows = self.store._db.fetchall(
+                                            _rows = await asyncio.to_thread(
+                                                self.store._db.fetchall,
                                                 "SELECT status FROM monitor_results WHERE monitor_id = ? "
                                                 "ORDER BY id DESC LIMIT 5",
                                                 (monitor.id,),
@@ -273,11 +274,13 @@ class HeartbeatLoop:
                                         retry_at = datetime.now(timezone.utc) - timedelta(
                                             seconds=max(0, monitor.schedule_seconds - _retry_delay)
                                         )
-                                        self.store.update(
+                                        await asyncio.to_thread(
+                                            self.store.update,
                                             monitor.id,
                                             last_check_at=retry_at.strftime("%Y-%m-%d %H:%M:%S"),
                                         )
-                                        self.store.add_result(
+                                        await asyncio.to_thread(
+                                            self.store.add_result,
                                             monitor.id, "error",
                                             message=f"Exception — retry in ~{_retry_delay // 60} min: {e}",
                                         )
@@ -285,7 +288,7 @@ class HeartbeatLoop:
                             await asyncio.gather(*[_limited_check(m) for m in slow], return_exceptions=True)
 
                     # Execute due heartbeat instructions
-                    due_instructions = self.store.get_due_instructions()
+                    due_instructions = await asyncio.to_thread(self.store.get_due_instructions)
                     for inst in due_instructions:
                         try:
                             await self._execute_instruction(inst)
@@ -322,7 +325,8 @@ class HeartbeatLoop:
                 "[Heartbeat] '%s' returned empty/short result (%d chars) — soft retry on next tick",
                 monitor.name, len(_stripped),
             )
-            self.store.add_result(
+            await asyncio.to_thread(
+                self.store.add_result,
                 monitor.id, "skip",
                 value=_stripped,
                 message=f"empty result ({len(_stripped)} chars) — will retry",
@@ -358,7 +362,8 @@ class HeartbeatLoop:
             # Count recent consecutive errors to determine backoff level.
             recent_errors = 0
             try:
-                rows = self.store._db.fetchall(
+                rows = await asyncio.to_thread(
+                    self.store._db.fetchall,
                     "SELECT status FROM monitor_results WHERE monitor_id = ? "
                     "ORDER BY id DESC LIMIT 5",
                     (monitor.id,),
@@ -379,24 +384,29 @@ class HeartbeatLoop:
             retry_at = datetime.now(timezone.utc) - timedelta(
                 seconds=max(0, monitor.schedule_seconds - _retry_delay)
             )
-            self.store.update(
+            await asyncio.to_thread(
+                self.store.update,
                 monitor.id,
                 last_check_at=retry_at.strftime("%Y-%m-%d %H:%M:%S"),
             )
-            self.store.add_result(monitor.id, "error", value=new_value[:4000] if new_value else "",
-                                 message=f"LLM failure — retry in ~{_retry_delay // 60} min")
+            await asyncio.to_thread(
+                self.store.add_result,
+                monitor.id, "error", value=new_value[:4000] if new_value else "",
+                message=f"LLM failure — retry in ~{_retry_delay // 60} min")
             logger.warning("[Heartbeat] '%s' LLM failure (streak=%d), retry in ~%d min: %s",
                            monitor.name, recent_errors + 1, _retry_delay // 60, (new_value or "")[:100])
             return
 
         if _is_skip:
             # Record normally — this is expected behavior, not an error
-            self.store.record_check(monitor.id, new_value)
-            self.store.add_result(monitor.id, "ok", value=new_value[:4000] if new_value else "")
+            await asyncio.to_thread(self.store.record_check, monitor.id, new_value)
+            await asyncio.to_thread(
+                self.store.add_result,
+                monitor.id, "ok", value=new_value[:4000] if new_value else "")
             return
 
         # Only record check (update last_check_at) on successful results
-        self.store.record_check(monitor.id, new_value)
+        await asyncio.to_thread(self.store.record_check, monitor.id, new_value)
 
         # Extract KG triples from all factual query monitors (skip non-factual ones).
         # We hold a strong reference to each create_task() result in `_kg_bg_tasks`
@@ -460,7 +470,9 @@ class HeartbeatLoop:
                     should_alert = False
 
         if not should_alert:
-            self.store.add_result(monitor.id, "ok", value=new_value[:4000] if new_value else "")
+            await asyncio.to_thread(
+                self.store.add_result,
+                monitor.id, "ok", value=new_value[:4000] if new_value else "")
             return
 
         # Check cooldown
@@ -469,8 +481,10 @@ class HeartbeatLoop:
             now_naive = datetime.now(timezone.utc).replace(tzinfo=None)
             if (now_naive - last_alert).total_seconds() < monitor.cooldown_minutes * 60:
                 logger.info("[Heartbeat] '%s' in cooldown, skipping alert", monitor.name)
-                self.store.add_result(monitor.id, "ok", value=new_value[:4000] if new_value else "",
-                                      message="in cooldown")
+                await asyncio.to_thread(
+                    self.store.add_result,
+                    monitor.id, "ok", value=new_value[:4000] if new_value else "",
+                    message="in cooldown")
                 return
 
         # For "always" monitors (domain studies etc), the result IS the alert —
@@ -492,8 +506,10 @@ class HeartbeatLoop:
                 "[Heartbeat] '%s' produced empty/tiny body (%d chars); skipping alert",
                 monitor.name, len(analysis.strip()) if analysis else 0,
             )
-            self.store.add_result(monitor.id, "ok", value=new_value[:4000] if new_value else "",
-                                  message="empty_body_suppressed")
+            await asyncio.to_thread(
+                self.store.add_result,
+                monitor.id, "ok", value=new_value[:4000] if new_value else "",
+                message="empty_body_suppressed")
             return
 
         # Send alert
@@ -517,16 +533,18 @@ class HeartbeatLoop:
                     monitor.name, monitor.schedule_seconds,
                 )
             else:
-                self.store.update(monitor.id, enabled=False)
+                await asyncio.to_thread(self.store.update, monitor.id, enabled=False)
                 logger.info("[Heartbeat] Reminder '%s' auto-disabled after alert", monitor.name)
 
         # Record
         status = "changed" if change_info else "ok"
         if change_info and change_info.get("type") == "numeric":
             status = "alert"
-        self.store.record_alert(monitor.id)
-        self.store.add_result(monitor.id, status, value=new_value[:4000] if new_value else "",
-                              message=analysis[:500] if analysis else "")
+        await asyncio.to_thread(self.store.record_alert, monitor.id)
+        await asyncio.to_thread(
+            self.store.add_result,
+            monitor.id, status, value=new_value[:4000] if new_value else "",
+            message=analysis[:500] if analysis else "")
 
     # Registry: check_type -> handler. Adding a new check type is one method
     # plus one entry here — _execute_check never changes. Lambdas adapt the
@@ -797,14 +815,17 @@ class HeartbeatLoop:
         from app.schema import EventType
 
         # --- Build system context ---
-        ctx_lines: list[str] = []
-        try:
+        # The whole block is sequential sync store reads; it runs via
+        # to_thread so the event loop never waits on the SQLite lock here
+        # (this exact path blocked the loop >60s in the 2026-06-11 incident).
+        def _build_context_lines() -> list[str]:
+            lines: list[str] = []
             svc = get_services()
 
             # Monitors
             monitors = self.store.list_all()
             enabled = [m for m in monitors if m.enabled]
-            ctx_lines.append(
+            lines.append(
                 f"Monitors: {len(monitors)} total, {len(enabled)} enabled — "
                 + ", ".join(m.name for m in monitors)
             )
@@ -813,18 +834,18 @@ class HeartbeatLoop:
             recent = self.store.get_recent_results(hours=24, limit=20)
             if recent:
                 alerts = [r for r in recent if r.status in ("alert", "changed", "error")]
-                ctx_lines.append(f"Last 24h: {len(recent)} results, {len(alerts)} alerts/changes")
+                lines.append(f"Last 24h: {len(recent)} results, {len(alerts)} alerts/changes")
             else:
-                ctx_lines.append("Last 24h: no monitor results yet")
+                lines.append("Last 24h: no monitor results yet")
 
             # Recent conversations
             if svc.conversations:
                 convos = svc.conversations.list_conversations(limit=10)
                 if convos:
                     titles = [c.get("title") or "(untitled)" for c in convos]
-                    ctx_lines.append(f"Recent conversations ({len(convos)}): " + ", ".join(titles))
+                    lines.append(f"Recent conversations ({len(convos)}): " + ", ".join(titles))
                 else:
-                    ctx_lines.append("Recent conversations: none")
+                    lines.append("Recent conversations: none")
 
             # Learning summary with actual content
             if svc.learning:
@@ -835,7 +856,7 @@ class HeartbeatLoop:
                     for les in summary["new_lessons"][:5]:
                         topic = les.get("topic", "?")[:60]
                         lesson_text = (les.get("lesson_text") or les.get("correct_answer", ""))[:100]
-                        ctx_lines.append(f"  Lesson: {topic} — {lesson_text}")
+                        lines.append(f"  Lesson: {topic} — {lesson_text}")
                 if summary.get("new_skills"):
                     parts.append(f"{len(summary['new_skills'])} new skill(s)")
                 if summary.get("degraded_skills"):
@@ -845,17 +866,22 @@ class HeartbeatLoop:
                     for ref in summary["new_reflexions"][:5]:
                         task = ref.get("task_summary", "?")[:60]
                         score = ref.get("quality_score", 0)
-                        ctx_lines.append(f"  Reflexion (quality={score:.1f}): {task}")
-                ctx_lines.append("Learning (24h): " + (", ".join(parts) if parts else "no activity"))
+                        lines.append(f"  Reflexion (quality={score:.1f}): {task}")
+                lines.append("Learning (24h): " + (", ".join(parts) if parts else "no activity"))
 
             # Owner facts
             if svc.user_facts:
                 facts = svc.user_facts.get_all()
                 if facts:
-                    ctx_lines.append(
+                    lines.append(
                         f"Known owner facts ({len(facts)}): "
                         + ", ".join(f"{f.key}={f.value}" for f in facts[:10])
                     )
+            return lines
+
+        ctx_lines: list[str] = []
+        try:
+            ctx_lines = await asyncio.to_thread(_build_context_lines)
         except Exception as e:
             logger.warning("[Heartbeat] Failed to build system context: %s", e)
 
@@ -929,15 +955,15 @@ class HeartbeatLoop:
                             tokens.append(text)
         except (TimeoutError, asyncio.TimeoutError):
             logger.warning("[Heartbeat] Instruction #%d timed out after %ds", inst.id, config.GENERATION_TIMEOUT)
-            self.store.record_instruction_run(inst.id)
+            await asyncio.to_thread(self.store.record_instruction_run, inst.id)
             return
         except Exception as e:
             logger.error("[Heartbeat] Instruction #%d failed: %s", inst.id, e)
-            self.store.record_instruction_run(inst.id)
+            await asyncio.to_thread(self.store.record_instruction_run, inst.id)
             return
 
         result = "".join(tokens).strip()
-        self.store.record_instruction_run(inst.id)
+        await asyncio.to_thread(self.store.record_instruction_run, inst.id)
 
         if not result:
             return
@@ -987,7 +1013,7 @@ class HeartbeatLoop:
         if not svc.learning:
             return "[No learning engine — quiz skipped]"
 
-        lessons = svc.learning.get_all_lessons(limit=200)
+        lessons = await asyncio.to_thread(svc.learning.get_all_lessons, limit=200)
         if not lessons:
             return "[No lessons to quiz on — skipped]"
 
@@ -997,7 +1023,8 @@ class HeartbeatLoop:
         # Otherwise NULLS FIRST → unquizzed; then oldest-quizzed by failure count.
         db = svc.learning._db
         lesson = None
-        row = db.fetchone(
+        row = await asyncio.to_thread(
+            db.fetchone,
             "SELECT id FROM lessons "
             "WHERE (quiz_failures < 5 "
             "   OR last_quizzed_at < datetime('now', '-7 days') "
@@ -1089,7 +1116,8 @@ class HeartbeatLoop:
         # Update quiz tracking
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         try:
-            db.execute(
+            await asyncio.to_thread(
+                db.execute,
                 "UPDATE lessons SET last_quizzed_at = ? WHERE id = ?",
                 (now_str, lesson.id),
             )
@@ -1114,19 +1142,21 @@ class HeartbeatLoop:
         if passed:
             # Reinforce the lesson
             try:
-                svc.learning.mark_lesson_helpful(lesson.id)
+                await asyncio.to_thread(svc.learning.mark_lesson_helpful, lesson.id)
             except Exception as e:
                 logger.warning("[Heartbeat] mark_lesson_helpful failed: %s", e)
             # CLOSURE: clear the quiz_failures counter — the lesson has been
             # re-validated. This is the closure signal for the
             # quiz-fail → curiosity-research → re-quiz feedback loop.
             try:
-                cleared_row = db.fetchone(
+                cleared_row = await asyncio.to_thread(
+                    db.fetchone,
                     "SELECT quiz_failures FROM lessons WHERE id = ?", (lesson.id,)
                 )
                 prior_failures = int(cleared_row["quiz_failures"]) if cleared_row else 0
                 if prior_failures > 0:
-                    db.execute(
+                    await asyncio.to_thread(
+                        db.execute,
                         "UPDATE lessons SET quiz_failures = 0 WHERE id = ?",
                         (lesson.id,),
                     )
@@ -1140,7 +1170,8 @@ class HeartbeatLoop:
 
         # Failed — increment quiz_failures counter
         try:
-            db.execute(
+            await asyncio.to_thread(
+                db.execute,
                 "UPDATE lessons SET quiz_failures = COALESCE(quiz_failures, 0) + 1 WHERE id = ?",
                 (lesson.id,),
             )
@@ -1151,7 +1182,7 @@ class HeartbeatLoop:
         fail_reason = grade.get("reason", "incorrect")
 
         try:
-            svc.learning.mark_lesson_unhelpful(lesson.id)
+            await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, lesson.id)
         except Exception as e:
             logger.warning("[Heartbeat] Quiz mark_lesson_unhelpful failed: %s", e)
 
@@ -1556,7 +1587,7 @@ class HeartbeatLoop:
             return "[No valid monitor candidates — skipped]"
 
         # Filter out topics that already have monitors
-        existing_monitors = {m.name.lower() for m in self.store.list_all()}
+        existing_monitors = {m.name.lower() for m in await asyncio.to_thread(self.store.list_all)}
         auto_count = sum(1 for name in existing_monitors if name.startswith("auto:"))
 
         created = []
@@ -1576,7 +1607,8 @@ class HeartbeatLoop:
                 f"one bullet: what happened and why it matters. Use this format:\n"
                 f"• Update 1: ...\n• Update 2: ...\n• Update 3: ..."
             )
-            mid = self.store.create(
+            mid = await asyncio.to_thread(
+                self.store.create,
                 name=monitor_name,
                 check_type="query",
                 check_config={"query": query_prompt},
@@ -1600,14 +1632,14 @@ class HeartbeatLoop:
         parts = []
         if svc.learning:
             try:
-                decayed = svc.learning.decay_stale_lessons(days=30)
+                decayed = await asyncio.to_thread(svc.learning.decay_stale_lessons, days=30)
                 if decayed:
                     parts.append(f"lessons decayed: {decayed}")
             except Exception as e:
                 parts.append(f"lesson decay failed: {e}")
                 logger.warning("[Heartbeat] Lesson decay failed: %s", e)
             try:
-                deleted = svc.learning.prune_dead_lessons()
+                deleted = await asyncio.to_thread(svc.learning.prune_dead_lessons)
                 if deleted:
                     parts.append(f"dead lessons pruned: {deleted}")
             except Exception as e:
@@ -1638,7 +1670,7 @@ class HeartbeatLoop:
                 cs_decayed = await svc.kg.decay_unused_speculative(
                     provenance="cross_synthesis", days=14, decay_amount=0.15
                 )
-                cs_stats = svc.kg.get_provenance_usage_stats("cross_synthesis")
+                cs_stats = await asyncio.to_thread(svc.kg.get_provenance_usage_stats, "cross_synthesis")
                 parts.append(
                     f"cross_synthesis: total={cs_stats['total']} used={cs_stats['used']} "
                     f"avg_retrievals={cs_stats['avg_retrievals']:.1f} decayed={cs_decayed}"
@@ -1648,7 +1680,7 @@ class HeartbeatLoop:
                 logger.warning("[Heartbeat] cross_synthesis decay failed: %s", e)
         if svc.reflexions:
             try:
-                decayed = svc.reflexions.decay_stale(days=90)
+                decayed = await asyncio.to_thread(svc.reflexions.decay_stale, days=90)
                 if decayed:
                     parts.append(f"reflexions decayed: {decayed}")
             except Exception as e:
@@ -1657,12 +1689,14 @@ class HeartbeatLoop:
             # Demote success patterns whose injection correlates with low quality
             # (A/B closure — useless suggestions get filtered out over time).
             try:
-                useless_ids = svc.reflexions.get_useless_success_patterns(
-                    min_uses=5, max_avg_quality=0.5
+                useless_ids = await asyncio.to_thread(
+                    svc.reflexions.get_useless_success_patterns,
+                    min_uses=5, max_avg_quality=0.5,
                 )
                 if useless_ids:
                     placeholders = ",".join("?" for _ in useless_ids)
-                    svc.reflexions._db.execute(
+                    await asyncio.to_thread(
+                        svc.reflexions._db.execute,
                         f"UPDATE reflexions SET outcome='failure' WHERE id IN ({placeholders})",
                         tuple(useless_ids),
                     )
@@ -1672,7 +1706,7 @@ class HeartbeatLoop:
                 logger.warning("[Heartbeat] Success pattern demotion failed: %s", e)
         if svc.curiosity:
             try:
-                pruned = svc.curiosity.prune(days=30)
+                pruned = await asyncio.to_thread(svc.curiosity.prune, days=30)
                 if pruned:
                     parts.append(f"curiosity items pruned: {pruned}")
             except Exception as e:
@@ -1683,13 +1717,13 @@ class HeartbeatLoop:
             from app.core.auto_tools import prune_unused_tools, get_auto_tool_health
             from app.database import get_db
             _db = get_db()
-            res = prune_unused_tools(_db, min_age_days=3)
+            res = await asyncio.to_thread(prune_unused_tools, _db, min_age_days=3)
             if res.get("disabled"):
                 parts.append(
                     f"auto-tools disabled: {res['disabled']} "
                     f"(unused={res.get('unused', 0)} bad={res.get('bad', 0)})"
                 )
-            health = get_auto_tool_health(_db)
+            health = await asyncio.to_thread(get_auto_tool_health, _db)
             if health.get("total", 0) > 0:
                 parts.append(
                     f"auto-tool health: total={health['total']} enabled={health['enabled']} "
@@ -1699,21 +1733,31 @@ class HeartbeatLoop:
         except Exception as e:
             parts.append(f"auto-tool prune failed: {e}")
             logger.warning("[Heartbeat] Auto-tool prune failed: %s", e)
-        # Audit log retention — keep 30 days for action_log, 30 days for trust_audit_log.
-        # Was unbounded; 20k+ rows accumulated over 6 weeks.
+        # Audit log retention — keep 30 days for action_log, trust_audit_log,
+        # and monitor_results. Was unbounded; 20k+ rows accumulated over 6 weeks
+        # (monitor_results hit 13.7k rows of multi-KB TEXT by 2026-06 and was
+        # part of the event-loop blocking incident).
         try:
             from app.database import get_db
             db = get_db()
-            action_deleted = db.execute(
-                "DELETE FROM action_log WHERE created_at < datetime('now', '-30 days')"
-            ).rowcount
+            action_deleted = (await asyncio.to_thread(
+                db.execute,
+                "DELETE FROM action_log WHERE created_at < datetime('now', '-30 days')",
+            )).rowcount
             if action_deleted:
                 parts.append(f"action_log pruned: {action_deleted}")
-            trust_deleted = db.execute(
-                "DELETE FROM trust_audit_log WHERE timestamp < datetime('now', '-30 days')"
-            ).rowcount
+            trust_deleted = (await asyncio.to_thread(
+                db.execute,
+                "DELETE FROM trust_audit_log WHERE timestamp < datetime('now', '-30 days')",
+            )).rowcount
             if trust_deleted:
                 parts.append(f"trust_audit pruned: {trust_deleted}")
+            results_deleted = (await asyncio.to_thread(
+                db.execute,
+                "DELETE FROM monitor_results WHERE created_at < datetime('now', '-30 days')",
+            )).rowcount
+            if results_deleted:
+                parts.append(f"monitor_results pruned: {results_deleted}")
         except Exception as e:
             logger.warning("[Heartbeat] Audit prune failed: %s", e)
         # Periodic SQLite backup — keep last 7 daily snapshots so a corruption
@@ -1728,10 +1772,14 @@ class HeartbeatLoop:
             today = datetime.now(timezone.utc).strftime("%Y%m%d")
             target = backup_dir / f"nova-{today}.db"
             if not target.exists():
-                # SQLite recommends VACUUM INTO for atomic snapshots
+                # SQLite recommends VACUUM INTO for atomic snapshots.
+                # MUST run off the event loop: it copies the whole DB while
+                # holding the SafeDB lock (seconds-to-minutes) — running it
+                # inline was a prime contributor to the 2026-06-11 incident
+                # where the loop blocked >60s and the container went unhealthy.
                 from app.database import get_db
                 _db = get_db()
-                _db.execute(f"VACUUM INTO '{target}'")
+                await asyncio.to_thread(_db.execute, f"VACUUM INTO '{target}'")
                 # Retain last 7 backups
                 snapshots = sorted(backup_dir.glob("nova-*.db"))
                 for old in snapshots[:-7]:
@@ -1781,7 +1829,6 @@ class HeartbeatLoop:
         import re
         from app.database import get_db
 
-        db = get_db()
         garbage = re.compile(
             r"no significant developments|"
             r"no significant\b.*\bdevelopments|"
@@ -1792,30 +1839,37 @@ class HeartbeatLoop:
             r"completely irrelevant",
             re.IGNORECASE,
         )
-        rows = db.fetchall(
-            "SELECT id, name FROM monitors WHERE enabled = 1"
-        )
-        disabled_count = 0
-        for row in rows:
-            mid, name = row["id"], row["name"]
-            results = db.fetchall(
-                "SELECT value FROM monitor_results "
-                "WHERE monitor_id = ? ORDER BY created_at DESC LIMIT 3",
-                (mid,),
+
+        # Pure DB loop — one thread hop for the whole scan instead of
+        # blocking the event loop per query.
+        def _scan_and_disable() -> int:
+            db = get_db()
+            rows = db.fetchall(
+                "SELECT id, name FROM monitors WHERE enabled = 1"
             )
-            if len(results) < 3:
-                continue
-            if all(r["value"] and garbage.search(r["value"]) for r in results):
-                db.execute(
-                    "UPDATE monitors SET enabled = 0 WHERE id = ?", (mid,)
+            disabled = 0
+            for row in rows:
+                mid, name = row["id"], row["name"]
+                results = db.fetchall(
+                    "SELECT value FROM monitor_results "
+                    "WHERE monitor_id = ? ORDER BY created_at DESC LIMIT 3",
+                    (mid,),
                 )
-                disabled_count += 1
-                logger.info(
-                    "[Heartbeat] Auto-disabled garbage monitor: [%d] %s "
-                    "(3 consecutive no-signal results)",
-                    mid, name,
-                )
-        return disabled_count
+                if len(results) < 3:
+                    continue
+                if all(r["value"] and garbage.search(r["value"]) for r in results):
+                    db.execute(
+                        "UPDATE monitors SET enabled = 0 WHERE id = ?", (mid,)
+                    )
+                    disabled += 1
+                    logger.info(
+                        "[Heartbeat] Auto-disabled garbage monitor: [%d] %s "
+                        "(3 consecutive no-signal results)",
+                        mid, name,
+                    )
+            return disabled
+
+        return await asyncio.to_thread(_scan_and_disable)
 
     async def _check_feedback_loops(self, svc) -> list[str]:
         """Cross-monitor intelligence: quiz→curiosity, skill degradation→early test, curiosity→quiz log."""
@@ -1835,7 +1889,8 @@ class HeartbeatLoop:
         if has_db and svc.curiosity:
             try:
                 db = svc.learning._db
-                failing = db.fetchall(
+                failing = await asyncio.to_thread(
+                    db.fetchall,
                     "SELECT id, topic FROM lessons "
                     "WHERE quiz_failures >= 3 "
                     "AND last_quizzed_at > datetime('now', '-7 days')"
@@ -1845,7 +1900,8 @@ class HeartbeatLoop:
                     topic = row["topic"]
                     # Prefix to pass CuriosityQueue validation (15+ chars, 4+ words)
                     padded = f"Re-research and verify: {topic}"
-                    cid = svc.curiosity.add(padded, source="quiz_feedback", urgency=0.7)
+                    cid = await asyncio.to_thread(
+                        svc.curiosity.add, padded, source="quiz_feedback", urgency=0.7)
                     if cid > 0:
                         requeued += 1
                 if requeued:
@@ -1858,13 +1914,13 @@ class HeartbeatLoop:
         if svc.skills:
             try:
                 degrading = [
-                    s for s in svc.skills.get_active_skills()
+                    s for s in await asyncio.to_thread(svc.skills.get_active_skills)
                     if 0.3 <= s.success_rate < 0.5 and s.times_used >= 5
                 ]
                 if degrading:
-                    sv_monitor = self.store.get_by_name("Skill Validation")
+                    sv_monitor = await asyncio.to_thread(self.store.get_by_name, "Skill Validation")
                     if sv_monitor:
-                        self.store.update(sv_monitor.id, last_check_at=None)
+                        await asyncio.to_thread(self.store.update, sv_monitor.id, last_check_at=None)
                         parts.append(f"skill→validation: {len(degrading)} degrading skills, forced early test")
             except Exception as e:
                 logger.warning("[Heartbeat] Loop B (skill→validation) failed: %s", e)
@@ -1874,7 +1930,8 @@ class HeartbeatLoop:
         if has_db:
             try:
                 db = svc.learning._db
-                row = db.fetchone(
+                row = await asyncio.to_thread(
+                    db.fetchone,
                     "SELECT COUNT(*) AS c FROM lessons "
                     "WHERE last_quizzed_at IS NULL "
                     "AND created_at > datetime('now', '-1 day')"
@@ -2066,7 +2123,8 @@ class HeartbeatLoop:
         # don't pound the LLM if the monitor runs too frequently.
         try:
             db = get_db()
-            row = db.fetchone("SELECT value FROM system_state WHERE key='last_dream_at'")
+            row = await asyncio.to_thread(
+                db.fetchone, "SELECT value FROM system_state WHERE key='last_dream_at'")
             if row and row["value"]:
                 last = datetime.fromisoformat(row["value"])
                 elapsed_hours = (datetime.now(timezone.utc).replace(tzinfo=None) - last).total_seconds() / 3600
@@ -2107,7 +2165,8 @@ class HeartbeatLoop:
 
         db = get_db()
         try:
-            rows = db.fetchall(
+            rows = await asyncio.to_thread(
+                db.fetchall,
                 "SELECT id, query, reason, quality_score FROM capability_gaps "
                 "WHERE reviewed = 0 ORDER BY created_at DESC LIMIT 50"
             )
@@ -2157,7 +2216,8 @@ class HeartbeatLoop:
         # Mark all reviewed gaps as reviewed
         try:
             gap_ids = [row["id"] for row in rows]
-            db.execute(
+            await asyncio.to_thread(
+                db.execute,
                 f"UPDATE capability_gaps SET reviewed = 1 WHERE id IN ({','.join('?' * len(gap_ids))})",
                 tuple(gap_ids),
             )
@@ -2475,13 +2535,17 @@ class HeartbeatLoop:
             )
 
         db = get_db()
-        for table in ("conversations", "messages", "lessons", "reflexions",
-                      "skills", "kg_facts", "monitors"):
-            try:
-                row = db.fetchone(f"SELECT count(*) as c FROM {table}")
-                fields[table] = row["c"]
-            except Exception:
-                pass
+
+        def _count_tables() -> None:
+            for table in ("conversations", "messages", "lessons", "reflexions",
+                          "skills", "kg_facts", "monitors"):
+                try:
+                    row = db.fetchone(f"SELECT count(*) as c FROM {table}")
+                    fields[table] = row["c"]
+                except Exception:
+                    pass
+
+        await asyncio.to_thread(_count_tables)
 
         return format_monitor_result("DB Size Monitor", status, summary, fields)
 
@@ -2523,14 +2587,19 @@ class HeartbeatLoop:
 
         try:
             db = svc.skills._db
-            total = db.fetchone("SELECT count(*) as c FROM skills")["c"]
-            enabled = db.fetchone("SELECT count(*) as c FROM skills WHERE enabled = 1")["c"]
+
+            def _skill_stats() -> tuple[int, int, float, int]:
+                t = db.fetchone("SELECT count(*) as c FROM skills")["c"]
+                en = db.fetchone("SELECT count(*) as c FROM skills WHERE enabled = 1")["c"]
+                avg_row = db.fetchone("SELECT avg(success_rate) as avg_sr FROM skills WHERE enabled = 1")
+                avg = avg_row["avg_sr"] if avg_row and avg_row["avg_sr"] is not None else 0.0
+                deg = db.fetchone(
+                    "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
+                )["c"]
+                return t, en, avg, deg
+
+            total, enabled, avg_sr, degrading = await asyncio.to_thread(_skill_stats)
             disabled = total - enabled
-            avg_row = db.fetchone("SELECT avg(success_rate) as avg_sr FROM skills WHERE enabled = 1")
-            avg_sr = avg_row["avg_sr"] if avg_row and avg_row["avg_sr"] is not None else 0.0
-            degrading = db.fetchone(
-                "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
-            )["c"]
             if degrading > 5 or avg_sr < 0.4:
                 status = "warning"
                 summary = f"{degrading} degrading, avg {avg_sr:.2f}"
@@ -2576,7 +2645,8 @@ class HeartbeatLoop:
 
         try:
             db = get_db()
-            fts_row = db.fetchone("SELECT count(*) as c FROM chunks_fts")
+            fts_row = await asyncio.to_thread(
+                db.fetchone, "SELECT count(*) as c FROM chunks_fts")
             fields["fts5"] = fts_row["c"]
         except Exception:
             pass
@@ -2592,19 +2662,20 @@ class HeartbeatLoop:
             return format_monitor_result("KG Health Monitor", "error", "kg unavailable")
 
         try:
-            stats = svc.kg.get_stats()
+            stats = await asyncio.to_thread(svc.kg.get_stats)
             fields: dict[str, str | int | float] = {
                 "facts": stats.get("total_facts", 0),
                 "active": stats.get("current_facts", 0),
                 "superseded": stats.get("superseded_facts", 0),
             }
             db = svc.kg._db
-            entities_row = db.fetchone(
+            entities_row = await asyncio.to_thread(
+                db.fetchone,
                 "SELECT count(DISTINCT subject) + count(DISTINCT object) as c FROM kg_facts WHERE valid_to IS NULL"
             )
             if entities_row:
                 fields["entities"] = entities_row["c"]
-            orphans_row = db.fetchone("""
+            orphans_row = await asyncio.to_thread(db.fetchone, """
                 SELECT count(*) as c FROM (
                     SELECT subject as entity FROM kg_facts WHERE valid_to IS NULL
                     GROUP BY subject HAVING count(*) = 1
@@ -2694,10 +2765,12 @@ class HeartbeatLoop:
 
         db = svc.kg._db
         try:
-            last_6h = db.fetchone(
+            last_6h = await asyncio.to_thread(
+                db.fetchone,
                 "SELECT count(*) as c FROM kg_facts WHERE created_at > datetime('now', '-6 hours')"
             )
-            prev_6h = db.fetchone(
+            prev_6h = await asyncio.to_thread(
+                db.fetchone,
                 "SELECT count(*) as c FROM kg_facts "
                 "WHERE created_at > datetime('now', '-12 hours') "
                 "AND created_at <= datetime('now', '-6 hours')"
@@ -2765,14 +2838,14 @@ class HeartbeatLoop:
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""
-        monitor = self.store.get(monitor_id)
+        monitor = await asyncio.to_thread(self.store.get, monitor_id)
         if not monitor:
             return {"error": "Monitor not found"}
 
         try:
             await self._check_monitor(monitor)
             # Get the latest result
-            results = self.store.get_results(monitor_id, limit=1)
+            results = await asyncio.to_thread(self.store.get_results, monitor_id, limit=1)
             if results:
                 r = results[0]
                 return {"status": r.status, "value": r.value, "message": r.message}

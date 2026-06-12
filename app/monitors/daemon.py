@@ -131,7 +131,14 @@ class DaemonOrchestrator:
             await self._execute_decision(decision, context)
 
     async def _gather_context(self) -> dict:
-        """Collect current state for daemon reasoning."""
+        """Collect current state for daemon reasoning.
+
+        Pure sequential DB reads — runs once per tick via to_thread so the
+        event loop never waits on the SQLite lock (2026-06-11 incident class).
+        """
+        return await asyncio.to_thread(self._gather_context_sync)
+
+    def _gather_context_sync(self) -> dict:
         now = datetime.utcnow()
 
         # Last user activity
@@ -317,7 +324,8 @@ class DaemonOrchestrator:
 
     async def _send_pending_alerts(self):
         """Send high-priority events as alerts to channels."""
-        rows = self._db.fetchall(
+        rows = await asyncio.to_thread(
+            self._db.fetchall,
             "SELECT id, event_type, payload, priority FROM event_queue "
             "WHERE status='pending' AND priority >= 0.8 "
             "ORDER BY priority DESC LIMIT 5"
@@ -343,13 +351,15 @@ class DaemonOrchestrator:
                 logger.warning("[Daemon] HeartbeatLoop unavailable — cannot deliver alert for event %d", row["id"])
 
             if delivered:
-                self._db.execute(
+                await asyncio.to_thread(
+                    self._db.execute,
                     "UPDATE event_queue SET status='processed', processed_at=datetime('now') WHERE id=?",
                     (row["id"],),
                 )
                 self._log("action", f"Alert sent: {row['event_type']}", "daemon")
             else:
-                self._db.execute(
+                await asyncio.to_thread(
+                    self._db.execute,
                     "UPDATE event_queue SET status='failed', processed_at=datetime('now') WHERE id=?",
                     (row["id"],),
                 )
@@ -364,31 +374,32 @@ class DaemonOrchestrator:
         from app.core.goals import GoalStore, execute_goal
 
         store = GoalStore(self._db)
-        goal = store.get_next_pending()
+        goal = await asyncio.to_thread(store.get_next_pending)
         if not goal:
             return
 
         self._log("decision", f"Pursuing goal #{goal.id}: {goal.goal[:120]}", "daemon")
-        store.mark_in_progress(goal.id)
+        await asyncio.to_thread(store.mark_in_progress, goal.id)
 
         # Snapshot the underlying metric so we can verify the goal actually
         # moved the needle — not just produced text. Without this, every goal
         # was being marked "completed" because Nova returned >40 chars,
         # regardless of whether the gap/skill/tool problem was actually fixed.
         ctx = goal.context if isinstance(goal.context, dict) else {}
-        before_metric, metric_query = _snapshot_goal_metric(self._db, ctx)
+        before_metric, metric_query = await asyncio.to_thread(
+            _snapshot_goal_metric, self._db, ctx)
 
         try:
             ok, output = await execute_goal(goal)
         except Exception as e:
-            store.mark_failed(goal.id, f"unhandled: {e}")
+            await asyncio.to_thread(store.mark_failed, goal.id, f"unhandled: {e}")
             self._log("error", f"Goal #{goal.id} crashed: {e}", "daemon")
             return
 
-        store.attach_output(goal.id, output)
+        await asyncio.to_thread(store.attach_output, goal.id, output)
 
         if not ok:
-            store.mark_failed(goal.id, output[:200])
+            await asyncio.to_thread(store.mark_failed, goal.id, output[:200])
             self._log(
                 "goal_execution",
                 f"Goal #{goal.id} failed: {output[:400]}",
@@ -400,13 +411,13 @@ class DaemonOrchestrator:
         # was about a capability gap and the gap count didn't decrease, this
         # was cosmetic — mark failed so it doesn't pollute the "completed"
         # bucket and so the deriver can re-attempt with a better strategy.
-        after_metric, _ = _snapshot_goal_metric(self._db, ctx)
+        after_metric, _ = await asyncio.to_thread(_snapshot_goal_metric, self._db, ctx)
         if before_metric is not None and after_metric is not None and after_metric >= before_metric:
             reason = (
                 f"verification: {metric_query} did not improve "
                 f"(before={before_metric} after={after_metric})"
             )
-            store.mark_failed(goal.id, reason)
+            await asyncio.to_thread(store.mark_failed, goal.id, reason)
             self._log(
                 "goal_execution",
                 f"Goal #{goal.id} produced output but no metric improvement. {reason}",
@@ -414,7 +425,7 @@ class DaemonOrchestrator:
             )
             return
 
-        store.mark_completed(goal.id)
+        await asyncio.to_thread(store.mark_completed, goal.id)
         improvement = ""
         if before_metric is not None and after_metric is not None:
             improvement = f" (metric: {before_metric} → {after_metric})"
@@ -442,22 +453,28 @@ class DaemonOrchestrator:
 
     async def _process_events(self):
         """Process pending events from the queue."""
-        rows = self._db.fetchall(
-            "SELECT id, event_type, payload, priority FROM event_queue "
-            "WHERE status='pending' ORDER BY priority DESC LIMIT 10"
-        )
-        processed = 0
-        for row in rows:
-            self._log(
-                "observation",
-                f"Event: {row['event_type']} (priority={row['priority']})",
-                "event_queue",
+
+        # Pure DB loop — single thread hop instead of blocking the loop per row.
+        def _drain() -> int:
+            rows = self._db.fetchall(
+                "SELECT id, event_type, payload, priority FROM event_queue "
+                "WHERE status='pending' ORDER BY priority DESC LIMIT 10"
             )
-            self._db.execute(
-                "UPDATE event_queue SET status='processed', processed_at=datetime('now') WHERE id=?",
-                (row["id"],),
-            )
-            processed += 1
+            n = 0
+            for row in rows:
+                self._log(
+                    "observation",
+                    f"Event: {row['event_type']} (priority={row['priority']})",
+                    "event_queue",
+                )
+                self._db.execute(
+                    "UPDATE event_queue SET status='processed', processed_at=datetime('now') WHERE id=?",
+                    (row["id"],),
+                )
+                n += 1
+            return n
+
+        processed = await asyncio.to_thread(_drain)
 
         if processed:
             self._log("action", f"Processed {processed} events from queue", "daemon")
@@ -465,11 +482,25 @@ class DaemonOrchestrator:
     # ── Logging ───────────────────────────────────────────────────────────
 
     def _log(self, category: str, content: str, source: str = ""):
-        """Write to daemon_log table."""
+        """Write to daemon_log table.
+
+        Callable from both sync helpers (worker threads) and async code. When
+        a loop is running, the INSERT is handed to the default executor
+        fire-and-forget so the loop never waits on the DB lock for a log row;
+        ordering across rows is best-effort, which is fine for a log.
+        """
+        def _write() -> None:
+            try:
+                self._db.execute(
+                    "INSERT INTO daemon_log (category, content, source) VALUES (?, ?, ?)",
+                    (category, content[:2000], source),
+                )
+            except Exception as e:
+                logger.warning("[Daemon] Failed to write log: %s", e)
+
         try:
-            self._db.execute(
-                "INSERT INTO daemon_log (category, content, source) VALUES (?, ?, ?)",
-                (category, content[:2000], source),
-            )
-        except Exception as e:
-            logger.warning("[Daemon] Failed to write log: %s", e)
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _write()
+            return
+        loop.run_in_executor(None, _write)
