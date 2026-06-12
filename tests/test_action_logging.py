@@ -41,3 +41,38 @@ def test_log_action_truncates_result(db):
     rows = db.fetchall("SELECT * FROM action_log WHERE action_type = 'test'")
     assert len(rows) >= 1
     assert len(rows[0]["result"]) <= 2000
+
+
+@pytest.mark.asyncio
+async def test_log_action_on_event_loop_does_not_block_and_writes(db):
+    """In an async context the DB write is dispatched off-loop (fire-and-forget)
+    and still lands — this is the path that froze the loop in the 2026-06-12
+    incident when the synchronous commit hung on a stalled disk."""
+    import asyncio
+
+    log_action("tool:web_search", {"q": "hello"}, "ok", True)
+    # The write runs in the default executor; give it a moment to land.
+    for _ in range(50):
+        rows = db.fetchall("SELECT * FROM action_log WHERE action_type = 'tool:web_search'")
+        if rows:
+            break
+        await asyncio.sleep(0.02)
+    assert len(rows) >= 1
+    assert rows[0]["success"] == 1
+
+
+@pytest.mark.asyncio
+async def test_log_action_on_event_loop_masks_sensitive(db):
+    """Sensitive-field masking still applies through the off-loop write path."""
+    import asyncio
+
+    log_action("webhook", {"url": "https://x.com", "api_key": "SECRET123"}, "sent", True)
+    for _ in range(50):
+        rows = db.fetchall("SELECT * FROM action_log WHERE action_type = 'webhook'")
+        if rows:
+            break
+        await asyncio.sleep(0.02)
+    assert len(rows) >= 1
+    params = json.loads(rows[0]["params"])
+    assert params["api_key"] == "***"
+    assert params["url"] == "https://x.com"
