@@ -112,6 +112,10 @@ services:
     volumes:
       - nova_data:/data
       - ./mcp:/data/mcp:ro
+      # Off-volume backup target: daily verified snapshots are copied here
+      # so they survive loss/corruption of the nova_data volume itself.
+      # Lives on the host filesystem next to the compose tree (gitignored).
+      - ./backups:/backups
       # /home/nova/.cache as tmpfs mounted with mode 1777 so nova (uid 1000)
       # can write ChromaDB's internal cache. Short-form tmpfs defaults to mode
       # 755/root — use long-form volume syntax instead.

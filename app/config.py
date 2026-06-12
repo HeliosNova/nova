@@ -479,6 +479,11 @@ class Config:
     # Database
     DB_PATH: str = field(default_factory=lambda: _env("DB_PATH", "/data/nova.db"))
     CHROMADB_PATH: str = field(default_factory=lambda: _env("CHROMADB_PATH", "/data/chromadb"))
+    # Off-volume backup target (bind mount in compose). The in-volume
+    # /data/backups snapshots die with the volume; this dir lives on the
+    # host filesystem. Empty/missing dir → off-volume copy is skipped
+    # with a warning (never fails the maintenance run).
+    BACKUP_OFFVOLUME_DIR: str = field(default_factory=lambda: _env("BACKUP_OFFVOLUME_DIR", "/backups"))
 
     # Sensitive field names — redacted in __repr__/__str__ to prevent secret leakage
     _SENSITIVE_FIELDS = frozenset({

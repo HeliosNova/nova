@@ -1760,13 +1760,17 @@ class HeartbeatLoop:
                 parts.append(f"monitor_results pruned: {results_deleted}")
         except Exception as e:
             logger.warning("[Heartbeat] Audit prune failed: %s", e)
-        # Periodic SQLite backup — keep last 7 daily snapshots so a corruption
-        # event isn't catastrophic. Shutil.copy with WAL is safe at SQLite level
-        # because the source DB is opened with WAL mode and the copy includes
-        # both nova.db and nova.db-wal. Backups land in /data/backups.
+        # Periodic SQLite backup — daily snapshot, VERIFIED, kept in two
+        # places: /data/backups (fast local restore) AND the off-volume
+        # bind mount (survives loss of the nova_data volume itself — the
+        # in-volume copies die with the volume they protect). Each new
+        # snapshot is opened read-only and integrity-checked immediately:
+        # an unverified backup is a hope, not a backup.
         try:
             import shutil
             from pathlib import Path
+            from app.core.backup import verify_snapshot
+
             backup_dir = Path("/data/backups")
             backup_dir.mkdir(exist_ok=True)
             today = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -1780,14 +1784,53 @@ class HeartbeatLoop:
                 from app.database import get_db
                 _db = get_db()
                 await asyncio.to_thread(_db.execute, f"VACUUM INTO '{target}'")
-                # Retain last 7 backups
+                ok, detail = await asyncio.to_thread(verify_snapshot, target)
+                if not ok:
+                    # A failed verification is an alert-worthy event, not a
+                    # log line — the monitor result carries it to channels.
+                    logger.error("[Heartbeat] Backup verification FAILED: %s", detail)
+                    parts.append(f"BACKUP VERIFY FAILED: {detail}")
+                    try:
+                        target.unlink()  # don't retain a snapshot proven bad
+                    except OSError:
+                        pass
+                else:
+                    parts.append(f"backup created+verified: {target.name}")
+                    # Off-volume copy — plain file copy of the just-verified
+                    # snapshot (cheaper than a second VACUUM INTO and
+                    # byte-identical), then verify the COPY independently:
+                    # bind-mount I/O has its own failure modes.
+                    off_dir = Path(config.BACKUP_OFFVOLUME_DIR or "")
+                    if str(off_dir) and off_dir.is_dir():
+                        off_target = off_dir / target.name
+                        await asyncio.to_thread(shutil.copyfile, target, off_target)
+                        off_ok, off_detail = await asyncio.to_thread(verify_snapshot, off_target)
+                        if off_ok:
+                            parts.append(f"off-volume backup verified: {off_target.name}")
+                            off_snaps = sorted(off_dir.glob("nova-*.db"))
+                            for old in off_snaps[:-7]:
+                                try:
+                                    old.unlink()
+                                except OSError:
+                                    pass
+                        else:
+                            logger.error(
+                                "[Heartbeat] Off-volume backup verification FAILED: %s", off_detail)
+                            parts.append(f"OFF-VOLUME BACKUP VERIFY FAILED: {off_detail}")
+                    else:
+                        logger.warning(
+                            "[Heartbeat] Off-volume backup dir %r not mounted — "
+                            "snapshots only exist inside the volume they protect",
+                            str(off_dir),
+                        )
+                        parts.append("off-volume backup SKIPPED (dir not mounted)")
+                # Retain last 7 in-volume backups
                 snapshots = sorted(backup_dir.glob("nova-*.db"))
                 for old in snapshots[:-7]:
                     try:
                         old.unlink()
                     except OSError:
                         pass
-                parts.append(f"backup created: {target.name}")
         except Exception as e:
             logger.warning("[Heartbeat] DB backup failed: %s", e)
         # Auto-disable garbage monitors — any whose last 3 results all match
