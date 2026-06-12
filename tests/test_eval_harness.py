@@ -1499,3 +1499,61 @@ class TestTimeoutSeparation:
         md = render_markdown(report)
         assert "Timeouts (excluded from pass rate) | 1" in md
         assert "Pass rate (over completed)" in md
+
+
+class TestCompletionRateRegressionVisibility:
+    """Timeouts must be visible to regression detection via completion_rate.
+
+    pass_rate excludes timeouts from its denominator, so before this metric a
+    build that timed out on every task flagged zero regressions.
+    """
+
+    def test_completion_rate_computed(self):
+        rows = [
+            _make_result("a", passed=True),
+            _make_result("b", passed=False),
+            _make_result("c", passed=False, timed_out=True, latency=60.0),
+            _make_result("d", passed=False, timed_out=True, latency=60.0),
+        ]
+        m = compute_category_metrics(rows)["reasoning"]
+        assert m.completion_rate == pytest.approx(0.5)
+
+    def test_all_timeouts_completion_rate_zero(self):
+        rows = [
+            _make_result("a", passed=False, timed_out=True, latency=60.0),
+            _make_result("b", passed=False, timed_out=True, latency=60.0),
+        ]
+        m = compute_category_metrics(rows)["reasoning"]
+        assert m.completion_rate == 0.0
+
+    def test_timeout_spike_flags_regression(self):
+        """The previously-invisible failure mode: pass_rate steady, all timeouts."""
+        baseline = {
+            "categories": {
+                "reasoning": {"pass_rate": 1.0, "completion_rate": 1.0},
+            }
+        }
+        current = {
+            "reasoning": CategoryMetrics(
+                category="reasoning", total=4, passed=1, pass_rate=1.0,
+                latency_p50=60.0, latency_p95=60.0, timeouts=3,
+                completion_rate=0.25,
+            ),
+        }
+        flags = detect_regressions(current, baseline, tolerance=0.10)
+        flagged = {f.metric for f in flags if f.flagged}
+        assert "reasoning.completion_rate" in flagged
+        assert "reasoning.pass_rate" not in flagged  # the blind spot this closes
+
+    def test_old_baseline_without_completion_rate_skipped(self):
+        """Baselines written before this metric simply don't compare it."""
+        baseline = {"categories": {"reasoning": {"pass_rate": 1.0}}}
+        current = {
+            "reasoning": CategoryMetrics(
+                category="reasoning", total=2, passed=1, pass_rate=1.0,
+                latency_p50=60.0, latency_p95=60.0, timeouts=1,
+                completion_rate=0.5,
+            ),
+        }
+        flags = detect_regressions(current, baseline, tolerance=0.10)
+        assert not any(f.flagged for f in flags)

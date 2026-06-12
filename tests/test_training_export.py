@@ -237,3 +237,84 @@ class TestJSONLFormat:
 
         for r in all_records:
             assert r["signal_type"] in valid_types
+
+
+class TestEvalContaminationExcluded:
+    """Train/eval holdout: eval-marked data must never reach training exports.
+
+    Eval runs store reflexions with is_eval=1, seed skills named 'Eval: *',
+    and seed lessons with context='eval-mem:<task_id>'. dream.py already
+    filters is_eval at lesson promotion; the export script bypassed all
+    three markers and leaked eval traffic into fine-tune data.
+    """
+
+    def test_eval_reflexions_excluded_from_positive(self, db):
+        db.execute(
+            "INSERT INTO reflexions (task_summary, outcome, reflection, quality_score, is_eval) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("eval probe: what is 2+2", "success", "Clean eval answer with plenty of detail.", 0.95),
+        )
+        from export_training_signal import _export_reflexion_positive
+        records = _export_reflexion_positive(db)
+        assert all("eval probe" not in r["prompt"] for r in records)
+
+    def test_eval_reflexions_excluded_from_negative(self, db):
+        db.execute(
+            "INSERT INTO reflexions (task_summary, outcome, reflection, quality_score, is_eval) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("eval probe: fail case", "failure", "Bad eval answer.", 0.1),
+        )
+        from export_training_signal import _export_reflexion_negative
+        records = _export_reflexion_negative(db)
+        assert all("eval probe" not in r["prompt"] for r in records)
+
+    def test_eval_reflexions_excluded_from_reasoning_traces(self, db):
+        db.execute(
+            "INSERT INTO reflexions (task_summary, outcome, reflection, quality_score, is_eval) "
+            "VALUES (?, ?, ?, ?, 1)",
+            ("eval probe: trace", "success", "A" * 150, 0.9),
+        )
+        from export_training_signal import _export_reasoning_traces
+        records = _export_reasoning_traces(db)
+        assert all("eval probe" not in r["prompt"] for r in records)
+
+    def test_eval_prefixed_skills_excluded(self, db):
+        db.execute(
+            "INSERT INTO skills (name, trigger_pattern, steps, times_used, success_rate, enabled) "
+            "VALUES (?, ?, ?, 5, 1.0, 1)",
+            ("Eval: Crypto Price Probe", r"(?i)\beval-probe[:\s]+.*price\b", '[{"tool": "web_search"}]'),
+        )
+        from export_training_signal import _export_skill_procedures
+        records = _export_skill_procedures(db)
+        assert all("Eval:" not in r["prompt"] for r in records)
+
+    def test_eval_marked_lessons_excluded_from_knowledge(self, db):
+        db.execute(
+            "INSERT INTO lessons (topic, correct_answer, context, confidence) "
+            "VALUES (?, ?, ?, 0.95)",
+            ("Peladora CEO", "Fictional Eval Person", "eval-mem:kg_runs_paraphrase"),
+        )
+        from export_training_signal import _export_lesson_knowledge
+        records = _export_lesson_knowledge(db)
+        assert all("Peladora" not in r["prompt"] for r in records)
+
+    def test_eval_marked_lessons_excluded_from_correction_dpo(self, db):
+        db.execute(
+            "INSERT INTO lessons (topic, wrong_answer, correct_answer, context, confidence) "
+            "VALUES (?, ?, ?, ?, 0.95)",
+            ("Quill leader", "Wrong Person", "Fictional Eval Person", "eval-mem:kg_leader_direct"),
+        )
+        from export_training_signal import _export_correction_dpo
+        records = _export_correction_dpo(db, training_data_path=None)
+        assert all("Quill" not in r["prompt"] for r in records)
+
+    def test_real_data_still_exported(self, db):
+        """The filters must not eat legitimate rows (fixture seeds real ones)."""
+        from export_training_signal import (
+            _export_correction_dpo,
+            _export_lesson_knowledge,
+            _export_reflexion_positive,
+        )
+        assert _export_reflexion_positive(db), "real reflexions vanished"
+        assert _export_lesson_knowledge(db), "real lessons vanished"
+        assert _export_correction_dpo(db, training_data_path=None), "real DPO pairs vanished"

@@ -1935,13 +1935,16 @@ async def _run_deliberation_path(
     if not ephemeral and final_content and intent == "general":
         try:
             from app.core.reflexion import critique_response, should_use_llm_critique
+            # Steps WITHOUT an observation are included as error entries —
+            # if every step failed, the judge must see "evidence was
+            # attempted but unavailable", not "(none — no tools were used)".
             step_evidence = [
                 {
                     "tool": str((s.action or {}).get("tool") or f"step-{s.id}"),
                     "output": s.observation or "",
+                    "error": "" if s.observation else "step produced no observation (failed or timed out)",
                 }
                 for s in result.plan.steps
-                if s.observation
             ]
             if should_use_llm_critique(intent, final_content, step_evidence):
                 deliberation_quality, deliberation_reason = await critique_response(
@@ -3187,10 +3190,19 @@ async def _run_multi_agent_path(
         if final_content and intent == "general" and not is_error:
             try:
                 from app.core.reflexion import critique_response, should_use_llm_critique
+                # Failed sub-agents are included as error entries — if all of
+                # them failed, the judge must see "evidence was attempted but
+                # unavailable", not "(none — no tools were used)" (which
+                # misgraded a timeless-knowledge answer grounded=0.00 on
+                # 2026-06-12 when the only sub-agent timed out).
                 merge_evidence = [
-                    {"tool": f"sub-agent:{r.role}", "output": r.response or ""}
+                    {
+                        "tool": f"sub-agent:{r.role}",
+                        "output": (r.response or "") if not r.error else "",
+                        "error": str(r.error or "") if (r.error or not r.response) else "",
+                    }
                     for r in results
-                    if r.response and not r.error
+                    if r.response or r.error
                 ]
                 if should_use_llm_critique(intent, final_content, merge_evidence):
                     merge_quality, merge_reason = await critique_response(

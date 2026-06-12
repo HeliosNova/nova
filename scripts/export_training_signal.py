@@ -82,10 +82,12 @@ def _export_correction_dpo(db: SafeDB, training_data_path: str | None) -> list[d
                     except json.JSONDecodeError:
                         continue
 
-    # Source 2: Lessons with wrong_answer (implicit DPO pairs)
+    # Source 2: Lessons with wrong_answer (implicit DPO pairs).
+    # Eval-seeded lessons (context marker 'eval-mem:') are excluded.
     rows = db.fetchall(
         "SELECT id, topic, wrong_answer, correct_answer, lesson_text, confidence, created_at "
         "FROM lessons WHERE wrong_answer IS NOT NULL AND wrong_answer != '' "
+        "AND (context IS NULL OR context NOT LIKE 'eval-mem:%') "
         "ORDER BY confidence DESC"
     )
     for row in rows:
@@ -112,9 +114,13 @@ def _export_correction_dpo(db: SafeDB, training_data_path: str | None) -> list[d
 
 def _export_reflexion_positive(db: SafeDB) -> list[dict]:
     """Export high-quality responses as SFT positive examples."""
+    # COALESCE(is_eval, 0) = 0: eval-harness runs store reflexions every
+    # night — training on them is train/eval contamination (same filter
+    # dream.py uses for lesson promotion).
     rows = db.fetchall(
         "SELECT id, task_summary, reflection, quality_score, tools_used, revision_count, created_at "
         "FROM reflexions WHERE outcome = 'success' AND quality_score >= 0.8 "
+        "AND COALESCE(is_eval, 0) = 0 "
         "ORDER BY quality_score DESC LIMIT 500"
     )
     records = []
@@ -141,6 +147,7 @@ def _export_reflexion_negative(db: SafeDB) -> list[dict]:
     rows = db.fetchall(
         "SELECT id, task_summary, reflection, quality_score, tools_used, revision_count, created_at "
         "FROM reflexions WHERE outcome = 'failure' AND quality_score < 0.4 "
+        "AND COALESCE(is_eval, 0) = 0 "
         "ORDER BY quality_score ASC LIMIT 500"
     )
     records = []
@@ -165,11 +172,15 @@ def _export_reflexion_negative(db: SafeDB) -> list[dict]:
 def _export_skill_procedures(db: SafeDB) -> list[dict]:
     """Export successful skill chains as instruction-following examples."""
     # 'source' column may not exist in older schemas — use a safe query
+    # name NOT LIKE 'Eval:%': the eval harness seeds probe skills with that
+    # exact prefix; re-triggered probes clear times_used >= 2 and would
+    # otherwise leak into training data.
     try:
         rows = db.fetchall(
             "SELECT id, name, trigger_pattern, steps, answer_template, success_rate, "
             "times_used, source, created_at "
             "FROM skills WHERE enabled = 1 AND success_rate >= 0.7 AND times_used >= 2 "
+            "AND name NOT LIKE 'Eval:%' "
             "ORDER BY success_rate DESC"
         )
     except Exception:
@@ -177,6 +188,7 @@ def _export_skill_procedures(db: SafeDB) -> list[dict]:
             "SELECT id, name, trigger_pattern, steps, answer_template, success_rate, "
             "times_used, created_at "
             "FROM skills WHERE enabled = 1 AND success_rate >= 0.7 AND times_used >= 2 "
+            "AND name NOT LIKE 'Eval:%' "
             "ORDER BY success_rate DESC"
         )
     records = []
@@ -219,6 +231,7 @@ def _export_reasoning_traces(db: SafeDB) -> list[dict]:
     rows = db.fetchall(
         "SELECT id, task_summary, reflection, quality_score, tools_used, revision_count, created_at "
         "FROM reflexions WHERE reflection IS NOT NULL AND length(reflection) > 100 "
+        "AND COALESCE(is_eval, 0) = 0 "
         "ORDER BY quality_score DESC LIMIT 300"
     )
     records = []
@@ -250,9 +263,12 @@ def _export_reasoning_traces(db: SafeDB) -> list[dict]:
 
 def _export_lesson_knowledge(db: SafeDB) -> list[dict]:
     """Export learned lessons as knowledge distillation examples."""
+    # context NOT LIKE 'eval-mem:%': memory-learning eval tasks seed lessons
+    # with that marker; purge is best-effort, so the export filters too.
     rows = db.fetchall(
         "SELECT id, topic, correct_answer, lesson_text, confidence, times_helpful, created_at "
         "FROM lessons WHERE confidence >= 0.6 "
+        "AND (context IS NULL OR context NOT LIKE 'eval-mem:%') "
         "ORDER BY confidence DESC, times_helpful DESC"
     )
     records = []
