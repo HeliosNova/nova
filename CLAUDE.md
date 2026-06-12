@@ -818,7 +818,7 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 
 | File | Purpose |
 |------|---------|
-| `evals/suite.yaml` | 40 evaluation tasks across 8 categories (reasoning, tool-use, skill-match, semantic-match, autonomous-tool, reflexion-calibration, multi-agent, retrieval) |
+| `evals/suite.yaml` | 63 evaluation tasks across 11 categories (reasoning, tool-use, skill-match, semantic-match, autonomous-tool, reflexion-calibration, multi-agent, retrieval, memory-learning, kg-retrieval, multi-turn) |
 | `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
 | `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
 | `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
@@ -837,6 +837,7 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 | `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
 | `multi-agent` | 5 | Decomposition gating + sub-agent merge correctness (incl. no-decompose baseline) |
 | `retrieval` | 3 | BM25 exact-keyword + semantic paraphrase + reranker regression probe |
+| `multi-turn` | 4 | Cross-turn recall, pronoun resolution, self-consistency — `turns:` run first in a shared ephemeral conversation (brain in-process history), assertions grade the final `query` |
 
 ### Metrics
 

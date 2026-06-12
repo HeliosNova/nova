@@ -59,6 +59,10 @@ class EvalTask:
     seed_fact: dict | None = None  # {subject, predicate, object} — KG analogue (wired in WS2C)
     paraphrase_of: str | None = None
     tags: list[str] = field(default_factory=list)
+    # Multi-turn: prior turns run sequentially in a shared ephemeral
+    # conversation before `query` (the final turn, which assertions grade).
+    # Each turn gets the task's full `timeout` budget.
+    turns: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -691,6 +695,7 @@ class EvalHarness:
                 seed_fact=raw.get("seed_fact"),
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
+                turns=raw.get("turns", []),
             ))
         return tasks
 
@@ -773,11 +778,15 @@ class EvalHarness:
 
     # --- Single task execution ---
 
-    async def _invoke_brain(self, query: str, timeout: int) -> _Invocation:
+    async def _invoke_brain(
+        self, query: str, timeout: int, conversation_id: str | None = None,
+    ) -> _Invocation:
         """Run one query through the real brain (ephemeral) and collect signals.
 
         Shared by run_task (normal categories) and _run_memory_task (the
         before/after runs). Honors the shadow-eval ContextVar overrides.
+        conversation_id opts into brain's in-process ephemeral history so
+        multi-turn tasks share context without touching persistent stores.
         """
         from app.core.brain import think
         from app.core.reflexion import assess_quality
@@ -799,7 +808,7 @@ class EvalHarness:
         start = time.monotonic()
         try:
             async with asyncio.timeout(timeout):
-                async for event in think(query=query, ephemeral=True):
+                async for event in think(query=query, ephemeral=True, conversation_id=conversation_id):
                     if event.type == EventType.TOKEN:
                         tokens.append(event.data.get("text", ""))
                     elif event.type == EventType.TOOL_USE:
@@ -848,6 +857,39 @@ class EvalHarness:
             timed_out=timed_out,
         )
 
+    async def _run_multi_turn(self, task: EvalTask) -> _Invocation:
+        """Run a multi-turn task: prior turns share one ephemeral conversation,
+        then the final `query` turn is graded.
+
+        Uses brain's in-process ephemeral history — persistent stores stay
+        untouched, and the history is cleared even on failure. A prior turn
+        that errors or times out aborts the task (the final turn would be
+        grading recall of context that was never established).
+        """
+        from app.core.brain import clear_ephemeral_history, record_ephemeral_turn
+
+        conv_id = f"eval-multiturn-{task.id}"
+        clear_ephemeral_history(conv_id)
+        try:
+            for i, turn in enumerate(task.turns, 1):
+                inv = await self._invoke_brain(turn, task.timeout, conversation_id=conv_id)
+                if inv.error or not inv.response_text:
+                    return _Invocation(
+                        response_text="",
+                        tools_invoked=inv.tools_invoked,
+                        skill_used=None,
+                        decomposed=inv.decomposed,
+                        max_decomposition_depth=inv.max_decomposition_depth,
+                        reflexion_score=None,
+                        latency_seconds=inv.latency_seconds,
+                        error=f"setup turn {i}/{len(task.turns)} failed: {inv.error or 'empty response'}",
+                        timed_out=inv.timed_out,
+                    )
+                record_ephemeral_turn(conv_id, turn, inv.response_text)
+            return await self._invoke_brain(task.query, task.timeout, conversation_id=conv_id)
+        finally:
+            clear_ephemeral_history(conv_id)
+
     def _evaluate_assertions(self, assertions: list[dict], inv: _Invocation) -> list[str]:
         """Return the list of failed-assertion descriptions for an invocation."""
         if inv.error and not inv.response_text:
@@ -877,7 +919,10 @@ class EvalHarness:
         if task.category == "memory-learning" and task.seed_lesson:
             return await self._run_memory_task(task)
 
-        inv = await self._invoke_brain(task.query, task.timeout)
+        if task.turns:
+            inv = await self._run_multi_turn(task)
+        else:
+            inv = await self._invoke_brain(task.query, task.timeout)
         failed_assertions = self._evaluate_assertions(task.assertions, inv)
         passed = len(failed_assertions) == 0
         # Slow-but-correct counts as a pass; a timeout that prevented proving
@@ -898,6 +943,10 @@ class EvalHarness:
                 svc = get_services()
                 if svc and svc.reflexions:
                     reason = "; ".join(failed_assertions[:3])[:400]
+                    # is_eval=True: still retrievable by failure injection
+                    # (reads don't filter it), but excluded from dream's
+                    # lesson promotion and the training-signal export — this
+                    # write was the last unmarked eval-traffic side door.
                     svc.reflexions.store(
                         task_summary=task.query[:500],
                         outcome="failure",
@@ -905,6 +954,7 @@ class EvalHarness:
                         quality_score=inv.reflexion_score if inv.reflexion_score is not None else 0.3,
                         tools_used=inv.tools_invoked,
                         revision_count=0,
+                        is_eval=True,
                     )
             except Exception as _e:
                 logger.debug("[EvalHarness] failure-reflexion write skipped: %s", _e)

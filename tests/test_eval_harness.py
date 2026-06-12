@@ -1557,3 +1557,132 @@ class TestCompletionRateRegressionVisibility:
         }
         flags = detect_regressions(current, baseline, tolerance=0.10)
         assert not any(f.flagged for f in flags)
+
+
+class TestMultiTurnTasks:
+    """Multi-turn eval: prior `turns` share an ephemeral conversation with the
+    graded final `query` via brain's in-process history."""
+
+    @staticmethod
+    def _inv(text, error=None, timed_out=False):
+        from app.monitors.eval_harness import _Invocation
+        return _Invocation(
+            response_text=text, tools_invoked=[], skill_used=None,
+            decomposed=False, max_decomposition_depth=0,
+            reflexion_score=0.7 if text else None,
+            latency_seconds=0.01, error=error, timed_out=timed_out,
+        )
+
+    @staticmethod
+    def _mt_task(turns=None):
+        return EvalTask(
+            id="mt_x", category="multi-turn",
+            query="What is my colleague's name?",
+            assertions=[{"type": "answer_contains", "value": "Lindqvist"}],
+            timeout=30,
+            turns=turns or ["My colleague is Dr. Verena Lindqvist."],
+        )
+
+    @pytest.mark.asyncio
+    async def test_turns_share_conversation_and_record_history(self):
+        task = self._mt_task()
+        harness = EvalHarness()
+        invoke = AsyncMock(side_effect=[self._inv("Noted."), self._inv("Dr. Verena Lindqvist.")])
+        recorded = []
+        with patch.object(EvalHarness, "_invoke_brain", new=invoke), \
+             patch("app.core.brain.record_ephemeral_turn",
+                   side_effect=lambda c, q, a: recorded.append((c, q, a))), \
+             patch("app.core.brain.clear_ephemeral_history") as clear_mock:
+            result = await harness.run_task(task)
+        assert result.passed is True
+        # both turns went through the same conversation id
+        conv_ids = {call.kwargs.get("conversation_id") or call.args[2] if len(call.args) > 2 else call.kwargs.get("conversation_id") for call in invoke.call_args_list}
+        assert conv_ids == {"eval-multiturn-mt_x"}
+        # the setup turn was recorded into history before the final turn
+        assert recorded == [("eval-multiturn-mt_x", task.turns[0], "Noted.")]
+        # history cleared before the run and after (finally)
+        assert clear_mock.call_count >= 2
+
+    @pytest.mark.asyncio
+    async def test_setup_turn_failure_aborts(self):
+        task = self._mt_task()
+        harness = EvalHarness()
+        invoke = AsyncMock(side_effect=[self._inv("", error="Timeout after 30s", timed_out=True)])
+        with patch.object(EvalHarness, "_invoke_brain", new=invoke), \
+             patch("app.core.brain.record_ephemeral_turn") as rec_mock, \
+             patch("app.core.brain.clear_ephemeral_history"):
+            result = await harness.run_task(task)
+        assert result.passed is False
+        assert "setup turn 1/1 failed" in (result.error or "")
+        rec_mock.assert_not_called()
+        assert invoke.call_count == 1  # final turn never ran
+
+    @pytest.mark.asyncio
+    async def test_single_turn_tasks_unaffected(self):
+        task = EvalTask(
+            id="single", category="reasoning", query="2+2?",
+            assertions=[{"type": "answer_contains", "value": "4"}], timeout=30,
+        )
+        harness = EvalHarness()
+        invoke = AsyncMock(return_value=self._inv("The answer is 4."))
+        with patch.object(EvalHarness, "_invoke_brain", new=invoke):
+            result = await harness.run_task(task)
+        assert result.passed is True
+        assert invoke.call_count == 1
+        # no conversation_id for single-turn tasks
+        assert invoke.call_args.kwargs.get("conversation_id") is None
+        assert len(invoke.call_args.args) <= 2
+
+    def test_suite_parses_turns(self):
+        harness = EvalHarness()
+        tasks = harness.load_suite()
+        mt = [t for t in tasks if t.category == "multi-turn"]
+        assert len(mt) == 4
+        assert all(t.turns for t in mt)
+        consistency = next(t for t in mt if t.id == "multiturn_consistency")
+        assert len(consistency.turns) == 2
+
+
+class TestEphemeralHistory:
+    """brain's in-process ephemeral conversation history."""
+
+    def setup_method(self):
+        from app.core import brain
+        brain._EPHEMERAL_HISTORIES.clear()
+
+    teardown_method = setup_method
+
+    def test_record_and_clear(self):
+        from app.core.brain import (
+            _EPHEMERAL_HISTORIES,
+            clear_ephemeral_history,
+            record_ephemeral_turn,
+        )
+        record_ephemeral_turn("c1", "hello", "hi there")
+        assert _EPHEMERAL_HISTORIES["c1"] == [
+            {"role": "user", "content": "hello"},
+            {"role": "assistant", "content": "hi there"},
+        ]
+        clear_ephemeral_history("c1")
+        assert "c1" not in _EPHEMERAL_HISTORIES
+
+    def test_default_ephemeral_id_never_recorded(self):
+        from app.core import brain
+        brain.record_ephemeral_turn("ephemeral", "q", "a")
+        brain.record_ephemeral_turn("", "q", "a")
+        assert brain._EPHEMERAL_HISTORIES == {}
+
+    def test_message_cap(self):
+        from app.core import brain
+        for i in range(60):
+            brain.record_ephemeral_turn("c2", f"q{i}", f"a{i}")
+        hist = brain._EPHEMERAL_HISTORIES["c2"]
+        assert len(hist) == brain._EPHEMERAL_MAX_MESSAGES
+        assert hist[-1] == {"role": "assistant", "content": "a59"}
+
+    def test_conversation_cap_evicts_oldest(self):
+        from app.core import brain
+        for i in range(brain._EPHEMERAL_MAX_CONVS + 5):
+            brain.record_ephemeral_turn(f"conv{i}", "q", "a")
+        assert len(brain._EPHEMERAL_HISTORIES) == brain._EPHEMERAL_MAX_CONVS
+        assert "conv0" not in brain._EPHEMERAL_HISTORIES
