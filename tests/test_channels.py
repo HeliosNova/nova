@@ -78,7 +78,8 @@ class TestTelegram:
         for chunk in chunks:
             assert len(chunk) <= 4096
 
-    def test_empty_allowlist_permits_all(self):
+    def test_empty_allowlist_denies_all(self):
+        # Fail-closed: an unconfigured allowlist must not expose the bot to anyone.
         from app.channels.telegram import TelegramBot
         with patch("app.channels.telegram.config") as mock_config:
             mock_config.TELEGRAM_TOKEN = ""
@@ -87,7 +88,7 @@ class TestTelegram:
             bot = MagicMock()
             bot._allowed_users = set()
             bot._is_allowed = TelegramBot._is_allowed.__get__(bot)
-            assert bot._is_allowed(12345) is True
+            assert bot._is_allowed(12345) is False
 
     def test_allowlist_restricts_users(self):
         from app.channels.telegram import TelegramBot
@@ -180,7 +181,7 @@ class TestSignal:
 
         bot = SignalBot.__new__(SignalBot)
         bot._processed_ids = collections.OrderedDict()
-        bot._allowed_users = set()
+        bot._allowed_users = {"+15551234567"}  # allowlists are fail-closed; sender must be listed
         bot._conversations = collections.OrderedDict()
         bot._conv_lock = asyncio.Lock()
         bot._client = AsyncMock()
@@ -228,6 +229,7 @@ class TestSignal:
         bot.api_url = "http://signal-cli:8080"
         bot.phone_number = "+15550000000"
         bot.default_recipient = "+15559999999"
+        bot._send_lock = asyncio.Lock()
 
         mock_response = MagicMock()
         mock_response.status_code = 201
@@ -302,6 +304,7 @@ class TestWhatsApp:
         bot.api_url = "https://graph.facebook.com/v17.0/12345/messages"
         bot.api_token = "test-token"
         bot.default_chat_id = "+15551234567"
+        bot._send_lock = asyncio.Lock()
 
         mock_response = MagicMock()
         mock_response.status_code = 200
@@ -314,3 +317,43 @@ class TestWhatsApp:
         payload = mock_client.post.call_args[1]["json"]
         assert payload["to"] == "+15551234567"
         assert payload["text"]["body"] == "Server is down!"
+
+
+class TestSendSerialization:
+    """Concurrent multi-chunk alerts must NOT interleave their parts — the
+    'monitors crossing paths on Discord' bug (2026-06-14). Two monitors firing
+    via the heartbeat gather used to interleave their split messages."""
+
+    @pytest.mark.asyncio
+    async def test_concurrent_discord_alerts_do_not_interleave(self):
+        from app.channels.discord import DiscordBot
+
+        bot = DiscordBot.__new__(DiscordBot)
+        bot.default_channel_id = "123"
+        bot._send_lock = asyncio.Lock()
+
+        sent: list[str] = []
+
+        class _Chan:
+            async def send(self, chunk):
+                # Yield mid-send so a competing sender could interleave if unlocked.
+                await asyncio.sleep(0)
+                sent.append(chunk)
+
+        class _Client:
+            def is_ready(self): return True
+            def get_channel(self, _id): return _Chan()
+
+        bot._client = _Client()
+
+        # Two long alerts that each split into multiple Discord messages.
+        msg_a = "A" * 5000   # ~3 chunks of 'A'
+        msg_b = "B" * 5000   # ~3 chunks of 'B'
+        await asyncio.gather(bot.send_alert(msg_a), bot.send_alert(msg_b))
+
+        # Every A-chunk must be contiguous (no B between them) and vice-versa.
+        kinds = [c[0] for c in sent]  # first char marks which alert
+        # find the boundary: kinds should be all-one-letter then all-the-other
+        first = kinds[0]
+        switches = sum(1 for i in range(1, len(kinds)) if kinds[i] != kinds[i-1])
+        assert switches == 1, f"alerts interleaved (kinds={kinds})"

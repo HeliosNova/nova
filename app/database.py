@@ -6,10 +6,13 @@ Ported from Nova's battle-tested SafeDB pattern.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 _instances: dict[str, "SafeDB"] = {}
 _instance_lock = threading.Lock()
@@ -292,22 +295,37 @@ class SafeDB:
 
     def __init__(self, db_path: str) -> None:
         self._db_path = db_path
-        self._lock = threading.Lock()
-        self._conn: sqlite3.Connection | None = None
+        # One connection PER THREAD. A single shared connection behind one global
+        # lock serialized every read and write, negating WAL entirely — the root
+        # of the recurring event-loop lock-convoy incidents (2026-06-11/-12).
+        # With a connection per thread, WAL lets readers run concurrently with
+        # each other and with the single writer.
+        self._local = threading.local()
+        # Writers are still serialized among OUR threads (RLock: re-entrant so a
+        # nested write on the same thread can't self-deadlock) so two to_thread
+        # workers never collide into SQLITE_BUSY. Reads take no lock at all.
+        self._write_lock = threading.RLock()
+        # Registry of every per-thread connection so close() can shut them all.
+        self._all_conns: list[sqlite3.Connection] = []
+        self._all_conns_lock = threading.Lock()
 
     def _get_conn(self) -> sqlite3.Connection:
-        if self._conn is None:
+        conn = getattr(self._local, "conn", None)
+        if conn is None:
             Path(self._db_path).parent.mkdir(parents=True, exist_ok=True)
-            self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA foreign_keys=ON")
-            self._conn.execute("PRAGMA busy_timeout=5000")
-        return self._conn
+            conn = sqlite3.connect(self._db_path, check_same_thread=False)
+            conn.row_factory = sqlite3.Row
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA foreign_keys=ON")
+            conn.execute("PRAGMA busy_timeout=5000")
+            self._local.conn = conn
+            with self._all_conns_lock:
+                self._all_conns.append(conn)
+        return conn
 
     def init_schema(self) -> None:
         """Create all tables. Safe to call multiple times."""
-        with self._lock:
+        with self._write_lock:
             conn = self._get_conn()
             conn.executescript(SCHEMA_SQL)
             conn.commit()
@@ -884,16 +902,134 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 22: index for time-window monitor_results queries ---
+        # get_recent_results filters on created_at alone; the existing
+        # idx_monitor_results_monitor(monitor_id, created_at) can't serve it,
+        # so every call was a full table scan over rows with multi-KB TEXT
+        # columns — one of the contributors to the 2026-06-11 event-loop
+        # blocking incident.
+        if 22 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_monitor_results_created "
+                    "ON monitor_results (created_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (22,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 23: Monitor Intelligence v2 — storylines, forecasts, salience ---
+        # Narrative engine (storylines + events), self-scoring forecasts, and the
+        # learned owner-interest salience weights. All additive; no existing table touched.
+        if 23 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS storylines ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  story_key TEXT UNIQUE NOT NULL,"
+                    "  title TEXT NOT NULL,"
+                    "  status TEXT DEFAULT 'active',"          # active | dormant | closed
+                    "  summary TEXT DEFAULT '',"
+                    "  monitors_csv TEXT DEFAULT '',"
+                    "  first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  update_count INTEGER DEFAULT 0,"
+                    "  last_digest_at TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_storylines_status ON storylines (status, last_updated)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS storyline_events ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  storyline_id INTEGER REFERENCES storylines(id) ON DELETE CASCADE,"
+                    "  summary TEXT NOT NULL,"
+                    "  source_monitor TEXT DEFAULT '',"
+                    "  item_url TEXT DEFAULT '',"
+                    "  published TIMESTAMP,"
+                    "  is_new INTEGER DEFAULT 1,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_storyline_events_story ON storyline_events (storyline_id, created_at)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS forecasts ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  claim TEXT NOT NULL,"
+                    "  storyline_key TEXT DEFAULT '',"
+                    "  confidence REAL DEFAULT 0.5,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  resolves_at TIMESTAMP,"
+                    "  status TEXT DEFAULT 'open',"            # open | hit | miss | unresolvable
+                    "  resolution TEXT DEFAULT '',"
+                    "  resolved_at TIMESTAMP,"
+                    "  source_monitor TEXT DEFAULT ''"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_forecasts_open ON forecasts (status, resolves_at)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS salience_weights ("
+                    "  topic TEXT PRIMARY KEY,"
+                    "  weight REAL DEFAULT 0.0,"
+                    "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (23,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+    # Statements already reported by _warn_if_event_loop — warn once per
+    # statement, capped so a pathological caller can't grow this unbounded.
+    _loop_thread_warned: set[str] = set()
+
+    def _warn_if_event_loop(self, sql: str) -> None:
+        """Flag sync DB calls running on the event-loop thread.
+
+        Such a call blocks every coroutine for the full lock-acquire +
+        query duration (incident 2026-06-11: heartbeat blocked the loop
+        >60s under lock convoy → container unhealthy). Route async-context
+        calls through AsyncSafeDB or asyncio.to_thread instead.
+        """
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        key = sql[:120]
+        if key not in SafeDB._loop_thread_warned and len(SafeDB._loop_thread_warned) < 256:
+            SafeDB._loop_thread_warned.add(key)
+            logger.warning(
+                "Sync DB call on event-loop thread (blocks asyncio; use "
+                "AsyncSafeDB or asyncio.to_thread): %s", key
+            )
+
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
-        with self._lock:
-            conn = self._get_conn()
+        # execute() commits, so it takes the writer lock even for the occasional
+        # SELECT-then-fetch caller. Pure reads use fetchone/fetchall (lock-free).
+        # The returned cursor and its lastrowid belong to THIS thread's
+        # connection, so reading cursor.lastrowid after the lock releases is safe
+        # (and no longer races a concurrent insert on a shared connection).
+        self._warn_if_event_loop(sql)
+        conn = self._get_conn()
+        with self._write_lock:
             cursor = conn.execute(sql, params)
             conn.commit()
             return cursor
 
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
-        with self._lock:
-            conn = self._get_conn()
+        self._warn_if_event_loop(sql)
+        conn = self._get_conn()
+        with self._write_lock:
             cursor = conn.executemany(sql, params_list)
             conn.commit()
             return cursor
@@ -906,7 +1042,12 @@ class SafeDB:
             self._conn: sqlite3.Connection | None = None
 
         def __enter__(self) -> "_TransactionCursor":
-            self._db._lock.acquire()
+            # A transaction is a write; hold the writer lock for its duration on
+            # THIS thread's connection. Readers on other threads run concurrently
+            # (WAL). The connection is captured before BEGIN so all statements in
+            # the block — including read-backs of just-inserted rows — hit the
+            # same connection and see the in-flight changes.
+            self._db._write_lock.acquire()
             self._conn = self._db._get_conn()
             self._conn.execute("BEGIN")
             return _TransactionCursor(self._conn)
@@ -918,7 +1059,7 @@ class SafeDB:
                 else:
                     self._conn.rollback()
             finally:
-                self._db._lock.release()
+                self._db._write_lock.release()
 
     def transaction(self) -> "_Transaction":
         """Return a context manager for atomic multi-statement transactions.
@@ -932,20 +1073,28 @@ class SafeDB:
         return self._Transaction(self)
 
     def fetchone(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Row | None:
-        with self._lock:
-            conn = self._get_conn()
-            return conn.execute(sql, params).fetchone()
+        # Lock-free: this thread's own connection, WAL gives a consistent
+        # snapshot concurrent with any writer. This is the concurrency win.
+        self._warn_if_event_loop(sql)
+        return self._get_conn().execute(sql, params).fetchone()
 
     def fetchall(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> list[sqlite3.Row]:
-        with self._lock:
-            conn = self._get_conn()
-            return conn.execute(sql, params).fetchall()
+        self._warn_if_event_loop(sql)
+        return self._get_conn().execute(sql, params).fetchall()
 
     def close(self) -> None:
-        with self._lock:
-            if self._conn:
-                self._conn.close()
-                self._conn = None
+        # Close every per-thread connection. Called at shutdown / test teardown
+        # when the DB is quiescent. check_same_thread=False lets us close
+        # other threads' connections from here.
+        with self._all_conns_lock:
+            for conn in self._all_conns:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            self._all_conns.clear()
+        # Reset per-thread storage so the next call re-opens fresh connections.
+        self._local = threading.local()
 
 
 class AsyncSafeDB:

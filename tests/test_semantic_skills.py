@@ -452,3 +452,38 @@ class TestSemanticDedupGuard:
             steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
         )
         assert result is not None, "ChromaDB error should not block skill creation"
+
+
+class TestSemanticTopicalGuard:
+    """_query_skill_topically_related rejects topic-only semantic matches.
+
+    Regression for the live false positive (2026-06-13): a bat-and-ball math
+    problem matched `real_time_price_lookup` at sim=0.751 because both mention
+    'price' — injecting a price-lookup procedure into an arithmetic answer.
+    """
+
+    def test_price_math_problem_rejected(self):
+        from app.core.skills import _query_skill_topically_related as ok
+        q = ("A bat and ball cost 1.10 total. The bat costs 1.00 more than the "
+             "ball. The shop doubles every price. What is the new price difference?")
+        assert ok(q, "real_time_price_lookup",
+                  r"(?i)\b(?:current|latest)\b.{0,80}\b(?:price|cost)\b") is False
+
+    def test_entity_price_query_kept(self):
+        from app.core.skills import _query_skill_topically_related as ok
+        # Anchors on the concrete entity 'gold', not the generic word 'price'.
+        assert ok("what is the current price of gold", "gold_price_check",
+                  r"(current|latest)\s+(price|rate)\s+of\s+gold") is True
+
+    def test_offtopic_rejected(self):
+        from app.core.skills import _query_skill_topically_related as ok
+        assert ok("what is the weather tomorrow", "real_time_price_lookup", "current price") is False
+
+    def test_shared_concrete_token_kept(self):
+        from app.core.skills import _query_skill_topically_related as ok
+        assert ok("tell me about ethereum staking", "ethereum_data_retrieval",
+                  r"(?i)ethereum.*(price|market)") is True
+
+    def test_empty_query_rejected(self):
+        from app.core.skills import _query_skill_topically_related as ok
+        assert ok("", "any_skill", "pattern") is False

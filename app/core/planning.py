@@ -137,7 +137,7 @@ async def create_plan(
                 ],
                 json_mode=True,
                 json_prefix='{"',
-                max_tokens=300,
+                max_tokens=512,  # 300 truncated longer plans → "Unterminated string"
                 temperature=0.1,
             ),
             timeout=config.INTERNAL_LLM_TIMEOUT,
@@ -145,7 +145,16 @@ async def create_plan(
         if not raw:
             return None
 
-        plan = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(raw, str):
+            try:
+                plan = json.loads(raw)
+            except json.JSONDecodeError:
+                # The 9B occasionally wraps JSON in prose or emits minor breakage;
+                # fall back to balanced-brace extraction (the codebase standard)
+                # instead of dropping the whole plan to a hard parse error.
+                plan = llm.extract_json_object(raw)
+        else:
+            plan = raw
         if not isinstance(plan, dict) or "steps" not in plan:
             return None
 

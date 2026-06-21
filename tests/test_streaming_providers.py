@@ -152,3 +152,84 @@ class TestOllamaStreaming:
         assert any(c.done for c in chunks)
 
 
+# ===========================================================================
+# invoke_nothink — JSON prefix handling and per-call options
+# ===========================================================================
+
+class TestInvokeNothinkJsonHandling:
+    """Regression: the json_prefix re-prepend must be conditional.
+
+    Prefill-continuation models (qwen35) return content WITHOUT the prefix
+    and need it prepended; models whose chat template closes the assistant
+    turn (gemma3) ignore the prefill and return the COMPLETE object —
+    unconditional prepending corrupted that to "{{..." (found 2026-06-11
+    wiring the grounded judge)."""
+
+    def _provider(self):
+        from app.core.providers.ollama import OllamaProvider
+        provider = OllamaProvider.__new__(OllamaProvider)
+        provider._llm_model = "test-model"
+        provider._get_client = MagicMock(return_value=MagicMock())
+        return provider
+
+    @pytest.mark.asyncio
+    async def test_complete_object_response_not_double_prefixed(self):
+        provider = self._provider()
+        complete = '{"score": 0.9, "grounded": 1.0, "unsupported_claims": [], "critique": "ok"}'
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": complete}}
+        with patch(
+            "app.core.providers.ollama.retry_on_transient",
+            new_callable=AsyncMock, return_value=mock_resp,
+        ):
+            out = await provider.invoke_nothink(
+                [{"role": "user", "content": "grade"}],
+                json_mode=True, json_prefix="{",
+                json_schema={"type": "object"},
+                model="gemma3:4b",
+            )
+        assert json.loads(out)["score"] == 0.9
+
+    @pytest.mark.asyncio
+    async def test_continuation_response_gets_prefix_prepended(self):
+        provider = self._provider()
+        continuation = '"score": 0.7, "critique": "fine"}'
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": continuation}}
+        with patch(
+            "app.core.providers.ollama.retry_on_transient",
+            new_callable=AsyncMock, return_value=mock_resp,
+        ):
+            out = await provider.invoke_nothink(
+                [{"role": "user", "content": "grade"}],
+                json_mode=True, json_prefix="{",
+                model="qwen-test",
+            )
+        assert json.loads(out)["score"] == 0.7
+
+    @pytest.mark.asyncio
+    async def test_num_ctx_flows_into_request_options(self):
+        provider = self._provider()
+        mock_resp = MagicMock()
+        mock_resp.json.return_value = {"message": {"content": '{"ok": true}'}}
+        with patch(
+            "app.core.providers.ollama.retry_on_transient",
+            new_callable=AsyncMock, return_value=mock_resp,
+        ) as mock_rot:
+            await provider.invoke_nothink(
+                [{"role": "user", "content": "x"}],
+                json_mode=True, json_prefix="{",
+                model="gemma3:4b", num_ctx=8192,
+            )
+            payload = mock_rot.call_args.kwargs["json"]
+            assert payload["options"]["num_ctx"] == 8192
+
+            mock_rot.reset_mock()
+            await provider.invoke_nothink(
+                [{"role": "user", "content": "x"}],
+                model="gemma3:4b",
+            )
+            payload = mock_rot.call_args.kwargs["json"]
+            assert "num_ctx" not in payload["options"]
+
+

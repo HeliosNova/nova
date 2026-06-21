@@ -109,6 +109,30 @@ class TestCreatePlan:
         assert plan["steps"][0]["tool"] == "none"
 
     @pytest.mark.asyncio
+    async def test_recovers_json_wrapped_in_prose(self):
+        # The 9B sometimes wraps JSON in text; bare json.loads fails. The
+        # balanced-brace fallback (llm.extract_json_object) must still recover it.
+        from app.core import llm as _llm
+        wrapped = (
+            'Here is the plan:\n{"steps": [{"description": "search", '
+            '"tool": "web_search"}], "complexity": "simple"}\nHope this helps!'
+        )
+        with patch.object(_llm, "invoke_nothink", AsyncMock(return_value=wrapped)):
+            plan = await create_plan("q", ["web_search", "calculator"])
+        assert plan is not None
+        assert plan["steps"][0]["tool"] == "web_search"
+
+    @pytest.mark.asyncio
+    async def test_unrecoverable_json_returns_none_not_exception(self):
+        # Genuinely broken/truncated JSON must degrade to None (no plan), not
+        # raise — this is what produced the noisy "Planning failed" log spam.
+        from app.core import llm as _llm
+        broken = '{"steps": [{"description": "do a thing", "tool": "web_search'  # truncated
+        with patch.object(_llm, "invoke_nothink", AsyncMock(return_value=broken)):
+            plan = await create_plan("q", ["web_search"])
+        assert plan is None
+
+    @pytest.mark.asyncio
     async def test_empty_response_returns_none(self):
         with patch("app.core.planning.llm") as mock_llm:
             mock_llm.invoke_nothink = AsyncMock(return_value="")

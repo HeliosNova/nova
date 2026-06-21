@@ -132,9 +132,12 @@ class TestLockContention:
     @pytest.mark.asyncio
     async def test_high_contention_write_consistency(self, kg):
         """Many concurrent writes to the same entity should not corrupt data."""
-        # All tasks write to the same entity with different predicates
+        # Use a FUNCTIONAL predicate (lives_in: one current residence) so the
+        # writes genuinely conflict and supersede. has_property is multi-valued —
+        # an entity has many traits, which now correctly coexist rather than
+        # collapsing to one (see MULTI_VALUED_PREDICATES).
         results = await asyncio.gather(*[
-            kg.add_fact("nova", f"has_property", f"trait_{i}", confidence=0.7 + 0.01 * i)
+            kg.add_fact("nova", "lives_in", f"city_{i}", confidence=0.7 + 0.01 * i)
             for i in range(15)
         ])
 
@@ -368,7 +371,7 @@ class TestSupersessionConcurrency:
         current = kg.query("earth")
         current_objects = [f["object"] for f in current if f["predicate"] == "capital_of"]
         assert len(current_objects) == 1
-        assert current_objects[0] == "Moscow"  # normalize_entity title-cases
+        assert current_objects[0] == "moscow"  # casing preserved since 2026-06-09
 
         # History should show all 5
         history = kg.get_fact_history("earth", "capital_of")

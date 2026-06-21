@@ -133,7 +133,10 @@ Main responses use `generate_with_tools()` (thinking suppressed for speed) or `s
 (thinking enabled for extended reasoning, controlled by `ENABLE_EXTENDED_THINKING`).
 
 ### JSON from LLM
-- `repeat_penalty` must be **1.1** (not 1.5) for `json_mode=True` -- higher values mangle JSON
+- `repeat_penalty` is **1.1 everywhere** (`ollama.py`, 2026-06-12). It must be 1.1 for
+  `json_mode=True` (higher mangles JSON); the non-JSON path used to default to 1.5, which
+  over-penalized ordinary repetition in freeform background gens (synthesis/merge/refine/polish)
+  and was an unexamined v1.0.0 default — now aligned with the streaming + tool paths.
 - Always pass `format: "json"` to Ollama for structured extraction
 - Use `extract_json_object()` as fallback parser (balanced brace matching)
 
@@ -156,6 +159,26 @@ Ollama now uses native tool calling (Ollama 0.17+). Text extraction is kept as f
 
 Brain.py imports `is_likely_correction` from `learning.py`. Do NOT duplicate patterns.
 
+**Regex-miss rescue (2026-06-12):** the strict regex measured ~88% recall; a miss
+no longer hard-drops the message. When there's a prior answer AND a soft reactive
+signal (`has_soft_correction_signal()` — short message with a negation/doubt
+token), `detect_correction` still runs the LLM confirmation (the precision
+backstop) to recover creatively-phrased corrections. The LLM rejects
+non-corrections, so the loose gate only costs calls, never bad lessons.
+
+**Pushback must not suppress ACCEPTED corrections (2026-06-12):** `response_pushes_back()`
+now returns False when `response_concedes()` matches ("you're right", "my mistake",
+"thanks for the correction"). The broad pushback patterns (e.g. `actually, the`)
+also fire on accepting replies, which silently dropped genuinely-accepted
+corrections before they were saved.
+
+### Lesson Dedup — never merge contradictions
+`_find_similar_lesson` merges by token-Jaccard, which can't see negation: "Pluto
+is a planet" vs "Pluto is **not** a planet" differ by one token and were folded
+into one lesson. `_answers_conflict()` now vetoes any merge whose answers flip
+polarity or cite disjoint numbers ("$50k" vs "$60k"). Opposites are stored as
+separate lessons. See `tests/test_learning_loop_fixes.py`.
+
 ### History Walking Bug Fix
 In `brain.py` step 13, the correction handler must **skip 1 assistant message** because step 11 already saved the new response before the correction handler runs. The second-from-end assistant message is the wrong answer.
 
@@ -176,6 +199,21 @@ Lower-authority sources cannot overwrite higher-authority facts.
 
 ### SafeDB.execute() Returns Cursor
 Always truthy. Use `fetchone()` / `fetchall()` for SELECTs.
+
+### SafeDB concurrency (per-thread connections, 2026-06-12)
+`SafeDB` keeps **one SQLite connection per thread** (`threading.local`) plus a
+single **write-only** `RLock`. Reads (`fetchone`/`fetchall`) take **no lock** —
+WAL gives each thread a consistent snapshot concurrent with the writer. Writes
+(`execute`/`executemany`/`transaction`) serialize on the write lock so our own
+`to_thread` workers never collide into `SQLITE_BUSY`. This replaced a single
+shared connection behind one global lock that serialized *everything* and negated
+WAL — the structural root of the recurring event-loop lock-convoy incidents.
+Bonus: `cursor.lastrowid` / `SELECT last_insert_rowid()` are now race-free
+(per-connection, not shared). `close()` shuts every per-thread connection; call
+it only when the DB is quiescent. Still route async-context calls through
+`AsyncSafeDB`/`asyncio.to_thread` — `_warn_if_event_loop` flags violations.
+Tests: `tests/test_safedb_concurrency.py` (read-not-blocked verified
+red-on-old/green-on-fixed).
 
 ### Access Tiers (`SYSTEM_ACCESS_LEVEL`)
 - **sandboxed** (default): Shell blocks system + interpreter commands. File ops only `/data`. Code blocks os/subprocess/socket/httpx/requests.
@@ -208,6 +246,25 @@ Background loop checks monitors on schedule, detects changes, sends alerts via D
 - **Geographic** (2): Latin America (24h), Africa & Emerging (24h)
 
 All query-type monitors auto-extract KG triples. All prompts anchored to "past 24-48 hours" with today's date injected.
+
+### Refine latency: concurrent + gated critique (2026-06-12)
+`_refine_response` ran the self-critique and adversarial passes as two SEQUENTIAL
+pre-stream LLM round-trips on every general answer ≥200 chars. Owner decision
+(keep grounding, cut time-to-first-token):
+- the two passes are independent read-only analyses of the same content, so they
+  now run **concurrently** via `asyncio.gather`; if self-critique rewrites, the
+  adversarial verdict is recomputed on the new content (else reused free);
+- the **adversarial factual-error hunter is gated** to answers that make checkable
+  claims — `_needs_factual_review` = tools ran OR retrieval present OR a claim
+  pattern OR any digit OR ≥2 mid-sentence capitalized words. Pure
+  conversational/opinion/greeting answers skip it (one fewer pass); knowledge-only
+  factual answers still trip it, so grounding holds.
+
+Note on streaming: true token streaming stays OFF by design — `validate_claims`
+strips unsupported claims and `_refine_response` can rewrite the whole answer, so
+the pipeline generates fully, grounds, then emits. The TOKEN events are a
+post-grounding chunking of the final text, not live generation.
+Tests: `tests/test_refine_gating.py`.
 
 ### Self-Improvement Pipeline
 1. **Reflexion** (`reflexion.py`): Heuristic + LLM critique after each response. Failures stored and retrieved on similar future queries.
@@ -311,6 +368,16 @@ Mock pattern: `patch("app.core.brain.llm")` for brain, `patch("app.core.memory.l
 
 ## Fine-Tuning
 
+> **ARCHIVED 2026-06-12.** The entire weight-training stack (fine-tuning + GRPO +
+> RLVR trainer, ~21.7k LOC) was moved to `archive/training/`. Rationale: across
+> every `run_history.json` there were **0 successful train→A/B→deploy** cycles,
+> and the one honest cross-family A/B showed `nova-ft` **ties** its base. The
+> in-context memory loop (lessons + temporal KG) is how Nova actually learns. The
+> runtime no longer ships any trainer; the Fine-Tune heartbeat monitor is inert
+> and `ENABLE_RLVR_SIGNALS` defaults off. The sections below are retained for
+> historical reference / revival (restore `archive/training/`). Do not re-wire
+> them into the live product without a measured reason.
+
 ### Venv setup
 
 Fine-tuning lives in a dedicated venv (`finetune_env/`) outside the Nova app
@@ -398,7 +465,7 @@ Sample config for Claude Code: `mcp_configs/nova_mcp.json`
 | WhatsApp | `app/channels/whatsapp.py` | Webhook (FastAPI router) | `WHATSAPP_API_URL`, `WHATSAPP_API_TOKEN`, `WHATSAPP_VERIFY_TOKEN`, `WHATSAPP_PHONE_ID`, `WHATSAPP_CHAT_ID`, `WHATSAPP_ALLOWED_USERS` |
 | Signal | `app/channels/signal.py` | Polling (signal-cli REST API) | `SIGNAL_API_URL`, `SIGNAL_PHONE_NUMBER`, `SIGNAL_CHAT_ID`, `SIGNAL_ALLOWED_USERS`, `SIGNAL_POLL_INTERVAL` |
 
-All channels: phone-number allowlisting (empty = allow all), message splitting for long responses, graceful connection failure handling.
+All channels: user/phone-number allowlisting (**fail-closed since 2026-06-12**: empty allowlist = deny ALL — you must list your own ID), message splitting for long responses, graceful connection failure handling. `searxng/settings.yml` is untracked (secret_key); `install.sh` generates it from `settings.yml.example`.
 
 ## Temporal Knowledge Graph
 
@@ -418,6 +485,28 @@ Other fields:
 - `provenance` — which conversation/source created it
 - `superseded_by` — FK to the fact that replaced it
 - Contradicting facts are **superseded** (not deleted), creating a temporal trail
+
+### Multi-valued vs functional predicates (fixed 2026-06-12)
+`add_fact` used to supersede EVERY same-(subject, predicate) fact on a differing
+object — collapsing genuinely multi-valued knowledge (`Python contains lists`
+*and* `dicts`; co-authors; `born_in Ulm` *and* `Germany`) down to one object, and
+silently overriding the LLM resolver's "keep both" verdict. Now:
+- **`MULTI_VALUED_PREDICATES`** (kg.py) coexist — a new object is an additional
+  fact. Includes `related_to` (the degrade target for non-canonical predicates),
+  so degraded facts never merge.
+- Everything else is **functional** (one current value): `lives_in`, `capital_of`,
+  `price_of`, `married_to`, `leads`, `currency_of`, `version_of`,
+  `successor_of`/`succeeded_by` — a differing object supersedes, which is the
+  change-over-time the bitemporal store exists to track.
+- **`INVERSE_FUNCTIONAL_PREDICATES`** (`leads`, `capital_of`, `married_to`): a new
+  *subject* for the same object supersedes the prior holder. Replaces the dead
+  `_UNIQUE_PREDICATES` set (it listed non-canonical strings like `is_ceo_of` that
+  `normalize_predicate` degrades to `related_to`, so it only ever matched `leads`).
+- **Revival fix:** re-adding a superseded triple (forced to reuse the row by
+  `UNIQUE(s,p,o)`) now resets `superseded_at=NULL` + `created_at=now`. The old
+  code left a stale `superseded_at`, so the live fact was invisible to every
+  bitemporal query (`query_as_of()` filters `superseded_at IS NULL`). Tests:
+  `tests/test_kg_multivalued.py`.
 
 Query API:
 - `query_at(entity, at_time)` — facts world-valid at a point in time (legacy
@@ -525,6 +614,30 @@ Heuristic-based detection on all ingested content (web search, HTTP fetch, exter
 
 Suspicious content is wrapped with a warning prefix, not stripped. Gated by `ENABLE_INJECTION_DETECTION`.
 
+### Code Execution Sandbox (`app/tools/code_exec.py`)
+Two layers, because static analysis alone is **not** a boundary (an AST screen
+can't soundly sandbox Python):
+1. **AST screen (`_check_code_safety`)** — fast first filter, tier-aware. Catches
+   blocked imports/builtins, the `getattr`-constant bypass, blocked dunder attrs,
+   AND simple aliasing (`e = exec; e(...)` — the 2026-06-12 audit bypass).
+2. **Runtime guard (`_build_guarded_runner`)** — the real enforcement, inside the
+   execution subprocess. Installs an `__import__` hook (every import spelling
+   funnels through it, so blocking is spelling-proof) that denies blocked modules
+   *not already preloaded at startup* — this stops fresh `socket`/`urllib`/
+   `subprocess`/`ctypes` imports (the exfil/escape vectors) without breaking
+   stdlib's transitive imports (json→re→enum→sys). User code runs under a builtins
+   mapping with `eval`/`exec`/`compile`/`open`/`breakpoint` stripped, so an alias
+   has nothing to point at. The runner imports only `sys`+`builtins`, so the
+   subclass-walk escape finds no `os`/`subprocess` gadget preloaded.
+
+Subprocess is `python -I` (isolated), clean env via `get_safe_env()` (no token
+leakage), per-request temp dir, and on POSIX hard `RLIMIT_CPU/AS/FSIZE/CORE`
+ceilings (`_posix_rlimits`). **Honest limit:** at `full` tier code_exec is
+intentionally unrestricted; and in-process Python can't be made airtight against
+an expert (preloaded `os`, frame walking). For true isolation use OS-level
+sandboxing (nsjail/seccomp) or a `pids_limit` on the container against fork bombs.
+Tests: `tests/test_code_exec_sandbox.py` (runtime layer, bypasses the AST gate).
+
 ### Skill Signing (`app/core/skill_export.py`)
 Skills can be exported/imported with HMAC-SHA256 signatures:
 ```bash
@@ -630,6 +743,11 @@ store.rollback(active.id)
 
 ## RLVR — Verifiable Signal Collection (`app/core/rlvr.py`)
 
+> **ARCHIVED consumer (2026-06-12).** RLVR signals only fed the GRPO/RLVR trainer,
+> now in `archive/training/`. `ENABLE_RLVR_SIGNALS` defaults **off** — with no
+> consumer, collection was pure write overhead on the chat path. The `rlvr.py`
+> module stays (small, imported by brain.py) but is dormant unless re-enabled.
+
 Records ground-truth-style signals during normal operation so the next
 GRPO/RLVR fine-tune cycle has reward data without re-grading. Distinct from
 reflexion grading (LLM-judged) — these signals come from deterministic checks.
@@ -677,7 +795,11 @@ of redactions so we can see when leaks are happening upstream.
 Caught live 2026-05-08 in `deliberation_chain_of_reasoning` outputs;
 17 unit tests + live deliberation probe verified clean.
 
-## GRPO Trainer (`scripts/grpo_train.py` + `app/core/grpo_dataset.py` + `app/core/grpo_verifier.py`)
+## GRPO Trainer (`archive/training/grpo_train.py` + `app/core/grpo_dataset.py` + `app/core/grpo_verifier.py`)
+
+> **ARCHIVED 2026-06-12.** `grpo_train.py` moved to `archive/training/`. The
+> `app/core/grpo_dataset.py` / `grpo_verifier.py` helpers remain in-tree but have
+> no live caller. Retained for revival only.
 
 Closes the RLVR loop: consumes `verifiable_signals` rows into a fresh LoRA
 adapter on the **9B base** (Qwen3.5-9B). Note: only the 9B is fine-tuned —
@@ -775,6 +897,13 @@ in the legacy path.
 | `ENABLE_RERANKER` | `true` | Apply composite score reranker after RRF fusion |
 | `RETRIEVAL_RRF_K` | `60` | RRF smoothing constant (alias `RRF_K`) |
 
+**KG vector arm can stand alone (2026-06-12):** `get_relevant_facts` used to fuse
+only `if keyword_ids or ppr_ids`, so a pure-paraphrase query (no keyword overlap
+≥2, no graph seed) retrieved nothing even with a clear semantic hit. A **strong**
+vector tier (distance ≤ `min(KG_VECTOR_MAX_DISTANCE, 0.5)` — bge-m3 places correct
+matches at 0.08–0.42) now drives retrieval on its own, mirroring the lessons
+`LESSON_VECTOR_STRONG_DISTANCE` pattern. Weak vector hits still only re-rank.
+
 Reranker: composite heuristic `0.55·vec + 0.30·bm25 + 0.15·coverage`. No external model required.
 A cross-encoder path (sentence-transformers) was evaluated empirically on a 300-doc adversarial corpus
 and gave 0pp gain over composite on Recall@5/P@1/MRR — deleted (see commit for 4×4 table).
@@ -818,7 +947,7 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 
 | File | Purpose |
 |------|---------|
-| `evals/suite.yaml` | 40 evaluation tasks across 8 categories (reasoning, tool-use, skill-match, semantic-match, autonomous-tool, reflexion-calibration, multi-agent, retrieval) |
+| `evals/suite.yaml` | 63 evaluation tasks across 11 categories (reasoning, tool-use, skill-match, semantic-match, autonomous-tool, reflexion-calibration, multi-agent, retrieval, memory-learning, kg-retrieval, multi-turn) |
 | `app/monitors/eval_harness.py` | Harness engine — task runner, metrics, regression detection |
 | `/data/eval_reports/eval_<ts>.json` | Full structured report (per run) |
 | `/data/eval_reports/eval_<ts>.md` | Human-readable markdown summary (per run) |
@@ -837,6 +966,7 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 | `reflexion-calibration` | 4 | Score distribution validation — detects inflation/deflation |
 | `multi-agent` | 5 | Decomposition gating + sub-agent merge correctness (incl. no-decompose baseline) |
 | `retrieval` | 3 | BM25 exact-keyword + semantic paraphrase + reranker regression probe |
+| `multi-turn` | 4 | Cross-turn recall, pronoun resolution, self-consistency — `turns:` run first in a shared ephemeral conversation (brain in-process history), assertions grade the final `query` |
 
 ### Metrics
 
@@ -845,6 +975,19 @@ monitor (`check_type="eval"`, monitor name "Quality Eval Harness").
 - **semantic-match**: recall_at_threshold (paraphrases matching at 0.65)
 - **autonomous-tool**: multi_tool_rate (fraction using ≥2 tools)
 - **Regression flags**: any metric dropping >EVAL_REGRESSION_TOLERANCE (10%) from baseline
+
+### Scale + staleness coverage (2026-06-12)
+The harness seeds ONE item into a near-empty store and reads it back through the
+SAME handle, so it is structurally blind to the two classes that kept recurring:
+the `LIMIT 500` candidate-window truncation (a relevant item past rank 500
+vanished once the store grew) and the stale-vector-handle after an out-of-process
+reindex. These are now guarded by **deterministic** regression tests
+(`tests/test_retrieval_scale.py`) — the right tool, since they have no LLM
+tool-use variance: they populate 600+ fillers and assert a low-ranked relevant
+item is still retrieved (fails if any small candidate cap returns), and that
+retrieval recovers through a fresh handle after a vector reindex. Both KG
+(`MAX_KG_FACTS`) and lessons (`MAX_LESSON_CANDIDATES`) caps are verified
+red-on-`LIMIT 500`, green-on-fix.
 
 ### How to add a task
 

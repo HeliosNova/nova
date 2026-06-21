@@ -138,6 +138,19 @@ async def status() -> StatusResponse:
     return StatusResponse(**counts)
 
 
+@router.get("/self-improvement", dependencies=[Depends(require_auth)])
+async def self_improvement_health() -> dict:
+    """Usage + quality snapshot of the self-improvement loop's output — so the
+    machinery's VALUE is visible, not just that it runs. Skills/auto-tools used
+    vs dead, lesson helpfulness, reflexion injection rate."""
+    from app.core import self_improvement as si
+
+    def _sync() -> dict:
+        return si.compute_health(get_db())
+
+    return await asyncio.to_thread(_sync)
+
+
 @router.get("/trust", dependencies=[Depends(require_auth)])
 async def get_trust_status():
     """Trust score health metric.
@@ -482,7 +495,7 @@ async def get_custom_tools():
     svc = get_services()
     if not svc.custom_tools:
         return []
-    tools = svc.custom_tools.get_all_tools()
+    tools = await asyncio.to_thread(svc.custom_tools.get_all_tools)
     return [{"id": t.id, "name": t.name, "description": t.description,
              "parameters": t.parameters, "times_used": t.times_used,
              "success_rate": t.success_rate, "enabled": t.enabled} for t in tools]

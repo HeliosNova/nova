@@ -51,6 +51,17 @@ _TOOL_COMMAND_RE = re.compile(
     r"(?i)(use the browser|fill.*form|httpbin|submit|navigate to|go to https?://)"
 )
 
+# A query answered by a deterministic computational tool is a computation, not a
+# knowledge gap worth researching (e.g. "17 times 4?" answered by the calculator).
+_COMPUTATIONAL_TOOLS = {"calculator", "code_exec"}
+# Inline arithmetic the model computed itself (no tool) is equally not a gap.
+_ARITHMETIC_RE = re.compile(
+    r"(?i)\d+\s*(?:[-+*/x×÷]|times|plus|minus|divided\s+by|multiplied\s+by)\s*\d+"
+)
+# Self-referential questions are about the USER (user-facts) — not researchable
+# external topics. "what do I like", "where do I work", "my favorite X".
+_SELF_REFERENTIAL_RE = re.compile(r"(?i)\bdo i\b|\bam i\b|\bmy\b")
+
 
 def detect_gaps(
     query: str,
@@ -93,8 +104,22 @@ def detect_gaps(
         gaps.append({"topic": topic, "source": "hedging", "urgency": _URGENCY_MEDIUM})
         return gaps
 
-    # Check for missing context (no lessons, KG, or docs matched)
-    if not had_lessons and not had_kg and not had_docs and len(query) > 30:
+    # context_gap is reached only when Nova answered WITHOUT hedging/admission
+    # (the checks above) — i.e. confidently. For a capable base model that usually
+    # means it knew the answer from training, NOT that there's a gap. So fire this
+    # weak signal only when the answer is THIN (suggesting it lacked depth) AND the
+    # query is a genuine external-knowledge ask: not a computation (calc/code_exec
+    # tool OR inline arithmetic), and not self-referential (about the user). This
+    # kills the queue noise from math ("17 times 4?"), personal queries ("what do I
+    # like"), and confidently-answered prompts ("compare REST vs GraphQL").
+    _computational = (
+        any(str(tr.get("tool", "")) in _COMPUTATIONAL_TOOLS for tr in tool_results)
+        or bool(_ARITHMETIC_RE.search(query))
+    )
+    if (not had_lessons and not had_kg and not had_docs
+            and len(query) > 30 and len(answer) < 180
+            and not _computational
+            and not _SELF_REFERENTIAL_RE.search(query)):
         gaps.append({"topic": topic, "source": "context_gap", "urgency": _URGENCY_LOW})
 
     return gaps

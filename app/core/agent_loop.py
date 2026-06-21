@@ -119,16 +119,42 @@ _HARD_REASONING_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Math / logic WORD PROBLEMS — queries that need careful System-2 reasoning but
+# don't announce themselves with "analyze/derive". A live probe (2026-06-13)
+# showed the 9B failing the classic bat-and-ball trap (it gave the intuitive
+# wrong ball=$0.10) because nothing flagged it for extended thinking. These
+# carry relational/constraint language; paired with >=2 numbers they signal a
+# constraint-satisfaction problem where pattern-matching loses.
+_MATH_LOGIC_RE = re.compile(
+    r"\b(more than|less than|fewer than|greater than|twice|thrice|"
+    r"three times|half of|double|triple|older than|younger than|"
+    r"faster than|slower than|taller than|heavier than|"
+    r"how many|how much|how long|how old|how far|how fast|"
+    r"ratio|combined|altogether|apiece|"
+    r"costs? .{0,25}\bmore\b|in total|doubles every)\b",
+    re.IGNORECASE,
+)
+_NUM_RE = re.compile(r"\d+(?:[.,]\d+)?")
+
+
+def _is_math_logic_word_problem(query: str) -> bool:
+    """Constraint/relational language + at least two numbers => a word problem
+    that benefits from step-by-step reasoning rather than pattern-matching."""
+    if not query or len(query) < 20:
+        return False
+    return bool(_MATH_LOGIC_RE.search(query)) and len(_NUM_RE.findall(query)) >= 2
+
 
 def _is_hard_reasoning_query(query: str) -> bool:
-    """Heuristic: does this query benefit from tree-of-thought sampling?
+    """Heuristic: does this query benefit from extended (System-2) reasoning?
 
     Hard queries: comparative reasoning, derivation, design, multi-factor
-    analysis. Cheap regex — no LLM call.
+    analysis, AND math/logic word problems (constraint satisfaction). Cheap
+    regex — no LLM call.
     """
     if not query or len(query) < 20:
         return False
-    return bool(_HARD_REASONING_RE.search(query))
+    return bool(_HARD_REASONING_RE.search(query)) or _is_math_logic_word_problem(query)
 
 
 # ---------------------------------------------------------------------------

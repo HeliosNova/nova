@@ -367,3 +367,29 @@ class TestMonitorTool:
         assert result.success
         m = store.get_by_name("StringConfig")
         assert m.check_config == {"query": "test"}
+
+
+class TestInteractivePriority:
+    """Background LLM monitors must yield the GPU to active interactive chat.
+    Measured 2026-06-11: monitor generations push interactive latency 13s->60-85s.
+    """
+
+    def test_note_and_check_window(self):
+        from app.core import llm
+        import time
+        # Far in the past -> not active
+        llm._last_interactive_monotonic = time.monotonic() - 1000
+        assert llm.interactive_active() is False
+        # Just noted -> active
+        llm.note_interactive_activity()
+        assert llm.interactive_active() is True
+
+    def test_window_expires(self, monkeypatch):
+        from app.core import llm
+        import time
+        base = time.monotonic()
+        llm.note_interactive_activity()
+        # Simulate time passing beyond the window
+        monkeypatch.setattr(llm._time, "monotonic",
+                            lambda: base + llm.INTERACTIVE_PRIORITY_WINDOW_S + 1)
+        assert llm.interactive_active() is False

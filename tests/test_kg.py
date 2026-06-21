@@ -435,6 +435,26 @@ class TestGarbageTripleFilter:
         assert is_garbage_triple("python", "created_by", "guido van rossum") is False
         assert is_garbage_triple("bitcoin", "is_a", "cryptocurrency") is False
 
+    def test_news_source_domain_rejected(self):
+        # News-extraction noise: a source domain is not an entity (2026-06-21).
+        assert is_garbage_triple("markets get the measure of t", "related_to", "ft.com") is True
+        assert is_garbage_triple("apple", "related_to", "bbc.com") is True
+        assert is_garbage_triple("theblock.co", "related_to", "bitcoin") is True
+
+    def test_headline_fragment_rejected(self):
+        assert is_garbage_triple("US", "related_to", "iran claim waterway is shut") is True
+        assert is_garbage_triple("amazon", "related_to", "engineers who criticized ai") is True
+        assert is_garbage_triple("markets get the measure of trump", "related_to", "ft") is True
+
+    def test_synthesis_label_artifact_rejected(self):
+        assert is_garbage_triple("cross_pattern:cross-confirmed", "related_to", "x") is True
+
+    def test_real_multiword_entities_still_pass(self):
+        # Must NOT over-reject legitimate multi-word noun-phrase entities.
+        assert is_garbage_triple("tim cook", "leads", "apple") is False
+        assert is_garbage_triple("tsmc", "located_in", "taiwan") is False
+        assert is_garbage_triple("san francisco", "located_in", "california") is False
+
 
 # ===========================================================================
 # Contradiction Detection

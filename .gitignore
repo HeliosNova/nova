@@ -66,3 +66,9 @@ local_train_data/
 *.log
 _phase0_*
 _phase1_*
+
+# Off-volume SQLite snapshots (bind-mounted into the container at /backups)
+backups/
+
+# SearXNG local settings (contains secret_key) — use settings.yml.example as template
+searxng/settings.yml

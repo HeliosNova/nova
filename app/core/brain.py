@@ -11,6 +11,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 from dataclasses import dataclass, field
 from typing import Any, AsyncGenerator, TYPE_CHECKING
 
@@ -514,8 +515,13 @@ async def _run_context_io(name: str, awaitable, default):
     degrade gracefully by returning `default` and logging the loss.
     The pipeline continues with whatever context succeeded.
     """
+    _t0 = time.monotonic()
     try:
-        return await asyncio.wait_for(awaitable, timeout=_CONTEXT_GATHER_TIMEOUT_S)
+        result = await asyncio.wait_for(awaitable, timeout=_CONTEXT_GATHER_TIMEOUT_S)
+        _dt = time.monotonic() - _t0
+        if _dt >= 1.0:
+            logger.info("[context-gather] %s took %.1fs", name, _dt)
+        return result
     except asyncio.TimeoutError:
         logger.warning(
             "[context-gather] %s timed out after %.1fs — degrading without it",
@@ -538,21 +544,41 @@ async def _gather_context(
     This is Steps 4–7b of the original think() pipeline.
     """
     ctx = _ThinkContext()
-    ctx.user_facts_text = (
-        await _run_context_io(
-            "user_facts",
-            asyncio.to_thread(svc.user_facts.format_for_prompt),
-            default="",
-        )
-    ) if svc.user_facts else ""
+    # The retrievals below are independent (each writes distinct ctx fields) and
+    # I/O-bound (DB + Ollama-embedder calls). They USED to run sequentially —
+    # measured ~15s of per-turn latency. The heavy embedder-backed ones are now
+    # DISPATCHED concurrently up front (with SafeDB's per-thread connections,
+    # concurrent reads are safe) and awaited at their existing post-processing
+    # sites, so the wall-clock collapses to the slowest single retrieval instead
+    # of their sum. Each keeps its intent/time-sensitivity gate.
+    _is_time_sensitive_query = bool(_TIME_SENSITIVE_RE.search(query))
+
+    # Dispatch the independent, embedder-heavy retrievals concurrently. ensure_future
+    # schedules them immediately; we await each below where its result is used.
+    _t_user_facts = asyncio.ensure_future(_run_context_io(
+        "user_facts", asyncio.to_thread(svc.user_facts.format_for_prompt), default="",
+    )) if svc.user_facts else None
+    _t_skill_match = asyncio.ensure_future(_run_context_io(
+        "skills.match", asyncio.to_thread(svc.skills.get_matching_skill, query), default=None,
+    )) if svc.skills else None
+    _t_lessons = asyncio.ensure_future(_run_context_io(
+        "lessons", asyncio.to_thread(svc.learning.get_relevant_lessons, query), default=[],
+    )) if (svc.learning and not _is_time_sensitive_query) else None
+    _t_kg = asyncio.ensure_future(_run_context_io(
+        "kg", asyncio.to_thread(svc.kg.get_relevant_facts, query, config.MAX_KG_FACTS_IN_PROMPT), default=None,
+    )) if svc.kg else None
+    _t_reflexions = asyncio.ensure_future(_run_context_io(
+        "reflexions", asyncio.to_thread(svc.reflexions.get_relevant, query, config.MAX_REFLEXIONS_IN_PROMPT), default=None,
+    )) if svc.reflexions else None
+    _t_success = asyncio.ensure_future(_run_context_io(
+        "reflexions.success_patterns", asyncio.to_thread(svc.reflexions.get_success_patterns, query, config.MAX_SUCCESS_PATTERNS_IN_PROMPT), default=None,
+    )) if svc.reflexions else None
+
+    ctx.user_facts_text = ((await _t_user_facts) or "") if _t_user_facts else ""
 
     # --- Skills ---
     if svc.skills:
-        ctx.matched_skill = await _run_context_io(
-            "skills.match",
-            asyncio.to_thread(svc.skills.get_matching_skill, query),
-            default=None,
-        )
+        ctx.matched_skill = await _t_skill_match
         if ctx.matched_skill:
             logger.info("Skill matched: '%s' (id=%d)", ctx.matched_skill.name, ctx.matched_skill.id)
             steps_desc = "\n".join(
@@ -585,13 +611,8 @@ async def _gather_context(
     # answer to "what's bitcoin currently?"). Force fresh tool answers.
     # Also: filter at the retrieval source by confidence so low-confidence
     # entries (<0.40) never pass — the formatter filter wasn't enough.
-    _is_time_sensitive_query = bool(_TIME_SENSITIVE_RE.search(query))
     if svc.learning and not _is_time_sensitive_query:
-        lessons = await _run_context_io(
-            "lessons",
-            asyncio.to_thread(svc.learning.get_relevant_lessons, query),
-            default=[],
-        )
+        lessons = await _t_lessons
         # Hard confidence floor at retrieval — ignore lessons that clearly
         # didn't validate. Was previously only enforced in the formatter,
         # which meant retrieval logs still showed conf=0.16 lessons being
@@ -645,11 +666,7 @@ async def _gather_context(
 
     # --- Knowledge graph facts ---
     if svc.kg:
-        kg_facts = await _run_context_io(
-            "kg",
-            asyncio.to_thread(svc.kg.get_relevant_facts, query, config.MAX_KG_FACTS_IN_PROMPT),
-            default=None,
-        )
+        kg_facts = await _t_kg
         if kg_facts:
             # Identity-aware filter: drop facts about known confusion entities
             # (Helios Protocol = blockchain, Nova Lake = Intel CPU, Supernova =
@@ -658,13 +675,56 @@ async def _gather_context(
             ctx.kg_facts_text = svc.kg.format_for_prompt(kg_facts)
             ctx.kg_facts_count = len(kg_facts)
 
+    # --- Global/thematic query route (GraphRAG community summaries) ---
+    # "What are the big themes across your monitors?" can't be answered from
+    # individual facts — it needs the community summaries built in the dream
+    # cycle. Cheap keyword lookup (no embedder); only fires for global queries.
+    if svc.kg:
+        try:
+            from app.core import kg_communities
+            if kg_communities.is_global_query(query):
+                from app.database import get_db
+                _comms = await _run_context_io(
+                    "kg_communities",
+                    asyncio.to_thread(kg_communities.get_relevant_communities, get_db(), query, 3),
+                    default=None,
+                )
+                if _comms:
+                    _ctext = kg_communities.format_for_prompt(_comms)
+                    ctx.kg_facts_text = (
+                        (_ctext + "\n\n" + ctx.kg_facts_text) if ctx.kg_facts_text else _ctext
+                    )
+                    logger.info("[kg-communities] injected %d theme summaries for global query", len(_comms))
+        except Exception as e:
+            logger.debug("[kg-communities] global-query route failed: %s", e)
+
+    # --- Storyline state (interrogable worldmodel) ---
+    # Make tracked monitor THREADS queryable in chat: "where does the Iran
+    # situation stand?" pulls the maintained narrative state. Cheap keyword
+    # match (no embedder, no LLM); gated; degrades silently.
+    if getattr(config, "ENABLE_STORYLINES", True):
+        try:
+            from app.core.storylines import get_relevant_storylines
+            from app.database import get_db
+            _stories = await _run_context_io(
+                "storylines",
+                asyncio.to_thread(get_relevant_storylines, get_db(), query, limit=2),
+                default=None,
+            )
+            if _stories:
+                _stext = "Tracked storylines (current state):\n" + "\n".join(
+                    f"- {s['title']}: {s['summary']}" for s in _stories
+                )
+                ctx.kg_facts_text = (
+                    (_stext + "\n\n" + ctx.kg_facts_text) if ctx.kg_facts_text else _stext
+                )
+                logger.info("[storylines] injected %d tracked thread(s) into context", len(_stories))
+        except Exception as e:
+            logger.debug("[storylines] chat retrieval failed: %s", e)
+
     # --- Reflexions (past failure warnings) ---
     if svc.reflexions:
-        reflexions = await _run_context_io(
-            "reflexions",
-            asyncio.to_thread(svc.reflexions.get_relevant, query, config.MAX_REFLEXIONS_IN_PROMPT),
-            default=None,
-        )
+        reflexions = await _t_reflexions
         if reflexions:
             ctx.reflexions_text = svc.reflexions.format_for_prompt(reflexions)
             ctx.reflexions_count = len(reflexions)
@@ -676,6 +736,11 @@ async def _gather_context(
     # of the *current* session).
     try:
         from app.core import gsw as _gsw
+        # get_db must be imported HERE: the later local import in the workspace
+        # block makes `get_db` function-local, so using it first without this
+        # import raises UnboundLocalError — which silently killed GSW retrieval
+        # for every query until 2026-06-12.
+        from app.database import get_db
         if _gsw.is_enabled() and intent == "general":
             prior_summaries = await _run_context_io(
                 "gsw",
@@ -696,16 +761,13 @@ async def _gather_context(
                         prior_summaries[0].get("key_entities", [])[:3],
                     )
     except Exception as e:
-        logger.debug("GSW retrieval failed: %s", e)
+        # warning, not debug: this swallow hid a total GSW outage for months.
+        logger.warning("GSW retrieval failed: %s", e, exc_info=True)
 
     # --- Success patterns (what worked before) ---
     if svc.reflexions:
         from app.core.reflexion import ReflexionStore
-        successes = await _run_context_io(
-            "reflexions.success_patterns",
-            asyncio.to_thread(svc.reflexions.get_success_patterns, query, config.MAX_SUCCESS_PATTERNS_IN_PROMPT),
-            default=None,
-        )
+        successes = await _t_success
         if successes:
             ctx.success_patterns_text = ReflexionStore.format_success_patterns(successes)
             ctx.success_pattern_ids = [
@@ -1061,6 +1123,21 @@ async def _run_generation_loop(
         and not image
         and selected_model != config.FAST_MODEL
     )
+    if _hard_query_auto_thinking:
+        # System-2 nudge for reasoning / constraint word problems. The 9B
+        # pattern-matches the intuitive (often wrong) answer otherwise — it
+        # failed the bat-and-ball trap live. With use_thinking on, the working
+        # goes in <think> and only the concise answer is shown.
+        messages = messages + [{
+            "role": "system",
+            "content": (
+                "This is a reasoning problem. Before answering: name the unknowns "
+                "as variables, write the equation implied by EACH stated condition, "
+                "solve, then check your solution satisfies every condition. Do not "
+                "assume the first intuitive answer is correct. State the final "
+                "answer concisely after reasoning."
+            ),
+        }]
     _GENERATION_TIMEOUT = float(config.GENERATION_TIMEOUT)
 
     # Intent-adaptive temperature: factual/computational → low, creative/opinion → higher
@@ -1919,13 +1996,47 @@ async def _run_deliberation_path(
         },
     )
 
+    # Grounded reflexion critique on the deliberated answer. AgentLoop
+    # critiques per-step, but the final synthesis shipped unscored — the
+    # judge score here feeds reflexion storage and learning stats in
+    # post-processing. Runs AFTER the DONE event so it adds zero perceived
+    # latency; evidence = the steps' actual observations.
+    deliberation_quality: float | None = None
+    deliberation_reason = ""
+    if not ephemeral and final_content and intent == "general":
+        try:
+            from app.core.reflexion import critique_response, should_use_llm_critique
+            # Steps WITHOUT an observation are included as error entries —
+            # if every step failed, the judge must see "evidence was
+            # attempted but unavailable", not "(none — no tools were used)".
+            step_evidence = [
+                {
+                    "tool": str((s.action or {}).get("tool") or f"step-{s.id}"),
+                    "output": s.observation or "",
+                    "error": "" if s.observation else "step produced no observation (failed or timed out)",
+                }
+                for s in result.plan.steps
+            ]
+            if should_use_llm_critique(intent, final_content, step_evidence):
+                deliberation_quality, deliberation_reason = await critique_response(
+                    query, final_content, step_evidence,
+                    user_facts=ctx.user_facts_text,
+                    kg_facts=ctx.kg_facts_text,
+                )
+                logger.info(
+                    "[QUALITY] path=deliberation score=%.2f reason=%s",
+                    deliberation_quality, deliberation_reason[:100],
+                )
+        except Exception as e:
+            logger.debug("[Deliberation] reflexion critique failed: %s", e)
+
     # Lightweight post-processing — fact extraction, etc. Skip on ephemeral.
     if not ephemeral:
         try:
             async for event in _run_post_processing(
                 svc, query, final_content, intent, conversation_id,
                 [], None, ctx.used_lesson_ids,  # no tool_results, no skill
-                False, None, "",  # not error, no reflexion_quality computed yet
+                False, deliberation_quality, deliberation_reason,
                 had_kg=bool(ctx.kg_facts_text),
                 had_docs=bool(ctx.retrieved_context),
                 channel=channel,
@@ -2047,17 +2158,79 @@ async def _refine_response(
     # ONLY if that exact text survived unmodified (any later regeneration changes
     # final_content and auto-suppresses the note — it under-fires, never over-fires).
     _flagged_unverified: str | None = None
-    if config.ENABLE_CRITIQUE and final_content and intent == "general":
-        from app.core.critique import critique_answer, format_critique_for_regeneration
-        if len(final_content) >= 200:
+
+    # Latency vs grounding (owner decision 2026-06-12: keep grounding, cut
+    # time-to-first-token). The self-critique and adversarial passes are
+    # INDEPENDENT read-only analyses of the same final_content, so run them
+    # CONCURRENTLY instead of two sequential pre-stream LLM round-trips. The
+    # adversarial factual-error hunter is also GATED to answers that actually
+    # make checkable claims (a tool ran, retrieval is present, or the claim
+    # validator finds candidate facts) — pure conversational / reasoning answers
+    # don't need it, removing a whole pre-stream LLM pass from the common turn.
+    _critique_eligible = bool(
+        config.ENABLE_CRITIQUE and final_content
+        and intent == "general" and len(final_content) >= 200
+    )
+    # "Makes checkable factual claims": tools/retrieval ran, a claim pattern was
+    # detected, any number/date/stat is present, or >=2 mid-sentence capitalized
+    # words (names/places/orgs, excluding sentence-initial capitals). Pure
+    # conversational / opinion / greeting answers have none and skip the hunter;
+    # knowledge-only factual answers still trip it, so grounding is preserved.
+    _mid_sentence_caps = len(re.findall(r"(?<=[a-z,;:]\s)[A-Z][a-z]{2,}", final_content))
+    _needs_factual_review = bool(
+        tool_results
+        or (retrieved_context or "").strip()
+        or count_claim_candidates(final_content) > 0
+        or re.search(r"\d", final_content)
+        or _mid_sentence_caps >= 2
+    )
+    # Grounding gate (Stage 1, 2026-06-14): when the answer is already grounded —
+    # every tool succeeded, OR it's a general answer backed by KG/owner facts —
+    # the LLM judge passes are redundant with the free, deterministic
+    # validate_claims that runs right after refine. Skip the judges (and route the
+    # quality score to the heuristic, below) so grounded / memory-loop turns pay
+    # ~0 refine LLM calls. validate_claims stays as the grounding backstop.
+    from app.core.quality import all_tools_clean as _all_tools_clean
+    _grounded = bool(
+        (tool_results and _all_tools_clean(tool_results))
+        or (intent == "general" and (kg_facts_text or user_facts_text))
+    )
+    _run_self_critique = _critique_eligible and not _grounded
+    _run_adversarial = _critique_eligible and _needs_factual_review and not _grounded
+
+    _crit_verdict = None
+    _adv_verdict = None
+    _adv_verdict_content: str | None = None  # content the adv verdict was computed on
+    if _run_self_critique or _run_adversarial:
+        # One merged judge call (coverage/grounding + logic/factual errors) instead
+        # of two separate LLM passes. asyncio.gather did NOT parallelize them on a
+        # single Ollama — generation serializes on the GPU — so merging, not
+        # parallelizing, is the real win. Split the unified result back into the two
+        # verdict shapes the downstream rewrite branches already expect.
+        from app.core.critique import critique_unified
+        try:
+            _uni = await critique_unified(
+                query, final_content, sources=retrieved_context,
+                user_facts=user_facts_text, kg_facts=kg_facts_text)
+        except Exception as e:
+            logger.warning("unified critique failed: %s", e)
+            _uni = None
+        if _uni:
+            if _run_self_critique:
+                _crit_verdict = {"pass": _uni.get("pass", True), "issues": _uni.get("issues", [])}
+            if _run_adversarial:
+                _adv_verdict = {
+                    "flaws": _uni.get("flaws", []),
+                    "blocking_flaws": _uni.get("blocking_flaws", []),
+                    "verdict": _uni.get("verdict", "pass"),
+                }
+                _adv_verdict_content = final_content
+
+    if _run_self_critique:
+        if len(final_content) >= 200:  # always true given _critique_eligible
             last_critique_issues: list[str] = []
             try:
-                critique = await critique_answer(
-                    query, final_content,
-                    sources=retrieved_context,
-                    user_facts=user_facts_text,
-                    kg_facts=kg_facts_text,
-                )
+                critique = _crit_verdict
                 if not critique or critique.get("pass", True):
                     critique_passed = True
                 else:
@@ -2160,15 +2333,22 @@ async def _refine_response(
                         pass
 
     # --- Adversarial critique (logic/factual error hunter) ---
-    if config.ENABLE_CRITIQUE and final_content and intent == "general" and len(final_content) >= 200:
+    if _run_adversarial:
         from app.core.critique import adversarial_critique, format_adversarial_for_replan
         try:
-            adv = await adversarial_critique(
-                query, final_content,
-                sources=retrieved_context,
-                user_facts=user_facts_text,
-                kg_facts=kg_facts_text,
-            )
+            # The verdict was computed concurrently with self-critique above, on
+            # the pre-critique content. If self-critique rewrote the answer, that
+            # verdict is stale — re-run the hunter on the new content (same as the
+            # old sequential path). Common case (critique passed): reuse it free.
+            if _adv_verdict is not None and _adv_verdict_content == final_content:
+                adv = _adv_verdict
+            else:
+                adv = await adversarial_critique(
+                    query, final_content,
+                    sources=retrieved_context,
+                    user_facts=user_facts_text,
+                    kg_facts=kg_facts_text,
+                )
             if adv:
                 severity = adv.get("verdict", "pass")
                 flaws = adv.get("flaws", [])
@@ -2271,13 +2451,16 @@ async def _refine_response(
     if final_content and intent == "general":
         from app.core.reflexion import should_use_llm_critique, critique_response, assess_quality
         try:
-            if should_use_llm_critique(intent, final_content, tool_results):
+            if should_use_llm_critique(intent, final_content, tool_results) and not _grounded:
                 reflexion_quality, reflexion_reason = await critique_response(
                     query, final_content, tool_results,
                     user_facts=user_facts_text,
                     kg_facts=kg_facts_text,
                 )
             else:
+                # Grounded answers (tools clean / KG-backed) use the free heuristic
+                # scorer — preserves reflexion_quality for downstream consumers
+                # without a third LLM pass. validate_claims is the grounding check.
                 reflexion_quality, reflexion_reason = assess_quality(final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query)
 
             if reflexion_quality is not None:
@@ -3140,13 +3323,49 @@ async def _run_multi_agent_path(
 
     # --- Post-processing on merged response (non-ephemeral only) ---
     if not ephemeral:
+        # Grounded reflexion critique on the MERGE. Sub-agents are judged
+        # individually inside their own think() runs; this catches
+        # merge-stage fabrication — claims in the merged text that no
+        # sub-agent actually produced. Runs after DONE: zero perceived
+        # latency. Evidence = the sub-agents' answers.
+        merge_quality: float | None = None
+        merge_reason = ""
+        if final_content and intent == "general" and not is_error:
+            try:
+                from app.core.reflexion import critique_response, should_use_llm_critique
+                # Failed sub-agents are included as error entries — if all of
+                # them failed, the judge must see "evidence was attempted but
+                # unavailable", not "(none — no tools were used)" (which
+                # misgraded a timeless-knowledge answer grounded=0.00 on
+                # 2026-06-12 when the only sub-agent timed out).
+                merge_evidence = [
+                    {
+                        "tool": f"sub-agent:{r.role}",
+                        "output": (r.response or "") if not r.error else "",
+                        "error": str(r.error or "") if (r.error or not r.response) else "",
+                    }
+                    for r in results
+                    if r.response or r.error
+                ]
+                if should_use_llm_critique(intent, final_content, merge_evidence):
+                    merge_quality, merge_reason = await critique_response(
+                        query, final_content, merge_evidence,
+                        user_facts=ctx.user_facts_text,
+                        kg_facts=ctx.kg_facts_text,
+                    )
+                    logger.info(
+                        "[QUALITY] path=multi-agent score=%.2f reason=%s",
+                        merge_quality, merge_reason[:100],
+                    )
+            except Exception as e:
+                logger.debug("[Multi-agent] merge reflexion critique failed: %s", e)
         tool_results_for_pp = [
             {"tool": t, "args": {}, "output": ""} for t in list(dict.fromkeys(all_tools))
         ]
         async for event in _run_post_processing(
             svc, query, final_content, intent, conversation_id,
             tool_results_for_pp, None, ctx.used_lesson_ids,
-            is_error, None, "",
+            is_error, merge_quality, merge_reason,
             had_kg=bool(ctx.kg_facts_text),
             had_docs=bool(ctx.retrieved_context),
             channel=channel,
@@ -3154,6 +3373,68 @@ async def _run_multi_agent_path(
             ephemeral=ephemeral,
         ):
             yield event
+
+
+# ---------------------------------------------------------------------------
+# Per-stage latency instrumentation (always on — microsecond cost)
+# ---------------------------------------------------------------------------
+
+class _StageTimer:
+    """Records wall-clock per pipeline stage so every query self-reports where
+    its time went. The audit's 122s timeouts were uniform (the client ceiling),
+    which told us nothing about WHICH stage was slow — this closes that gap.
+    Emits one INFO line at the end; stages over 1s are the ones worth chasing.
+    """
+    __slots__ = ("_marks", "_t0", "_last")
+
+    def __init__(self) -> None:
+        self._marks: list[tuple[str, float]] = []
+        self._t0 = time.monotonic()
+        self._last = self._t0
+
+    def mark(self, stage: str) -> None:
+        now = time.monotonic()
+        self._marks.append((stage, now - self._last))
+        self._last = now
+
+    def total(self) -> float:
+        return time.monotonic() - self._t0
+
+    def summary(self) -> str:
+        parts = [f"{s}={d:.1f}s" for s, d in self._marks if d >= 0.05]
+        return f"total={self.total():.1f}s | " + " ".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Ephemeral multi-turn history (eval harness only)
+# ---------------------------------------------------------------------------
+# ephemeral=True keeps eval traffic out of every persistent store, but it
+# also meant history was always empty — so multi-turn behavior (cross-turn
+# recall, pronoun resolution, consistency) was untestable. An explicit
+# conversation_id passed WITH ephemeral=True opts into this bounded
+# in-process history instead. The caller records completed turns via
+# record_ephemeral_turn(); nothing here touches SQLite.
+
+_EPHEMERAL_HISTORIES: dict[str, list[dict]] = {}
+_EPHEMERAL_MAX_CONVS = 50
+_EPHEMERAL_MAX_MESSAGES = 40  # user+assistant messages kept per conversation
+
+
+def record_ephemeral_turn(conversation_id: str, query: str, answer: str) -> None:
+    """Record one completed ephemeral turn so later turns can see it."""
+    if not conversation_id or conversation_id == "ephemeral":
+        return
+    hist = _EPHEMERAL_HISTORIES.setdefault(conversation_id, [])
+    hist.append({"role": "user", "content": query})
+    hist.append({"role": "assistant", "content": answer})
+    del hist[:-_EPHEMERAL_MAX_MESSAGES]
+    while len(_EPHEMERAL_HISTORIES) > _EPHEMERAL_MAX_CONVS:
+        _EPHEMERAL_HISTORIES.pop(next(iter(_EPHEMERAL_HISTORIES)))
+
+
+def clear_ephemeral_history(conversation_id: str) -> None:
+    """Drop the in-process history for one ephemeral conversation."""
+    _EPHEMERAL_HISTORIES.pop(conversation_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -3199,7 +3480,10 @@ async def think(
                         f"Query blocked: prompt injection detected "
                         f"({_inj_result.score:.0%} confidence). "
                         "Rephrase your request without instruction-override patterns."
-                    )
+                    ),
+                    # Policy refusal, not a server fault — the chat API must
+                    # surface this as a normal (200) refusal answer, not a 500.
+                    "code": "blocked",
                 },
             )
             return
@@ -3207,19 +3491,23 @@ async def think(
         logger.warning("Injection detection failed — blocking as fail-safe: %s", e)
         yield StreamEvent(
             type=EventType.ERROR,
-            data={"message": "Query blocked: injection pre-check failed. Please try again."},
+            data={"message": "Query blocked: injection pre-check failed. Please try again.",
+                  "code": "blocked"},
         )
         return
 
     svc = get_services()
 
     # --- Step 1: Conversation setup ---
+    _timer = _StageTimer()
     yield StreamEvent(type=EventType.THINKING, data={"stage": "loading_context"})
 
     if ephemeral:
         is_new_conversation = False
+        # An explicit conversation_id opts into the bounded in-process
+        # history (multi-turn eval) — persistent stores stay untouched.
+        history = list(_EPHEMERAL_HISTORIES.get(conversation_id, [])) if conversation_id else []
         conversation_id = conversation_id or "ephemeral"
-        history = []
     else:
         is_new_conversation = conversation_id is None
         if is_new_conversation:
@@ -3275,6 +3563,7 @@ async def think(
 
         # --- Step 4: Gather all context ---
         ctx = await _gather_context(svc, query, intent, conversation_id=conversation_id or "")
+        _timer.mark("context")
 
         # --- Step 5: Emit LESSON_USED events ---
         if ctx.used_lesson_ids and ctx.lessons:
@@ -3391,6 +3680,7 @@ async def think(
             was_planned, ephemeral, gen, query=query,
         ):
             yield event
+        _timer.mark(f"generation({len(gen.tool_results)}tools)")
 
         # --- Step 8: Ephemeral early return ---
         if ephemeral:
@@ -3462,6 +3752,7 @@ async def think(
                 user_facts_text=ctx.user_facts_text,
                 kg_facts_text=ctx.kg_facts_text,
             )
+        _timer.mark("refine")
 
         # --- Step 10: Emit sources + stream tokens ---
         # Guard against None content from LLM (would cause IntegrityError on NOT NULL column)
@@ -3513,6 +3804,7 @@ async def think(
             chunk_size = 20
             for i in range(0, len(final_content), chunk_size):
                 yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
+        _timer.mark("validate+emit")
         saved_msg_id = await asyncio.to_thread(
             lambda: svc.conversations.add_message(
                 conversation_id,
@@ -3522,21 +3814,39 @@ async def think(
                 sources=ctx.retrieved_sources or None,
             )
         )
+        _timer.mark("save_msg")
 
         if ctx.matched_skill and svc.skills:
+            # Skill success means the answer was actually GOOD, not merely that
+            # it rendered. The old `not gen.is_error` counted confidently-wrong
+            # output as success, so a skill that fed a bad expression to a tool
+            # and templated the garbage survived indefinitely (e.g. the
+            # calculator_arithmetic skill at 32.9% "success", poisoning
+            # arithmetic). When the quality judge has a verdict, it decides;
+            # the structural checks only act as a hard floor (a real tool/error
+            # failure is never a success regardless of score).
+            structural_ok = not gen.is_error
             if ctx.matched_skill.steps:
-                skill_success = (
-                    len(gen.tool_results) > 0
-                    and not gen.is_error
-                    and not any(
-                        isinstance(tr.get("output", ""), str)
-                        and tr["output"].startswith("[Tool") and "failed" in tr["output"]
-                        for tr in gen.tool_results
-                    )
+                structural_ok = structural_ok and len(gen.tool_results) > 0 and not any(
+                    isinstance(tr.get("output", ""), str)
+                    and tr["output"].startswith("[Tool") and "failed" in tr["output"]
+                    for tr in gen.tool_results
                 )
+            if reflexion_quality is not None:
+                skill_success = structural_ok and reflexion_quality >= config.SKILL_SUCCESS_QUALITY
             else:
-                skill_success = not gen.is_error
-            await asyncio.to_thread(svc.skills.record_use, ctx.matched_skill.id, skill_success)
+                # No quality verdict (e.g. depth-restricted leaf): fall back to
+                # the structural check alone.
+                skill_success = structural_ok
+            # A quality-only miss (ran fine, answer just wasn't good enough) is a
+            # SOFT failure: it erodes the slow EMA but must not feed the fast
+            # 5-consecutive disable, which stays reserved for structural failures
+            # (so a long-track-record skill isn't fast-killed by a mediocre streak).
+            _hard_failure = not structural_ok
+            await asyncio.to_thread(
+                svc.skills.record_use, ctx.matched_skill.id, skill_success,
+                hard_failure=_hard_failure,
+            )
 
         if is_new_conversation and final_content:
             # Fire-and-forget. Title gen takes 5-30s on a busy Ollama; don't make
@@ -3698,6 +4008,15 @@ async def think(
                 logger.warning("Workspace save failed: %s", e)
 
         # --- Step 12: Done event ---
+        _timer.mark("stream")
+        # Always-on latency breakdown. A slow query now says WHERE it was slow
+        # (context vs generation vs refine) instead of just "122s". WARNING when
+        # the total crosses 30s so slow queries surface in normal log scans.
+        _summary = _timer.summary()
+        if _timer.total() >= 30:
+            logger.warning("[LATENCY] slow query (%s): %s", intent, _summary)
+        else:
+            logger.info("[LATENCY] %s: %s", intent, _summary)
         yield StreamEvent(
             type=EventType.DONE,
             data={
@@ -3708,6 +4027,7 @@ async def think(
                 "kg_facts_used": ctx.kg_facts_count,
                 "reflexions_used": ctx.reflexions_count,
                 "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
+                "latency_breakdown": _summary,
             },
         )
 

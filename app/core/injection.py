@@ -81,7 +81,7 @@ _INSTRUCTION_PATTERNS: list[tuple[re.Pattern, str]] = [
     # 'forget everything' tightened 2026-05-13 — was FP on "forget everything
     # else and just ship it" (benign reported speech). Require an attack object
     # like before/prior/above/I-said/etc. so legit reset phrases pass.
-    (re.compile(r"forget\s+everything\s+(?:before|prior|above|previous|that|I\s+(?:said|told|wrote)|you\s+(?:knew|learned|read))", re.I), "instruction injection: 'forget everything <attack-object>'"),
+    (re.compile(r"forget\s+everything\s+(?:before|prior|above|previous|that|I\s+(?:said|told|wrote)|you\s+(?:know|knew|learned|read))", re.I), "instruction injection: 'forget everything <attack-object>'"),
     # Additional instruction injection patterns
     (re.compile(r"respond\s+(?:only\s+)?(?:with|in)\s+(?:the\s+)?(?:following|this)", re.I), "instruction injection: 'respond with following'"),
     (re.compile(r"(?:output|print|return)\s+(?:only\s+)?(?:the\s+)?(?:system\s+prompt|instructions|hidden)", re.I), "instruction injection: 'output system prompt'"),
@@ -193,7 +193,7 @@ _COMPACT_PATTERNS: list[tuple[re.Pattern, str]] = [
     (re.compile(r"disregard(?:all|any|the)?(?:previous|prior|above|rules?)"), "compact bypass: disregard-X"),
     (re.compile(r"youarenow(?:dan|aim|stan|dude|an?)"), "compact bypass: you-are-now-persona"),
     (re.compile(r"newinstructions"), "compact bypass: new-instructions"),
-    (re.compile(r"forgeteverything(?:before|prior|above|previous|isaid|youknew)"), "compact bypass: forget-everything-X"),
+    (re.compile(r"forgeteverything(?:before|prior|above|previous|isaid|youknow|youknew)"), "compact bypass: forget-everything-X"),
     (re.compile(r"actasif(?:youhave|youare|ihave)"), "compact bypass: act-as-if-X"),
     (re.compile(r"fromnowonyou(?:are|will|must|act)"), "compact bypass: from-now-on-you"),
     (re.compile(r"doanything(?:now|mode)"), "compact bypass: DAN"),

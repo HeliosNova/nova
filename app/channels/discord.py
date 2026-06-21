@@ -27,7 +27,19 @@ class DiscordBot:
         self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # discord user_id → conv_id
         self._conv_store = None  # lazy-init DB store
         self._conv_lock = asyncio.Lock()
+        # Serializes ALL multi-chunk sends. Slow monitors run concurrently
+        # (heartbeat gather), so two alerts that each split into several 2000-char
+        # Discord messages used to interleave their chunks ("crossing paths").
+        # Every send path holds this lock so one message's chunks post fully
+        # before the next begins; a tiny inter-chunk delay also respects Discord's
+        # per-channel rate limit.
+        self._send_lock = asyncio.Lock()
         self._allowed_users = self._parse_allowed_users()
+        if not self._allowed_users:
+            logger.warning(
+                "[Discord] DISCORD_ALLOWED_USERS is empty — ALL users are denied "
+                "(fail-closed). Set your Discord user ID to use the bot."
+            )
         self._setup_events()
 
     @staticmethod
@@ -43,9 +55,7 @@ class DiscordBot:
             return set()
 
     def _is_allowed(self, user_id: int) -> bool:
-        """Check if user is in the allowlist. Empty list = allow all."""
-        if not self._allowed_users:
-            return True
+        """Check if user is in the allowlist. Empty list = deny all (fail-closed)."""
         return user_id in self._allowed_users
 
     def _setup_events(self):
@@ -86,8 +96,12 @@ class DiscordBot:
             async with message.channel.typing():
                 answer = await self._handle_query(content, message.author.id)
 
-            for chunk in self._split_message(answer):
-                await message.reply(chunk)
+            _reply_chunks = self._split_message(answer)
+            async with self._send_lock:
+                for i, chunk in enumerate(_reply_chunks):
+                    await message.reply(chunk)
+                    if i + 1 < len(_reply_chunks):
+                        await asyncio.sleep(0.3)
 
     async def _handle_query(self, query: str, user_id: int) -> str:
         """Run query through think() and collect the response."""
@@ -167,8 +181,12 @@ class DiscordBot:
         try:
             channel = self._client.get_channel(int(self.default_channel_id))
             if channel:
-                for chunk in self._split_message(message):
-                    await channel.send(chunk)
+                chunks = self._split_message(message)
+                async with self._send_lock:
+                    for i, chunk in enumerate(chunks):
+                        await channel.send(chunk)
+                        if i + 1 < len(chunks):
+                            await asyncio.sleep(0.3)  # pace multi-part posts
         except Exception as e:
             logger.error("[Discord] Alert send failed: %s", e)
 

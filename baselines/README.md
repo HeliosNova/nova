@@ -35,10 +35,18 @@ docker exec nova-app python tests/live_audit.py
 
 ## History
 
-- `2026-03-18` — live audit 4.5/10 (42/94): the honest "before" snapshot
-  (`tests/live_audit_results.json`). Major failure clusters: multi-part queries,
-  KG-in-chat retrieval, identity, safety refusals.
+- `2026-03-18` — live audit 4.5/10 (42/94): the honest "before" snapshot.
+  Major failure clusters: multi-part queries, KG-in-chat retrieval, identity,
+  safety refusals. (Methodology note: timeouts were graded as wrong answers.)
 - `2026-04-24` — harness suite pass rate 97.2% (35/36) after multi-agent and
   retrieval fixes (see CHANGELOG v1.5.1).
 - `2026-06-08` — memory-learning causal-fix 1.0, kg-retrieval causal-fix 0.83
   after MIN_RRF_SCORE / LIMIT-500 / RRF-discard fixes.
+- `2026-06-10` — live audit **9.3/10 (62/67 completed checks, grade A)** on the
+  production build (`live_audit_2026-06-10.json`), first run under the
+  timeout-separated methodology: 9 timeouts excluded and listed (latency mean
+  87s / p95 122s — measured while a full pytest suite ran on the same machine,
+  so latency is worst-case). Remaining real failures kept visible: one
+  calculator arithmetic miss, two memory-recall misses tracing to the
+  deliberate v1.5.0 removal of auto fact extraction, one 500 on the
+  system-prompt-leak probe.

@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
+import time
 import urllib.request
 
 from ..config import config
@@ -70,16 +72,65 @@ class OllamaEmbeddingFunction:
         self._doc_prefix = doc_prefix
         self._timeout = timeout
         self._batch = batch
+        # Single-query coalescing cache. Per-turn the brain fires several
+        # retrievals (lessons, KG, reflexions, success-patterns) that each embed
+        # the SAME query; running them concurrently used to flood the one GPU
+        # embedder so calls queued and timed out. Cache (short TTL) + in-flight
+        # dedup so identical concurrent/recent query embeds compute ONCE.
+        self._cache_lock = threading.Lock()
+        self._cache: dict[str, tuple[float, list[float]]] = {}   # key -> (expiry, vec)
+        self._inflight: dict[str, threading.Event] = {}
+        self._cache_ttl = 30.0
+        self._cache_max = 256
 
     # ChromaDB requires the parameter to be named `input`.
     def __call__(self, input):  # noqa: A002 - name mandated by ChromaDB
         texts = list(input)
+        # Coalesce the single-text QUERY case (the retrieval hot path). Batch
+        # (indexing) embeds are distinct texts — no coalescing benefit.
+        if len(texts) == 1:
+            return [self._embed_one_cached(texts[0])]
         if self._doc_prefix:
             texts = [self._doc_prefix + t for t in texts]
         out: list[list[float]] = []
         for i in range(0, len(texts), self._batch):
             out.extend(self._embed(texts[i:i + self._batch]))
         return out
+
+    def _embed_one_cached(self, text: str) -> list[float]:
+        key = (self._doc_prefix + text) if self._doc_prefix else text
+        now = time.monotonic()
+        leader = False
+        with self._cache_lock:
+            hit = self._cache.get(key)
+            if hit and hit[0] > now:
+                return hit[1]
+            ev = self._inflight.get(key)
+            if ev is None:
+                ev = threading.Event()
+                self._inflight[key] = ev
+                leader = True
+        if not leader:
+            # Another thread is already embedding this exact query — wait for it.
+            ev.wait(timeout=self._timeout + 5)
+            with self._cache_lock:
+                hit = self._cache.get(key)
+            if hit:
+                return hit[1]
+            # Leader failed/evicted (rare) — fall through and compute directly.
+            return self._embed([key])[0]
+        try:
+            vec = self._embed([key])[0]
+            with self._cache_lock:
+                self._cache[key] = (now + self._cache_ttl, vec)
+                if len(self._cache) > self._cache_max:
+                    self._cache = {k: v for k, v in self._cache.items() if v[0] > now}
+            return vec
+        finally:
+            with self._cache_lock:
+                done = self._inflight.pop(key, None)
+            if done is not None:
+                done.set()
 
     def _embed(self, chunk: list[str]) -> list[list[float]]:
         payload = json.dumps({"model": self._model, "input": chunk}).encode()
@@ -131,3 +182,49 @@ def get_embedding_function(force: bool = False):
             "ChromaDB default (all-MiniLM-L6-v2)", model, e)
         _CACHED = None
     return _CACHED
+
+
+def open_collection(client, name: str, *, reindex=None, metadata=None):
+    """get_or_create a Chroma collection wired to the configured embedder,
+    reconciling a dimension mismatch from a previously-defaulted collection.
+
+    Every collection MUST go through here so the whole store uses ONE embedder.
+    Collections created before the embedder upgrade persist as 384-dim MiniLM;
+    attaching the 1024-dim bge-m3 function then throws InvalidDimension on the
+    first query. When that happens we drop and recreate the collection under
+    the new embedder and (if a `reindex` callable is supplied) repopulate it
+    from the SQLite source of truth — the vectors are always re-derivable.
+
+    `reindex(collection)` should backfill rows; it's only called after a
+    rebuild, so it must NOT early-return on `count()>0`.
+    """
+    md = metadata or {"hnsw:space": "cosine"}
+    ef = get_embedding_function()
+    kw = {"name": name, "metadata": md}
+    if ef is not None:
+        kw["embedding_function"] = ef
+    coll = client.get_or_create_collection(**kw)
+
+    if ef is None:
+        return coll
+
+    # Detect a stale-dimension collection by probing a query. A fresh/empty
+    # collection can't mismatch, so skip the probe when it's empty.
+    try:
+        if coll.count() > 0:
+            coll.query(query_texts=["__dim_probe__"], n_results=1)
+    except Exception as e:
+        if "dimension" not in str(e).lower() and "InvalidDimension" not in type(e).__name__:
+            raise
+        logger.warning(
+            "Collection %r has a stale embedding dimension — rebuilding under %s",
+            name, getattr(config, "EMBEDDING_MODEL", "?"))
+        client.delete_collection(name)
+        coll = client.get_or_create_collection(**kw)
+        if reindex is not None:
+            try:
+                n = reindex(coll)
+                logger.info("Rebuilt %r: reindexed %s items under the new embedder", name, n)
+            except Exception as re:
+                logger.error("Reindex of rebuilt collection %r failed: %s", name, re)
+    return coll

@@ -24,22 +24,30 @@ RUN pip install --no-cache-dir -r requirements.txt
 ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright
 RUN playwright install chromium
 
-# Application code
-COPY app/ app/
+# Application code.
+# ORDER MATTERS for build-cache reuse: COPY the rarely-changing trees FIRST and
+# the frequently-edited app/ LAST. A COPY layer invalidates every layer after
+# it, so with app/ first, every app edit re-ran the tests/ and evals/ COPYs too
+# — and on this host the build context lives on a slow 9p mount where each COPY
+# costs 60-85s. App-last keeps the big tests/evals layers cached across app edits.
 COPY tests/ tests/
 COPY evals/ evals/
 COPY pytest.ini .
-# Phase-0: include the bootstrap verification script so it can be run via
-# `docker exec nova-app python -m scripts.verify_phase_0`. We copy a single
-# file rather than the whole scripts/ directory because most other scripts
-# are heavyweight training pipelines that don't belong in the runtime image.
+# scripts/ package marker only. The fine-tuning / GRPO / RLVR-trainer stack was
+# archived 2026-06-12 (see archive/training/ + CLAUDE.md) — the in-context memory
+# loop is the product, weight training was 0-successful-deploy experimental. The
+# runtime image no longer ships any trainer.
 COPY scripts/__init__.py scripts/__init__.py
-COPY scripts/verify_phase_0.py scripts/verify_phase_0.py
-# GRPO trainer — small, no torch import at module load. Lets us run
-# `docker exec nova-app python -m scripts.grpo_train --dry-run` without
-# staging the file via /data each time. The actual training step still
-# requires the full finetune venv outside the container.
-COPY scripts/grpo_train.py scripts/grpo_train.py
+# app/ last: the most frequently edited tree, so its cache miss never cascades
+# into re-copying tests/ or evals/.
+# CACHEBUST: Docker Desktop on Windows over the 9p F: mount does not reliably
+# propagate file-content changes to BuildKit's COPY cache key, so edited app/
+# files were silently served from a stale cached layer (the image sat unchanged
+# for hours across "successful" builds). Passing --build-arg CACHEBUST=<epoch>
+# each build forces this layer to re-copy. Cheap: only the small app/ layer.
+ARG CACHEBUST=0
+RUN echo "cachebust=${CACHEBUST}" > /tmp/.cachebust
+COPY app/ app/
 
 # Data directory + non-root user
 RUN mkdir -p /data /data/screenshots /data/mcp && \

@@ -38,6 +38,9 @@ class ChatResponse(BaseModel):
     kg_facts_used: int = 0
     reflexions_used: int = 0
     skill_used: str | None = None
+    # Per-stage wall-clock ("total=Xs | context=.. generation=.. refine=..").
+    # Surfaced so latency is queryable from the API, not only the logs.
+    latency_breakdown: str | None = None
 
 
 # ---------------------------------------------------------------------------

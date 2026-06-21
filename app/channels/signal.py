@@ -23,9 +23,15 @@ class SignalBot:
         self.phone_number = config.SIGNAL_PHONE_NUMBER
         self.default_recipient = config.SIGNAL_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
+        if not self._allowed_users:
+            logger.warning(
+                "[Signal] SIGNAL_ALLOWED_USERS is empty — ALL senders are denied "
+                "(fail-closed). Set your Signal number to use the bot."
+            )
         self._conversations: collections.OrderedDict[str, str] = collections.OrderedDict()  # sender phone → conv_id
         self._conv_store = None  # lazy-init DB store
         self._conv_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()  # serialize multi-chunk sends (see Discord adapter)
         self._dedup_db = None  # lazy-init SQLite dedup
         self._running = False
         self._client: httpx.AsyncClient | None = None
@@ -43,9 +49,7 @@ class SignalBot:
             return set()
 
     def _is_allowed(self, sender: str) -> bool:
-        """Check if sender is in the allowlist. Empty list = allow all."""
-        if not self._allowed_users:
-            return True
+        """Check if sender is in the allowlist. Empty list = deny all (fail-closed)."""
         return sender in self._allowed_users
 
     async def _poll_messages(self) -> None:
@@ -109,8 +113,9 @@ class SignalBot:
             query = text.strip()
             answer = await self._handle_query(query, source)
 
-            for chunk in self._split_message(answer):
-                await self._send_message(source, chunk)
+            async with self._send_lock:
+                for chunk in self._split_message(answer):
+                    await self._send_message(source, chunk)
 
         except Exception as e:
             logger.error("[Signal] Error processing message: %s", e, exc_info=True)
@@ -225,8 +230,12 @@ class SignalBot:
         try:
             from app.channels.format_for_channel import to_signal
             sig_message = to_signal(message)
-            for chunk in self._split_message(sig_message):
-                await self._send_message(self.default_recipient, chunk)
+            _chunks = self._split_message(sig_message)
+            async with self._send_lock:
+                for _ci, chunk in enumerate(_chunks):
+                    if _ci:
+                        await asyncio.sleep(0.3)
+                    await self._send_message(self.default_recipient, chunk)
         except Exception as e:
             logger.error("[Signal] Alert send failed: %s", e)
 

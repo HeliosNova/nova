@@ -208,3 +208,48 @@ def test_maybe_update_summary_too_few_messages(gsw_db):
         )
     out = asyncio.run(gsw.maybe_update_summary(gsw_db, "conv-1"))
     assert out is False
+
+
+# ---- brain._gather_context wiring (regression) ---------------------------
+# GSW was 100% dead from birth to 2026-06-12: brain._gather_context called
+# get_db() before the function's local `from app.database import get_db`
+# (in the workspace block below it), so Python treated get_db as an unbound
+# local -> UnboundLocalError on EVERY query, swallowed at debug level.
+# This test drives the real _gather_context path and fails on that code.
+
+def test_gather_context_surfaces_prior_sessions(gsw_db, monkeypatch):
+    from types import SimpleNamespace
+    from app.core import brain as brain_mod
+
+    # A prior conversation with a current summary about bitcoin
+    gsw_db.execute(
+        "INSERT INTO conversations (id, title) VALUES (?, ?)",
+        ("conv-prior", "Prior session"),
+    )
+    gsw.save_summary(
+        gsw_db,
+        "conv-prior",
+        {
+            "summary": "we set up a bitcoin price alert above 80k",
+            "narrative": "Configured alerting and discussed thresholds.",
+            "key_entities": ["bitcoin", "price alert"],
+        },
+        message_count=6,
+    )
+
+    # Deterministic entity extraction (PPR quality is not under test here)
+    import app.core.ppr as ppr_mod
+    monkeypatch.setattr(ppr_mod, "extract_entities", lambda q, max_seeds=8: ["bitcoin"])
+
+    svc = SimpleNamespace(
+        user_facts=None, skills=None, learning=None, kg=None,
+        reflexions=None, retriever=None, external_skills=None,
+    )
+    ctx = asyncio.run(
+        brain_mod._gather_context(svc, "what did we decide about bitcoin?", "general", "conv-current")
+    )
+    assert ctx.prior_sessions_text, (
+        "GSW retrieval injected nothing — get_db() at the GSW call site is "
+        "broken again (see 2026-06-12 UnboundLocalError regression)"
+    )
+    assert "bitcoin" in ctx.prior_sessions_text.lower()

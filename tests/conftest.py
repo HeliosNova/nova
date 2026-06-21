@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import os
+import sys
 import tempfile
 
 import pytest
+
+# Windows: the C runtime caps stdio handles at 512. A full-suite run (~2,400
+# tests opening SQLite, ChromaDB, and socket handles) exhausts the cap late in
+# the run and unrelated tests start dying with OSError errno 24 (Too many
+# open files) inside ssl/certifi. Raise the cap to the CRT maximum once.
+if sys.platform == "win32":
+    try:
+        import ctypes
+        ctypes.cdll.msvcrt._setmaxstdio(8192)
+    except Exception:
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -74,9 +86,16 @@ def _test_env(tmp_path, monkeypatch):
     from app.config import reset_config
     reset_config()
 
-    # Clear DB singletons
+    # Close + clear DB singletons. close_all() (not a bare _instances.clear())
+    # is required since SafeDB went to one connection PER THREAD: clearing the
+    # registry without closing leaks every per-thread WAL connection from the
+    # prior test. Across the full suite those accumulate into thousands of open
+    # -wal/-shm handles, and on the container's overlay/9p filesystem the next
+    # WAL writer (init_schema) eventually hangs on shared-memory I/O. Closing
+    # each instance releases them. (Host fs tolerated the leak; the container
+    # did not — full-suite hang surfaced 2026-06-12.)
     import app.database
-    app.database._instances.clear()
+    app.database.close_all()
 
     yield
 

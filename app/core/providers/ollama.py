@@ -84,6 +84,7 @@ class OllamaProvider:
         max_tokens: int = 1000,
         temperature: float = 0.1,
         model: str | None = None,
+        num_ctx: int | None = None,
     ) -> str:
         model = model or self._llm_model
         client = self._get_client()
@@ -108,9 +109,21 @@ class OllamaProvider:
             "options": {
                 "num_predict": max_tokens,
                 "temperature": temperature,
-                "repeat_penalty": 1.1 if json_mode else 1.5,
+                # 1.1 for everything. The old `1.5 if not json_mode` was an
+                # unexamined v1.0.0 default that crippled the freeform background
+                # gens this path actually serves (synthesis, agent merge,
+                # refinement, polish) — 1.5 over-penalizes the ordinary word
+                # repetition natural prose needs. The streaming path generates
+                # the longest freeform prose in the system at 1.1, so 1.1 is the
+                # proven-good value; JSON already required it.
+                "repeat_penalty": 1.1,
             },
         }
+        if num_ctx:
+            # Models without a Modelfile num_ctx default low (e.g. 4096); a
+            # long grading prompt would silently truncate from the head,
+            # cutting the rubric. Callers with big prompts set this explicitly.
+            payload["options"]["num_ctx"] = num_ctx
 
         if json_mode:
             # Schema enforcement (Ollama 0.17+) or generic JSON mode
@@ -122,7 +135,13 @@ class OllamaProvider:
             content = data.get("message", {}).get("content", "")
 
             if json_mode and json_prefix:
-                content = json_prefix + content
+                # Prefill-continuation models (qwen35) return content WITHOUT
+                # the prefix — re-prepend it. Models whose chat template closes
+                # the assistant turn instead (gemma3) ignore the prefill and
+                # return the complete object — prepending again would corrupt
+                # it to "{{...". Verified against both families 2026-06-11.
+                if not content.lstrip().startswith(json_prefix.lstrip()):
+                    content = json_prefix + content
 
             content = _strip_think_tags(content)
 

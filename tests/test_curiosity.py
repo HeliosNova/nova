@@ -71,6 +71,59 @@ class TestGapDetection:
         )
         assert len(gaps) == 0
 
+    def test_no_gap_for_calculator_answered_query(self):
+        """A query a computational tool answered is not a researchable gap."""
+        gaps = detect_gaps(
+            query="17 times 4? answer with just the number please",
+            answer="68",
+            tool_results=[{"tool": "calculator", "output": "17*4 = 68"}],
+            had_lessons=False, had_kg=False, had_docs=False,
+        )
+        assert gaps == []
+
+    def test_no_gap_for_code_exec_answered_query(self):
+        gaps = detect_gaps(
+            query="Compute the 20th Fibonacci number and tell me the value",
+            answer="The 20th Fibonacci number is 6765.",
+            tool_results=[{"tool": "code_exec", "output": "6765"}],
+            had_lessons=False, had_kg=False, had_docs=False,
+        )
+        assert gaps == []
+
+    def test_no_gap_for_inline_math(self):
+        """Math the model computed inline (no tool) is still not a gap."""
+        gaps = detect_gaps(
+            query="19 times 6? answer with just the number please",
+            answer="114",
+            tool_results=[],
+            had_lessons=False, had_kg=False, had_docs=False,
+        )
+        assert gaps == []
+
+    def test_no_gap_for_self_referential_query(self):
+        """Questions about the user's own attributes aren't researchable topics."""
+        gaps = detect_gaps(
+            query="what color do i like and what car do i drive",
+            answer="You like teal and you drive a Subaru.",
+            tool_results=[],
+            had_lessons=False, had_kg=False, had_docs=False,
+        )
+        assert gaps == []
+
+    def test_no_gap_for_confident_long_answer(self):
+        """A long confident answer from training is not a gap (the model knew it)."""
+        long_answer = (
+            "Photosynthesis converts light energy into chemical energy stored in "
+            "glucose, using chlorophyll in the chloroplasts. " * 3
+        )
+        gaps = detect_gaps(
+            query="Explain in detail how photosynthesis works in plants",
+            answer=long_answer,
+            tool_results=[],
+            had_lessons=False, had_kg=False, had_docs=False,
+        )
+        assert gaps == []
+
     def test_no_gap_short_query_without_context(self):
         """Short queries should not trigger context_gap."""
         gaps = detect_gaps(

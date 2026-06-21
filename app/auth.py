@@ -6,6 +6,7 @@ evicted on every auth check and every recorded failure.
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import json
 import logging
@@ -102,24 +103,40 @@ def load_lockouts_from_db() -> None:
 
 
 def _sync_to_db(ip: str) -> None:
-    """Persist current lockout/failure state for an IP to the database."""
+    """Persist current lockout/failure state for an IP to the database.
+
+    Called from require_auth (the event loop) on every auth failure and
+    cleanup — the in-memory state is snapshotted here (single-threaded on
+    the loop, so consistent) and the DB write is handed to the default
+    executor fire-and-forget so the request path never waits on the
+    SQLite lock. Off-loop callers (startup) write inline.
+    """
     db = _get_db()
     if db is None:
         return
+    failures = list(_auth_failures.get(ip, []))
+    locked_until = _lockouts.get(ip)
+
+    def _write() -> None:
+        try:
+            if not failures and locked_until is None:
+                # Clean up — no state to persist
+                db.execute("DELETE FROM auth_lockouts WHERE ip = ?", (ip,))
+            else:
+                db.execute(
+                    "INSERT OR REPLACE INTO auth_lockouts (ip, failures, locked_until, updated_at) "
+                    "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
+                    (ip, json.dumps(failures), locked_until),
+                )
+        except Exception as e:
+            logger.warning("Failed to sync lockout state to DB for %s: %s", ip, e)
+
     try:
-        failures = _auth_failures.get(ip, [])
-        locked_until = _lockouts.get(ip)
-        if not failures and locked_until is None:
-            # Clean up — no state to persist
-            db.execute("DELETE FROM auth_lockouts WHERE ip = ?", (ip,))
-        else:
-            db.execute(
-                "INSERT OR REPLACE INTO auth_lockouts (ip, failures, locked_until, updated_at) "
-                "VALUES (?, ?, ?, CURRENT_TIMESTAMP)",
-                (ip, json.dumps(failures), locked_until),
-            )
-    except Exception as e:
-        logger.warning("Failed to sync lockout state to DB for %s: %s", ip, e)
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write()
+        return
+    loop.run_in_executor(None, _write)
 
 
 def _get_client_ip(request: Request) -> str:

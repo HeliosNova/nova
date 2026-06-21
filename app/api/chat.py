@@ -47,6 +47,9 @@ router = APIRouter(tags=["chat"], dependencies=[Depends(require_auth)])
 @router.post("/chat/stream")
 async def chat_stream(request: ChatRequest):
     """Stream a chat response via Server-Sent Events."""
+    # Mark interactive activity so background LLM monitors yield the GPU to chat.
+    from app.core import llm as _llm
+    _llm.note_interactive_activity()
 
     _KEEPALIVE_INTERVAL = 15.0
     _SENTINEL = object()
@@ -115,6 +118,10 @@ async def chat_stream(request: ChatRequest):
 @router.post("/chat", response_model=ChatResponse)
 async def chat_sync(request: ChatRequest):
     """Synchronous chat — collects the full response and returns it."""
+    # Mark interactive activity so background LLM monitors yield the GPU to chat.
+    from app.core import llm as _llm
+    _llm.note_interactive_activity()
+
     tokens: list[str] = []
     conversation_id = request.conversation_id
     tool_results: list[dict] = []
@@ -123,6 +130,7 @@ async def chat_sync(request: ChatRequest):
     kg_facts_used = 0
     reflexions_used = 0
     skill_used = None
+    latency_breakdown = None
 
     try:
         async for event in think(
@@ -139,6 +147,7 @@ async def chat_sync(request: ChatRequest):
                 kg_facts_used = event.data.get("kg_facts_used", 0)
                 reflexions_used = event.data.get("reflexions_used", 0)
                 skill_used = event.data.get("skill_used")
+                latency_breakdown = event.data.get("latency_breakdown")
             elif event.type == EventType.TOOL_USE and event.data.get("status") == "complete":
                 tool_results.append({
                     "tool": event.data.get("tool"),
@@ -147,6 +156,13 @@ async def chat_sync(request: ChatRequest):
             elif event.type == EventType.SOURCES:
                 sources = event.data.get("sources", [])
             elif event.type == EventType.ERROR:
+                # Policy blocks (e.g. prompt-injection refusals) are correct
+                # outcomes — return them as a normal refusal answer. Only
+                # genuine faults become 500s. Reproduced by the live audit
+                # (10.2): the injection block was surfacing as a server error.
+                if event.data.get("code") == "blocked":
+                    tokens.append(event.data.get("message", "Query blocked."))
+                    break
                 raise HTTPException(status_code=500, detail=event.data.get("message", "Unknown error"))
     except HTTPException:
         raise
@@ -171,6 +187,7 @@ async def chat_sync(request: ChatRequest):
         kg_facts_used=kg_facts_used,
         reflexions_used=reflexions_used,
         skill_used=skill_used,
+        latency_breakdown=latency_breakdown,
     )
 
 

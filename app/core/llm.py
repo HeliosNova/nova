@@ -8,6 +8,7 @@ To swap providers: call set_provider() at startup, or set LLM_PROVIDER env var.
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -94,6 +95,7 @@ class LLMProvider(Protocol):
         max_tokens: int = 8000,
         temperature: float = 0.1,
         model: str | None = None,
+        num_ctx: int | None = None,
     ) -> str:
         """Generate text with thinking disabled. Used for background tasks."""
         ...
@@ -161,6 +163,36 @@ def get_provider() -> LLMProvider:
     return _provider
 
 
+# ---------------------------------------------------------------------------
+# Interactive-priority GPU coordination
+# ---------------------------------------------------------------------------
+# Measured 2026-06-11: interactive chat is fast (~13s) when the GPU is idle but
+# 60-85s when the 79 background monitors are firing 19K-token generations — the
+# models are co-resident (~23/24GB) so Ollama can't truly run NUM_PARALLEL=4 and
+# a monitor generation holds a slot 10-40s, serializing interactive work. We
+# can't preempt a running generation, but we CAN stop STARTING new background
+# LLM work while the owner is actively chatting. Monitors are scheduled every
+# 6-24h; deferring a cycle by a couple minutes costs nothing and gives the owner
+# the idle-GPU latency. No new config flag (Rule 2): the window is a constant.
+
+import time as _time
+
+INTERACTIVE_PRIORITY_WINDOW_S = 45.0  # background LLM monitors defer if a chat happened within this long
+_last_interactive_monotonic: float = -1e9
+
+
+def note_interactive_activity() -> None:
+    """Call at the start of every interactive (owner-facing) chat request."""
+    global _last_interactive_monotonic
+    _last_interactive_monotonic = _time.monotonic()
+
+
+def interactive_active() -> bool:
+    """True if an interactive chat happened within the priority window — used by
+    the heartbeat loop to defer background LLM monitors so chat keeps the GPU."""
+    return (_time.monotonic() - _last_interactive_monotonic) < INTERACTIVE_PRIORITY_WINDOW_S
+
+
 def get_capabilities() -> ProviderCapabilities:
     """Get the current provider's capabilities."""
     return get_provider().capabilities
@@ -182,6 +214,7 @@ async def invoke_nothink(
     max_tokens: int = 8000,
     temperature: float = 0.1,
     model: str | None = None,
+    num_ctx: int | None = None,
 ) -> str:
     """Call LLM with thinking disabled. Used for background tasks."""
     return await get_provider().invoke_nothink(
@@ -192,6 +225,7 @@ async def invoke_nothink(
         max_tokens=max_tokens,
         temperature=temperature,
         model=model,
+        num_ctx=num_ctx,
     )
 
 
@@ -373,6 +407,86 @@ def _validate_tool_obj(obj: dict, valid_names: set[str], lower_map: dict[str, st
     return ToolCall(tool=tool_name, args=args)
 
 
+def _parse_paren_call_args(arg_str: str) -> dict | None:
+    """Parse the argument list of a Python-style call into a dict.
+
+    Handles keyword args with literal values (key="v", key=3, key=True). Parses
+    via the `ast` module so quoting/escaping/nested parens are handled correctly.
+    Non-literal kwargs are skipped; positional-only calls return {} (the tool
+    validates its own args downstream). Returns None if the args don't parse.
+    """
+    arg_str = arg_str.strip()
+    if not arg_str:
+        return {}
+    try:
+        node = ast.parse(f"_f({arg_str})", mode="eval")
+    except SyntaxError:
+        return None
+    call = node.body
+    if not isinstance(call, ast.Call):
+        return None
+    args: dict = {}
+    for kw in call.keywords:
+        if kw.arg is None:  # **kwargs spread — skip
+            continue
+        try:
+            args[kw.arg] = ast.literal_eval(kw.value)
+        except Exception:
+            continue
+    return args
+
+
+def _extract_paren_tool_calls(
+    content: str, valid_names: set[str], lower_map: dict[str, str],
+) -> list[ToolCall]:
+    """Parse a Python-style tool call the model emits as plain text, e.g.
+    `calculator(expression="17*23")` or `web_search(query='news')` — a format the
+    JSON extractor misses, which leaks the raw call into the answer.
+
+    Precision-first: only fires when the content STARTS with a registered tool
+    name followed by `(`, so prose that merely mentions a tool isn't misread as a
+    call. Only registered tool names match.
+    """
+    if not content or not valid_names:
+        return []
+    names = sorted(valid_names | set(lower_map.keys()), key=len, reverse=True)
+    name_alt = "|".join(re.escape(n) for n in names)
+    head = re.match(r"\s*(" + name_alt + r")\s*\(", content, re.IGNORECASE)
+    if not head:
+        return []
+    raw_name = head.group(1)
+    tool_name = raw_name if raw_name in valid_names else lower_map.get(raw_name.lower())
+    if not tool_name:
+        return []
+    # Balanced-paren scan for the argument list (quote- and nesting-aware).
+    open_idx = head.end() - 1
+    depth = 0
+    in_str: str | None = None
+    end_idx: int | None = None
+    i = open_idx
+    while i < len(content):
+        ch = content[i]
+        if in_str:
+            if ch == in_str and content[i - 1] != "\\":
+                in_str = None
+        elif ch in ("'", '"'):
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                end_idx = i
+                break
+        i += 1
+    if end_idx is None:
+        return []
+    args = _parse_paren_call_args(content[open_idx + 1:end_idx])
+    if args is None:
+        return []
+    return [ToolCall(tool=tool_name, args=args)]
+
+
 def _extract_tool_calls(content: str, tools: list[dict]) -> list[ToolCall]:
     """Try to parse one or more tool calls from the model's text output.
 
@@ -380,6 +494,7 @@ def _extract_tool_calls(content: str, tools: list[dict]) -> list[ToolCall]:
     - Single JSON object: {"tool": "...", "args": {...}}
     - JSON array: [{"tool": "...", "args": {...}}, {"tool": "...", "args": {...}}]
     - Multiple JSON objects separated by text
+    - Python-style call syntax: name(arg="val") — fallback when no JSON found
     """
     if not content or not tools:
         return []
@@ -426,4 +541,9 @@ def _extract_tool_calls(content: str, tools: list[dict]) -> list[ToolCall]:
                 continue
         i += 1
 
-    return calls
+    if calls:
+        return calls
+
+    # Fallback: Python-style function-call syntax the model sometimes emits as
+    # text, e.g. calculator(expression="17*23"), which the JSON paths above miss.
+    return _extract_paren_tool_calls(content, valid_names, lower_map)

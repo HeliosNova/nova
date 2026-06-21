@@ -63,7 +63,10 @@ class TestCircuitBreakerConfig:
         assert config.MAX_TOOL_CALLS_PER_QUERY == 15
 
     def test_max_tool_rounds_default(self):
-        assert config.MAX_TOOL_ROUNDS == 10
+        # 10 -> 6 on 2026-06-09: latency/depth study showed chat self-limits
+        # at <=3 rounds; 6 keeps headroom for monitor research while halving
+        # the worst-case spin ceiling.
+        assert config.MAX_TOOL_ROUNDS == 6
 
 
 class TestCircuitBreakerLogic:

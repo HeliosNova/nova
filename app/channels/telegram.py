@@ -28,9 +28,17 @@ class TelegramBot:
         self.token = config.TELEGRAM_TOKEN
         self.default_chat_id = config.TELEGRAM_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
+        if not self._allowed_users:
+            logger.warning(
+                "[Telegram] TELEGRAM_ALLOWED_USERS is empty — ALL users are denied "
+                "(fail-closed). Set your Telegram user ID to use the bot."
+            )
         self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # telegram user_id → conv_id
         self._conv_store = None  # lazy-init DB store
         self._conv_lock = asyncio.Lock()
+        # Serializes multi-chunk sends so concurrent monitor alerts don't
+        # interleave their parts (see Discord adapter for the full rationale).
+        self._send_lock = asyncio.Lock()
         self._app: Application | None = None
         self._stop_event = asyncio.Event()
 
@@ -47,9 +55,7 @@ class TelegramBot:
             return set()
 
     def _is_allowed(self, user_id: int) -> bool:
-        """Check if user is in the allowlist. Empty list = allow all."""
-        if not self._allowed_users:
-            return True
+        """Check if user is in the allowlist. Empty list = deny all (fail-closed)."""
         return user_id in self._allowed_users
 
     async def _handle_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -115,8 +121,9 @@ class TelegramBot:
 
         answer = await self._handle_query(query, user_id)
 
-        for chunk in self._split_message(answer):
-            await update.message.reply_text(chunk)
+        async with self._send_lock:
+            for chunk in self._split_message(answer):
+                await update.message.reply_text(chunk)
 
     async def _handle_query(self, query: str, user_id: int) -> str:
         """Run query through think() and collect the response."""
@@ -186,7 +193,11 @@ class TelegramBot:
         try:
             from app.channels.format_for_channel import to_telegram_html
             html_message = to_telegram_html(message)
-            for chunk in self._split_message(html_message):
+            _chunks = self._split_message(html_message)
+            async with self._send_lock:
+              for _ci, chunk in enumerate(_chunks):
+                if _ci:
+                    await asyncio.sleep(0.3)  # pace multi-part posts
                 try:
                     await self._app.bot.send_message(
                         chat_id=int(self.default_chat_id),

@@ -265,6 +265,102 @@ def format_adversarial_for_replan(critique: dict) -> str:
     )
 
 
+_UNIFIED_SYSTEM = """You are a strict answer verifier AND a devil's-advocate error detector. Do BOTH jobs in a single pass.
+
+IMPORTANT: Owner facts and knowledge-graph facts are PRE-VERIFIED. Claims matching them are NEVER hallucinations or errors.
+
+PART A — Coverage & grounding (find what's MISSING or UNSUPPORTED):
+1. Count the distinct questions/requests in the query.
+2. For each: is it addressed in the answer? Note any missed part.
+3. For each specific factual claim (date, name, number): is it supported by sources, owner facts, OR KG facts? Only flag claims with ZERO support.
+4. Verify any arithmetic, unit conversions, or logical deductions.
+Record these as "issues" (short strings). Set "pass" to false if there are any real coverage/grounding issues.
+
+PART B — Logic & factual errors (find what's WRONG):
+- Logic: for each because/therefore/since/so, does the conclusion follow from the premise? Flag faulty inferences.
+- Factual: numbers, dates, names, relationships that contradict the provided context.
+- Contradiction: any part of the answer contradicting another part.
+- Unsupported: specific claims asserted with certainty with no basis in context, tools, or common knowledge.
+NEVER flag here: owner/KG-matching claims, estimates/ranges labeled approximate, opinions, or merely-missing info (that belongs to Part A).
+Record these as "flaws". Set blocking=true ONLY for a definite, answer-breaking error; when uncertain set blocking=false.
+
+Output JSON only — exactly this shape:
+{"pass": true, "issues": [], "flaws": [], "verdict": "pass"}
+
+Example with problems:
+{"pass": false, "issues": ["missed part 2 of 3: did not address X"], "flaws": [{"type": "factual", "description": "says Python released 1989 but context says 1991", "blocking": true}], "verdict": "fail"}
+
+Rules: Be strict but fair. Short correct answers pass with empty issues/flaws. verdict="fail" ONLY when 1+ flaws have blocking=true. Default to pass when uncertain."""
+
+
+async def critique_unified(
+    query: str, answer: str, sources: str = "",
+    user_facts: str = "", kg_facts: str = "",
+) -> dict | None:
+    """One merged judge pass: coverage/grounding (issues) + logic/factual errors (flaws).
+
+    Replaces the separate critique_answer + adversarial_critique LLM round-trips
+    with ONE call — asyncio.gather did not parallelize them on a single Ollama
+    (generation serializes on the GPU), so merging is the real latency win.
+
+    Returns {"pass": bool, "issues": [...], "flaws": [...], "blocking_flaws": [...],
+    "verdict": "pass"|"fail"} or None on failure. The shape is a superset of both
+    legacy judges so callers can split it into the two verdict dicts unchanged.
+    """
+    user_content = f"Question: {query}\n\nAnswer: {answer[:config.CRITIQUE_ANSWER_LIMIT]}"
+    if sources:
+        user_content += f"\n\nRetrieved sources:\n{sources[:config.CRITIQUE_SOURCES_LIMIT]}"
+    if user_facts:
+        user_content += f"\n\nOwner facts (verified personal info about the user):\n{user_facts[:config.CRITIQUE_FACTS_LIMIT]}"
+    if kg_facts:
+        user_content += f"\n\nKnowledge graph facts (verified stored facts):\n{kg_facts[:config.CRITIQUE_FACTS_LIMIT]}"
+
+    try:
+        raw = await llm.invoke_nothink(
+            [
+                {"role": "system", "content": _UNIFIED_SYSTEM},
+                {"role": "user", "content": user_content},
+            ],
+            json_mode=True,
+            json_prefix='{"',
+            max_tokens=700,
+            temperature=0.1,
+        )
+        if not raw:
+            return None
+
+        result = json.loads(raw) if isinstance(raw, str) else raw
+        if not isinstance(result, dict):
+            return None
+
+        passed = result.get("pass", True)
+        issues = result.get("issues", [])
+        if not isinstance(issues, list):
+            issues = [str(issues)] if issues else []
+
+        flaws = result.get("flaws", [])
+        if not isinstance(flaws, list):
+            flaws = []
+        verdict = str(result.get("verdict", "pass")).lower().strip()
+        if verdict not in ("pass", "fail"):
+            verdict = "pass"
+        blocking = [f for f in flaws if isinstance(f, dict) and f.get("blocking", False)]
+        # A "fail" verdict is only valid if a blocking flaw actually backs it.
+        if verdict == "fail" and not blocking:
+            verdict = "pass"
+
+        return {
+            "pass": bool(passed),
+            "issues": issues,
+            "flaws": flaws,
+            "blocking_flaws": blocking,
+            "verdict": verdict,
+        }
+    except Exception as e:
+        logger.warning("Unified critique failed: %s", e)
+        return None
+
+
 def format_critique_for_regeneration(critique: dict) -> str:
     """Format critique issues as a system message for regeneration."""
     if not critique or critique.get("pass", True):

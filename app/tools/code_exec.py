@@ -13,10 +13,91 @@ from pathlib import Path
 
 from app.config import config
 from app.core.access_tiers import get_blocked_builtins, get_blocked_imports
-from app.core.platform import get_safe_env
+from app.core.platform import IS_WINDOWS, get_safe_env
 from app.tools.base import BaseTool, ToolResult, ErrorCategory
 
 logger = logging.getLogger(__name__)
+
+# Resource ceilings for the execution subprocess (POSIX only). These are
+# tier-independent DoS guards — not new config knobs (Rule 2). Generous enough
+# for numpy/pandas, tight enough to stop runaway allocation or disk-fill.
+_CODE_EXEC_MAX_ADDRESS_SPACE = 1024 * 1024 * 1024  # 1 GiB virtual memory
+_CODE_EXEC_MAX_FILE_BYTES = 50 * 1024 * 1024        # 50 MiB per written file
+
+# Builtins we physically remove from the user namespace at runtime (when the
+# tier blocks them) — the execution + file-open primitives. Static AST checks
+# alone never held: `e = exec; e(...)` rebinds past them. Removing the names
+# means the alias has nothing to point at. Introspection builtins
+# (getattr/globals/dir/...) are left to the AST layer; pulling them breaks too
+# much normal code for little gain once import is guarded and eval/exec are gone.
+_RUNTIME_REMOVABLE_BUILTINS = frozenset({"eval", "exec", "compile", "open", "breakpoint"})
+
+# Bootstrap that wraps user code in the subprocess. It installs a runtime
+# import guard (every import spelling funnels through builtins.__import__, so
+# blocking there is spelling-proof) and runs user code under a builtins mapping
+# with the dangerous primitives stripped. The runner itself keeps full builtins
+# — only the *user* globals are restricted. Imports only sys+builtins so the
+# subclass-walk escape has no os/subprocess/socket gadget already loaded.
+_RUNNER_BODY = '''
+import sys as _sys, builtins as _builtins
+
+# Modules the interpreter already loaded at startup (os, io, sys, ...). We must
+# NOT block these or stdlib's own transitive imports (json -> re -> enum ->
+# import sys) break. They are also impossible to truly contain in-process, so
+# source-level use of them is the AST layer's job. Fresh imports of dangerous
+# modules that are NOT preloaded (socket, urllib, subprocess, ctypes,
+# requests, httpx) are the exfil/escape vectors this hook actually stops.
+_PRELOADED = frozenset(_sys.modules)
+
+_real_import = _builtins.__import__
+
+def _guarded_import(name, *a, **k):
+    top = name.split(".", 1)[0]
+    if top in _BLOCKED_IMPORTS and top not in _PRELOADED:
+        raise ImportError("import of %r is blocked by the code sandbox" % top)
+    return _real_import(name, *a, **k)
+
+_builtins.__import__ = _guarded_import
+
+_user_builtins = _builtins.__dict__.copy()
+for _n in _REMOVED_BUILTINS:
+    _user_builtins.pop(_n, None)
+_user_builtins["__import__"] = _guarded_import
+
+_script = _sys.argv[1]
+with open(_script, "r", encoding="utf-8") as _fh:
+    _source = _fh.read()
+
+_user_globals = {"__name__": "__main__", "__file__": _script, "__builtins__": _user_builtins}
+exec(compile(_source, _script, "exec"), _user_globals)
+'''
+
+
+def _build_guarded_runner() -> str:
+    """Return runner source with the current tier's block lists baked in."""
+    blocked_imports = sorted(get_blocked_imports())
+    blocked_builtin_names = {b.rstrip("(") for b in get_blocked_builtins()}
+    removed = sorted(_RUNTIME_REMOVABLE_BUILTINS & blocked_builtin_names)
+    header = "_BLOCKED_IMPORTS = set(%r)\n_REMOVED_BUILTINS = set(%r)\n" % (
+        blocked_imports,
+        removed,
+    )
+    return header + _RUNNER_BODY
+
+
+def _posix_rlimits() -> None:
+    """preexec_fn: cap CPU/memory/file-size/core for the child (POSIX only)."""
+    import resource
+
+    cpu = int(config.CODE_EXEC_TIMEOUT) + 2
+    resource.setrlimit(resource.RLIMIT_CPU, (cpu, cpu + 1))
+    resource.setrlimit(resource.RLIMIT_FSIZE, (_CODE_EXEC_MAX_FILE_BYTES, _CODE_EXEC_MAX_FILE_BYTES))
+    resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
+    try:
+        resource.setrlimit(resource.RLIMIT_AS, (_CODE_EXEC_MAX_ADDRESS_SPACE, _CODE_EXEC_MAX_ADDRESS_SPACE))
+    except (ValueError, OSError):
+        # Some platforms refuse RLIMIT_AS; the other limits still apply.
+        pass
 
 
 def _check_code_safety(code: str) -> str | None:
@@ -48,6 +129,21 @@ def _check_code_safety(code: str) -> str | None:
         "__globals__", "__code__",
     })
 
+    # First pass: collect simple aliases of blocked builtins, e.g. `e = exec`
+    # or `o = open`. The original checker only matched calls whose func.id was
+    # *literally* a blocked name, so `e = exec; e(code)` slipped straight
+    # through (audit 2026-06-12). We now flag both the binding and any later
+    # call through the alias. This is a cheap first layer — the real boundary
+    # is the runtime guard in the subprocess (see _build_guarded_runner).
+    aliases: dict[str, str] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Name):
+            src = node.value.id
+            if src in blocked_builtin_names:
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        aliases[target.id] = src
+
     for node in ast.walk(tree):
         # Check import statements
         if isinstance(node, ast.Import):
@@ -68,6 +164,9 @@ def _check_code_safety(code: str) -> str | None:
             # Direct call: eval(...), exec(...), __import__(...)
             if isinstance(func, ast.Name) and func.id in blocked_builtin_names:
                 return f"'{func.id}' is blocked for security."
+            # Call through an alias: e = exec; e(...)
+            if isinstance(func, ast.Name) and func.id in aliases:
+                return f"'{aliases[func.id]}' (aliased as '{func.id}') is blocked for security."
             # Attribute access: builtins.__import__(...)
             if isinstance(func, ast.Attribute) and func.attr in blocked_builtin_names:
                 return f"'{func.attr}' is blocked for security."
@@ -86,6 +185,9 @@ def _check_code_safety(code: str) -> str | None:
                 return f"'{node.id}' is blocked for security."
             if node.id == "builtins":
                 return "Access to 'builtins' is blocked for security."
+            # Aliasing a blocked builtin at all is suspicious — flag the binding.
+            if node.id in aliases:
+                return f"'{aliases[node.id]}' (aliased as '{node.id}') is blocked for security."
 
         # Block access to module internals for sandbox escape
         elif isinstance(node, ast.Attribute):
@@ -153,18 +255,27 @@ class CodeExecTool(BaseTool):
             # Everything created by user code lands here and is wiped in finally.
             sandbox_dir = tempfile.mkdtemp(prefix="nova_code_")
             script_path = str(Path(sandbox_dir) / "_script.py")
-            with open(script_path, "w") as f:
+            with open(script_path, "w", encoding="utf-8") as f:
                 f.write(code)
 
-            # Execute in subprocess with timeout and minimal env (no token leakage)
+            # The runner enforces the tier's block lists at RUNTIME (import hook
+            # + stripped builtins), so source-spelling tricks that slip past the
+            # static AST screen still can't import os or call exec.
+            runner_path = str(Path(sandbox_dir) / "_runner.py")
+            with open(runner_path, "w", encoding="utf-8") as f:
+                f.write(_build_guarded_runner())
+
+            # Execute in subprocess with timeout and minimal env (no token leakage).
+            # POSIX gets hard CPU/memory/file-size ceilings via preexec_fn.
             result = await asyncio.to_thread(
                 subprocess.run,
-                [sys.executable, "-I", script_path],
+                [sys.executable, "-I", runner_path, script_path],
                 capture_output=True,
                 text=True,
                 timeout=config.CODE_EXEC_TIMEOUT,
                 cwd=sandbox_dir,
                 env=get_safe_env(),
+                preexec_fn=None if IS_WINDOWS else _posix_rlimits,
             )
 
             if result.stdout and result.stderr:

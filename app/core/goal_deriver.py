@@ -60,6 +60,17 @@ _GOAL_TEMPLATES = {
 async def derive_goals(db, *, max_new_goals: int = 5) -> list[dict]:
     """Inspect state and create new goals. Returns list of created goal dicts.
 
+    The body is pure sequential DB work — it runs in a worker thread so the
+    event loop never waits on the SQLite lock (the function had zero awaits;
+    it was async-in-name-only while blocking the loop for its whole run).
+    """
+    import asyncio
+    return await asyncio.to_thread(_derive_goals_sync, db, max_new_goals=max_new_goals)
+
+
+def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
+    """Sync body of derive_goals — see wrapper above.
+
     Conservative: caps new goals per run so we don't spam the queue. Skips
     creating duplicates of recent active/pending goals on the same theme.
     """

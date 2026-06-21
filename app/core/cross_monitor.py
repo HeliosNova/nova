@@ -95,6 +95,16 @@ _STOPWORDS = frozenset({
     "recent", "current", "various", "additional", "particular",
     "specific", "general", "broad", "narrow", "common", "typical",
     "primary", "secondary", "tertiary", "official", "unofficial",
+    # Digest FORMATTING metadata — never a real cross-monitor theme. These leak
+    # from the "✓ Confirmed by N outlets / Primary source:" digest scaffolding
+    # (2026-06-21: "outlets" was surfacing as a top false theme).
+    "outlets", "outlet", "confirmed", "corroborated", "headline", "headlines",
+    "story", "stories", "update", "updates", "developments",
+    # More digest scaffolding leaking as false themes (live-caught 2026-06-21):
+    # the "💡 Insight" analysis line and "N cross-confirmed by multiple outlets"
+    # footer in domain_study_runner recur across every domain digest.
+    "insight", "insights", "cross-confirmed", "recurrence", "recurring",
+    "sourced", "convergence", "intelligence",
 })
 
 # Match "real" content tokens: 4+ chars, lowercase letters or numbers
@@ -175,6 +185,10 @@ def _gather_recent_outputs(
         "WHERE mr.created_at > datetime('now', ?) "
         "  AND mr.status IN ('ok','changed','alert') "
         "  AND m.category = 'content' "
+        # Exclude meta-monitors that synthesize OVER monitor output — feeding
+        # their narrative/synthesis back in creates a loop where their own
+        # scaffolding ("insight", "cross-confirmed") recurs as false themes.
+        "  AND m.check_type NOT IN ('storyline', 'synthesis', 'forecast_resolve') "
         "  AND mr.value IS NOT NULL AND length(mr.value) > 80 "
         "ORDER BY mr.created_at DESC LIMIT 2000",
         (f"-{hours} hours",),
@@ -311,6 +325,61 @@ async def _validate_cluster_keys(keys: list[str]) -> set[str]:
     return keep
 
 
+_CAUSAL_PROMPT = (
+    "These excerpts about '{theme}' come from {n} different intelligence domains "
+    "({domains}). Identify the single most-likely CAUSAL CHAIN connecting them — "
+    "how a development in one domain drives another (e.g. 'export controls' → "
+    "'chip revenue' → 'AI buildout'). Only if there is a REAL causal link.\n\n"
+    "{evidence}\n\n"
+    'Return JSON only: {{"chain": [{{"cause": "short entity", "effect": "short entity"}}], '
+    '"confidence": 0.0-0.85}}. Use SHORT entity names (1-4 words), never sentences. '
+    'If the connection is coincidental return {{"chain": []}}.'
+)
+
+
+async def _causal_probe(cluster: ThemeCluster, *, hours: int) -> list[dict]:
+    """Ask the LLM for a cross-domain causal chain. Returns [{cause, effect, confidence}].
+
+    Cross-domain by construction (clusters span >= min_breadth distinct monitors).
+    Short entity names so the chain lands as real `caused_by` KG facts, not noise.
+    """
+    from app.core.llm import invoke_nothink, extract_json_object
+    domains = ", ".join(sorted({re.sub(r"^Domain Study:\s*", "", m) for m in cluster.monitors})[:6])
+    evidence = "\n".join(f"- [{m}] {s}" for m, s in cluster.snippets[:8])
+    prompt = _CAUSAL_PROMPT.format(theme=cluster.key, n=cluster.breadth, domains=domains, evidence=evidence)
+    try:
+        raw = await invoke_nothink(
+            [{"role": "user", "content": prompt}],
+            json_mode=True, json_prefix='{"', max_tokens=300, temperature=0.1,
+        )
+    except Exception as e:
+        logger.warning("[Synthesis] causal probe failed for '%s': %s", cluster.key, e)
+        return []
+    if not raw:
+        return []
+    try:
+        data = json.loads(raw) if isinstance(raw, str) else raw
+    except Exception:
+        data = extract_json_object(raw)
+    if not isinstance(data, dict):
+        return []
+    conf = data.get("confidence", 0.6)
+    try:
+        conf = max(0.3, min(0.85, float(conf)))
+    except (TypeError, ValueError):
+        conf = 0.6
+    out = []
+    for link in (data.get("chain") or [])[:4]:
+        if not isinstance(link, dict):
+            continue
+        cause = str(link.get("cause", "")).strip().lower()
+        effect = str(link.get("effect", "")).strip().lower()
+        # Guard: short entity names only (the KG garbage gate also enforces this).
+        if cause and effect and cause != effect and len(cause.split()) <= 5 and len(effect.split()) <= 5:
+            out.append({"cause": cause, "effect": effect, "confidence": conf})
+    return out
+
+
 async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
     """Ask the LLM to name the cross-cutting pattern for one cluster."""
     from app.core.llm import invoke_nothink
@@ -445,32 +514,35 @@ async def synthesize_across_monitors(
             logger.info("[Synthesis] rejecting meta-commentary for '%s'", c.key)
             continue
 
-        # Write to KG if we have one. kg.add_fact caps subject+object at
-        # 200 chars each (silently rejects longer); truncate the synthesis
-        # to its first sentence (or first 200 chars) so we land it.
+        # Cross-domain CAUSAL synthesis (Phase B): probe for a causal chain
+        # connecting the domains and store it as real `caused_by` entity triples.
+        # This replaces the old `cross_pattern:X recurs_across <paragraph>` write —
+        # which was meta-noise the KG garbage gate now rejects anyway. Causal
+        # entity triples are durable knowledge that passes the gate and is
+        # queryable in chat.
+        chain = await _causal_probe(c, hours=hours)
+        if chain:
+            arrow = " → ".join(
+                [chain[0]["cause"]] + [lk["effect"] for lk in chain]
+            )
+            summaries.append(f"    ⮑ causal chain: {arrow}")
         if kg is not None:
-            obj = synth[:200].rstrip()
-            # Prefer cutting at sentence boundary inside the 200-char window
-            for sep in [". ", "; ", " — ", ", "]:
-                idx = obj.rfind(sep)
-                if 80 <= idx <= 195:
-                    obj = obj[: idx + 1]
-                    break
-            try:
-                ok = await kg.add_fact(
-                    subject=f"cross_pattern:{c.key[:80]}",
-                    predicate="recurs_across",
-                    object_=obj,
-                    confidence=0.75,
-                    source="cross_synthesis",
-                    provenance=f"cross_synthesis:{c.breadth}_monitors:{hours}h",
-                )
-                if ok:
-                    kg_writes += 1
-            except Exception as e:
-                logger.warning(
-                    "[Synthesis] kg.add_fact failed for '%s': %s", c.key, e
-                )
+            for lk in chain:
+                try:
+                    ok = await kg.add_fact(
+                        subject=lk["effect"][:80],
+                        predicate="caused_by",
+                        object_=lk["cause"][:80],
+                        confidence=lk["confidence"],
+                        source="cross_synthesis",
+                        provenance=f"cross_synthesis_causal:{c.breadth}_monitors:{hours}h",
+                    )
+                    if ok:
+                        kg_writes += 1
+                except Exception as e:
+                    logger.warning(
+                        "[Synthesis] causal add_fact failed for '%s': %s", c.key, e
+                    )
 
     if rich_themes == 0:
         summaries[0] = (

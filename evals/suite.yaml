@@ -1,4 +1,4 @@
-# Nova automated evaluation suite — 53 tasks across 9 categories.
+# Nova automated evaluation suite — 63 tasks across 10 categories.
 #
 # Each task runs through the real brain pipeline (ephemeral=True so no
 # conversation history is written).  seed_skill entries are created in the
@@ -18,7 +18,7 @@
 #   reflexion_below      — score < value
 #   response_not_empty   — response has >= 20 non-whitespace characters
 
-version: "1"
+version: "2"
 
 # Per-category regression tolerance (added 2026-05-13, task #33).
 # Overrides config.EVAL_REGRESSION_TOLERANCE for the named category.
@@ -906,3 +906,57 @@ tasks:
     assertions:
       - type: answer_contains
         value: "Peladora"
+
+  # =========================================================================
+  # Category: multi-turn  (4 tasks)
+  # Tests cross-turn recall, pronoun resolution, and self-consistency inside
+  # one conversation. `turns` run first in a shared ephemeral conversation
+  # (brain's in-process history — nothing persisted); assertions grade the
+  # final `query` turn. Added 2026-06-12: the suite previously had ZERO
+  # multi-turn coverage — every task was a single isolated ephemeral query.
+  # =========================================================================
+
+  - id: multiturn_recall_name
+    category: multi-turn
+    turns:
+      - "My colleague's name is Dr. Verena Lindqvist — she's leading our fusion project. Just acknowledge this."
+    query: "What is my colleague's name?"
+    timeout: 120
+    assertions:
+      - type: answer_contains
+        value: "Lindqvist"
+      - type: reflexion_in_range
+        min: 0.1
+        max: 0.9
+
+  - id: multiturn_recall_number
+    category: multi-turn
+    turns:
+      - "For this conversation, note that the lab access code is 7341. Just confirm you've noted it."
+    query: "What is the lab access code I mentioned?"
+    timeout: 120
+    assertions:
+      - type: answer_contains
+        value: "7341"
+
+  - id: multiturn_pronoun_resolution
+    category: multi-turn
+    turns:
+      - "Who wrote the novel Dune? One sentence."
+    query: "And in what year did he die?"
+    timeout: 120
+    assertions:
+      - type: answer_contains
+        value: "1986"
+
+  - id: multiturn_consistency
+    category: multi-turn
+    turns:
+      - "Is TCP connection-oriented? Answer in one sentence."
+      - "Is UDP connection-oriented? Answer in one sentence."
+    query: "Based on what you just told me, which one of the two protocols is connection-oriented?"
+    timeout: 120
+    assertions:
+      - type: answer_contains
+        value: "TCP"
+      - type: response_not_empty

@@ -61,6 +61,64 @@ def _pattern_specificity(pattern: str) -> tuple[int, int, int]:
     return (len(pattern), -wildcard_count, -alternation_count)
 
 
+# Tokens that don't prove topical relevance for a semantic skill match.
+_SKILL_MATCH_STOPWORDS = frozenset({
+    "what", "where", "when", "which", "show", "tell",
+    "explain", "describe", "should", "could", "would",
+    "their", "there", "these", "those", "about", "from",
+    "with", "have", "been", "into", "than", "this", "that",
+    "between", "among", "across", "before", "after", "during",
+    "while", "such", "some", "many", "much", "every", "each",
+    "really", "actually", "currently",
+})
+# Generic verbs + quantitative/financial TOPIC nouns. These are too broad to
+# anchor a match. The nouns were added 2026-06-13: a math word problem ("the
+# shop doubles every price") matched `real_time_price_lookup` at sim=0.751 via
+# the shared word "price" — a false positive that injected a price-lookup
+# procedure into an arithmetic answer. With these non-anchoring, such a skill
+# must fire via its specific regex ("current price of X"), while entity queries
+# ("price of gold") still match the right skill via the entity token ("gold").
+_SKILL_MATCH_GENERIC = frozenset({
+    "compare", "comparison", "contrast", "find", "search",
+    "lookup", "look", "get", "fetch", "retrieve", "store",
+    "save", "remember", "set", "create", "make", "build",
+    "give", "show", "list", "calculate", "compute", "convert",
+    "test", "check", "validate", "verify", "explain", "describe",
+    "preference", "user", "info", "data", "result", "value",
+    "difference", "differences", "different", "versus",
+    "method", "methods", "approach", "approaches",
+    "type", "types", "kind", "kinds", "sort", "sorts",
+    "case", "cases", "example", "examples",
+    "price", "prices", "cost", "costs", "rate", "rates",
+    "amount", "amounts", "total", "totals", "market", "markets",
+    "number", "numbers", "count", "level", "levels", "point",
+    "points", "current", "latest", "today", "real", "time",
+})
+
+
+def _query_skill_topically_related(query: str, skill_name: str, trigger_pattern: str) -> bool:
+    """Reject a semantic skill match that shares no SUBSTANTIVE token with the
+    query. Embedding similarity alone conflates *topic* with *intent* — a math
+    problem about prices is ~0.75 similar to a price-lookup skill. A match is
+    kept only if query and skill share a concrete (non-stopword, non-generic)
+    token; returns False to reject.
+    """
+    q_all = {
+        t for t in re.findall(r"[a-z][a-z0-9]{3,}", (query or "").lower())
+        if t not in _SKILL_MATCH_STOPWORDS
+    }
+    if not q_all:
+        return False
+    q_sub = q_all - _SKILL_MATCH_GENERIC
+    raw = set(re.findall(r"[a-z][a-z0-9_]{3,}", (skill_name + " " + (trigger_pattern or "")).lower()))
+    skill_all = {t for piece in raw for t in re.split(r"[_\\]", piece) if len(t) >= 4}
+    skill_sub = skill_all - _SKILL_MATCH_GENERIC
+    # If both sides have tokens but no substantive overlap, reject.
+    if skill_all and not (q_sub & skill_sub):
+        return False
+    return True
+
+
 class SkillStore:
     """Store, match, and execute learned skills."""
 
@@ -81,12 +139,30 @@ class SkillStore:
         with self._chroma_lock:
             if self._chroma_collection is None:
                 import chromadb
+                from .embedding import open_collection
                 self._chroma_client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                self._chroma_collection = self._chroma_client.get_or_create_collection(
-                    name="skills",
-                    metadata={"hnsw:space": "cosine"},
+                self._chroma_collection = open_collection(
+                    self._chroma_client, "skills", reindex=self._backfill_collection,
                 )
         return self._chroma_collection
+
+    def _backfill_collection(self, collection) -> int:
+        """Repopulate `collection` from enabled skills — used by the
+        embedder-rebuild path so a dimension change doesn't lose skill vectors.
+
+        Writes straight to the passed collection (NOT via _embed_skill, which
+        re-enters _get_skill_collection — this runs while that's mid-init and
+        holding the lock).
+        """
+        rows = self._db.fetchall("SELECT id, name, trigger_pattern FROM skills WHERE enabled = 1")
+        ids, docs, metas = [], [], []
+        for row in rows:
+            ids.append(f"skill_{row['id']}")
+            docs.append(f"{row['name']}: {row['trigger_pattern']}")
+            metas.append({"skill_id": str(row["id"]), "name": row["name"]})
+        if ids:
+            collection.upsert(ids=ids, documents=docs, metadatas=metas)
+        return len(ids)
 
     # Keep backward-compat alias used by HEAD's _index_skill / refine_skill / toggle_skill
     def _get_skills_collection(self):
@@ -181,6 +257,42 @@ class SkillStore:
             collection.delete(ids=[f"skill_{skill_id}"])
         except Exception as e:
             logger.debug("Failed to unembed skill #%d: %s", skill_id, e)
+
+    def revalidate_enabled_skills(self) -> int:
+        """Disable already-stored skills that fail the CURRENT creation guards.
+
+        Guards tighten over time (e.g. the structured-input rule added after the
+        calculator_arithmetic skill was found feeding English to SymPy). New
+        skills are screened at create_skill, but pre-existing ones linger until
+        they rack up live failures. This enforces the policy on the back catalog
+        at startup. Returns the number disabled.
+        """
+        import json as _json
+        rows = self._db.fetchall(
+            "SELECT id, name, trigger_pattern, steps, answer_template FROM skills WHERE enabled = 1"
+        )
+        disabled = 0
+        for row in rows:
+            try:
+                steps = _json.loads(row["steps"]) if row["steps"] else []
+            except Exception:
+                steps = []
+            reason = None
+            if _is_redos_risk(row["trigger_pattern"]):
+                reason = "ReDoS-risk trigger"
+            elif _has_capture_group_mismatch(row["trigger_pattern"], steps, row["answer_template"]):
+                reason = "undefined-placeholder args_template"
+            elif _pipes_raw_query_to_structured_tool(steps):
+                reason = "raw {query} into a structured-input tool"
+            if reason:
+                self._db.execute("UPDATE skills SET enabled = 0 WHERE id = ?", (row["id"],))
+                self._unembed_skill(row["id"])
+                disabled += 1
+                logger.warning("Revalidation disabled skill #%d '%s': %s",
+                               row["id"], row["name"], reason)
+        if disabled:
+            logger.info("Skill revalidation disabled %d skill(s) failing current guards", disabled)
+        return disabled
 
     def sync_embeddings(self) -> int:
         """Sync all enabled DB skills into ChromaDB. Safe to call at startup.
@@ -307,66 +419,14 @@ class SkillStore:
                     continue
                 if not skill.enabled:
                     continue
-                # Sanity gate: semantic match must share substantive content
-                # tokens with the query, beyond a generic verb. Without this,
-                # `factorial_calculation` matched "What is 2 plus 2?" via
-                # embedding similarity, and `compare_network_protocols`
-                # matched "hash table vs B-tree" because both contain "compare".
-                # Generic verbs alone (compare/find/get/store/set) don't prove
-                # topical relevance — require at least one CONCRETE noun match.
-                _STOPWORDS = {
-                    "what", "where", "when", "which", "show", "tell",
-                    "explain", "describe", "should", "could", "would",
-                    "their", "there", "these", "those", "about", "from",
-                    "with", "have", "been", "into", "than", "this", "that",
-                    # Prepositions / connectives — picked these up via runtime
-                    # audit: "between" was the only overlap that passed for
-                    # "hash table vs B-tree" matching `compare_network_protocols`.
-                    "between", "among", "across", "before", "after", "during",
-                    "while", "such", "some", "many", "much", "every", "each",
-                    "would", "should", "really", "actually", "currently",
-                }
-                _GENERIC_VERBS = {
-                    "compare", "comparison", "contrast", "find", "search",
-                    "lookup", "look", "get", "fetch", "retrieve", "store",
-                    "save", "remember", "set", "create", "make", "build",
-                    "give", "show", "list", "calculate", "compute", "convert",
-                    "test", "check", "validate", "verify", "explain", "describe",
-                    "preference", "user", "info", "data", "result", "value",
-                    # "difference"/"differences"/"different" are connectives in
-                    # comparison queries — they don't carry topical signal on
-                    # their own. Same for "versus", "method", "approach".
-                    "difference", "differences", "different", "versus",
-                    "method", "methods", "approach", "approaches",
-                    "type", "types", "kind", "kinds", "sort", "sorts",
-                    "case", "cases", "example", "examples",
-                }
-                _q_tokens_all = {
-                    t for t in re.findall(r"[a-z][a-z0-9]{3,}", query.lower())
-                    if t not in _STOPWORDS
-                }
-                _q_tokens_substantive = _q_tokens_all - _GENERIC_VERBS
-                _skill_tokens_all = set(re.findall(
-                    r"[a-z][a-z0-9_]{3,}",
-                    (skill.name + " " + (skill.trigger_pattern or "")).lower(),
-                ))
-                _skill_tokens_all = {
-                    t for piece in _skill_tokens_all for t in re.split(r"[_\\]", piece)
-                    if len(t) >= 4
-                }
-                _skill_tokens_substantive = _skill_tokens_all - _GENERIC_VERBS
-
-                # Reject if: query has no substantive tokens at all, OR
-                # query and skill share no substantive (non-verb) overlap.
-                _no_substantive_overlap = not (_q_tokens_substantive & _skill_tokens_substantive)
-                _query_too_short = len(_q_tokens_all) == 0
-                if _query_too_short or (_q_tokens_all and _skill_tokens_all and _no_substantive_overlap):
+                # Sanity gate: a semantic match must share a SUBSTANTIVE token
+                # with the query — embedding similarity alone conflates topic
+                # with intent (a price-themed math problem matched a price-lookup
+                # skill at sim=0.751). See _query_skill_topically_related.
+                if not _query_skill_topically_related(query, skill.name, skill.trigger_pattern):
                     logger.info(
-                        "Semantic skill match REJECTED (insufficient overlap): "
-                        "'%s' for query=%r — q=%r skill=%r",
+                        "Semantic skill match REJECTED (insufficient overlap): '%s' for query=%r",
                         skill.name, query[:60],
-                        list(_q_tokens_substantive)[:5],
-                        list(_skill_tokens_substantive)[:5],
                     )
                     continue
                 logger.info(
@@ -424,6 +484,17 @@ class SkillStore:
             logger.warning(
                 "Skill '%s' rejected: args_template references undefined placeholder "
                 "(add (?P<name>…) groups or use {query}/{output_key})",
+                name,
+            )
+            return None
+
+        # Guard: reject skills that pipe the raw natural-language query into a
+        # structured-input tool (calculator/code_exec). The query is prose; the
+        # tool needs the extracted expression via a capture group.
+        if _pipes_raw_query_to_structured_tool(steps):
+            logger.warning(
+                "Skill '%s' rejected: passes raw {query} to a structured-input tool "
+                "(calculator/code_exec) — extract the expression with a capture group",
                 name,
             )
             return None
@@ -532,16 +603,25 @@ class SkillStore:
 
         return skill_id
 
-    def record_use(self, skill_id: int, success: bool) -> None:
+    def record_use(self, skill_id: int, success: bool, hard_failure: bool = True) -> None:
         """Record a skill execution. Updates times_used, success_rate, and quality counters.
 
-        Fast demotion: 5 consecutive failures disables the skill immediately
+        Fast demotion: 5 consecutive HARD failures disables the skill immediately
         (in addition to the slow EMA-based auto-disable at success_rate < 0.3).
-        Threshold was raised from 3 — 3 is too aggressive when a skill hits a
-        transient upstream issue (SearXNG rate-limited, Ollama briefly down).
+
+        `hard_failure` distinguishes a structural failure (tool errored, no
+        output) from a merely-low-QUALITY answer. A string of mediocre-but-
+        working answers should only erode the slow EMA — it must NOT fast-kill a
+        skill with a long successful track record (found in self-audit 2026-06-11:
+        the quality gate had project_helios_info, 45 uses, at 4 consecutive
+        "failures", one short of fast-disable). Quality-only failures therefore
+        leave consecutive_failures untouched; only hard failures increment it.
         """
         success_val = 1.0 if success else 0.0
         alpha = config.SKILL_EMA_ALPHA
+        # A quality-only (soft) failure updates the EMA but not the fast-disable
+        # streak counter.
+        bump_consecutive = (not success) and hard_failure
 
         import sqlite3 as _sqlite3
         if success:
@@ -562,12 +642,15 @@ class SkillStore:
                     (alpha, success_val, alpha, skill_id),
                 )
         else:
+            # Soft (quality-only) failures erode the EMA but leave the
+            # consecutive-failure streak alone, so they can't fast-disable.
+            _consec_clause = "consecutive_failures = consecutive_failures + 1, " if bump_consecutive else ""
             try:
                 self._db.execute(
                     "UPDATE skills SET "
                     "times_used = times_used + 1, "
                     "success_rate = ? * ? + (1 - ?) * success_rate, "
-                    "consecutive_failures = consecutive_failures + 1, "
+                    f"{_consec_clause}"
                     "last_used_at = CURRENT_TIMESTAMP "
                     "WHERE id = ?",
                     (alpha, success_val, alpha, skill_id),
@@ -1143,6 +1226,31 @@ def _is_too_broad(pattern: str) -> bool:
         return True
     matches = sum(1 for q in _BROADNESS_TEST_QUERIES if regex.search(q))
     return matches >= 2
+
+
+# Tools whose input is a STRUCTURED expression, not natural language. Piping the
+# raw {query} ("Calculate 47*89+156") into these means the tool receives prose
+# it can't use — the source of the calculator_arithmetic skill that fed English
+# to SymPy and templated the garbage. Such a step must extract the operand via a
+# capture group, not pass the whole query.
+_STRUCTURED_INPUT_TOOLS = frozenset({"calculator", "code_exec"})
+
+
+def _pipes_raw_query_to_structured_tool(steps: list[dict]) -> bool:
+    """True if any step sends a bare {query} (the whole NL query) into a tool
+    that needs a structured expression. Capture groups / output_keys are fine."""
+    for step in steps:
+        if step.get("tool") not in _STRUCTURED_INPUT_TOOLS:
+            continue
+        args = step.get("args_template", {})
+        values = args.values() if isinstance(args, dict) else [args]
+        for v in values:
+            s = str(v).strip()
+            # Bare {query}, or {query} with only surrounding whitespace/words —
+            # i.e. no capture group / output_key supplying the actual operand.
+            if "{query}" in s and not re.search(r"\{(?:capture_\d+|[A-Za-z_]\w*)\}", s.replace("{query}", "")):
+                return True
+    return False
 
 
 def _has_capture_group_mismatch(pattern: str, steps: list[dict], answer_template: str | None) -> bool:

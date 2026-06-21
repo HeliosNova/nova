@@ -129,6 +129,12 @@ async def lifespan(app: FastAPI):
     learning = LearningEngine(db)
     skills = SkillStore(db)
     try:
+        _disabled = skills.revalidate_enabled_skills()
+        if _disabled:
+            logger.info("Disabled %d stored skill(s) failing current guards", _disabled)
+    except Exception as _e:
+        logger.warning("Skill revalidation skipped: %s", _e)
+    try:
         skills.sync_embeddings()
     except Exception as _e:
         logger.warning("Skill embedding sync failed (ChromaDB may be unavailable): %s", _e)

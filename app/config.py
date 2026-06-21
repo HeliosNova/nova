@@ -70,11 +70,12 @@ _MUTABLE_FIELDS = {
     "KG_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
     "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
-    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS",
+    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS", "SKILL_SUCCESS_QUALITY",
     "INJECTION_SUSPICIOUS_THRESHOLD",
     "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
+    "ENABLE_MONITOR_DIGEST", "MONITOR_DIGEST_ITEM_MAX_CHARS",
     "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT", "MAX_PARALLEL_AGENTS", "MAX_STRUCTURAL_DEPTH",
     "ENABLE_TREE_OF_THOUGHT", "TOT_SAMPLE_N",
     "ENABLE_BEST_OF_N", "BEST_OF_N_SAMPLES", "BEST_OF_N_QUALITY_THRESHOLD",
@@ -84,6 +85,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
     "ENABLE_RLVR_SIGNALS",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
+    "ENABLE_STORYLINES", "ENABLE_SALIENCE_FILTER", "ENABLE_FORECASTS",
     "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
     "ENABLE_PROMPT_SELF_MOD",
@@ -151,9 +153,12 @@ class Config:
     LORA_MERGE_ALPHA: float = field(default_factory=lambda: _env_float("LORA_MERGE_ALPHA", 0.5))
     # open-rs SFT pre-DPO bootstrap — short SFT epoch on reasoning traces before DPO
     ENABLE_SFT_BOOTSTRAP: bool = field(default_factory=lambda: _env("ENABLE_SFT_BOOTSTRAP", "false").lower() == "true")
-    # RLVR — record verifiable signals (tool/JSON/math/claim/quiz/code outcomes) so a
-    # later GRPO/RLVR fine-tune can train on real rewards instead of LLM-judge noise.
-    ENABLE_RLVR_SIGNALS: bool = field(default_factory=lambda: _env("ENABLE_RLVR_SIGNALS", "true").lower() == "true")
+    # RLVR — recorded verifiable signals (tool/JSON/math/claim/quiz/code outcomes)
+    # ONLY to feed the GRPO/RLVR weight trainer, which was archived 2026-06-12
+    # (archive/training/). With no consumer left, collection is pure write
+    # overhead on the chat path, so it now defaults OFF. Re-enable only if weight
+    # training is revived.
+    ENABLE_RLVR_SIGNALS: bool = field(default_factory=lambda: _env("ENABLE_RLVR_SIGNALS", "false").lower() == "true")
     # SCM/SleepGate-style two-phase dream consolidation: split the current
     # kitchen-sink Phase 3 into NREM (structural ops: prune/compact/disable —
     # fast, deterministic) and REM (integrative ops: promote/resolve/distill —
@@ -165,6 +170,12 @@ class Config:
     # Procedural memory consolidation in dream — cluster near-duplicate lessons,
     # generalize via LLM, demote subsumed members so retrieval prefers the canonical.
     ENABLE_PROCEDURAL_CONSOLIDATION: bool = field(default_factory=lambda: _env("ENABLE_PROCEDURAL_CONSOLIDATION", "true").lower() == "true")
+    # Monitor Intelligence v2 (background, single-GPU cost). Storyline tracking +
+    # change-detection; salience digest filtering; self-scoring forecasts. Default
+    # on; flip off to cut background LLM duty without a rebuild.
+    ENABLE_STORYLINES: bool = field(default_factory=lambda: _env("ENABLE_STORYLINES", "true").lower() == "true")
+    ENABLE_SALIENCE_FILTER: bool = field(default_factory=lambda: _env("ENABLE_SALIENCE_FILTER", "true").lower() == "true")
+    ENABLE_FORECASTS: bool = field(default_factory=lambda: _env("ENABLE_FORECASTS", "true").lower() == "true")
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))
@@ -210,6 +221,11 @@ class Config:
     # Automated eval harness
     ENABLE_EVAL_HARNESS: bool = field(default_factory=lambda: _env("ENABLE_EVAL_HARNESS", "true").lower() == "true")
     EVAL_SUITE_PATH: str = field(default_factory=lambda: _env("EVAL_SUITE_PATH", "evals/suite.yaml"))
+    # Batch a heartbeat cycle's monitor alerts into ONE digest per channel-group
+    # instead of one message per monitor (80 monitors -> 80 posts was a firehose,
+    # and concurrent sends interleaved). Set false to restore per-monitor posting.
+    ENABLE_MONITOR_DIGEST: bool = field(default_factory=lambda: _env("ENABLE_MONITOR_DIGEST", "true").lower() == "true")
+    MONITOR_DIGEST_ITEM_MAX_CHARS: int = field(default_factory=lambda: _env_int("MONITOR_DIGEST_ITEM_MAX_CHARS", 600))
     EVAL_REPORT_PATH: str = field(default_factory=lambda: _env("EVAL_REPORT_PATH", "/data/eval_reports"))
     EVAL_REGRESSION_TOLERANCE: float = field(default_factory=lambda: _env_float("EVAL_REGRESSION_TOLERANCE", 0.10))
 
@@ -241,6 +257,12 @@ class Config:
     FAST_MODEL: str = field(default_factory=lambda: _env("FAST_MODEL", "qwen3.5:4b"))
     HEAVY_MODEL: str = field(default_factory=lambda: _env("HEAVY_MODEL", ""))
     ENABLE_MODEL_ROUTING: bool = field(default_factory=lambda: _env("ENABLE_MODEL_ROUTING", "true").lower() == "true")
+    # Independent judge for quality grading (reflexion critique, monitor output
+    # eval). MUST be a different model family from LLM_MODEL — a model grading
+    # its own output inherits its own blind spots (self-preference bias).
+    # Empty = disabled (legacy self-critique). Deliberately NOT in
+    # _MUTABLE_FIELDS: a self-improving system must not pick its own judge.
+    JUDGE_MODEL: str = field(default_factory=lambda: _env("JUDGE_MODEL", ""))
 
     # Critique
     MAX_CRITIQUE_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_CRITIQUE_ROUNDS", 3))
@@ -380,6 +402,11 @@ class Config:
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
     ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
+    # Minimum answer quality (reflexion score) for a skill execution to count as
+    # a success. Below this, the skill rendered something but it wasn't good —
+    # which feeds the EMA success_rate and the auto-disable path. 0.6 matches
+    # the "vouched-good" bar used for lesson-helpful and workspace persistence.
+    SKILL_SUCCESS_QUALITY: float = field(default_factory=lambda: _env_float("SKILL_SUCCESS_QUALITY", 0.6))
     # Cosine similarity threshold for semantic skill matching (higher = stricter)
     SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.55))
     # Days without use before a skill is considered stale for decay/pruning
@@ -468,6 +495,11 @@ class Config:
     # Database
     DB_PATH: str = field(default_factory=lambda: _env("DB_PATH", "/data/nova.db"))
     CHROMADB_PATH: str = field(default_factory=lambda: _env("CHROMADB_PATH", "/data/chromadb"))
+    # Off-volume backup target (bind mount in compose). The in-volume
+    # /data/backups snapshots die with the volume; this dir lives on the
+    # host filesystem. Empty/missing dir → off-volume copy is skipped
+    # with a warning (never fails the maintenance run).
+    BACKUP_OFFVOLUME_DIR: str = field(default_factory=lambda: _env("BACKUP_OFFVOLUME_DIR", "/backups"))
 
     # Sensitive field names — redacted in __repr__/__str__ to prevent secret leakage
     _SENSITIVE_FIELDS = frozenset({

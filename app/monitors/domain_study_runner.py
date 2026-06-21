@@ -471,6 +471,7 @@ async def run_domain_study(monitor_name: str) -> str:
         except Exception as e:
             logger.warning("[DomainRunner] RSS pass failed for '%s': %s", monitor_name, e)
             rss_items = []
+        rss_items = _drop_non_news(rss_items, label)
         if len(rss_items) >= 2:
             # When RSS gave us only a title (Coindesk/Cointelegraph commonly
             # do this), try to enrich via page-fetch BUT keep the item even
@@ -544,7 +545,18 @@ async def run_domain_study(monitor_name: str) -> str:
                 if x.get("_title_only") or (x.get("snippet") or "").strip()
             ]
             if len(fresh) >= 2:
-                return _render_items_deterministic(label, emoji, fresh[:5], today)
+                # Collapse wire reprints to one source, cross-reference the FULL
+                # set (so corroboration counts every INDEPENDENT outlet), then
+                # select the most important — authority + corroboration — not the
+                # freshest 5.
+                fresh = _collapse_syndication(fresh)
+                _cross_reference(fresh)
+                _picks = _importance_rank(fresh)[:5]
+                # Directed deep-dive on the top stories: trace to a primary
+                # source + find independent corroboration (analyst move).
+                await _deep_dive_top(label, _picks)
+                _insight = await _synthesize_insight(label, _picks)
+                return _render_items_deterministic(label, emoji, _picks, today, insight=_insight)
 
     # 1. Search news category, with retry + general-category fallback. SearXNG
     # has been observed to drop the connection on some queries; retrying once
@@ -654,9 +666,16 @@ async def run_domain_study(monitor_name: str) -> str:
         return f"No significant {label} developments in the past 72 hours."
 
     # 3. Enrich each item with a real LLM-written summary based on the
-    # snippet/page text.
+    # snippet/page text. Drop promotional/affiliate items first so we never
+    # spend an enrichment call on a coupon page.
+    fresh = _drop_non_news(fresh, label)
+    fresh = _collapse_syndication(fresh)
     fresh = await _enrich_summaries(label, fresh)
-    return _render_items_deterministic(label, emoji, fresh, today)
+    _cross_reference(fresh)
+    fresh = _importance_rank(fresh)
+    await _deep_dive_top(label, fresh)
+    _insight = await _synthesize_insight(label, fresh)
+    return _render_items_deterministic(label, emoji, fresh, today, insight=_insight)
 
 
 async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
@@ -817,8 +836,306 @@ async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
     return await asyncio.gather(*[_one(it) for it in items])
 
 
+# Newsworthiness gate. Consumer-tech outlets (Wired/Engadget/ZDNet/CNET) mix
+# affiliate commerce — coupon codes, deal roundups, "best X of YEAR" buying
+# guides — into their feeds. That's shopping content, not intelligence, and it
+# must never reach a digest (the owner flagged "coupons in my digest = dumb").
+# This is the missing RELEVANCE gate, not a keyword band-aid: it classifies an
+# item's TYPE (promotional/affiliate vs news) from the strongest, least-ambiguous
+# signals in the title and URL. "deal" in the M&A/diplomacy sense (singular, no
+# commerce qualifier) stays — only commerce-shaped uses are dropped.
+_COMMERCE_TITLE_RE = re.compile(
+    # Plural "deals" with a commerce qualifier — NOT singular "trade deal on X"
+    r"coupon|promo\s*code|discount\s*code"
+    r"|best\s+.{0,40}\bdeals\b|(?:today's|daily|weekly)\s+(?:best\s+)?deals"
+    r"|\bdeals\b\s+(?:of\s+the\s+(?:day|week)|under\s+\$)"
+    r"|\d+%\s*off|\$\d+\s*off|\bon\s+sale\b|lowest\s+price"
+    r"|black\s+friday|cyber\s+monday|prime\s+day"
+    r"|buying\s+guide|gift\s+guide|\bgiveaways?\b"
+    r"|best\s+.{0,40}\b(?:of|in)\s+20\d\d\b",  # "best time-tracking software of 2026" listicles
+    re.IGNORECASE,
+)
+_COMMERCE_URL_RE = re.compile(
+    r"/(?:coupon|coupons|deal|deals|promo|promo-code|discount|offers?|shop|"
+    r"buying-guide|best-)", re.IGNORECASE,
+)
+
+
+def _importance_rank(items: list[dict]) -> list[dict]:
+    """Order items by importance, not recency: dataset-backed source authority
+    (app/core/source_authority) + a strong INDEPENDENT-corroboration bonus.
+    Per the research, corroboration breadth must count independent outlets, so
+    `_corroborating` is already syndication-collapsed by _cross_reference. Stable
+    sort keeps feed order on ties. Call AFTER _cross_reference."""
+    from app.core.source_authority import authority as _authority
+
+    def _score(it: dict) -> float:
+        auth = _authority(it.get("outlet", ""))
+        corrob = len(it.get("_corroborating") or [])
+        # Independent corroboration dominates significance; capped so one
+        # mega-covered story can't bury everything else.
+        corrob_bonus = min(corrob, 4) * 0.35
+        return auth + corrob_bonus
+    return sorted(items, key=_score, reverse=True)
+
+
+def _newsworthy_title_url(title: str, url: str) -> bool:
+    """False for promotional/affiliate/listicle content that isn't news."""
+    if _COMMERCE_TITLE_RE.search(title or ""):
+        return False
+    if _COMMERCE_URL_RE.search(url or ""):
+        return False
+    return True
+
+
+def _is_newsworthy(item) -> bool:
+    """Accepts a dict (search items) or an RSS item object (.title/.url)."""
+    if isinstance(item, dict):
+        return _newsworthy_title_url(item.get("title", ""), item.get("url", ""))
+    return _newsworthy_title_url(getattr(item, "title", ""), getattr(item, "url", ""))
+
+
+def _drop_non_news(items: list, label: str) -> list:
+    kept, dropped = [], []
+    for it in items:
+        (kept if _is_newsworthy(it) else dropped).append(it)
+    if dropped:
+        def _t(x):
+            return (x.get("title", "") if isinstance(x, dict) else getattr(x, "title", ""))[:50]
+        logger.info("[DomainRunner] %s: dropped %d non-news item(s): %s",
+                    label, len(dropped), [_t(d) for d in dropped[:3]])
+    return kept
+
+
+# Common words that don't identify a story — excluded from cross-reference keys.
+_STORY_STOPWORDS = frozenset({
+    "the", "a", "an", "and", "or", "of", "to", "in", "on", "for", "with", "as",
+    "at", "by", "from", "is", "are", "was", "were", "be", "new", "says", "say",
+    "after", "amid", "over", "into", "its", "his", "her", "their", "this", "that",
+    "report", "reports", "update", "updates", "news", "today", "latest", "more",
+    "will", "has", "have", "had", "but", "not", "you", "your", "how", "why", "what",
+})
+
+
+def _story_key_tokens(title: str) -> set[str]:
+    """Significant tokens identifying a story — lowercased words 4+ chars and any
+    capitalized multi-char tokens (proper nouns), minus generic news words."""
+    toks: set[str] = set()
+    for w in re.findall(r"[A-Za-z][A-Za-z0-9'&-]+", title or ""):
+        lw = w.lower()
+        if lw in _STORY_STOPWORDS:
+            continue
+        if w[:1].isupper() or len(lw) >= 4:
+            toks.add(lw)
+    return toks
+
+
+_WIRE_ATTRIB_RE = re.compile(
+    r"\(\s*(reuters|ap|associated press|afp|bloomberg|pa media|dpa)\s*\)"
+    r"|—\s*(reuters|associated press|afp)\b", re.IGNORECASE,
+)
+
+
+def _content_tokens(item: dict) -> frozenset:
+    """Word set of an item's body (snippet), for near-duplicate detection."""
+    text = (item.get("snippet") or item.get("title") or "")
+    return frozenset(w for w in re.findall(r"[a-z0-9]+", text.lower()) if len(w) >= 4)
+
+
+def _is_syndicated(a: dict, b: dict) -> bool:
+    """True if two same-story items are the SAME underlying source — a wire
+    reprint — rather than independent reporting. Per the research, corroboration
+    must count INDEPENDENT sources; N outlets reprinting one AP story = 1 source.
+    Signal: near-verbatim body (token Jaccard >= 0.7) OR both carry an explicit
+    wire attribution ((Reuters)/(AP)/...)."""
+    ta, tb = _content_tokens(a), _content_tokens(b)
+    if ta and tb:
+        inter = len(ta & tb)
+        union = len(ta | tb)
+        if union and inter / union >= 0.7:
+            return True
+    a_wire = bool(_WIRE_ATTRIB_RE.search((a.get("snippet") or "") + " " + (a.get("title") or "")))
+    b_wire = bool(_WIRE_ATTRIB_RE.search((b.get("snippet") or "") + " " + (b.get("title") or "")))
+    # Both attributed to a wire AND same story → same origin.
+    return a_wire and b_wire
+
+
+def _collapse_syndication(items: list[dict]) -> list[dict]:
+    """Drop wire reprints, keeping ONE representative per syndication group (the
+    highest-authority outlet). Two items collapse when they're the same story
+    AND syndicated (near-verbatim / shared wire attribution). This stops the
+    digest showing five copies of one AP story and keeps corroboration counts
+    honest (independent sources only). Order-preserving for the survivors."""
+    from app.core.source_authority import authority as _authority
+    survivors: list[dict] = []
+    for it in items:
+        it_tokens = _story_key_tokens(it.get("title", ""))
+        merged = False
+        for s in survivors:
+            s_tokens = _story_key_tokens(s.get("title", ""))
+            overlap = len(it_tokens & s_tokens)
+            same_story = it_tokens and s_tokens and (
+                overlap >= 2 or overlap >= 0.6 * min(len(it_tokens), len(s_tokens))
+            )
+            if same_story and _is_syndicated(it, s):
+                # Same underlying source — keep the higher-authority outlet.
+                if _authority(it.get("outlet", "")) > _authority(s.get("outlet", "")):
+                    survivors[survivors.index(s)] = it
+                merged = True
+                break
+        if not merged:
+            survivors.append(it)
+    if len(survivors) < len(items):
+        logger.info("[DomainRunner] collapsed %d wire reprint(s) -> %d independent items",
+                    len(items) - len(survivors), len(survivors))
+    return survivors
+
+
+def _cross_reference(items: list[dict]) -> None:
+    """Mark items that INDEPENDENT outlets cover as the SAME story, across the
+    whole set (RSS + search). Two items corroborate when they share >=2
+    significant title tokens (or >=60% of the smaller set), come from different
+    outlets, AND are not syndication of one wire story (_is_syndicated). The
+    syndication collapse is the key correctness fix: counting 10 reprints of one
+    AP story as "10 outlets" is false corroboration. Populates `_corroborating`
+    with the independent outlets; the renderer shows 'Confirmed by N outlets'."""
+    keys = [(_story_key_tokens(it.get("title", "")), it) for it in items]
+    for i, (ti, a) in enumerate(keys):
+        if not ti:
+            continue
+        a_outlet = (a.get("outlet") or "").lower()
+        others = set(a.get("_corroborating") or [])
+        for j, (tj, b) in enumerate(keys):
+            if i == j or not tj:
+                continue
+            b_outlet = (b.get("outlet") or "").lower()
+            if not b_outlet or b_outlet == a_outlet:
+                continue
+            overlap = len(ti & tj)
+            same_story = overlap >= 2 or (overlap and overlap >= 0.6 * min(len(ti), len(tj)))
+            if same_story and not _is_syndicated(a, b):
+                others.add(b.get("outlet") or "")
+        if others:
+            a["_corroborating"] = sorted(o for o in others if o)
+
+
+async def _directed_followup(label: str, item: dict, *, max_results: int = 10) -> None:
+    """Helios/analyst directed deep-dive on ONE story (the move that separates an
+    analyst from a clipping service). For a top-ranked item: run a focused
+    follow-up search for THAT specific story, then (a) trace to a higher-
+    authority / primary source and (b) find INDEPENDENT corroboration. Annotates
+    the item in place: `_primary_source` and a merged `_corroborating`.
+
+    Bounded to a single follow-up search per item (latency); the caller limits
+    how many top items get this. Stop-on-sufficiency: we already have the
+    primary + independent corroborator after one well-targeted search — no
+    iterative loop needed for a news item. Patterns: query-decomposition (one
+    story = one focused sub-query), corroboration-based stop (FactAgent), and
+    the OSINT primary-source preference. Fails silent — the digest is still good
+    without it."""
+    from app.tools import native_search
+    from app.core.source_authority import authority
+
+    title = (item.get("title") or "").strip()
+    item_tokens = _story_key_tokens(title)
+    if len(item_tokens) < 2:
+        return
+    cur_outlet = (item.get("outlet") or "").lower()
+    cur_auth = authority(cur_outlet)
+    # Focused sub-query: the story's most distinctive tokens.
+    query = " ".join(sorted(item_tokens, key=len, reverse=True)[:8])
+    try:
+        results = await native_search.search(query, max_results=max_results, mode="news")
+    except Exception as e:
+        logger.debug("[DomainRunner] directed follow-up search failed: %s", e)
+        return
+
+    new_corrob = set(item.get("_corroborating") or [])
+    best_primary: tuple[float, str, str] | None = None  # (authority, url, outlet)
+    for r in results:
+        try:
+            host = urlparse(r.url).netloc.lower()
+        except Exception:
+            continue
+        host = host[4:] if host.startswith("www.") else host
+        if not host or host == cur_outlet:
+            continue
+        rt = _story_key_tokens(r.title or "")
+        overlap = len(item_tokens & rt)
+        if not (overlap >= 2 or (overlap and overlap >= 0.5 * min(len(item_tokens), len(rt)))):
+            continue  # not the same story
+        cand = {"title": r.title, "snippet": r.snippet or "", "outlet": host}
+        # Independent corroboration only (skip wire reprints of the same copy).
+        if not _is_syndicated(item, cand):
+            new_corrob.add(host)
+        # Primary / higher-authority source: meaningfully more authoritative.
+        a = authority(host)
+        if a > cur_auth + 0.05 and (best_primary is None or a > best_primary[0]):
+            best_primary = (a, r.url, host)
+
+    if new_corrob:
+        item["_corroborating"] = sorted(o for o in new_corrob if o)
+    if best_primary:
+        item["_primary_source"] = {
+            "url": best_primary[1], "outlet": best_primary[2],
+            "authority": round(best_primary[0], 2),
+        }
+        logger.info("[DomainRunner] %s: deep-dive found a more-authoritative source for '%s': %s (%.2f)",
+                    label, title[:50], best_primary[2], best_primary[0])
+
+
+async def _deep_dive_top(label: str, items: list[dict], *, n: int = 2) -> None:
+    """Directed deep-dive on the top N items (by current order). Bounded extra
+    searches per digest; runs on the background monitor lane (which already
+    defers to interactive chat)."""
+    for it in items[:n]:
+        try:
+            await _directed_followup(label, it)
+        except Exception as e:
+            logger.debug("[DomainRunner] deep-dive skipped for an item: %s", e)
+
+
+async def _synthesize_insight(label: str, items: list[dict]) -> str:
+    """One tight LLM pass over the day's items for cross-cutting INSIGHT — the
+    connective analysis a headline list can't give: the throughline, what's
+    notable or surprising, and the implication. Not a re-summary of each item.
+    Returns '' on any failure (the digest is still useful without it)."""
+    usable = [it for it in items if (it.get("title") or "").strip()][:8]
+    if len(usable) < 3:
+        return ""
+    from app.core.llm import invoke_nothink
+    bullets = "\n".join(
+        f"- {(it.get('title') or '').strip()[:160]}"
+        + (f" [also: {', '.join(it['_corroborating'][:2])}]" if it.get("_corroborating") else "")
+        for it in usable
+    )
+    prompt = (
+        f"You are an intelligence analyst. Below are today's {label} headlines.\n"
+        f"Write 2-3 sentences of ANALYSIS — the connective insight, NOT a summary:\n"
+        f"- The throughline or tension linking these (if any)\n"
+        f"- What is most notable, surprising, or consequential\n"
+        f"- The 'so what' — likely implication or what to watch next\n"
+        f"If the items are unrelated, say so in one line and name the single most "
+        f"important one. Output ONLY the analysis, no preamble, no bullet list, "
+        f"no restating headlines verbatim.\n\nHEADLINES:\n{bullets}"
+    )
+    try:
+        out = await invoke_nothink(
+            [{"role": "user", "content": prompt}],
+            max_tokens=220, temperature=0.4,
+        )
+        out = (out or "").strip()
+        # Guard against the model echoing the instructions or a headline list.
+        if not out or out.lower().startswith(("headline", "- ", "1.")) or len(out) < 40:
+            return ""
+        return out
+    except Exception as e:
+        logger.debug("[DomainRunner] insight synthesis skipped: %s", e)
+        return ""
+
+
 def _render_items_deterministic(
-    label: str, emoji: str, items: list[dict], today: datetime
+    label: str, emoji: str, items: list[dict], today: datetime, insight: str = ""
 ) -> str:
     """Format the verified-fresh items as a Discord-ready Markdown report.
     Drops items where the LLM-summarised snippet is empty or junk-filtered,
@@ -832,6 +1149,12 @@ def _render_items_deterministic(
     ]
     if not keepers:
         return f"No significant {label} developments in the past 72 hours."
+
+    # Corroboration is computed by the caller on the FULL pre-selection set (so
+    # it counts every independent outlet, not just the rendered top-N). If a
+    # caller passed un-cross-referenced items, do it now as a fallback.
+    if not any("_corroborating" in it for it in keepers):
+        _cross_reference(keepers)
 
     today_str = today.strftime("%B %d, %Y")
     lines = [
@@ -864,6 +1187,10 @@ def _render_items_deterministic(
             outlet_line += f" _(also {others})_"
         outlet_line += f"  ·  📅 {it['date_str']}  ·  <{clean_url}>"
         lines.append(outlet_line)
+        # Primary / more-authoritative source surfaced by the directed deep-dive.
+        prim = it.get("_primary_source")
+        if prim and (prim.get("outlet") or "").lower() != (it.get("outlet") or "").lower():
+            lines.append(f"   📄 _Primary source:_ **{prim['outlet']}** <{_clean_url(prim['url'])}>")
         # Title-only items: the headline IS the news. No need for a
         # "(no body)" disclaimer — that just makes the grader penalise.
         # Just leave a blank line to separate items.
@@ -908,6 +1235,11 @@ def _render_items_deterministic(
         summary_bits.append(f"with **{verified_count}** cross-confirmed by multiple outlets")
     lines.append("─" * 28)
     lines.append("  ·  ".join(summary_bits) + ".")
+    # Insight section — cross-cutting analysis, placed last so the reader gets
+    # the "so what" after the facts.
+    if insight:
+        lines.append("")
+        lines.append(f"💡 **Insight** — {insight.strip()}")
     return "\n".join(lines).strip()
 
 

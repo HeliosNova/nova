@@ -29,9 +29,15 @@ class WhatsAppBot:
         self.phone_number_id = config.WHATSAPP_PHONE_ID
         self.default_chat_id = config.WHATSAPP_CHAT_ID
         self._allowed_users = self._parse_allowed_users()
+        if not self._allowed_users:
+            logger.warning(
+                "[WhatsApp] WHATSAPP_ALLOWED_USERS is empty — ALL senders are denied "
+                "(fail-closed). Set your WhatsApp number to use the bot."
+            )
         self._conversations: collections.OrderedDict[str, str] = collections.OrderedDict()  # whatsapp phone → conv_id
         self._conv_store = None  # lazy-init DB store
         self._conv_lock = asyncio.Lock()
+        self._send_lock = asyncio.Lock()  # serialize multi-chunk sends (see Discord adapter)
         self._client = httpx.AsyncClient(timeout=30)
         self._dedup_db = None  # lazy-init SQLite dedup
 
@@ -48,9 +54,7 @@ class WhatsAppBot:
             return set()
 
     def _is_allowed(self, phone: str) -> bool:
-        """Check if phone is in the allowlist. Empty list = allow all."""
-        if not self._allowed_users:
-            return True
+        """Check if phone is in the allowlist. Empty list = deny all (fail-closed)."""
         return phone in self._allowed_users
 
     def _get_dedup_db(self):
@@ -173,8 +177,12 @@ class WhatsAppBot:
         try:
             from app.channels.format_for_channel import to_whatsapp
             wa_message = to_whatsapp(message)
-            for chunk in self._split_message(wa_message):
-                await self._send_message(self.default_chat_id, chunk)
+            _chunks = self._split_message(wa_message)
+            async with self._send_lock:
+                for _ci, chunk in enumerate(_chunks):
+                    if _ci:
+                        await asyncio.sleep(0.3)
+                    await self._send_message(self.default_chat_id, chunk)
         except Exception as e:
             logger.error("[WhatsApp] Alert send failed: %s", e)
 
@@ -268,8 +276,9 @@ class WhatsAppBot:
                 # Process the message
                 answer = await self._handle_query(text_body, sender_phone)
 
-                for chunk in self._split_message(answer):
-                    await self._send_message(sender_phone, chunk)
+                async with self._send_lock:
+                    for chunk in self._split_message(answer):
+                        await self._send_message(sender_phone, chunk)
 
             except Exception as e:
                 logger.error("[WhatsApp] Webhook handler error: %s", e, exc_info=True)

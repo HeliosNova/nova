@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-2%2C387-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2%2C392-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
@@ -115,15 +115,9 @@ This is in-context, retrieval-based learning — the approach favored by 2026 ag
 
 The `memory-learning` eval category (`evals/suite.yaml`) proves it: for each test it asks a question **without** the lesson, stores the lesson, asks again **with** it, and checks the answer flipped wrong→right. On the shipped 9B model a seeded correction causally fixes the answer the **majority** of the time (`memory_causal_fix_rate`); remaining misses are tracked as work items. The harness (`app/monitors/eval_harness.py`) runs nightly and on demand.
 
-### Self fine-tuning (experimental — off by default)
+### Self fine-tuning (archived)
 
-Nova can also export `{query, chosen, rejected}` pairs from corrections and run a local DPO fine-tune behind an A/B gate. **This is experimental and disabled by default** (`ENABLE_AUTO_FINETUNE=false`). In honest, independently-judged A/B evals (a *different-family* local judge, position-swapped, multi-dimension) our small-data fine-tunes have so far **tied or lost to the base model** — consistent with the research consensus that retrieval/memory beats fine-tuning for injecting facts, and that small models degrade under small-data tuning. A candidate deploys **only if it wins** that A/B; otherwise the base is kept. Use weight fine-tuning, if at all, for *style/behavior* — not as the way Nova learns facts.
-
-```bash
-docker compose stop ollama                                              # free VRAM
-python scripts/finetune_auto.py --check                                 # readiness only (no auto-deploy)
-python scripts/eval_harness.py --base <base> --candidate <ft> --judge <other-family-model>
-```
+Nova used to export `{query, chosen, rejected}` pairs from corrections and run a local DPO fine-tune behind an A/B gate. In honest, independently-judged A/B evals (a *different-family* local judge, position-swapped, multi-dimension) those small-data fine-tunes **tied or lost to the base model** — consistent with the research consensus that retrieval/memory beats fine-tuning for injecting facts, and that small models degrade under small-data tuning. Because it never beat the base across any run, the whole weight-training stack was **archived on 2026-06-12** to `archive/training/`; the memory loop above is how Nova learns. Restore that directory if you want to revisit weight tuning for *style/behavior* (not facts).
 
 ## Tools (20 built-in)
 

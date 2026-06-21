@@ -1,5 +1,11 @@
 # Changelog
 
+## [Unreleased]
+
+### Archived the weight-training stack (2026-06-12)
+- **Fine-tuning + GRPO + RLVR-trainer (~21.7k LOC) moved to `archive/training/`.** Across every `run_history.json` there were 0 successful train→A/B→deploy cycles, and the one honest cross-family A/B showed the fine-tune *ties* its base. The in-context memory loop (lessons + temporal KG) is how Nova learns; weight training was experimental and never beat the base. Git history is preserved and the stack is restorable.
+- The runtime image no longer ships any trainer (Dockerfile drops the `verify_phase_0` / `grpo_train` COPYs); the Fine-Tune heartbeat monitor is **inert** (no more "FINETUNE READY → run scripts/finetune_auto.py" pointing at a missing script); `/api/learning/finetune/trigger` reports the archival; `ENABLE_RLVR_SIGNALS` now defaults **off** (its only consumer was the archived trainer).
+
 ## [1.6.0] - 2026-06-10
 
 Polish pass: measurement honesty, paraphrase-robust memory retrieval, onboarding repair, experiment pruning.

@@ -109,6 +109,32 @@ def is_likely_correction(text: str) -> bool:
     return any(p.search(text) for p in _CORRECTION_PATTERNS)
 
 
+# Softer, higher-recall reactive signal used ONLY to decide whether to spend an
+# LLM confirmation call on a message the strict patterns missed. The strict set
+# measured ~88% recall; the misses are creatively-phrased corrections. The LLM
+# stage rejects non-corrections, so a loose gate here can only cost extra calls
+# — it cannot create bad lessons. Bounded to short, reactive messages so we
+# don't fire the LLM on every long question.
+_SOFT_CORRECTION_HINT = re.compile(
+    r"(?i)\b(?:no|not|n'?t|never|nope|nah|wrong|incorrect|false|untrue|bogus|"
+    r"mistaken|inaccurate|outdated|stale|doubt|disagree|"
+    r"sure|really|isn'?t|aren'?t|wasn'?t|weren'?t|doesn'?t|didn'?t|"
+    r"actually|hmm+|off|backwards?)\b"
+)
+
+
+def has_soft_correction_signal(text: str, *, max_len: int = 400) -> bool:
+    """Loose reactive-signal check for the correction LLM-rescue path.
+
+    Returns True for short messages carrying a negation/doubt/disagreement
+    token. Higher recall + lower precision than `is_likely_correction`; the
+    LLM confirmation stage is the precision backstop.
+    """
+    if not text or len(text) > max_len:
+        return False
+    return bool(_SOFT_CORRECTION_HINT.search(text))
+
+
 # ---------------------------------------------------------------------------
 # Pushback detection — did Nova disagree with the user's correction?
 # ---------------------------------------------------------------------------
@@ -136,6 +162,33 @@ _PUSHBACK_PATTERNS = [
 ]
 
 
+# Concession patterns — Nova ACCEPTING the user's correction. These must veto
+# pushback: an accepting reply like "Actually, the correct answer is Canberra —
+# thanks for the correction" trips the broad `\bactually,?\s+the\b` pushback
+# pattern, which used to suppress a genuinely-accepted correction (it never got
+# saved as a lesson). Concession is the stronger signal, so it wins.
+_CONCESSION_PATTERNS = [
+    re.compile(r"(?i)\byou(?:'?re|\s+are)\s+(?:absolutely\s+|quite\s+|completely\s+)?(?:right|correct)\b"),
+    re.compile(r"(?i)\bthat'?s\s+(?:absolutely\s+|quite\s+)?(?:right|correct|true)\b"),
+    re.compile(r"(?i)\bI\s+(?:was|stand|am)\s+(?:wrong|mistaken|corrected|incorrect)\b"),
+    re.compile(r"(?i)\bmy\s+(?:mistake|apolog\w*|error|bad)\b"),
+    re.compile(r"(?i)\bI\s+apologi[sz]e\b"),
+    re.compile(r"(?i)\bgood\s+catch\b"),
+    re.compile(r"(?i)\b(?:thanks?|thank\s+you)\s+for\s+(?:the\s+|pointing|correct|catching|flagging)"),
+    re.compile(r"(?i)\bI\s+stand\s+corrected\b"),
+    re.compile(r"(?i)\byou'?re\s+right\s+to\s+(?:point|correct|note)\b"),
+    re.compile(r"(?i)\b(?:oh|ah),?\s+(?:you'?re\s+right|right|I\s+see)\b"),
+    re.compile(r"(?i)\bcorrecting\s+myself\b"),
+]
+
+
+def response_concedes(response: str) -> bool:
+    """Check if Nova's response ACCEPTS the user's correction (concedes the point)."""
+    if not response:
+        return False
+    return any(p.search(response) for p in _CONCESSION_PATTERNS)
+
+
 def response_pushes_back(response: str) -> bool:
     """Check if Nova's response pushes back against the user's correction.
 
@@ -144,9 +197,14 @@ def response_pushes_back(response: str) -> bool:
     that means Nova correctly stood its ground and we should NOT save the
     user's incorrect correction as a lesson or DPO pair.
 
-    Returns True if the response contains disagreement/pushback signals.
+    Returns True only when Nova DISAGREES — a clear concession ("you're right",
+    "my mistake", "thanks for the correction") vetoes pushback, because the
+    broad pushback patterns also match accepting replies and were silently
+    dropping genuinely-accepted corrections.
     """
     if not response:
+        return False
+    if response_concedes(response):
         return False
     return any(p.search(response) for p in _PUSHBACK_PATTERNS)
 
@@ -202,35 +260,23 @@ class LearningEngine:
         if self._lessons_collection is None:
             try:
                 import chromadb
-                from .embedding import get_embedding_function
+                from .embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                _kw = {"name": "lessons", "metadata": {"hnsw:space": "cosine"}}
-                _ef = get_embedding_function()
-                if _ef is not None:
-                    _kw["embedding_function"] = _ef
-                self._lessons_collection = client.get_or_create_collection(**_kw)
+                self._lessons_collection = open_collection(
+                    client, "lessons", reindex=self._backfill_collection,
+                )
             except Exception as e:
                 logger.warning("Failed to init lessons ChromaDB collection: %s", e)
                 return None
         return self._lessons_collection
 
-    def reindex_lessons(self) -> int:
-        """One-time backfill of existing lessons into ChromaDB. Returns count indexed."""
-        collection = self._get_lessons_collection()
-        if collection is None:
-            return 0
-        # Skip if collection already has data
-        if collection.count() > 0:
-            logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
-            return 0
-
+    def _backfill_collection(self, collection) -> int:
+        """Populate `collection` from the lessons table, unconditionally.
+        Shared by reindex_lessons (guarded) and the embedder-rebuild path."""
         all_lessons = self._db.fetchall("SELECT * FROM lessons")
         if not all_lessons:
             return 0
-
-        ids = []
-        documents = []
-        metadatas = []
+        ids, documents, metadatas = [], [], []
         for row in all_lessons:
             topic = row["topic"] or ""
             correct_answer = row["correct_answer"] or ""
@@ -243,11 +289,21 @@ class LearningEngine:
             ids.append(str(row["id"]))
             documents.append(searchable)
             metadatas.append({"topic": topic, "confidence": row["confidence"]})
-
         if ids:
             collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
             logger.info("Reindexed %d lessons into ChromaDB", len(ids))
         return len(ids)
+
+    def reindex_lessons(self) -> int:
+        """One-time backfill of existing lessons into ChromaDB. Returns count indexed."""
+        collection = self._get_lessons_collection()
+        if collection is None:
+            return 0
+        # Skip if collection already has data
+        if collection.count() > 0:
+            logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
+            return 0
+        return self._backfill_collection(collection)
 
     async def detect_correction(
         self,
@@ -260,8 +316,15 @@ class LearningEngine:
         Stage 1: regex check (fast)
         Stage 2: LLM confirmation + extraction (only if regex matches)
         """
+        # Stage 1: gate the (costly) LLM confirmation. The fast strict-regex path
+        # catches obvious corrections; a regex MISS still gets an LLM rescue when
+        # the message carries a softer reactive signal and there's a prior answer
+        # to correct — this recovers the ~12% of creatively-phrased corrections
+        # the strict patterns can't match, without firing the LLM on every turn.
         if not is_likely_correction(user_message):
-            return None
+            if not (previous_answer and has_soft_correction_signal(user_message)):
+                return None
+            logger.debug("Correction rescue: strict regex missed, soft signal present — confirming via LLM")
 
         # Stage 2: Use LLM to confirm and extract the correction
         try:
@@ -969,15 +1032,18 @@ class LearningEngine:
                     score = overlap / union if union > 0 else 0.0
                     if score > max_jaccard:
                         max_jaccard = score
-                    if score >= 0.55:
+                    # Never merge contradictory answers ("X is Y" vs "X is NOT
+                    # Y", or differing figures) even on the same topic — that
+                    # silently collapses opposites into one lesson.
+                    if score >= 0.55 and not _answers_conflict(correct_answer, row["correct_answer"] or ""):
                         _dm.record_decision("lesson", score, 0.55, "merged")
                         return row
             else:
-                # Brief answer + same topic — treat as dup of most recent.
-                # Jaccard isn't meaningful here (too few tokens); record at
-                # the topic-level threshold so the row is still legible.
-                _dm.record_decision("lesson", 0.55, 0.55, "merged")
-                return same_topic[0]
+                # Brief answer + same topic — treat as dup of most recent,
+                # unless the two answers contradict (polarity/number mismatch).
+                if not _answers_conflict(correct_answer, same_topic[0]["correct_answer"] or ""):
+                    _dm.record_decision("lesson", 0.55, 0.55, "merged")
+                    return same_topic[0]
 
         # Slow path — fuzzy word overlap
         new_words = _normalize_words(topic + " " + correct_answer) - _STOP_WORDS
@@ -1001,7 +1067,9 @@ class LearningEngine:
             score = overlap / union if union > 0 else 0.0
             if score > max_jaccard:
                 max_jaccard = score
-            if score >= config.DEDUP_JACCARD_THRESHOLD:
+            if score >= config.DEDUP_JACCARD_THRESHOLD and not _answers_conflict(
+                correct_answer, row["correct_answer"] or ""
+            ):
                 _dm.record_decision("lesson", score, config.DEDUP_JACCARD_THRESHOLD, "merged")
                 return row
 
@@ -1177,6 +1245,35 @@ from app.core.text_utils import STOP_WORDS as _STOP_WORDS, normalize_words as _b
 def _normalize_words(text: str) -> set[str]:
     """Normalize text into stemmed word set for keyword comparison."""
     return _base_normalize_words(text, stem=True)
+
+
+_NEGATION_RE = re.compile(
+    r"(?i)\b(?:not|no|never|none|isn'?t|aren'?t|wasn'?t|weren'?t|don'?t|doesn'?t|"
+    r"didn'?t|can'?t|won'?t|cannot|false|incorrect|untrue)\b"
+)
+_NUMERIC_RE = re.compile(r"\d[\d,]*(?:\.\d+)?")
+
+
+def _answers_conflict(a: str, b: str) -> bool:
+    """True if two lesson answers are CONTRADICTORY, not redundant.
+
+    Token-Jaccard dedup can't see negation: "Pluto is a planet" and "Pluto is
+    NOT a planet" differ by one token, score near-identical, and were merged —
+    collapsing semantic opposites into one lesson. Veto a merge when the two
+    answers disagree on polarity, or cite different numbers (e.g. "$50k" vs
+    "$60k" price lessons are distinct claims, not a duplicate to fold together).
+    """
+    a = a or ""
+    b = b or ""
+    # Polarity flip — one negates, the other doesn't.
+    if bool(_NEGATION_RE.search(a)) != bool(_NEGATION_RE.search(b)):
+        return True
+    # Disjoint numeric content — different figures = different claims.
+    nums_a = set(_NUMERIC_RE.findall(a))
+    nums_b = set(_NUMERIC_RE.findall(b))
+    if nums_a and nums_b and not (nums_a & nums_b):
+        return True
+    return False
 
 
 def _extract_answer_from_message(message: str) -> str | None:

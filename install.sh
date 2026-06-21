@@ -57,6 +57,13 @@ if [ ! -f .env ]; then
     echo "  Created .env from .env.example"
 fi
 
+# Create searxng/settings.yml if missing (with a fresh secret_key)
+if [ ! -f searxng/settings.yml ]; then
+    SEARX_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))" 2>/dev/null || openssl rand -hex 32)
+    sed "s|^  secret_key: \".*\"$|  secret_key: \"$SEARX_KEY\"|" searxng/settings.yml.example > searxng/settings.yml
+    echo "  Created searxng/settings.yml with a fresh secret_key"
+fi
+
 # Start the stack for the detected tier. Nova is Ollama-only by design
 # (local inference is the point) — smaller hardware just means a smaller model.
 set_model() {

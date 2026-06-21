@@ -1,7 +1,7 @@
 use_default_settings: true
 
 server:
-  secret_key: "2709d60d00ac9c6c2ea2feb381001464dc624d6c92f6ac0a195d1fc3c74155a7"
+  secret_key: "CHANGE_ME_generate_with: python -c 'import secrets; print(secrets.token_hex(32))'"
   limiter: false
   image_proxy: false
   bind_address: "0.0.0.0"

@@ -369,6 +369,7 @@ class TestMonitorRouting:
             whatsapp_bot=whatsapp_bot,
             signal_bot=signal_bot,
         )
+        loop._digest_enabled = False  # test immediate-send routing (digest batches separately)
         await loop._send_alert(m, "db healthy")
 
         discord_bot.send_alert.assert_not_called()
@@ -401,6 +402,7 @@ class TestMonitorRouting:
             whatsapp_bot=whatsapp_bot,
             signal_bot=signal_bot,
         )
+        loop._digest_enabled = False  # test immediate-send routing (digest batches separately)
         await loop._send_alert(m, "major news")
 
         discord_bot.send_alert.assert_called_once()

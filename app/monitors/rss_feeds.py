@@ -49,8 +49,8 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.cnbc.com/id/100727362/device/rss/rss.html",  # CNBC AI
         # MIT Tech Review — major AI features
         "https://www.technologyreview.com/feed/",
-        # Reuters tech
-        "https://www.reuters.com/technology/artificial-intelligence/rss",
+        # Guardian AI (Reuters discontinued public RSS — 401/404)
+        "https://www.theguardian.com/technology/artificialintelligenceai/rss",
         # The Information (limited RSS but high-signal)
         "https://www.theinformation.com/feed",
         # Substack AI — Latent Space, Stratechery, others
@@ -58,12 +58,8 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.aisnakeoil.com/feed",
         # ScienceDaily AI section
         "https://www.sciencedaily.com/rss/computers_math/artificial_intelligence.xml",
-        # Anthropic blog
-        "https://www.anthropic.com/news/rss.xml",
-        # The Verge / Wired AI
-        "https://www.wired.com/feed/category/business/artificial-intelligence/latest/rss",
-        "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml",
-    ],
+        # Anthropic blog        # The Verge / Wired AI
+        "https://www.wired.com/feed/tag/ai/latest/rss",    ],
     "technology": [
         "https://techcrunch.com/feed/",
         "https://www.theverge.com/rss/index.xml",
@@ -93,26 +89,31 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.cnbc.com/id/10000664/device/rss/rss.html",
         "https://feeds.bloomberg.com/markets/news.rss",
         "https://www.ft.com/markets?format=rss",
-        "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
+        "https://www.theguardian.com/uk/business/rss",
         "https://www.investing.com/rss/news.rss",
         "https://www.marketwatch.com/rss/topstories",
         "https://www.fool.com/feeds/index.aspx",
         "https://seekingalpha.com/feed.xml",
-        "https://www.zerohedge.com/fullrss2.xml",
+        "https://feeds.feedburner.com/zerohedge/feed",
         "https://www.barrons.com/feed/rss",
+        "https://www.forbes.com/business/feed/",
+        "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     ],
     "geopolitics": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
         "https://foreignpolicy.com/feed/",
-        "https://www.cfr.org/rss-feeds/all-feeds.xml",
+        "https://www.justsecurity.org/feed/",
         "https://thediplomat.com/feed/",
         "https://www.lawfaremedia.org/all-content.rss",
         "https://warontherocks.com/feed/",
         "https://www.economist.com/international/rss.xml",
         "https://www.aljazeera.com/xml/rss/all.xml",
-        "https://feeds.npr.org/1004/rss.xml",
-        "https://www.brookings.edu/feed/",
-        "https://carnegieendowment.org/rss/all/en",
+        "https://feeds.npr.org/1004/rss.xml",        # Non-Western / realist / multipolar perspectives — balance the Western
+        # establishment think-tank lean above (bias audit 2026-06-21).
+        "https://asiatimes.com/feed/",
+        "https://responsiblestatecraft.org/feeds/feed.rss",
+        "https://moderndiplomacy.eu/feed/",
+        "https://geopoliticalfutures.com/feed/",
     ],
     # Topic-filter regex — items whose title/summary doesn't match these
     # keyword patterns are dropped from the feed for the named domain.
@@ -125,19 +126,17 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.schneier.com/feed/atom/",
         "https://www.cisa.gov/news.xml",
         "https://www.securityweek.com/feed/",
-        "https://www.scmagazine.com/feed",
-        "https://www.csoonline.com/feed/",
-        "https://nakedsecurity.sophos.com/feed/",
-        "https://threatpost.com/feed/",
+        "https://www.welivesecurity.com/en/rss/feed/",
+        "https://www.csoonline.com/feed/",        "https://threatpost.com/feed/",
         "https://www.helpnetsecurity.com/feed/",
-        "https://blog.talosintelligence.com/feeds/posts/default",
+        "https://unit42.paloaltonetworks.com/feed/",
         "https://grahamcluley.com/feed/",
     ],
     "quantum computing": [
         "https://thequantuminsider.com/feed/",
         "https://quantumcomputingreport.com/feed/",
         "https://blog.research.google/feeds/posts/default/-/Quantum",
-        "https://www.ibm.com/quantum/blog/rss",
+        "https://phys.org/rss-feed/physics-news/quantum-physics/",
         "https://www.nature.com/subjects/quantum-information.rss",
         "https://physicsworld.com/c/quantum/feed/",
         "https://hpcwire.com/feed/",
@@ -153,9 +152,9 @@ _FEEDS: dict[str, list[str]] = {
     "health and medicine": [
         "https://www.statnews.com/feed/",
         "https://www.medpagetoday.com/rss/headlines.xml",
-        "https://www.medscape.com/rss/public/all-medscape-headlines.xml",
+        "https://www.medscape.com/cx/rssfeeds/2700.xml",
         "https://www.nature.com/subjects/medical-research.rss",
-        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds",
+        "https://www.fiercepharma.com/rss/xml",
     ],
     "energy and climate": [
         "https://www.utilitydive.com/feeds/news/",
@@ -166,13 +165,10 @@ _FEEDS: dict[str, list[str]] = {
     "semiconductors": [
         "https://semiengineering.com/feed/",
         "https://www.eetimes.com/feed/",
-        "https://www.tomshardware.com/feeds/all",
-        "https://www.anandtech.com/rss/",
+        "https://www.tomshardware.com/feeds/all",        "https://www.semiconductor-digest.com/feed/",
     ],
     "robotics and autonomy": [
-        "https://www.therobotreport.com/feed/",
-        "https://spectrum.ieee.org/topic/robotics/feeds.rss",
-        "https://www.therobotreport.com/category/news/feed/",
+        "https://www.therobotreport.com/feed/",        "https://www.therobotreport.com/category/news/feed/",
     ],
     "biotech and genetics": [
         "https://www.fiercebiotech.com/rss/xml",
@@ -193,7 +189,7 @@ _FEEDS: dict[str, list[str]] = {
     "earnings and corporate events": [
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
         "https://feeds.bloomberg.com/markets/news.rss",
-        "https://www.businesswire.com/portal/site/home/rss/",
+        "https://www.globenewswire.com/rssfeed/orgclass/1/feedTitle/GlobeNewswire%20-%20News%20about%20Public%20Companies",
         "https://seekingalpha.com/feed.xml",
         "https://www.fool.com/feeds/index.aspx",
     ],
@@ -201,7 +197,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.sciencedaily.com/rss/all.xml",
         "https://www.nature.com/nature.rss",
         "https://feeds.bbci.co.uk/news/science_and_environment/rss.xml",
-        "https://www.scientificamerican.com/rss/news/",
+        "https://www.scientificamerican.com/platform/syndication/rss/",
         "https://www.newscientist.com/feed/home/",
         "https://www.quantamagazine.org/feed/",
     ],
@@ -211,9 +207,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://news.crunchbase.com/feed/",
         "https://www.theinformation.com/feed",
         "https://stratechery.com/feed/",
-        "https://www.fortune.com/feed",
-        "https://thisweekinstartups.com/feed/",
-    ],
+        "https://www.fortune.com/feed",    ],
     "physics and mathematics": [
         "https://physicsworld.com/feed/",
         "https://www.nature.com/subjects/physics.rss",
@@ -227,9 +221,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.bloomberg.com/economics/news.rss",
         "https://www.federalreserve.gov/feeds/press_all.xml",
         "https://www.ft.com/economics?format=rss",
-        "https://www.reutersagency.com/feed/?best-topics=economy&post_type=best",
-        "https://www.imf.org/en/News/RSS",
-    ],
+        "https://www.theguardian.com/business/economics/rss",    ],
     "whale watch": [
         "https://cryptoslate.com/feed/",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -238,7 +230,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://protos.com/feed/",
     ],
     "top trades and positioning": [
-        "https://www.zerohedge.com/fullrss2.xml",
+        "https://feeds.feedburner.com/zerohedge/feed",
         "https://seekingalpha.com/feed.xml",
         "https://www.barrons.com/feed/rss",
         "https://feeds.bloomberg.com/markets/news.rss",
@@ -256,15 +248,11 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.bloomberg.com/economics/news.rss",
     ],
     "fda drug approvals": [
-        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
-        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/cder-news/rss.xml",
-        "https://www.fiercebiotech.com/rss/xml",
+        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",        "https://www.fiercebiotech.com/rss/xml",
         "https://www.statnews.com/category/biotech/feed/",
     ],
     "government contract awards": [
-        "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400",
-        "https://sam.gov/api/prod/sgs/v1/search/feed",
-        "https://www.gao.gov/rss/reports.xml",
+        "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400",        "https://www.gao.gov/rss/reports.xml",
     ],
     "hacker news top stories": [
         "https://news.ycombinator.com/rss",
@@ -276,9 +264,7 @@ _FEEDS: dict[str, list[str]] = {
     ],
     "github security advisories": [
         "https://github.com/advisories.atom",
-        "https://www.cisa.gov/cybersecurity-advisories/all.xml",
-        "https://nvd.nist.gov/feeds/xml/cve/misc/nvd-rss.xml",
-    ],
+        "https://www.cisa.gov/cybersecurity-advisories/all.xml",    ],
     "github stargazer counts": [
         "https://github.com/trending.atom",
         "https://github.blog/feed/",
@@ -286,23 +272,36 @@ _FEEDS: dict[str, list[str]] = {
     "morning check-in": [
         "https://feeds.bbci.co.uk/news/rss.xml",
         "https://feeds.npr.org/1001/rss.xml",
-        "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=best",
+        "https://www.theguardian.com/world/rss",
+        "https://rss.dw.com/xml/rss-en-world",
+        "https://www.france24.com/en/rss",
     ],
     "us policy and regulation": [
         "https://www.politico.com/rss/politicopicks.xml",
         "https://www.axios.com/feeds/feed.rss",
         "https://thehill.com/feed/",
+        # Right + libertarian sources balance the center-establishment lean above
+        # (bias audit 2026-06-21) — span the spectrum, not one side.
+        "https://www.nationalreview.com/feed/",
+        "https://thedispatch.com/feed/",
+        "https://reason.com/feed/",
     ],
     "current events": [
-        "https://www.reutersagency.com/feed/?best-topics=top-news&post_type=best",
+        "https://www.theguardian.com/world/rss",
         "https://feeds.bbci.co.uk/news/rss.xml",
         "https://www.aljazeera.com/xml/rss/all.xml",
         "https://www.npr.org/rss/rss.php?id=1001",
+        "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+        "https://rss.dw.com/rdf/rss-en-all",
+        "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
     ],
     "world awareness": [
         "https://feeds.bbci.co.uk/news/world/rss.xml",
-        "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
+        "https://www.theguardian.com/world/rss",
         "https://www.aljazeera.com/xml/rss/all.xml",
+        "https://rss.dw.com/xml/rss-en-world",
+        "https://www.france24.com/en/rss",
+        "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
     ],
     "middle east": [
         "https://www.aljazeera.com/xml/rss/all.xml",
@@ -313,6 +312,7 @@ _FEEDS: dict[str, list[str]] = {
         "https://technode.com/feed/",
         "https://www.scmp.com/rss/91/feed",   # SCMP tech
         "https://www.scmp.com/rss/2/feed",    # SCMP china
+        "https://pandaily.com/feed/",          # China tech, reduce SCMP over-weight
     ],
     "russia and eastern europe": [
         "https://meduza.io/rss/en/all",
@@ -322,10 +322,14 @@ _FEEDS: dict[str, list[str]] = {
     "europe and eu": [
         "https://www.politico.eu/feed/",
         "https://www.euractiv.com/feed/",
+        "https://www.theguardian.com/world/europe-news/rss",  # thin domain — broaden
+        "https://rss.dw.com/xml/rss-en-eu",
     ],
     "india": [
         "https://www.thehindu.com/news/feeder/default.rss",
         "https://www.business-standard.com/rss/latest.rss",
+        "https://indianexpress.com/section/india/feed/",       # thin domain — broaden
+        "https://feeds.feedburner.com/ndtvnews-india-news",
     ],
     "africa and emerging markets": [
         "https://www.theafricareport.com/feed/",
@@ -334,9 +338,7 @@ _FEEDS: dict[str, list[str]] = {
     ],
     "latin america": [
         "https://restofworld.org/feed/",
-        "https://riotimesonline.com/feed/",
-        "https://www.bnamericas.com/feed",
-    ],
+        "https://riotimesonline.com/feed/",    ],
     "supply chain and trade": [
         "https://www.supplychaindive.com/feeds/news/",
         "https://www.freightwaves.com/news/feed",
@@ -349,7 +351,8 @@ _FEEDS: dict[str, list[str]] = {
     "defense and military tech": [
         "https://breakingdefense.com/feed/",
         "https://www.defensenews.com/arc/outboundfeeds/rss/",
-        "https://www.thedrive.com/the-war-zone/feed",
+        "https://www.twz.com/feed",            # The War Zone (current home of thedrive)
+        "https://www.aspistrategist.org.au/feed/",
     ],
     "defi and protocols": [
         "https://thedefiant.io/feed",
@@ -357,9 +360,7 @@ _FEEDS: dict[str, list[str]] = {
     ],
     "commodities and forex": [
         "https://oilprice.com/rss/main",
-        "https://www.fxstreet.com/rss/news",
-        "https://www.kitco.com/news/rss.xml",
-    ],
+        "https://www.fxstreet.com/rss/news",    ],
 }
 
 

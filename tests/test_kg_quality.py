@@ -26,11 +26,19 @@ class TestNormalizeEntity:
     def test_strips_whitespace(self):
         assert normalize_entity("  Python  ") == "Python"
 
-    def test_collapses_internal_whitespace(self):
-        assert normalize_entity("machine   learning") == "Machine Learning"
+    # Casing is PRESERVED since 2026-06-09: the old title-casing mangled
+    # correct forms (BlackRock->Blackrock, OpenAI->Openai, iPhone->Iphone)
+    # and fragmented entities into casing variants. Cross-variant merging
+    # is now the job of the kg_entity_aliases registry (_canonical_entity),
+    # covered by tests/test_kg_canonical.py.
 
-    def test_title_case(self):
-        assert normalize_entity("python programming") == "Python Programming"
+    def test_collapses_internal_whitespace(self):
+        assert normalize_entity("machine   learning") == "machine learning"
+
+    def test_casing_preserved(self):
+        assert normalize_entity("python programming") == "python programming"
+        assert normalize_entity("BlackRock") == "BlackRock"
+        assert normalize_entity("iPhone") == "iPhone"
 
     def test_preserves_acronyms(self):
         assert normalize_entity("AI") == "AI"
@@ -40,21 +48,19 @@ class TestNormalizeEntity:
 
     def test_mixed_case_with_acronyms(self):
         result = normalize_entity("AI in healthcare")
-        assert result == "AI In Healthcare"
+        assert result == "AI in healthcare"
 
     def test_empty_string(self):
         assert normalize_entity("") == ""
         assert normalize_entity("   ") == ""
 
     def test_single_word(self):
-        assert normalize_entity("python") == "Python"
-        assert normalize_entity("BITCOIN") == "Bitcoin"  # >5 chars, not acronym
+        assert normalize_entity("python") == "python"
+        assert normalize_entity("BITCOIN") == "BITCOIN"
 
     def test_short_acronym_preserved(self):
         assert normalize_entity("EU") == "EU"
-        # Lowercase input gets capitalized (not recognized as acronym)
-        assert normalize_entity("uk") == "Uk"
-        # ALL-CAPS input stays as-is
+        assert normalize_entity("uk") == "uk"
         assert normalize_entity("UK") == "UK"
 
 
@@ -175,8 +181,11 @@ class TestNeighborEnrichment:
 class TestPredicateNormalizationExtended:
     """Additional predicate normalization tests."""
 
-    def test_custom_valid_predicate(self):
-        assert normalize_predicate("trades_with") == "trades_with"
+    def test_unknown_predicate_degrades_to_related_to(self):
+        # Permissive custom predicates were removed 2026-05-13: LLM extractions
+        # like "trades_with" or "founded_in_year" would orphan facts under keys
+        # no canonical query ever hits. Unknown predicates degrade to related_to.
+        assert normalize_predicate("trades_with") == "related_to"
 
     def test_invalid_predicate_fallback(self):
         # Too long, contains spaces after normalization

@@ -414,6 +414,7 @@ class MonitorStore:
     _CORE_ENABLED: frozenset[str] = frozenset({
         # System health (telegram-only)
         "DB Size Monitor",
+        "Source Health Monitor",
         "Ollama Latency Monitor",
         "Skill Quality Monitor",
         "ChromaDB Integrity",
@@ -423,6 +424,8 @@ class MonitorStore:
         "Training Job Watch",
         "KG Growth Rate",
         # Meta / self-improvement (telegram-only)
+        "Storyline Tracker",
+        "Forecast Resolution",
         "Dream Consolidation",
         "Capability Review",
         "Quality Eval Harness",
@@ -630,6 +633,22 @@ class MonitorStore:
                 "notify_condition": "on_change",
             },
             {
+                "name": "Storyline Tracker",
+                "check_type": "storyline",
+                "check_config": {},
+                "schedule_seconds": 28800,   # every 8h — track evolving threads, surface what moved
+                "cooldown_minutes": 420,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Forecast Resolution",
+                "check_type": "forecast_resolve",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily — grade calls whose horizon passed
+                "cooldown_minutes": 1380,
+                "notify_condition": "on_change",
+            },
+            {
                 "name": "Auto-Tool Synthesis",
                 "check_type": "auto_tool",
                 "check_config": {},
@@ -658,6 +677,8 @@ class MonitorStore:
             # --- System Health Monitors ---
             {"name": "DB Size Monitor", "check_type": "db_size", "schedule_seconds": 14400, "cooldown_minutes": 240, "notify_condition": "on_change",
              "check_config": {"threshold_pct": 20}},
+            {"name": "Source Health Monitor", "check_type": "feed_health", "schedule_seconds": 86400, "cooldown_minutes": 1440, "notify_condition": "on_change",
+             "check_config": {}},
             {"name": "Ollama Latency Monitor", "check_type": "ollama_latency", "schedule_seconds": 7200, "cooldown_minutes": 120, "notify_condition": "on_change",
              "check_config": {"threshold_pct": 50}},
             {"name": "Skill Quality Monitor", "check_type": "skill_quality", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",

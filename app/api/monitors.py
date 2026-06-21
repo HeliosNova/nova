@@ -8,6 +8,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field, field_validator
 
 from app.auth import require_auth
+from app.config import config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["monitors"], dependencies=[Depends(require_auth)])
@@ -471,10 +472,18 @@ async def rate_result(result_id: int, body: RatingBody):
     # Find the monitor_id for this result
     from app.database import get_db
     db = get_db()
-    row = db.fetchone("SELECT monitor_id FROM monitor_results WHERE id = ?", (result_id,))
+    row = db.fetchone("SELECT monitor_id, value FROM monitor_results WHERE id = ?", (result_id,))
     adapted = None
     if row:
         adapted = store.adapt_cooldown(row["monitor_id"])
+        # Salience learning: nudge this content's topic weights from the rating
+        # (closes the loop the rating button opens — see app/core/salience.py).
+        if config.ENABLE_SALIENCE_FILTER and body.rating in (-1, 1) and row["value"]:
+            try:
+                from app.core.salience import learn_from_rating
+                learn_from_rating(db, row["value"], body.rating)
+            except Exception:
+                pass
 
     return {
         "rated": True,

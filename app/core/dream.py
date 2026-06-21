@@ -288,7 +288,24 @@ class DreamConsolidator:
         # 3h. Mine DPO pairs from quality extremes (deterministic extraction,
         # no LLM call in the mining step itself).
         await self._mine_dpo_pairs(signals, result)
+        # 3k. Prune dead cruft + log self-improvement health. The success-based
+        # gate (_disable_weak_skills) only catches FAILING skills; never-used
+        # aged skills/auto-tools have no failures and lived forever otherwise.
+        await self._prune_self_improvement_cruft(result)
         result.nrem_completed = True
+
+    async def _prune_self_improvement_cruft(self, result: ConsolidationResult) -> None:
+        try:
+            from app.core import self_improvement as si
+            from app.database import get_db
+            db = get_db()
+            pruned = await asyncio.to_thread(si.prune_dead_artifacts, db)
+            result.skills_disabled += int(pruned.get("skills", 0))
+            health = await asyncio.to_thread(si.compute_health, db)
+            logger.info("[Dream] self-improvement health: %s", health)
+        except Exception as e:
+            logger.warning("[Dream] self-improvement prune/health failed: %s", e)
+            result.errors.append(f"self_improvement: {e}")
 
     # ── Phase 3b: REM (integrative / LLM-driven consolidation) ─────────
     #
@@ -306,7 +323,23 @@ class DreamConsolidator:
         from app.config import config as _cfg
         if getattr(_cfg, "ENABLE_PROCEDURAL_CONSOLIDATION", True):
             await self._consolidate_procedural_memory(result, svc)
+        # 3j. KG community synthesis (GraphRAG): cluster the monitor-fed graph
+        # into themes and summarize each, so global/thematic queries can be
+        # answered from a handful of summaries instead of thousands of facts.
+        await self._build_kg_communities(result)
         result.rem_completed = True
+
+    async def _build_kg_communities(self, result: ConsolidationResult) -> None:
+        """Detect + summarize KG communities (best-effort; never rolls back)."""
+        try:
+            from app.core import kg_communities
+            from app.database import get_db
+            n = await kg_communities.build_and_store(get_db())
+            if n:
+                logger.info("[Dream] KG community synthesis: %d theme summaries", n)
+        except Exception as e:
+            logger.warning("[Dream] KG community synthesis failed: %s", e)
+            result.errors.append(f"kg_communities: {e}")
 
     async def consolidate(self, signals: GatherSignals) -> ConsolidationResult:
         """Execute consolidation actions. LLM-assisted where needed.

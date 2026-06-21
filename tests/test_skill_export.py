@@ -49,7 +49,10 @@ def _insert_skill(db, name="unit_convert", trigger=r"\bconvert\b.*\bto\b", steps
     return store.create_skill(
         name=name,
         trigger_pattern=trigger,
-        steps=steps or [{"tool": "calculator", "args_template": {"expr": "{query}"}}],
+        # web_search legitimately takes the raw {query}; calculator/code_exec do
+        # not (they need an extracted expression — enforced by create_skill's
+        # structured-input guard), so the default uses web_search.
+        steps=steps or [{"tool": "web_search", "args_template": {"q": "{query}"}}],
         answer_template="The result is {result}",
     )
 

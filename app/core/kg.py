@@ -52,6 +52,37 @@ CANONICAL_PREDICATES = frozenset({
     "succeeded_by", "price_of", "version_of",
 })
 
+# Predicates where a subject legitimately holds MANY simultaneous objects, so a
+# new differing object is an ADDITIONAL fact — NOT a contradiction. add_fact
+# must not mechanically supersede these; doing so silently collapsed
+# multi-valued knowledge ("Python contains lists AND dicts", co-authors of a
+# paper, a thing born_in Ulm AND Germany at different scales). Genuine
+# contradictions on these are caught upstream by the LLM resolver
+# (check_and_resolve_contradictions), which sets valid_to BEFORE add_fact runs.
+# `related_to` is included deliberately: it is the degrade target for every
+# non-canonical predicate (see normalize_predicate), so collapsing it would
+# defeat the whole "degrade, don't orphan" design and merge unrelated facts.
+# Everything NOT listed here stays functional (single current value that a new
+# value supersedes): lives_in, capital_of, price_of, married_to, leads,
+# currency_of, version_of, successor_of/succeeded_by — residence/role/price
+# style facts whose change-over-time IS the supersession the bitemporal store
+# is built to track.
+MULTI_VALUED_PREDICATES = frozenset({
+    "is_a", "part_of", "located_in", "created_by", "used_for", "known_for",
+    "related_to", "belongs_to", "has_property", "born_in", "founded_in",
+    "spoken_in", "developed_by", "written_by", "caused_by", "contains",
+    "produces", "works_at", "employed_by", "studied_at", "member_of",
+    "invented_by",
+})
+
+# Predicates where only ONE subject may hold the relation to a given object, so
+# a new subject for the same object supersedes the prior holder (one current
+# leader per org, one capital per country). Replaces the old `_UNIQUE_PREDICATES`
+# set, which mostly listed non-canonical strings (is_ceo_of, is_president_of)
+# that normalize_predicate degrades to `related_to` — so they never matched and
+# the inverse-functional guard was effectively dead for everything but `leads`.
+INVERSE_FUNCTIONAL_PREDICATES = frozenset({"leads", "capital_of", "married_to"})
+
 _PREDICATE_ALIASES: dict[str, str] = {
     "is a": "is_a", "is an": "is_a", "type of": "is_a",
     "is part of": "part_of", "part of": "part_of",
@@ -245,6 +276,34 @@ def _is_org(name: str) -> bool:
     return name.strip().lower() in _KNOWN_ORGS
 
 
+# News-extraction noise guards (2026-06-21). Monitors extract triples from
+# formatted news digests, which leaked two junk classes into the KG:
+#   (a) a bare news-source domain as an entity ("X related_to ft.com")
+#   (b) a headline clause/fragment as an entity ("US related_to iran claim ... shut")
+# A real entity is a short noun phrase; a domain or a clause is not a durable fact.
+_BARE_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z]{2,}){1,}(/|$)")
+# Finite verbs / clause markers that signal a sentence fragment, not an entity name.
+_FRAGMENT_MARKERS = re.compile(
+    r"\b(is|are|was|were|be|been|has|have|had|will|would|claims?|said|says|"
+    r"shut|closed?|criticized|wants?|seeks?|plans?|warns?|after|amid|"
+    r"because|despite|while|when|that|which)\b"
+)
+
+
+def _looks_like_fragment(x: str) -> bool:
+    """A subject/object that reads as a sentence fragment, not an entity name.
+
+    Entity names are short noun phrases (<=5 words, no finite verb). Headline
+    clauses ('iran claim waterway is shut') are not durable facts.
+    """
+    words = x.split()
+    if len(words) > 5:
+        return True
+    if len(words) >= 3 and _FRAGMENT_MARKERS.search(x):
+        return True
+    return False
+
+
 def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     """Return True if a triple is obvious garbage that should not be stored."""
     s, o = subject.strip().lower(), object_.strip().lower()
@@ -267,6 +326,14 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     for pat in _GARBAGE_PATTERNS:
         if pat.match(s) or pat.match(o):
             return True
+
+    # News-extraction noise (source domains, headline fragments, synthesis labels)
+    if _BARE_DOMAIN_RE.match(s) or _BARE_DOMAIN_RE.match(o):
+        return True
+    if _looks_like_fragment(s) or _looks_like_fragment(o):
+        return True
+    if ":" in s and re.match(r"^[a-z0-9_]+:", s):  # "cross_pattern:..." synthesis artifact
+        return True
 
     # Predicate-direction sanity (rejects obvious reversals)
     p = predicate.strip().lower()
@@ -412,17 +479,34 @@ class KnowledgeGraph:
             try:
                 import chromadb
                 from ..config import config
-                from .embedding import get_embedding_function
+                from .embedding import open_collection
                 client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
-                _kw = {"name": "kg_facts", "metadata": {"hnsw:space": "cosine"}}
-                _ef = get_embedding_function()
-                if _ef is not None:
-                    _kw["embedding_function"] = _ef
-                self._collection = client.get_or_create_collection(**_kw)
+                self._collection = open_collection(
+                    client, "kg_facts", reindex=self._backfill_collection,
+                )
             except Exception as e:
                 logger.warning("Failed to init kg_facts ChromaDB collection: %s", e)
                 return None
         return self._collection
+
+    def _backfill_collection(self, collection) -> int:
+        """Populate `collection` from current KG facts, unconditionally.
+        Shared by reindex_kg_facts (guarded) and the embedder-rebuild path."""
+        all_rows = self._db.fetchall(
+            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
+        )
+        if not all_rows:
+            return 0
+        ids, documents, metadatas = [], [], []
+        for row in all_rows:
+            searchable = f"{row['subject']} {row['predicate'].replace('_', ' ')} {row['object']}"
+            ids.append(str(row["id"]))
+            documents.append(searchable)
+            metadatas.append({"subject": row["subject"], "predicate": row["predicate"]})
+        if ids:
+            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
+            logger.info("Reindexed %d KG facts into ChromaDB", len(ids))
+        return len(ids)
 
     def reindex_kg_facts(self) -> int:
         """One-time backfill of existing KG facts into ChromaDB. Returns count indexed."""
@@ -432,24 +516,7 @@ class KnowledgeGraph:
         if collection.count() > 0:
             logger.info("KG facts collection already has %d entries, skipping reindex", collection.count())
             return 0
-
-        all_rows = self._db.fetchall(
-            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
-        )
-        if not all_rows:
-            return 0
-
-        ids, documents, metadatas = [], [], []
-        for row in all_rows:
-            searchable = f"{row['subject']} {row['predicate'].replace('_', ' ')} {row['object']}"
-            ids.append(str(row["id"]))
-            documents.append(searchable)
-            metadatas.append({"subject": row["subject"], "predicate": row["predicate"]})
-
-        if ids:
-            collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-            logger.info("Reindexed %d KG facts into ChromaDB", len(ids))
-        return len(ids)
+        return self._backfill_collection(collection)
 
     def _add_to_vector(self, fact_id: int, subject: str, predicate: str, object_: str) -> None:
         """Add a single fact to the vector collection."""
@@ -622,23 +689,33 @@ class KnowledgeGraph:
                 return True
             return False
 
-        # Check for contradicting facts
-        conflicts = self._db.fetchall(
-            "SELECT id, object, confidence FROM kg_facts "
-            "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
-            "AND valid_to IS NULL",
-            (subject, predicate, object_),
-        )
-        _UNIQUE_PREDICATES = {"leads", "is_leader_of", "is_president_of", "is_ceo_of",
-                              "is_capital_of", "is_champion_of"}
-        if predicate in _UNIQUE_PREDICATES:
+        # Forward contradiction: a DIFFERENT object for the same subject+predicate.
+        # Only supersede when the predicate is single-valued (functional) — a
+        # person lives in one place, a coin has one current price. Multi-valued
+        # predicates (contains/member_of/has_property/...) coexist instead, so
+        # multi-valued knowledge no longer silently collapses. Genuine
+        # contradictions on multi-valued predicates are resolved upstream by the
+        # LLM resolver, which sets valid_to before we get here.
+        if predicate in MULTI_VALUED_PREDICATES:
+            conflicts: list = []
+        else:
+            conflicts = list(self._db.fetchall(
+                "SELECT id, object, confidence FROM kg_facts "
+                "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
+                "AND valid_to IS NULL",
+                (subject, predicate, object_),
+            ))
+
+        # Inverse contradiction: a DIFFERENT subject for the same object on an
+        # inverse-functional predicate (one leader per org → supersede the prior).
+        if predicate in INVERSE_FUNCTIONAL_PREDICATES:
             inverse_conflicts = self._db.fetchall(
                 "SELECT id, object, confidence FROM kg_facts "
                 "WHERE LOWER(subject) != LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
                 "AND valid_to IS NULL",
                 (subject, predicate, object_),
             )
-            conflicts = list(conflicts) + list(inverse_conflicts)
+            conflicts = conflicts + list(inverse_conflicts)
 
         # Supersede conflicting facts + insert new fact atomically
         with self._db.transaction() as tx:
@@ -656,11 +733,19 @@ class KnowledgeGraph:
             )
 
             if old_superseded:
+                # Revival of a previously-superseded triple (the UNIQUE(s,p,o)
+                # constraint forbids a second row, so we re-assert this one).
+                # superseded_at and created_at MUST reset too: a revived row is
+                # current as of NOW. Leaving a stale superseded_at made the fact
+                # vanish from every bitemporal query — `query_as_of()` with no
+                # args filters `superseded_at IS NULL`, and the recorded_at
+                # belief query filters `superseded_at > recorded_at`, so a live
+                # fact with an old supersession stamp was silently invisible.
                 tx.execute(
                     "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
-                    "superseded_by = NULL, confidence = ?, source = ?, "
-                    "provenance = ? WHERE id = ?",
-                    (fact_valid_from, confidence, source, provenance, old_superseded["id"]),
+                    "superseded_by = NULL, superseded_at = NULL, created_at = ?, "
+                    "confidence = ?, source = ?, provenance = ? WHERE id = ?",
+                    (fact_valid_from, now, confidence, source, provenance, old_superseded["id"]),
                 )
                 new_id = old_superseded["id"]
             else:
@@ -693,10 +778,10 @@ class KnowledgeGraph:
                         "UPDATE kg_facts SET superseded_by = ?, superseded_at = ? WHERE id = ?",
                         (new_id, now, conflict["id"]),
                     )
-            logger.info(
-                "KG: superseded %d fact(s) for %s/%s -> %s",
-                len(conflicts), subject, predicate, object_,
-            )
+                logger.info(
+                    "KG: superseded %d fact(s) for %s/%s -> %s",
+                    len(conflicts), subject, predicate, object_,
+                )
 
         # Add new fact to vector store for semantic search
         if new_id is not None:
@@ -1131,6 +1216,7 @@ class KnowledgeGraph:
 
         # --- Vector search (semantic similarity via ChromaDB) ---
         vector_ids: list[int] = []
+        vector_strong: set[int] = set()  # paraphrase-grade hits (may stand alone)
         collection = self._get_collection()
         if collection is not None and collection.count() > 0:
             try:
@@ -1145,11 +1231,19 @@ class KnowledgeGraph:
                     # modern embedders (bge-m3) place relevant pairs at different
                     # distances. RRF fusion is the real ranker; this is a coarse gate.
                     _MAX_DISTANCE = float(getattr(_config, "KG_VECTOR_MAX_DISTANCE", 0.8))
+                    # Strong tier: a tight gate (derived from the max, no new
+                    # config knob) for matches confident enough to drive retrieval
+                    # with no keyword/PPR support — a paraphrase has zero keyword
+                    # overlap by definition. bge-m3 places correct matches at
+                    # cosine 0.08-0.42, so 0.5 admits genuine paraphrases only.
+                    _STRONG_DISTANCE = min(_MAX_DISTANCE, 0.5)
                     distances = results.get("distances", [[]])[0]
                     for rid_str, dist in zip(results["ids"][0], distances):
                         rid = int(rid_str)
                         if rid in rows_by_id and dist < _MAX_DISTANCE:
                             vector_ids.append(rid)
+                            if dist <= _STRONG_DISTANCE:
+                                vector_strong.add(rid)
             except Exception as e:
                 logger.debug("KG vector search failed: %s", e)
 
@@ -1176,18 +1270,25 @@ class KnowledgeGraph:
                 logger.warning("[KG/PPR] graph walk failed: %s", e)
 
         # --- RRF fusion ---
-        # Require keyword matches OR PPR signal for fusion — vector-only matches
-        # are too noisy in small KGs where ChromaDB returns whatever it has
-        # regardless of relevance. PPR-only allowed because graph reachability
-        # is a strong relevance signal even without keyword overlap (HippoRAG 2).
-        if keyword_ids or ppr_ids:
+        # Fuse when there is a keyword match, a PPR (graph-reachability) signal,
+        # OR a STRONG vector hit. Weak vector matches still only re-rank — they
+        # are too noisy in small KGs where ChromaDB returns whatever it has. But
+        # a strong (tightly distance-gated) vector hit is a real paraphrase match
+        # and must be allowed to stand alone, or pure-paraphrase queries with no
+        # keyword overlap and no graph seed retrieve nothing (the documented
+        # remaining KG paraphrase-recall miss). HippoRAG-2 PPR likewise stands alone.
+        if keyword_ids or ppr_ids or vector_strong:
             fused_ids = self._rrf_fuse(keyword_ids, vector_ids, ppr_ids)
+            # When ONLY the vector arm fired, _rrf_fuse still ranks vector_ids;
+            # restrict to strong hits so a lone weak match can't leak through.
+            if not keyword_ids and not ppr_ids:
+                fused_ids = [rid for rid in fused_ids if rid in vector_strong]
             # Filter to valid IDs and take top limit
             top_ids = [rid for rid in fused_ids if rid in rows_by_id][:limit]
         elif query_words:
             # No keyword matches with overlap >= 2, no PPR seeds in graph,
-            # and no vector boost. Do NOT fall back to overlap >= 1 — single-
-            # word matches are too noisy.
+            # and no strong vector hit. Do NOT fall back to overlap >= 1 or weak
+            # vector — single-word / low-confidence matches are too noisy.
             top_ids = []
         else:
             return []
