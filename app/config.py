@@ -85,6 +85,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
     "ENABLE_RLVR_SIGNALS",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
+    "ENABLE_DEEP_RESEARCH",
     "ENABLE_STORYLINES", "ENABLE_SALIENCE_FILTER", "ENABLE_FORECASTS",
     "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
@@ -173,6 +174,10 @@ class Config:
     # Monitor Intelligence v2 (background, single-GPU cost). Storyline tracking +
     # change-detection; salience digest filtering; self-scoring forecasts. Default
     # on; flip off to cut background LLM duty without a rebuild.
+    # Deep research engine: domain monitors search wide, READ full articles, and
+    # bank cross-source-verified facts — instead of skimming RSS headlines.
+    # Heavy (background); the whole point of "monitor the world properly".
+    ENABLE_DEEP_RESEARCH: bool = field(default_factory=lambda: _env("ENABLE_DEEP_RESEARCH", "true").lower() == "true")
     ENABLE_STORYLINES: bool = field(default_factory=lambda: _env("ENABLE_STORYLINES", "true").lower() == "true")
     ENABLE_SALIENCE_FILTER: bool = field(default_factory=lambda: _env("ENABLE_SALIENCE_FILTER", "true").lower() == "true")
     ENABLE_FORECASTS: bool = field(default_factory=lambda: _env("ENABLE_FORECASTS", "true").lower() == "true")

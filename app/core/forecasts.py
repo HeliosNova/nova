@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import logging
 import re
+from urllib.parse import urlparse
 
 from app.core import llm
 
@@ -74,18 +75,90 @@ def list_due(db, limit: int = 8) -> list[dict]:
 
 
 _RESOLVE_PROMPT = (
-    "You made this forecast on {created}, due now:\n\n"
+    "You made this forecast on {created}, now due:\n\n"
     "  \"{claim}\"\n\n"
-    "Given what is known as of today, did it come true?\n"
+    "RECENT EVIDENCE (live web search run today):\n{evidence}\n\n"
+    "Judge STRICTLY from the evidence above — do NOT use prior knowledge or "
+    "assumptions about what probably happened. A 9B model's memory of recent "
+    "events is unreliable; the evidence is the only ground truth here.\n"
     "Reply JSON only: {{\"verdict\": \"hit\"|\"miss\"|\"unresolvable\", "
-    "\"reason\": \"one sentence\"}}. Use 'unresolvable' only if it genuinely "
-    "cannot be judged yet."
+    "\"reason\": \"one sentence pointing to the evidence\"}}. Use 'unresolvable' "
+    "if the evidence does not clearly settle whether the forecast came true."
 )
 
 
+async def _gather_evidence(claim: str, *, max_results: int = 8) -> str:
+    """Live web evidence for grading a forecast — recent news, falling back to
+    general results. Returns a compact titled-snippet block, or '' if nothing
+    usable (in which case the caller must NOT let the model guess). This is what
+    makes the self-scoring honest: the verdict traces to today's web, not to the
+    frozen-cutoff model's recollection of a near-future event."""
+    try:
+        from app.tools import native_search
+        results = await native_search.search(claim, max_results=max_results, mode="news")
+        if len(results) < 3:
+            results = list(results) + await native_search.search(
+                claim, max_results=max_results, mode="general")
+    except Exception as e:
+        logger.debug("[Forecast] evidence search failed: %s", e)
+        return ""
+    seen: set[str] = set()
+    lines: list[str] = []
+    for r in results:
+        url = (getattr(r, "url", "") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        title = (getattr(r, "title", "") or "").strip()
+        snippet = (getattr(r, "snippet", "") or "").strip()
+        date = (getattr(r, "published_date", "") or "").strip()
+        host = (urlparse(url).netloc or "").replace("www.", "")
+        entry = f"- {title}" + (f" ({date})" if date else "") + (f" [{host}]" if host else "")
+        if snippet:
+            entry += f": {snippet[:300]}"
+        lines.append(entry)
+        if len(lines) >= 8:
+            break
+    return "\n".join(lines)
+
+
+_MAX_RESOLVE_ATTEMPTS = 3
+
+
+def _bump_attempts(db, fc: dict) -> str:
+    """Non-terminal outcome: count the attempt; auto-retire after the cap so a
+    permanently-unparseable forecast can't re-process every cycle forever."""
+    attempts = int(fc.get("attempts", 0) or 0) + 1
+    if attempts >= _MAX_RESOLVE_ATTEMPTS:
+        try:
+            db.execute(
+                "UPDATE forecasts SET status = 'unresolvable', attempts = ?, "
+                "resolution = 'auto-retired: could not be graded', resolved_at = datetime('now') WHERE id = ?",
+                (attempts, fc["id"]),
+            )
+        except Exception:
+            pass
+        return "unresolvable"
+    try:
+        db.execute("UPDATE forecasts SET attempts = ? WHERE id = ?", (attempts, fc["id"]))
+    except Exception:
+        pass
+    return "open"
+
+
 async def resolve_one(db, fc: dict) -> str:
-    """Grade one due forecast via an LLM judgment. Returns the verdict."""
-    prompt = _RESOLVE_PROMPT.format(created=fc.get("created_at", "?"), claim=fc["claim"])
+    """Grade one due forecast against LIVE web evidence. Returns the verdict.
+
+    The grade is grounded: we web-search the claim first and force the model to
+    judge only from those results. If no evidence is found, we DEFER (count the
+    attempt) rather than let a frozen-cutoff 9B invent a verdict — an honest
+    'couldn't verify yet' beats a fabricated track record."""
+    evidence = await _gather_evidence(fc["claim"])
+    if not evidence:
+        logger.info("[Forecast] no web evidence to grade %r — deferring", fc["claim"][:80])
+        return _bump_attempts(db, fc)
+    prompt = _RESOLVE_PROMPT.format(
+        created=fc.get("created_at", "?"), claim=fc["claim"], evidence=evidence)
     try:
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": prompt}],
@@ -94,10 +167,10 @@ async def resolve_one(db, fc: dict) -> str:
         data = llm.extract_json_object(raw) if raw else {}
     except Exception as e:
         logger.warning("[Forecast] resolve LLM failed: %s", e)
-        return "open"
+        return _bump_attempts(db, fc)
     verdict = str(data.get("verdict", "")).lower().strip()
     if verdict not in ("hit", "miss", "unresolvable"):
-        return "open"  # leave open, try again next cycle
+        return _bump_attempts(db, fc)  # count it; retire if chronically ungradeable
     reason = str(data.get("reason", ""))[:300]
     try:
         db.execute(

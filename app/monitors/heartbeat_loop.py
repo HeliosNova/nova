@@ -170,7 +170,7 @@ class HeartbeatLoop:
         # per channel-group at the end of the tick — so 80 due monitors post a
         # single briefing instead of 80 interleaving messages.
         self._digest_enabled = bool(getattr(config, "ENABLE_MONITOR_DIGEST", True))
-        self._digest_buffer: list[tuple[frozenset, str, str]] = []
+        self._digest_buffer: list[tuple[frozenset, str, str, str]] = []
 
     def start(self) -> asyncio.Task:
         """Start the heartbeat loop as a background task."""
@@ -687,9 +687,11 @@ class HeartbeatLoop:
         if not getattr(config, "ENABLE_STORYLINES", True):
             return "STORYLINES | disabled (ENABLE_STORYLINES=false)"
         from app.database import get_db
+        from app.core.brain import get_services
         from app.core.storylines import track_storylines
         try:
-            return await track_storylines(get_db())
+            kg = getattr(get_services(), "kg", None)
+            return await track_storylines(get_db(), kg)
         except Exception as e:
             logger.exception("[Heartbeat] Storyline tracker failed")
             return f"STORYLINE ERROR: {e}"
@@ -2323,7 +2325,7 @@ class HeartbeatLoop:
         # Batch this cycle's alerts into one digest per channel-group (the loop
         # flushes after the tick), unless digest mode is disabled.
         if self._digest_enabled:
-            self._digest_buffer.append((frozenset(targets), monitor.name, message))
+            self._digest_buffer.append((frozenset(targets), monitor.name, message, monitor.category or ""))
             return
 
         full_message = f"[{monitor.name}]\n" + message.lstrip("\n")
@@ -2371,17 +2373,26 @@ class HeartbeatLoop:
                     logger.error("[Heartbeat] %s alert failed: %s", ch, e)
         return sent
 
-    def _format_digest(self, items: list[tuple[str, str]]) -> str:
+    def _format_digest(self, items: list[tuple[str, str]], categories: dict | None = None) -> str:
         """One message from a cycle's alerts. Single item keeps its plain form;
-        multiple get a digest with each monitor as a section, body-capped."""
+        multiple get a digest with each monitor as a section.
+
+        CONTENT briefings (the deep-research product) post in FULL — gutting a
+        ~4000-char briefing down to a preview throws away the secondary developments
+        and bottom line the engine produced, which is the whole point of the feed.
+        Only operational/system status lines get the scannable per-item cap (they're
+        short, so it rarely bites — it's just a runaway guard). The channel adapters
+        already split over-long messages, so a full briefing delivers fine.
+        `categories` maps monitor name → category; absent → cap applies to all."""
         if len(items) == 1:
             name, msg = items[0]
             return f"[{name}]\n" + msg.lstrip("\n")
+        categories = categories or {}
         cap = int(getattr(config, "MONITOR_DIGEST_ITEM_MAX_CHARS", 600))
         parts = [f"🛰 **Monitor digest — {len(items)} updates**", ""]
         for name, msg in items:
             body = (msg or "").strip()
-            if len(body) > cap:
+            if categories.get(name) != "content" and len(body) > cap:
                 body = body[:cap].rstrip() + " […]"
             parts.append(f"## {name}")
             parts.append(body)
@@ -2395,8 +2406,10 @@ class HeartbeatLoop:
         if not buf:
             return
         groups: dict[frozenset, list[tuple[str, str]]] = {}
-        for tgt, name, msg in buf:
+        cats: dict[str, str] = {}
+        for tgt, name, msg, cat in buf:
             groups.setdefault(tgt, []).append((name, msg))
+            cats[name] = cat
         for tgt, items in groups.items():
             try:
                 # Salience: lead with what matters to the owner, drop sub-floor
@@ -2408,7 +2421,7 @@ class HeartbeatLoop:
                         items = rank_digest_items(get_db(), items)
                     except Exception as e:
                         logger.warning("[Heartbeat] salience ranking skipped: %s", e)
-                digest = self._format_digest(items)
+                digest = self._format_digest(items, cats)
                 if await self._broadcast(digest, set(tgt)):
                     logger.info("[Heartbeat] digest sent: %d update(s) → %s",
                                 len(items), ",".join(sorted(tgt)))

@@ -51,6 +51,12 @@ def _common_stubs(monkeypatch):
     async def fake_adv(query, answer, **kw):
         return {"verdict": "pass", "flaws": []}
 
+    # The two pre-rewrite judges are now ONE merged call (critique_unified, 2026-06).
+    async def fake_unified(query, answer, **kw):
+        return {"pass": False, "issues": ["Date/amount unsupported by any source."],
+                "verdict": "pass", "flaws": [], "blocking_flaws": []}
+
+    monkeypatch.setattr("app.core.critique.critique_unified", fake_unified)
     monkeypatch.setattr("app.core.critique.critique_answer", fake_critique)
     monkeypatch.setattr("app.core.critique.adversarial_critique", fake_adv)
     monkeypatch.setattr("app.core.reflexion.should_use_llm_critique", lambda *a, **k: False)

@@ -105,6 +105,12 @@ _STOPWORDS = frozenset({
     # footer in domain_study_runner recur across every domain digest.
     "insight", "insights", "cross-confirmed", "recurrence", "recurring",
     "sourced", "convergence", "intelligence",
+    # deep_research.py digest scaffolding (2026-06-23): these template words
+    # surfaced as the TOP false themes ("[learned] across 45 monitors",
+    # "[overview]", "[million]") because every overview header/section uses them.
+    "learned", "overview", "domain", "briefing", "connections", "throughline",
+    "bottom", "lead", "million", "billion", "trillion", "percent", "facts",
+    "fact", "weekly", "researched", "verified", "corroborated",
 })
 
 # Match "real" content tokens: 4+ chars, lowercase letters or numbers
@@ -515,12 +521,15 @@ async def synthesize_across_monitors(
             continue
 
         # Cross-domain CAUSAL synthesis (Phase B): probe for a causal chain
-        # connecting the domains and store it as real `caused_by` entity triples.
-        # This replaces the old `cross_pattern:X recurs_across <paragraph>` write —
-        # which was meta-noise the KG garbage gate now rejects anyway. Causal
-        # entity triples are durable knowledge that passes the gate and is
-        # queryable in chat.
+        # connecting the domains and store it as real `caused_by` entity triples
+        # (durable, queryable). Replaces the old `cross_pattern:X recurs_across
+        # <paragraph>` meta-noise. Each link is run through is_garbage_triple at
+        # write time — add_fact does NOT gate, so without this an LLM-emitted
+        # fragment ("chip sales fell") could persist until daily curation.
+        from app.core.kg import is_garbage_triple
         chain = await _causal_probe(c, hours=hours)
+        chain = [lk for lk in chain
+                 if not is_garbage_triple(lk["effect"], "caused_by", lk["cause"])]
         if chain:
             arrow = " → ".join(
                 [chain[0]["cause"]] + [lk["effect"] for lk in chain]
@@ -557,11 +566,91 @@ async def synthesize_across_monitors(
     }
 
 
+_LEAD_RE = re.compile(
+    r"(?is)lead\s+develop(?:ment)?s?\s*[:*#\n]*\s*(.+?)"
+    r"(?=\n\s*(?:\*\*|#{1,3}\s|secondary|connections|bottom\s+line|━|─|📌)|\Z)")
+
+
+def _extract_lead(text: str) -> str:
+    """Pull a monitor digest's actual LEAD story, stripping header/scaffold lines.
+    This is what makes cross-synthesis work — clustering on the raw digest picks up
+    template words ('overview', 'learned'); the lead is the real content."""
+    if not text:
+        return ""
+    m = _LEAD_RE.search(text)
+    if m:
+        lead = m.group(1)
+    else:
+        # fallback: first substantive prose lines (skip headers/source/footer lines)
+        good = []
+        for ln in text.split("\n"):
+            s = ln.strip()
+            low = s.lower()
+            if (not s or s.startswith(("#", "_", "##", "**`", "↳", "📌", "━", "─", "💡", "🌐"))
+                    or "domain overview" in low or low.startswith("read ") or "sources:" in low):
+                continue
+            good.append(s)
+            if len(" ".join(good)) > 400:
+                break
+        lead = " ".join(good)
+    return re.sub(r"\s+", " ", lead).strip()[:520]
+
+
+async def meta_synthesis(db, *, hours: int = 36) -> str:
+    """TODAY'S BIG PICTURE — one narrative pass over every monitor's lead story to
+    surface the 2-3 threads that span MULTIPLE domains (the meta-story a per-domain
+    digest can't see). Operates on the leads, not raw digests, so it can't be fooled
+    by template words. This is the user-facing cross-domain intelligence."""
+    from app.core.llm import invoke_nothink
+    grouped = _gather_recent_outputs(db, hours=hours, max_per_monitor=1)
+    leads = []
+    for name, vals in grouped.items():
+        lead = _extract_lead(vals[0]) if vals else ""
+        if lead and len(lead) > 60:
+            label = name.replace("Domain Study:", "").strip()
+            leads.append((label, lead))
+    if len(leads) < 4:
+        return ""
+    blob = "\n\n".join(f"[{lbl}] {ld}" for lbl, ld in leads)[:13000]
+    try:
+        out = await invoke_nothink([{"role": "user", "content":
+            f"Below are today's LEAD developments from {len(leads)} domain-intelligence monitors "
+            "(each tagged with its domain).\n"
+            "Find the 2-3 dominant THREADS that connect MULTIPLE domains — a single force or event "
+            "driving stories across several monitors (e.g. one geopolitical event moving energy, "
+            "markets, trade, and inflation at once). For EACH thread write a tight paragraph: name the "
+            "thread, the domains it spans (in [brackets]), and why it matters. Lead with the single "
+            "biggest cross-cutting thread. IGNORE stories confined to one domain. Use ONLY what's in "
+            "the leads — invent nothing. No preamble, no restating the list.\n\n"
+            f"LEADS:\n{blob}"}],
+            max_tokens=750, temperature=0.3, num_ctx=8192)
+        out = (out or "").strip()
+    except Exception as e:
+        logger.warning("[MetaSynthesis] failed: %s", e)
+        return ""
+    if len(out) < 100:
+        return ""
+    from datetime import datetime, timezone
+    today = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    return (f"## 🧭 **TODAY'S BIG PICTURE** · {today}\n"
+            f"_threads connecting {len(leads)} monitors_\n\n{out}")
+
+
 async def synthesize_and_log(db, kg) -> str:
-    """Monitor-friendly wrapper — returns the summary string only."""
+    """Monitor-friendly wrapper. Leads with the narrative TODAY'S BIG PICTURE
+    (user-facing), then still runs the causal cluster pass to bank `caused_by`
+    KG facts in the background."""
+    big_picture = ""
+    try:
+        big_picture = await meta_synthesis(db)
+    except Exception:
+        logger.exception("meta_synthesis failed")
     try:
         result = await synthesize_across_monitors(db, kg)
-        return result["summary"]
+        causal = result["summary"]
     except Exception as e:
         logger.exception("synthesize_across_monitors failed")
-        return f"CROSS-SYNTHESIS ERROR: {e}"
+        causal = f"CROSS-SYNTHESIS ERROR: {e}"
+    if big_picture:
+        return big_picture + "\n\n---\n" + causal
+    return causal

@@ -156,3 +156,30 @@ class TestRevivalBitemporalIntegrity:
         # "What did we believe on 2026-03-15?" must include the revived paris.
         belief = kg.query_as_of("alice", recorded_at="2026-03-15 00:00:00")
         assert {r["object"].lower() for r in belief} == {"paris"}
+
+
+class TestHasStatusFunctional:
+    """`has_status` (added 2026-06-24 for storyline state-change detection) is
+    FUNCTIONAL — a new value supersedes the old, so a thing has one current status
+    and `get_fact_history` keeps the queryable trail the storyline tracker reads."""
+
+    @pytest.mark.asyncio
+    async def test_has_status_supersedes_keeping_trail(self, db):
+        kg = KnowledgeGraph(db)
+        await kg.add_fact("hormuz crisis", "has_status", "talks ongoing", source="storyline")
+        await kg.add_fact("hormuz crisis", "has_status", "ceasefire holding", source="storyline")
+
+        hist = kg.get_fact_history("hormuz crisis", "has_status")
+        current = [h for h in hist if h["valid_to"] is None]
+        assert len(current) == 1, current
+        assert current[0]["object"].lower() == "ceasefire holding"
+        # prior value retained (superseded, not deleted) → the trail is queryable
+        assert any(h["object"].lower() == "talks ongoing" for h in hist)
+
+    @pytest.mark.asyncio
+    async def test_has_status_not_multivalued(self):
+        # Guard the predicate config itself: has_status must be canonical AND
+        # functional (NOT in MULTI_VALUED) or supersession silently stops working.
+        assert "has_status" in kg_module.CANONICAL_PREDICATES
+        assert "has_status" not in kg_module.MULTI_VALUED_PREDICATES
+        assert kg_module.normalize_predicate("status of") == "has_status"

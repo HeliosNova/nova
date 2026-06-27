@@ -989,6 +989,22 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 24: forecasts.attempts (prevent infinite-retry starvation) ---
+        # A permanently-unparseable forecast stayed 'open' and was re-selected by
+        # list_due every cycle forever; >=8 such rows starved the queue. Track
+        # attempts so they auto-retire to 'unresolvable'.
+        if 24 not in applied:
+            conn.execute("BEGIN")
+            try:
+                fc_cols = {row[1] for row in conn.execute("PRAGMA table_info(forecasts)").fetchall()}
+                if "attempts" not in fc_cols:
+                    conn.execute("ALTER TABLE forecasts ADD COLUMN attempts INTEGER DEFAULT 0")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (24,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

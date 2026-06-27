@@ -3,7 +3,9 @@
 The `goals` table holds desired outcomes (seeded by Phase-0 migration or derived
 at runtime). `GoalStore` manages CRUD. `execute_goal()` pulls a goal, passes its
 text through `brain.think()`, and logs the outcome. `derive_goals_from_state()`
-mints new goals from system state (stub for now).
+is a thin sync shim over `goal_deriver.derive_goals()` — the real implementation
+(capability-gap clusters, curiosity, failing skills, trust regressions). The
+production path awaits `derive_goals(db)` directly from the heartbeat loop.
 
 The daemon orchestrator picks a pending goal each tick (see daemon.py
 `pursue_goal` action) and calls `execute_goal`. Output lands in `daemon_log`
@@ -18,6 +20,10 @@ from dataclasses import dataclass
 from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+# Strong refs to fire-and-forget derivation tasks so the event loop can't GC them
+# mid-flight (see derive_goals_from_state running-loop branch).
+_PENDING_DERIVATIONS: set = set()
 
 
 @dataclass
@@ -148,9 +154,13 @@ def derive_goals_from_state(db, services) -> list[dict]:
         except RuntimeError:
             loop = None
         if loop and loop.is_running():
-            # Cannot block in a running loop — schedule and return what we have
+            # Cannot block in a running loop. Schedule the async derivation and keep
+            # a strong reference so it isn't garbage-collected mid-flight (asyncio
+            # holds only a weak ref to bare tasks). Async callers should await
+            # goal_deriver.derive_goals(db) directly rather than this sync shim.
             task = asyncio.ensure_future(derive_goals(db))
-            # Best-effort wait briefly; if it doesn't complete, return empty
+            _PENDING_DERIVATIONS.add(task)
+            task.add_done_callback(_PENDING_DERIVATIONS.discard)
             return []
         return asyncio.run(derive_goals(db))
     except Exception as e:

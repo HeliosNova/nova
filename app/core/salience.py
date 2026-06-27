@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import logging
 import re
+import statistics
 
 logger = logging.getLogger(__name__)
 
@@ -57,14 +58,26 @@ def _learned_weights(db) -> dict[str, float]:
     return {r["topic"]: float(r["weight"] or 0.0) for r in rows}
 
 
-def score_text(db, text: str, *, monitors: str = "") -> float:
-    """Return a 0..1 salience score. Higher = more likely to matter to the owner."""
+def score_text(db, text: str, *, owner: dict | None = None,
+               learned: dict | None = None) -> float:
+    """Return a 0..1 salience score. Higher = more likely to matter to the owner.
+
+    `owner`/`learned` may be precomputed (see rank_digest_items) to avoid a SQL
+    read per item; if None they're fetched. A genuinely irrelevant item (no owner
+    interest, no corroboration) scores LOW so it can fall below the drop floor —
+    the previous version floored everything at 0.4 == the drop threshold, making
+    the noise-drop inert.
+    """
     toks = _tokens(text)
     if not toks:
-        return 0.3
+        return 0.2
+
+    if owner is None:
+        owner = _owner_topics(db)
+    if learned is None:
+        learned = _learned_weights(db)
 
     # 1) Owner-interest: fraction of this item's tokens the owner queries about.
-    owner = _owner_topics(db)
     if owner:
         hits = sum(owner[t] for t in toks if t in owner)
         max_possible = max(owner.values()) * 3  # normalize against a few strong hits
@@ -76,19 +89,20 @@ def score_text(db, text: str, *, monitors: str = "") -> float:
     m = re.search(r"(\d+)\s*outlets?", (text or "").lower())
     corrob = min(1.0, (int(m.group(1)) / 8.0)) if m else 0.0
 
-    # 3) Learned weight: max over matching topics, squashed to 0..1.
-    learned = _learned_weights(db)
-    lw = 0.0
+    # 3) Learned weight: best matching topic weight, squashed to 0..1 (0.5 neutral).
+    lw = 0.5
     if learned:
         best = max((learned.get(t, 0.0) for t in toks), default=0.0)
-        lw = max(0.0, min(1.0, 0.5 + best / 4.0))  # 0 weight → 0.5 neutral
+        lw = max(0.0, min(1.0, 0.5 + best / 4.0))
 
-    # Weighted blend. Owner interest dominates; corroboration + learning refine.
-    # Cold-start (no owner/learned signal) lands near 0.4–0.5 so nothing is
-    # wrongly dropped before Nova has learned anything.
-    score = 0.5 * interest + 0.3 * corrob + 0.2 * (lw if learned else 0.5)
-    base = 0.4  # floor so a brand-new system doesn't nuke its own digest
-    return round(max(base, min(1.0, base + score)), 3) if (owner or learned) else round(0.45 + 0.3 * corrob, 3)
+    # COLD START (no owner queries AND no learned weights): we know nothing about
+    # what matters, so don't drop anything — score mid/high, corroboration only.
+    if not owner and not learned:
+        return round(0.5 + 0.3 * corrob, 3)
+
+    # Informed: convex blend in [0,1]; low items CAN fall below the drop floor.
+    score = 0.5 * interest + 0.3 * corrob + 0.2 * lw
+    return round(min(1.0, score), 3)
 
 
 def learn_from_rating(db, text: str, rating: int) -> None:
@@ -112,15 +126,28 @@ def learn_from_rating(db, text: str, rating: int) -> None:
         logger.warning("[Salience] learn_from_rating failed: %s", e)
 
 
-def rank_digest_items(db, items: list[tuple[str, str]], *, floor: float = 0.4) -> list[tuple[str, str]]:
-    """Order digest items by salience (high first); drop sub-floor items only when
-    the digest is large enough that dropping won't blank it."""
+def rank_digest_items(db, items: list[tuple[str, str]], *, floor: float = 0.15) -> list[tuple[str, str]]:
+    """Order digest items by salience (high first) and drop the genuinely weak tail.
+
+    The cut is RELATIVE to this digest's own score distribution (below mean − 0.75σ),
+    not an absolute threshold. The convex blend in `score_text` isn't calibrated to a
+    fixed scale across digests, so an absolute floor either dropped nothing or — as in
+    practice — dropped everything and collapsed to a blind top-half. A distribution-
+    relative cut trims the real tail while always leading with the strongest signal.
+    `floor` remains only as a hard noise backstop for near-zero-signal items.
+    """
     if len(items) <= 2:
         return items  # never thin out a tiny digest
-    scored = [(name, msg, score_text(db, msg, monitors=name)) for name, msg in items]
+    # Hoist the owner/learned reads ONCE (was 2 SQL reads per item before).
+    owner, learned = _owner_topics(db), _learned_weights(db)
+    scored = [(name, msg, score_text(db, msg, owner=owner, learned=learned)) for name, msg in items]
     scored.sort(key=lambda x: x[2], reverse=True)
-    kept = [(n, m) for n, m, s in scored if s >= floor]
-    # Always keep at least the top half so a harsh floor can't gut the briefing.
-    if len(kept) < max(2, len(items) // 2):
-        kept = [(n, m) for n, m, s in scored[: max(2, len(items) // 2)]]
+    scores = [s for _, _, s in scored]
+    mean, std = statistics.fmean(scores), statistics.pstdev(scores)
+    cut = max(floor, mean - 0.75 * std)
+    kept = [(n, m) for n, m, s in scored if s >= cut]
+    # Always keep at least the top half so a harsh cut can't gut the briefing.
+    keep_min = max(2, len(items) // 2)
+    if len(kept) < keep_min:
+        kept = [(n, m) for n, m, s in scored[:keep_min]]
     return kept

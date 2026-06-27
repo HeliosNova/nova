@@ -1190,12 +1190,13 @@ class TestHeartbeatSeedCount:
         assert monitor.schedule_seconds == 86400
 
     def test_seed_count_includes_eval(self, db):
-        """Total seeded monitors = 69 (61 catalog + 3 system + 4 loop closers + 1 added later)."""
+        """Total seeded monitors = 72 (61 catalog + 3 system + 4 loop closers + 1
+        added later + 3 v2: Source Health, Storyline Tracker, Forecast Resolution)."""
         from app.monitors.heartbeat import MonitorStore
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 69
+        assert len(all_monitors) == 72
 
 
 class TestMemoryLearningEval:

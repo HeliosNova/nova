@@ -275,9 +275,18 @@ class BrowserTool(BaseTool):
                 cdp_url = None  # Fall through to headless launch below
 
         if cdp_url:
-            BrowserTool._browser = await BrowserTool._playwright.chromium.connect_over_cdp(ws_url)
-            logger.info("[Browser] Connected to host browser at %s", cdp_url)
-        else:
+            # Spoof Host: localhost on the WS handshake too — modern Chromium (149)
+            # rejects a non-localhost Host on the devtools WebSocket (DNS-rebinding
+            # guard), which 500s the connect even though /json/version succeeded.
+            # Any CDP failure must fall back to headless, never break browser fetches.
+            try:
+                BrowserTool._browser = await BrowserTool._playwright.chromium.connect_over_cdp(
+                    ws_url, headers={"Host": "localhost"})
+                logger.info("[Browser] Connected to host browser at %s", cdp_url)
+            except Exception as e:
+                logger.warning("[Browser] CDP connect failed (%s) — launching headless", e)
+                cdp_url = None
+        if not cdp_url:
             BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],

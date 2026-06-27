@@ -455,6 +455,24 @@ class TestGarbageTripleFilter:
         assert is_garbage_triple("tsmc", "located_in", "taiwan") is False
         assert is_garbage_triple("san francisco", "located_in", "california") is False
 
+    def test_dotted_tech_entities_not_rejected_as_domains(self):
+        # Regression (2026-06-21 review): the domain gate was nuking dotted tech
+        # entities our AI/dev monitors extract — and curation was deleting them.
+        for ent in ("node.js", "next.js", "vue.js", "socket.io", "asp.net",
+                    "x.ai", "character.ai", "perplexity.ai"):
+            assert is_garbage_triple(ent, "related_to", "javascript") is False, ent
+            assert is_garbage_triple("express", "related_to", ent) is False, ent
+        # but real news-source domains are still rejected
+        assert is_garbage_triple("apple", "related_to", "ft.com") is True
+        assert is_garbage_triple("apple", "related_to", "bbc.com") is True
+
+    def test_multiword_entities_with_prepositions_pass(self):
+        # Narrowed fragment markers must not reject legit names containing
+        # after/will/with (not finite verbs in context).
+        assert is_garbage_triple("the day after tomorrow", "is_a", "film") is False
+        assert is_garbage_triple("last will and testament", "is_a", "document") is False
+        assert is_garbage_triple("bank of england", "located_in", "london") is False
+
 
 # ===========================================================================
 # Contradiction Detection

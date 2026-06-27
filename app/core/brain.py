@@ -457,6 +457,25 @@ from app.core.brain_routing import (  # noqa: E402,F401
 )
 
 
+# When claim-validation strips a non-empty answer down to nothing — the
+# fully-unsupported case it exists to catch — DON'T emit a silent blank turn.
+_VALIDATION_BLANKED_MSG = (
+    "I can't give a verified answer here — the specifics I'd otherwise state aren't "
+    "supported by my sources, and I won't guess at them. If you can point me to a "
+    "source or rephrase, I'll take another pass."
+)
+
+
+def _guard_validated_content(pre_validate: str, validated: str) -> str:
+    """If claim-validation reduced a non-empty answer to empty/whitespace, return an
+    explicit can't-verify message instead of nothing. A blank `validated` otherwise
+    emits zero tokens AND persists an empty assistant message to history — a silent
+    failure on exactly the hallucination case the validator is meant to handle."""
+    if (pre_validate or "").strip() and not (validated or "").strip():
+        return _VALIDATION_BLANKED_MSG
+    return validated
+
+
 
 
 # ---------------------------------------------------------------------------
@@ -3250,6 +3269,7 @@ async def _run_multi_agent_path(
         final_content, stripped_reasons = validate_claims(
             final_content, evidence, current_model_tag=config.LLM_MODEL,
         )
+        final_content = _guard_validated_content(_pre_validate_content, final_content)
         if stripped_reasons:
             for r in stripped_reasons:
                 logger.warning("[claim-validator-multi-agent] %s", r)
@@ -3698,6 +3718,8 @@ async def think(
                 final_content, stripped_reasons = validate_claims(
                     final_content, evidence, current_model_tag=config.LLM_MODEL,
                 )
+                final_content = _guard_validated_content(
+                    _pre_validate_content_ephemeral, final_content)
                 if stripped_reasons:
                     for r in stripped_reasons:
                         logger.warning("[claim-validator-ephemeral] %s", r)
@@ -3777,6 +3799,7 @@ async def think(
             final_content, stripped_reasons = validate_claims(
                 final_content, evidence, current_model_tag=config.LLM_MODEL,
             )
+            final_content = _guard_validated_content(_pre_validate_content_main, final_content)
             if stripped_reasons:
                 for r in stripped_reasons:
                     logger.warning("[claim-validator] %s", r)

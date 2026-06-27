@@ -100,6 +100,21 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.a.dj.com/rss/RSSMarketsMain.xml",
     ],
     "geopolitics": [
+        # http-friendly, server-rendered sources lead — BBC/AlJazeera are JS-shells
+        # that fail the article-body fetch, so we anchor on readable outlets.
+        # DW World + Atlantic Council are high-volume, server-rendered, and read
+        # cleanly via http (verified) — they lift Geopolitics' readable yield.
+        "https://www.theguardian.com/world/rss",
+        "https://rss.dw.com/xml/rss-en-world",
+        "https://www.atlanticcouncil.org/feed/",
+        # High-volume, browser-readable (Cloudflare-gated) defense/geopolitics —
+        # verified render OK; they fill the breaking-news gap the analysis sites
+        # miss. (19FortyFive deliberately excluded — it mixes in evergreen
+        # military-history explainers that read as filler in a current digest.)
+        "https://www.defenseone.com/rss/all/",
+        "https://balkaninsight.com/feed/",
+        "https://www.al-monitor.com/rss",
+        "https://theconversation.com/global/articles.atom",
         "https://feeds.bbci.co.uk/news/world/rss.xml",
         "https://foreignpolicy.com/feed/",
         "https://www.justsecurity.org/feed/",
@@ -161,14 +176,24 @@ _FEEDS: dict[str, list[str]] = {
         "https://insideclimatenews.org/feed/",
         "https://www.carbonbrief.org/feed/",
         "https://cleantechnica.com/feed/",
+        # verified parse+read 2026-06-23 — high-volume, server-rendered
+        "https://www.canarymedia.com/articles.rss",
+        "https://www.pv-magazine.com/feed/",
     ],
     "semiconductors": [
         "https://semiengineering.com/feed/",
         "https://www.eetimes.com/feed/",
-        "https://www.tomshardware.com/feeds/all",        "https://www.semiconductor-digest.com/feed/",
+        "https://www.tomshardware.com/feeds/all",
+        "https://www.semiconductor-digest.com/feed/",
+        # verified parse+read 2026-06-23 (browser-readable, high-volume)
+        "https://wccftech.com/feed/",
+        "https://www.datacenterdynamics.com/en/rss/",
     ],
     "robotics and autonomy": [
-        "https://www.therobotreport.com/feed/",        "https://www.therobotreport.com/category/news/feed/",
+        "https://www.therobotreport.com/feed/",
+        "https://spectrum.ieee.org/feeds/topic/robotics.rss",
+        "https://techcrunch.com/tag/robotics/feed/",
+        "https://www.therobotreport.com/category/news/feed/",
     ],
     "biotech and genetics": [
         "https://www.fiercebiotech.com/rss/xml",
@@ -217,11 +242,14 @@ _FEEDS: dict[str, list[str]] = {
         "http://export.arxiv.org/rss/math",
     ],
     "economics and markets": [
+        # http-friendly leads (Economist/Bloomberg/FT below are paywalled shells).
+        "https://www.cnbc.com/id/20910258/device/rss/rss.html",  # CNBC Economy
+        "https://www.theguardian.com/business/economics/rss",
+        "https://www.federalreserve.gov/feeds/press_all.xml",
         "https://www.economist.com/finance-and-economics/rss.xml",
         "https://feeds.bloomberg.com/economics/news.rss",
-        "https://www.federalreserve.gov/feeds/press_all.xml",
         "https://www.ft.com/economics?format=rss",
-        "https://www.theguardian.com/business/economics/rss",    ],
+    ],
     "whale watch": [
         "https://cryptoslate.com/feed/",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
@@ -237,9 +265,10 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.fool.com/feeds/index.aspx",
     ],
     "sec insider trading": [
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&output=atom",
+        # owner=only returns actual Form 4 INSIDER trades; the bare type=4 feed
+        # ignores the filter and returns generic 424B2 prospectuses (verified).
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb=&owner=only&count=40&output=atom",
         "https://www.sec.gov/news/pressreleases.rss",
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=8-K&output=atom",
     ],
     "fomc and fed watch": [
         "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -252,7 +281,10 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.statnews.com/category/biotech/feed/",
     ],
     "government contract awards": [
-        "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400",        "https://www.gao.gov/rss/reports.xml",
+        "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400",
+        "https://fedscoop.com/feed/",
+        "https://federalnewsnetwork.com/feed/",
+        "https://www.gao.gov/rss/reports.xml",
     ],
     "hacker news top stories": [
         "https://news.ycombinator.com/rss",
@@ -266,7 +298,9 @@ _FEEDS: dict[str, list[str]] = {
         "https://github.com/advisories.atom",
         "https://www.cisa.gov/cybersecurity-advisories/all.xml",    ],
     "github stargazer counts": [
-        "https://github.com/trending.atom",
+        # GitHub killed its official trending.atom (returns empty); this
+        # community-maintained feed gives the actual daily trending repos.
+        "https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml",
         "https://github.blog/feed/",
     ],
     "morning check-in": [
@@ -280,6 +314,9 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.politico.com/rss/politicopicks.xml",
         "https://www.axios.com/feeds/feed.rss",
         "https://thehill.com/feed/",
+        # verified parse+read 2026-06-23 — Congress + federal-gov, high-volume
+        "https://rollcall.com/feed/",
+        "https://federalnewsnetwork.com/feed/",
         # Right + libertarian sources balance the center-establishment lean above
         # (bias audit 2026-06-21) — span the spectrum, not one side.
         "https://www.nationalreview.com/feed/",
@@ -304,9 +341,12 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
     ],
     "middle east": [
-        "https://www.aljazeera.com/xml/rss/all.xml",
-        "https://www.middleeastmonitor.com/feed/",
+        # Lead with http-friendly outlets; AlJazeera is a JS shell for body reads.
         "https://www.timesofisrael.com/feed/",
+        "https://www.al-monitor.com/rss",
+        "https://www.middleeastmonitor.com/feed/",
+        "https://www.theguardian.com/world/middleeast/rss",
+        "https://www.aljazeera.com/xml/rss/all.xml",
     ],
     "china tech and economy": [
         "https://technode.com/feed/",
@@ -326,9 +366,15 @@ _FEEDS: dict[str, list[str]] = {
         "https://rss.dw.com/xml/rss-en-eu",
     ],
     "india": [
+        # Verified parse+read via the engine (2026-06-23). The indiatimes family
+        # (TOI, Economic Times) + News18 + Moneycontrol are server-rendered and
+        # read cleanly; the old business-standard feed is dead and indianexpress
+        # is bot-gated, so they were dropped.
+        "https://timesofindia.indiatimes.com/rssfeedstopstories.cms",
+        "https://economictimes.indiatimes.com/rssfeedstopstories.cms",
+        "https://www.news18.com/rss/india.xml",
+        "https://www.moneycontrol.com/rss/latestnews.xml",
         "https://www.thehindu.com/news/feeder/default.rss",
-        "https://www.business-standard.com/rss/latest.rss",
-        "https://indianexpress.com/section/india/feed/",       # thin domain — broaden
         "https://feeds.feedburner.com/ndtvnews-india-news",
     ],
     "africa and emerging markets": [
@@ -338,29 +384,43 @@ _FEEDS: dict[str, list[str]] = {
     ],
     "latin america": [
         "https://restofworld.org/feed/",
-        "https://riotimesonline.com/feed/",    ],
+        "https://en.mercopress.com/rss",
+        "https://www.batimes.com.ar/feed",
+        "https://riotimesonline.com/feed/",
+    ],
     "supply chain and trade": [
         "https://www.supplychaindive.com/feeds/news/",
         "https://www.freightwaves.com/news/feed",
+        "https://theloadstar.com/feed/",
+        "https://www.supplychainbrain.com/rss/articles",
     ],
     "research frontiers": [
         "http://export.arxiv.org/rss/cs.AI",
         "http://export.arxiv.org/rss/cs.LG",
         "https://www.nature.com/nature.rss",
+        "https://www.quantamagazine.org/feed/",   # browser-verified 2026-06-24
     ],
     "defense and military tech": [
         "https://breakingdefense.com/feed/",
         "https://www.defensenews.com/arc/outboundfeeds/rss/",
         "https://www.twz.com/feed",            # The War Zone (current home of thedrive)
         "https://www.aspistrategist.org.au/feed/",
+        # verified parse+read 2026-06-23 — high-volume defense news
+        "https://www.defenseone.com/rss/all/",
+        "https://www.militarytimes.com/arc/outboundfeeds/rss/",
     ],
     "defi and protocols": [
         "https://thedefiant.io/feed",
+        "https://www.theblock.co/rss.xml",
+        "https://blockworks.co/feed",
         "https://www.coindesk.com/arc/outboundfeeds/rss/",
     ],
     "commodities and forex": [
         "https://oilprice.com/rss/main",
-        "https://www.fxstreet.com/rss/news",    ],
+        "https://www.mining.com/feed/",
+        "https://www.investing.com/rss/commodities.rss",
+        "https://www.fxstreet.com/rss/news",
+    ],
 }
 
 
@@ -759,11 +819,21 @@ async def _fetch_one_feed(url: str, *, max_items: int = 8) -> list[FeedItem]:
 
     # RSS 2.0: <rss><channel><item>...
     # Atom: <feed><entry>...
-    # Walk children looking for items/entries
+    # Walk children looking for items/entries. Track the feed-level date (channel
+    # pubDate/lastBuildDate, seen before any item) as a fallback for items that
+    # omit their own date — some valid feeds (e.g. the GitHub trending RSS) only
+    # date the channel; skipping those dateless items loses the whole feed.
+    feed_date = None
+    seen_item = False
     for elem in root.iter():
         tag = _strip_xmlns(elem.tag).lower()
         if tag not in ("item", "entry"):
+            if not seen_item and tag in ("lastbuilddate", "pubdate", "updated", "date"):
+                d = _parse_date((elem.text or "").strip())
+                if d:
+                    feed_date = d
             continue
+        seen_item = True
         title = ""
         link = ""
         summary = ""
@@ -781,7 +851,7 @@ async def _fetch_one_feed(url: str, *, max_items: int = 8) -> list[FeedItem]:
                 pub_raw = (child.text or "").strip()
         if not title or not link:
             continue
-        pub = _parse_date(pub_raw)
+        pub = _parse_date(pub_raw) or feed_date
         if not pub:
             continue
         items.append(FeedItem(

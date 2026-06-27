@@ -49,7 +49,7 @@ CANONICAL_PREDICATES = frozenset({
     "contains", "produces", "leads",
     "works_at", "employed_by", "lives_in", "studied_at",
     "married_to", "member_of", "invented_by", "successor_of",
-    "succeeded_by", "price_of", "version_of",
+    "succeeded_by", "price_of", "version_of", "has_status",
 })
 
 # Predicates where a subject legitimately holds MANY simultaneous objects, so a
@@ -114,6 +114,8 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "successor of": "successor_of", "succeeded by": "succeeded_by", "replaced by": "succeeded_by",
     "price of": "price_of", "cost of": "price_of", "costs": "price_of",
     "version of": "version_of", "variant of": "version_of",
+    "has status": "has_status", "status of": "has_status", "status": "has_status",
+    "current status": "has_status", "state of": "has_status",
 }
 
 
@@ -281,12 +283,22 @@ def _is_org(name: str) -> bool:
 #   (a) a bare news-source domain as an entity ("X related_to ft.com")
 #   (b) a headline clause/fragment as an entity ("US related_to iran claim ... shut")
 # A real entity is a short noun phrase; a domain or a clause is not a durable fact.
-_BARE_DOMAIN_RE = re.compile(r"^[a-z0-9][a-z0-9-]*(\.[a-z]{2,}){1,}(/|$)")
-# Finite verbs / clause markers that signal a sentence fragment, not an entity name.
+# Match a bare news/source domain ONLY on news-style TLDs. Critically this must
+# NOT catch dotted TECH entities (node.js, next.js, socket.io, asp.net, x.ai,
+# character.ai) — those are real entities our AI/dev/semiconductor monitors
+# extract, and the gate also runs in daily curation which would RETROACTIVELY
+# delete them. So .js/.io/.ai/.net are deliberately excluded from the TLD set.
+_BARE_DOMAIN_RE = re.compile(
+    r"^[a-z0-9][a-z0-9-]*(\.[a-z]{2,})*\.(com|org|co|news|info|gov|edu|press|uk)(/|$)"
+)
+# Genuine finite verbs that signal a sentence fragment, not an entity name.
+# Deliberately NARROW: conjunctions/prepositions (after, amid, while, that, which)
+# were rejecting legitimate multi-word entities ("The Day After Tomorrow"), and
+# ambiguous noun-verbs (will, plans, seeks, wants) reject names ("Last Will and
+# Testament"). Keep only words that are almost always finite verbs in context.
 _FRAGMENT_MARKERS = re.compile(
-    r"\b(is|are|was|were|be|been|has|have|had|will|would|claims?|said|says|"
-    r"shut|closed?|criticized|wants?|seeks?|plans?|warns?|after|amid|"
-    r"because|despite|while|when|that|which)\b"
+    r"\b(is|are|was|were|been|has|have|had|claims?|claimed|said|says|"
+    r"announced|reported|criticized|shut|closed)\b"
 )
 
 
@@ -921,7 +933,10 @@ class KnowledgeGraph:
                 keep = str(obj.get("keep", "both")).upper()
                 decisions.append((conflict, keep))
             except Exception as e:
-                logger.debug("KG contradiction check failed (allowing both): %s", e)
+                # Unresolved → both values stay live. For a FUNCTIONAL predicate
+                # that's a silent current-state contradiction, so surface it (was
+                # DEBUG-only, invisible to the operator).
+                logger.warning("KG contradiction check failed (allowing both): %s", e)
 
         # Phase 3: Re-read and write under lock — verify data hasn't gone stale
         def _sync_resolve() -> bool | None:

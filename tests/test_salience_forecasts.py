@@ -48,6 +48,30 @@ def test_rank_keeps_small_digest_intact(db):
     assert salience.rank_digest_items(db, items) == items  # never thin a tiny digest
 
 
+def test_irrelevant_item_can_be_dropped(db):
+    # Regression (2026-06-21 review): the drop-floor was inert (base==floor).
+    # With owner signal present, a truly-irrelevant item must score BELOW floor.
+    _seed_topics(db)
+    db.execute("INSERT INTO topic_frequency (topic, query_count) VALUES ('nvidia gpus', 9)")
+    s = salience.score_text(db, "Council debates downtown parking permits and zoning rules.")
+    assert s < 0.4, f"irrelevant item should fall below drop floor, got {s}"
+    # and a digest with clear noise actually drops something
+    items = [("AI", "NVIDIA GPU roadmap update. Confirmed by 9 outlets."),
+             ("AI2", "New NVIDIA datacenter GPUs announced for AI training."),
+             ("Noise", "Council debates downtown parking permits and zoning rules."),
+             ("Noise2", "Mild weather expected across the region this weekend.")]
+    kept = salience.rank_digest_items(db, items)
+    assert len(kept) < len(items)  # noise dropped
+
+
+def test_cold_start_drops_nothing(db):
+    # No owner queries AND no learned weights → don't gut the digest.
+    items = [("A", "alpha item one with content here"),
+             ("B", "beta item two with content here"),
+             ("C", "gamma item three with content here")]
+    assert len(salience.rank_digest_items(db, items)) == len(items)
+
+
 def test_rank_orders_by_salience(db):
     _seed_topics(db)
     db.execute("INSERT INTO topic_frequency (topic, query_count) VALUES ('bitcoin', 9)")
@@ -87,11 +111,31 @@ def test_no_forecast_line_returns_none(db):
 
 
 @pytest.mark.asyncio
+async def test_unparseable_forecast_auto_retires(db):
+    # Regression (2026-06-21 review): a forecast the LLM never grades must not
+    # re-process forever — it auto-retires to 'unresolvable' after N attempts.
+    fid = forecasts.create_forecast(db, "Some vague claim that cannot be judged.", days=1, confidence=0.5)
+    db.execute("UPDATE forecasts SET resolves_at = datetime('now','-1 hour') WHERE id=?", (fid,))
+    # LLM always returns an invalid verdict → non-terminal each time. Evidence is
+    # stubbed present so grading is reached (resolution is web-grounded now).
+    with patch("app.core.forecasts._gather_evidence", AsyncMock(return_value="- headline [news.com]")), \
+         patch("app.core.forecasts.llm.invoke_nothink", AsyncMock(return_value='{"verdict":"maybe"}')), \
+         patch("app.core.forecasts.llm.extract_json_object", return_value={"verdict": "maybe"}):
+        for _ in range(3):
+            await forecasts.resolve_due(db)
+    row = db.fetchone("SELECT status, attempts FROM forecasts WHERE id=?", (fid,))
+    assert row["status"] == "unresolvable" and row["attempts"] >= 3
+    assert forecasts.list_due(db) == []  # no longer re-selected → no starvation
+
+
+@pytest.mark.asyncio
 async def test_resolve_grades_hit_and_updates_accuracy(db):
     fid = forecasts.create_forecast(db, "X will happen within a week.", days=1, confidence=0.7)
     db.execute("UPDATE forecasts SET resolves_at = datetime('now','-1 hour') WHERE id=?", (fid,))
     verdict_json = '{"verdict": "hit", "reason": "It happened as predicted."}'
-    with patch("app.core.forecasts.llm.invoke_nothink", AsyncMock(return_value=verdict_json)), \
+    with patch("app.core.forecasts._gather_evidence",
+               AsyncMock(return_value="- X happened on schedule [news.com]")), \
+         patch("app.core.forecasts.llm.invoke_nothink", AsyncMock(return_value=verdict_json)), \
          patch("app.core.forecasts.llm.extract_json_object", return_value={"verdict": "hit", "reason": "ok"}):
         out = await forecasts.resolve_due(db)
     row = db.fetchone("SELECT status FROM forecasts WHERE id=?", (fid,))
@@ -99,3 +143,24 @@ async def test_resolve_grades_hit_and_updates_accuracy(db):
     acc = forecasts.accuracy(db)
     assert acc["resolved"] == 1 and acc["hits"] == 1 and acc["rate"] == 1.0
     assert "FORECAST" in out
+
+
+@pytest.mark.asyncio
+async def test_resolve_defers_without_evidence(db):
+    # Grounding guard (2026-06-24 audit): with NO live web evidence, the model must
+    # NOT be asked to guess — defer (count an attempt), leave the forecast open
+    # rather than fabricate a verdict from a frozen-cutoff recollection.
+    fid = forecasts.create_forecast(db, "Something will occur within a week.", days=1, confidence=0.6)
+    db.execute("UPDATE forecasts SET resolves_at = datetime('now','-1 hour') WHERE id=?", (fid,))
+    called = {"llm": False}
+
+    async def _should_not_run(*a, **k):
+        called["llm"] = True
+        return '{"verdict":"hit"}'
+
+    with patch("app.core.forecasts._gather_evidence", AsyncMock(return_value="")), \
+         patch("app.core.forecasts.llm.invoke_nothink", _should_not_run):
+        await forecasts.resolve_due(db)
+    row = db.fetchone("SELECT status, attempts FROM forecasts WHERE id=?", (fid,))
+    assert row["status"] == "open" and row["attempts"] == 1
+    assert called["llm"] is False  # never graded without evidence

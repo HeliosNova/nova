@@ -48,7 +48,7 @@ _DOMAIN_PROFILES: dict[str, tuple[str, str, str]] = {
     "biotech and genetics": ("🧬", "biotech", "biotech CRISPR gene therapy clinical announcement"),
     "economics and markets": ("📊", "economics", "Fed rate decision GDP inflation jobs report announced"),
     "whale watch": ("🐋", "crypto whales", "whale alert Bitcoin Ethereum large transfer wallet"),
-    "top trades and positioning": ("📈", "top trades", "hedge fund position 13F filing buy sell announced"),
+    "top trades and positioning": ("📈", "hedge fund trades and positioning", "hedge fund position 13F filing buy sell announced"),
     "china tech and economy": ("🇨🇳", "China tech", "China DeepSeek Baidu Alibaba Tencent announcement"),
     "russia and eastern europe": ("🇷🇺", "Russia + E. Europe", "Russia Ukraine NATO sanctions announcement today"),
     "middle east": ("🕌", "Middle East", "Israel Iran Saudi Hamas OPEC announcement today"),
@@ -113,6 +113,97 @@ _MONTH_NUM = {
 def _profile_for(monitor_name: str) -> tuple[str, str, str]:
     label = monitor_name.replace("Domain Study:", "").strip().lower()
     return _DOMAIN_PROFILES.get(label, ("📰", label.title(), label))
+
+
+def _profile_label_local(monitor_name: str) -> str:
+    return monitor_name.replace("Domain Study:", "").strip().lower()
+
+
+# Structured-list monitors: their value is the ranked/dated LIST of actual items
+# (stories, launches, filings, advisories, approvals, awards, repos), not a
+# synthesized news narrative. Routed to the native list renderer.
+_SPECIALIZED = {
+    "hacker news top stories", "product hunt trending", "github security advisories",
+    "github stargazer counts", "sec insider trading", "fda drug approvals",
+    "government contract awards",
+    # Research Frontiers is a PAPERS domain (arxiv/Nature/Quanta feeds), not news —
+    # forcing it through news-synthesis produced off-topic drift (a syndication-farm
+    # UK-politics story became its "lead" 2026-06-24) and dropped the actual papers.
+    # The native list surfaces today's papers (title + abstract) with a throughline
+    # insight, using only the curated feeds — on-topic, contamination-proof.
+    "research frontiers",
+}
+
+
+async def _native_insight(label: str, items: list) -> str:
+    """One-line 'what's notable' across today's list items — the throughline a bare
+    link list can't give. Synthesized from titles only (cheap, one LLM pass, no
+    fetching), so it stays a fast list, not an overview."""
+    from app.core.llm import invoke_nothink
+    titles = [(it.title or "").strip() for it in items[:15] if (it.title or "").strip()]
+    if len(titles) < 3:
+        return ""
+    blob = "\n".join(f"- {t[:140]}" for t in titles)
+    try:
+        out = await invoke_nothink([{"role": "user", "content":
+            f"Below are today's {label} items. In ONE sentence (≤32 words), name the throughline or "
+            f"the 2-3 most notable themes a reader should clock. Be concrete; do NOT restate the list, "
+            f"do NOT add preamble.\n\n{blob}"}],
+            max_tokens=110, temperature=0.3)
+    except Exception:
+        return ""
+    out = re.sub(r"\s+", " ", (out or "").strip())
+    low = out.lower()
+    if len(out) < 30 or low.startswith(("here", "the items", "these", "today's list", "this list")):
+        return ""
+    return out[:300].rstrip()
+
+
+async def _render_native_list(monitor_name: str, label: str, emoji: str) -> str:
+    """Native format for structured feed-monitors: a clean ranked/dated list of
+    the actual feed items (title · source · date · link + a short summary when the
+    feed carries real prose), TOPPED with a one-line 'what's notable' insight so the
+    reader gets the throughline, not just bare links. Uses a wider (7-day) window
+    since several (SEC, FDA, contracts) are low-volume."""
+    from app.monitors.rss_feeds import fetch_recent_items
+
+    items = await fetch_recent_items(monitor_name, hours=168, max_total=15)
+    items = _drop_non_news(items, label)
+    if len(items) < 2:
+        return f"No significant {label} items in the past week."
+
+    today_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
+    lines = [f"## {emoji} **{label.upper()}**  ·  {today_str}", ""]
+    insight = await _native_insight(label, items)
+    if insight:
+        lines.append(f"💡 _{insight}_")
+        lines.append("")
+    for i, it in enumerate(items, 1):
+        title = _dedupe_repeats((it.title or "").strip().rstrip("."))
+        title = re.sub(r"\s*[-–|]\s*[A-Z][\w. ]{2,30}$", "", title).strip()
+        if len(title) > 150:
+            title = title[:147].rstrip() + "…"
+        if not title:
+            continue
+        lines.append(f"**`{i}.`** {emoji}  **{title}**")
+        clean = _clean_url(it.url)
+        lines.append(f"   ↳ **{it.source_host}**  ·  📅 {it.date_str}  ·  <{clean}>")
+        # Short summary only when the feed carries real prose (many list feeds —
+        # HN, SEC, trending — give an empty/URL-only summary; the title IS the item).
+        summ = re.sub(r"\s+", " ", _HTML_TAG_RE.sub(" ", (it.summary or ""))).strip()
+        if summ and summ.lower() != title.lower() and len(summ) >= 60 and "http" not in summ[:30]:
+            if len(summ) > 280:
+                cut = summ[:280]
+                idx = cut.rfind(". ")
+                summ = (cut[:idx + 1] if idx > 150 else cut.rstrip() + "…")
+            lines.append(f"   {summ}")
+        lines.append("")
+
+    n_items = sum(1 for l in lines if l.startswith("**`"))
+    lines.append("─" * 28)
+    lines.append(f"📌 **{label}** — {n_items} items from "
+                 f"{', '.join(sorted({it.source_host for it in items}))[:120]}.")
+    return "\n".join(lines).strip()
 
 
 def _confirm_fresh(
@@ -463,6 +554,38 @@ async def run_domain_study(monitor_name: str) -> str:
     emoji, label, keywords = _profile_for(monitor_name)
     today = datetime.now(timezone.utc)
     year = today.year
+
+    # Specialized monitors are STRUCTURED LISTS (HN stories, PH launches, SEC
+    # filings, CVEs, FDA approvals, contracts, trending repos) — not narrative
+    # news. Render their curated feed as a clean ranked/dated list (native
+    # format) instead of forcing them through the news-synthesis overview.
+    if _profile_label_local(monitor_name) in _SPECIALIZED:
+        try:
+            native = await _render_native_list(monitor_name, label, emoji)
+            if native and "No significant" not in native:
+                return native
+            logger.info("[DomainRunner] native feed thin for '%s' — normal path", monitor_name)
+        except Exception as e:
+            logger.warning("[DomainRunner] native render failed for '%s': %s", monitor_name, e)
+
+    # Deep research engine: actually search wide + READ the articles + learn,
+    # instead of skimming RSS headlines. Falls back to the legacy RSS path on any
+    # failure so a monitor never goes dark. (2026-06-21 — see deep_research.py)
+    from app.config import config as _cfg
+    if getattr(_cfg, "ENABLE_DEEP_RESEARCH", True):
+        try:
+            from app.monitors.deep_research import domain_overview
+            from app.core.brain import get_services
+            _kg = getattr(get_services(), "kg", None)
+            # Broad overlook over a deep base: top current stories, each fully
+            # read, synthesized into one grounded overview (not a headline skim).
+            _brief = await domain_overview(label, kg=_kg, n_stories=5, feed_key=monitor_name)
+            if _brief and "No readable credible sources" not in _brief and "synthesis unavailable" not in _brief:
+                return _brief
+            logger.info("[DomainRunner] deep research thin for '%s' — RSS fallback", monitor_name)
+        except Exception as e:
+            logger.warning("[DomainRunner] deep research failed for '%s' — RSS fallback: %s",
+                           monitor_name, e)
 
     # 0. RSS pass — preferred when curated feeds exist for this domain
     if feeds_for(monitor_name):

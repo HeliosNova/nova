@@ -8,7 +8,11 @@ threads changed" — not raw items.
 Reuses:
   - cross_monitor._gather_recent_outputs : recent content monitor_results
   - cross_monitor._extract_signals       : cheap entity/phrase pre-cluster
-  - kg bitemporal API (add_fact supersession) : state-change detection
+  - kg bitemporal API : each moved thread emits one `<entity> has_status <value>`
+    fact through `add_fact`; `has_status` is functional, so a changed value
+    SUPERSEDES the prior one — `get_fact_history` then yields a structured,
+    queryable state trail and the digest surfaces the deterministic delta
+    ("status: X → Y") alongside the narrative CHANGED line.
   - llm.invoke_nothink                    : naming + summary passes
 
 Background-only (runs on the Storyline Tracker monitor schedule). One LLM pass to
@@ -66,17 +70,33 @@ def _sig_tokens(text: str) -> set[str]:
             if t not in _GENERIC_STORY_WORDS}
 
 _UPDATE_PROMPT = (
-    "You track an ongoing story. Here is its prior state, then NEW developments.\n\n"
+    "You track an ongoing story. Below is its PRIOR STATE (written in an earlier "
+    "cycle), then NEW DEVELOPMENTS (more recent — what is happening now).\n\n"
     "STORY: {title}\n"
     "PRIOR STATE: {prior}\n\n"
     "NEW DEVELOPMENTS:\n{developments}\n\n"
-    "Write an updated state in 2-3 sentences (the current situation, incorporating "
-    "what's new). Then on a new line starting 'CHANGED: ' give ONE sentence on what "
-    "specifically moved since the prior state.\n"
+    "Write the CURRENT state of this story in 2-3 sentences. Rules:\n"
+    "- The NEW DEVELOPMENTS are more recent than the prior state. Where they "
+    "CONFLICT, the new developments WIN: describe the latest reality and do NOT "
+    "repeat a prior claim that has been overtaken (e.g. if a ceasefire later holds, "
+    "do not still call it 'shattered'; if a deal is signed, the talks are no longer "
+    "'ongoing').\n"
+    "- If the developments REVERSE or supersede the prior state, say so plainly.\n"
+    "- Describe the situation as it stands NOW — not a blend of stale and current.\n"
+    "Then on a new line starting 'CHANGED: ' give ONE sentence on what specifically "
+    "moved since the prior state.\n"
+    "If the story has a clear CURRENT STATUS that can change over time (a ceasefire "
+    "holding, talks pending, an outage ongoing, a price level, a deal signed), add a "
+    "line 'STATE: <main entity> | <short current status>' — the status in 2-6 words. "
+    "Use the SAME main-entity wording each cycle so the status can be tracked. Omit "
+    "the line entirely if there is no clear trackable status.\n"
     "If — and only if — there is a clear, falsifiable near-term expectation, add a "
     "final line 'FORECAST: <specific testable claim> | <N> days | <0.x confidence>'.\n"
     "If the new developments add nothing substantive, reply exactly 'NO CHANGE'."
 )
+
+# Parses an optional 'STATE: <entity> | <current status>' line for KG state-tracking.
+_STATE_RE = re.compile(r"(?im)^\s*STATE:\s*(?P<entity>[^|\n]{2,70}?)\s*\|\s*(?P<status>[^\n|]{2,70}?)\s*$")
 
 
 def _collect_items(db) -> list[dict]:
@@ -200,11 +220,42 @@ def _find_matching_storyline(db, story: dict):
     return best
 
 
-async def _update_story(db, story: dict) -> dict | None:
+async def _record_state(kg, entity: str, status: str, key: str) -> str:
+    """Write the thread's current status as a functional `has_status` KG fact and
+    return a deterministic 'status: prior → new' delta when the value changed (else
+    ''). `has_status` is functional, so the new value supersedes the old — that IS
+    the change-detection, and `get_fact_history` keeps the queryable trail.
+    Garbage-gated + provenanced so monitor state can't pollute the user-fact graph."""
+    from app.core.kg import is_garbage_triple
+    entity, status = (entity or "").strip(), (status or "").strip()
+    if not entity or not status or is_garbage_triple(entity, "has_status", status):
+        return ""
+    prior = ""
+    try:
+        for h in kg.get_fact_history(entity, "has_status"):  # most-recent first
+            if not h.get("superseded_by"):
+                prior = (h.get("object") or "").strip()
+                break
+    except Exception:
+        prior = ""
+    try:
+        await kg.add_fact(entity, "has_status", status, confidence=0.6,
+                          source="storyline", provenance=f"storyline_state:{key[:60]}")
+    except Exception as e:
+        logger.debug("[Storyline] state add_fact failed for %r: %s", entity, e)
+        return ""
+    if prior and prior.lower() != status.lower():
+        return f"{entity} status: {prior} → {status}"
+    return ""
+
+
+async def _update_story(db, story: dict, kg=None) -> dict | None:
     """Match story to an existing storyline, diff new developments, update state.
 
     Returns a digest-ready dict {title, changed, summary} ONLY if the thread moved,
-    else None.
+    else None. When `kg` is provided, the thread's current status is also written as
+    a functional `has_status` fact so a changed value supersedes the prior one (a
+    structured, queryable state-change trail surfaced as a deterministic delta).
     """
     row = _find_matching_storyline(db, story)
     prior_summary = row["summary"] if row else ""
@@ -247,6 +298,21 @@ async def _update_story(db, story: dict) -> dict | None:
     if m:
         changed = m.group(1).strip()
         summary = out[:m.start()].strip()
+    # Strip trailing STATE: / FORECAST: lines so they never leak into the stored/
+    # displayed summary (the CHANGED parse above misses them when CHANGED is absent).
+    summary = re.sub(r"(?im)^\s*(?:STATE|FORECAST):.*$", "", summary).strip()
+
+    # Effective key: when this story was FUZZY-matched into an existing thread,
+    # the forecast must reference the MATCHED thread's key, not the unused new one.
+    eff_key = row["story_key"] if row else story["key"]
+
+    # Structured state-change via the KG: a `<entity> has_status <value>` fact whose
+    # functional supersession yields the queryable trail + a deterministic delta.
+    state_delta = ""
+    if kg is not None:
+        sm = _STATE_RE.search(out)
+        if sm:
+            state_delta = await _record_state(kg, sm.group("entity"), sm.group("status"), eff_key)
 
     # Opportunistic forecast: if the model emitted a falsifiable call, record it
     # for later self-grading (Phase C). Gated; failures are non-fatal.
@@ -254,7 +320,7 @@ async def _update_story(db, story: dict) -> dict | None:
         from app.config import config as _cfg
         if getattr(_cfg, "ENABLE_FORECASTS", True):
             from app.core.forecasts import parse_and_store_forecast
-            parse_and_store_forecast(db, out, storyline_key=story["key"],
+            parse_and_store_forecast(db, out, storyline_key=eff_key,
                                      source_monitor="Storyline Tracker")
     except Exception:
         pass
@@ -262,9 +328,12 @@ async def _update_story(db, story: dict) -> dict | None:
     sid = _record(db, row, story, fresh or story["developments"], summary=summary)
     logger.info("[Storyline] %s thread %r (+%d new)", "NEW" if new_story else "moved",
                 story["title"], len(fresh or story["developments"]))
+    narrative = changed or ("new story" if new_story else "updated")
     return {
         "title": story["title"],
-        "changed": changed or ("new story" if new_story else "updated"),
+        # Lead with the structured KG delta when the status moved; keep the
+        # narrative one-liner alongside it.
+        "changed": f"{state_delta} · {narrative}" if state_delta else narrative,
         "summary": summary,
         "new": new_story,
         "storyline_id": sid,
@@ -327,10 +396,12 @@ def get_relevant_storylines(db, query: str, *, limit: int = 2) -> list[dict]:
     return [s for _, s in scored[:limit]]
 
 
-async def track_storylines(db) -> str:
+async def track_storylines(db, kg=None) -> str:
     """Full cycle: collect → cluster → diff/update → digest of moved threads.
 
-    Returns a digest string (only moved threads) or a no-change marker.
+    Returns a digest string (only moved threads) or a no-change marker. When `kg`
+    is provided, each moved thread also records a functional `has_status` fact so
+    state changes supersede (queryable trail + deterministic delta in the digest).
     """
     items = _collect_items(db)
     if len(items) < 3:
@@ -351,7 +422,7 @@ async def track_storylines(db) -> str:
     moved = []
     for story in stories[:_MAX_STORIES]:
         try:
-            upd = await _update_story(db, story)
+            upd = await _update_story(db, story, kg=kg)
         except Exception as e:
             logger.warning("[Storyline] update failed for %r: %s", story.get("title"), e)
             continue

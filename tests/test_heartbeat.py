@@ -179,8 +179,9 @@ class TestMonitorStore:
         # 61 pre-cull + 3 system (Training Job Watch, KG Growth Rate,
         # Ollama Model Loaded) + 4 self-improvement loop closers
         # (Goal Derivation, Cross-Monitor Synthesis, Auto-Tool Synthesis,
-        # Output Quality Eval) + 1 added later = 69.
-        assert count == 69
+        # Output Quality Eval) + 1 added later = 69, then +3 (Source Health
+        # Monitor, Storyline Tracker, Forecast Resolution) = 72.
+        assert count == 72
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)

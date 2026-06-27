@@ -44,6 +44,21 @@ def test_format_multiple_is_digest_with_sections_and_cap():
     assert len([l for l in out.splitlines() if l.startswith("## ")]) == 2
 
 
+def test_content_briefing_not_truncated_in_digest():
+    # Best-possible delivery (2026-06-26): a full content briefing must NOT be
+    # gutted to a 600-char preview when batched — only operational status lines get
+    # the scannable cap. Pins the fix for "domain studies truncated when 2 land in
+    # one cycle" found in the live monitor audit.
+    lp = _loop()
+    long_brief = "Lead Development: " + "x" * 3000
+    items = [("Domain Study: Crypto", long_brief), ("System Health", "y" * 3000)]
+    cats = {"Domain Study: Crypto": "content", "System Health": "system"}
+    out = lp._format_digest(items, cats)
+    assert long_brief in out                  # content posted in full, no '[…]'
+    assert ("y" * 700) not in out             # operational line still capped
+    assert out.count("[…]") == 1              # exactly the operational item truncated
+
+
 def test_alert_targets_category_defaults():
     lp = _loop(discord=True, telegram=True)
     # content -> all configured channels
@@ -70,9 +85,9 @@ async def test_flush_groups_by_channel_and_sends_once():
     lp = _loop(discord=True, telegram=True)
     # two content alerts (both -> discord+telegram) and one system (-> telegram).
     lp._digest_buffer = [
-        (frozenset({"discord", "telegram"}), "China Tech", "chips"),
-        (frozenset({"discord", "telegram"}), "Crypto", "btc"),
-        (frozenset({"telegram"}), "Health", "ok"),
+        (frozenset({"discord", "telegram"}), "China Tech", "chips", "content"),
+        (frozenset({"discord", "telegram"}), "Crypto", "btc", "content"),
+        (frozenset({"telegram"}), "Health", "ok", "system"),
     ]
     await lp._flush_digest()
     # content group -> ONE send to each of discord+telegram (a 2-update digest)
