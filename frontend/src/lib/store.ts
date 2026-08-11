@@ -36,6 +36,7 @@ interface ChatState {
   setThinkingStage: (stage: string | null) => void;
   setThinkingContent: (content: string | null) => void;
   appendToken: (text: string) => void;
+  replaceStream: (text: string) => void;
   addToolCall: (tc: ToolCall) => void;
   updateToolCall: (id: string, updates: Partial<ToolCall>) => void;
   finalizeAssistantMessage: (conversationId: string) => void;
@@ -101,6 +102,9 @@ export const useChatStore = create<ChatState>((set) => ({
 
   appendToken: (text) =>
     set((s) => ({ streamedTokens: s.streamedTokens + text })),
+
+  // stream-first refine: a REVISION event replaces the draft in place
+  replaceStream: (text) => set({ streamedTokens: text }),
 
   addToolCall: (tc) =>
     set((s) => ({ toolCalls: [...s.toolCalls, tc] })),

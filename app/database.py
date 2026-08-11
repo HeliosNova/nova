@@ -9,10 +9,17 @@ import asyncio
 import logging
 import sqlite3
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+# Ceiling on waiting for the writer lock. Writes are milliseconds; a wait this
+# long means a writer is wedged or the lock leaked (incident 2026-07-03: a
+# leaked lock froze every writer INCLUDING the event loop for 54h). Raising
+# loudly is strictly better than a silent permanent hang.
+_WRITE_LOCK_TIMEOUT = 120.0
 
 _instances: dict[str, "SafeDB"] = {}
 _instance_lock = threading.Lock()
@@ -1029,6 +1036,24 @@ class SafeDB:
                 "AsyncSafeDB or asyncio.to_thread): %s", key
             )
 
+    @contextmanager
+    def _acquire_write(self):
+        """Writer-lock acquire with a hang ceiling and guaranteed release.
+
+        A plain `with self._write_lock:` waits FOREVER; when the lock leaked
+        (2026-07-03) that froze every writer — including the event-loop thread
+        — for 54 hours with zero log evidence. A bounded wait converts that
+        failure mode into a loud, diagnosable exception.
+        """
+        if not self._write_lock.acquire(timeout=_WRITE_LOCK_TIMEOUT):
+            raise TimeoutError(
+                f"SafeDB writer lock not acquired within {_WRITE_LOCK_TIMEOUT:.0f}s — "
+                "a writer is wedged or the lock leaked (see incident 2026-07-03)")
+        try:
+            yield
+        finally:
+            self._write_lock.release()
+
     def execute(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Cursor:
         # execute() commits, so it takes the writer lock even for the occasional
         # SELECT-then-fetch caller. Pure reads use fetchone/fetchall (lock-free).
@@ -1037,18 +1062,31 @@ class SafeDB:
         # (and no longer races a concurrent insert on a shared connection).
         self._warn_if_event_loop(sql)
         conn = self._get_conn()
-        with self._write_lock:
-            cursor = conn.execute(sql, params)
-            conn.commit()
-            return cursor
+        with self._acquire_write():
+            try:
+                cursor = conn.execute(sql, params)
+                conn.commit()
+                return cursor
+            except BaseException:
+                # A failed commit leaves the connection mid-transaction; the next
+                # BEGIN on this thread would then raise inside _Transaction.__enter__.
+                # Clear it here so no dangling transaction survives this call.
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
         self._warn_if_event_loop(sql)
         conn = self._get_conn()
-        with self._write_lock:
-            cursor = conn.executemany(sql, params_list)
-            conn.commit()
-            return cursor
+        with self._acquire_write():
+            try:
+                cursor = conn.executemany(sql, params_list)
+                conn.commit()
+                return cursor
+            except BaseException:
+                if conn.in_transaction:
+                    conn.rollback()
+                raise
 
     class _Transaction:
         """Context manager for atomic multi-statement transactions."""
@@ -1063,9 +1101,20 @@ class SafeDB:
             # (WAL). The connection is captured before BEGIN so all statements in
             # the block — including read-backs of just-inserted rows — hit the
             # same connection and see the in-flight changes.
-            self._db._write_lock.acquire()
-            self._conn = self._db._get_conn()
-            self._conn.execute("BEGIN")
+            if not self._db._write_lock.acquire(timeout=_WRITE_LOCK_TIMEOUT):
+                raise TimeoutError(
+                    f"SafeDB writer lock not acquired within {_WRITE_LOCK_TIMEOUT:.0f}s — "
+                    "a writer is wedged or the lock leaked (see incident 2026-07-03)")
+            # If anything after acquire() raises (e.g. BEGIN hits 'database is
+            # locked'), the `with` body is never entered and __exit__ never runs
+            # — so the lock MUST be released here or it leaks forever. That exact
+            # leak froze every writer + the event loop for 54h (2026-07-03).
+            try:
+                self._conn = self._db._get_conn()
+                self._conn.execute("BEGIN")
+            except BaseException:
+                self._db._write_lock.release()
+                raise
             return _TransactionCursor(self._conn)
 
         def __exit__(self, exc_type, exc_val, exc_tb) -> None:

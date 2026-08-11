@@ -226,12 +226,19 @@ class MonitorStore:
             due.append(m)
         return due
 
+    # Storage cap for digests/results. Must be ≥ the posted-digest cap (12000,
+    # heartbeat_loop) — a 4000 cap silently amputated every rich digest IN THE DB
+    # while Discord got the full text (found 2026-07-06: the report grader scored
+    # truncated stumps — Science support 0.417 — and storylines/cross-monitor
+    # read the same amputated rows).
+    _RESULT_CAP = 12000
+
     def record_check(self, monitor_id: int, result: str) -> None:
         """Update last_check_at and last_result."""
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
         self._db.execute(
             "UPDATE monitors SET last_check_at = ?, last_result = ? WHERE id = ?",
-            (now, result[:4000] if result else "", monitor_id),
+            (now, result[:self._RESULT_CAP] if result else "", monitor_id),
         )
 
     def record_alert(self, monitor_id: int) -> None:
@@ -246,7 +253,8 @@ class MonitorStore:
         """Store a monitor result. Returns its ID."""
         cursor = self._db.execute(
             "INSERT INTO monitor_results (monitor_id, status, value, message) VALUES (?, ?, ?, ?)",
-            (monitor_id, status, value[:4000] if value else "", message[:4000] if message else ""),
+            (monitor_id, status, value[:self._RESULT_CAP] if value else "",
+             message[:self._RESULT_CAP] if message else ""),
         )
         return cursor.lastrowid
 
@@ -729,6 +737,8 @@ class MonitorStore:
              "check_config": {"query": "Use web_search to find 2-3 significant Middle East developments from the past 24-48 hours. Cover: regional conflicts, OPEC decisions, Gulf state diversification (Saudi Vision 2030, UAE tech), Iran developments, Israel-Palestine. Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
             {"name": "Domain Study: India", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 significant developments from India from the past 24-48 hours. Cover: tech sector (Infosys, TCS, Reliance Jio), startup ecosystem, economic data (GDP, rupee), digital policy (UPI, Aadhaar), semiconductor ambitions. Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
+            {"name": "Domain Study: East Asia", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
+             "check_config": {"query": "Use web_search to find 2-3 significant East Asia developments (Japan, South Korea, Taiwan, ASEAN — excluding mainland China) from the past 24-48 hours. Cover: Japan (BOJ, yen, Nikkei, Toyota/Sony/SoftBank), South Korea (Samsung, SK Hynix, BOK, won), Taiwan (TSMC, cross-strait), and ASEAN economies/supply chains. Include dates and key actors.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
             {"name": "Domain Study: Europe and EU", "check_type": "query", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 2-3 significant European and EU developments from the past 24-48 hours. Cover: EU regulatory actions (AI Act, DMA, antitrust), ECB decisions, European tech (SAP, ASML, ARM), defense policy, Brexit. Include dates.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},
             {"name": "Domain Study: Semiconductors", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",

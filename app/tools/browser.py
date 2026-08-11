@@ -21,6 +21,32 @@ def _max_content_length() -> int:
     return config.TOOL_OUTPUT_MAX_CHARS
 _SESSION_TIMEOUT = 600  # 10 min idle timeout
 
+# Stealth: strip the headless-automation tells that anti-bot walls (Cloudflare) key
+# on — chiefly navigator.webdriver=true. Runs before any page script. Combined with
+# a residential egress IP this passes the "Security Verification" JS interstitial that
+# a plain httpx GET (no JS engine) can never solve. Benign for normal sites.
+_STEALTH_INIT_JS = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+window.chrome = window.chrome || {runtime: {}};
+try {
+  const _q = navigator.permissions && navigator.permissions.query;
+  if (_q) navigator.permissions.query = (p) => (
+    p && p.name === 'notifications'
+      ? Promise.resolve({state: Notification.permission})
+      : _q(p));
+} catch (e) {}
+"""
+
+# An anti-bot interstitial (Cloudflare et al.) shows one of these while its JS runs;
+# a stealthed browser on a residential IP auto-clears it in a few seconds.
+_CF_CHALLENGE_MARKERS = (
+    "just a moment", "checking your browser", "security verification",
+    "verifying you are human", "enable javascript and cookies to continue",
+    "needs to review the security of your connection",
+)
+
 # ---------------------------------------------------------------------------
 # JS snippet — extract visible interactive elements with reliable selectors
 # ---------------------------------------------------------------------------
@@ -208,6 +234,7 @@ class BrowserTool(BaseTool):
     _playwright = None
     _browser = None
     _last_used = 0.0      # Timestamp for session timeout
+    _launch_lock: "asyncio.Lock | None" = None  # single-flight guard for _launch
 
     def trim_output(self, output: str) -> str:
         """Keep page header + text excerpt + interactive elements."""
@@ -243,9 +270,34 @@ class BrowserTool(BaseTool):
             except Exception:
                 logger.info("[Browser] Stale browser detected, reconnecting")
 
-        # Clean up anything stale
-        await self._close_session()
+        # Launch is SINGLE-FLIGHT + CANCELLATION-SHIELDED. Without this, two
+        # leaks spawned zombie chromium trees (13 observed live on 2026-07-06):
+        #  - concurrent fetches (semaphore allows 3) all miss the liveness check
+        #    on a stale session and each start playwright+chromium — the last
+        #    assignment wins, the others orphan;
+        #  - callers run under asyncio.wait_for, and a timeout cancels this
+        #    coroutine mid-launch, orphaning whatever had already spawned.
+        # The lock serializes launches; the shield lets a launch COMPLETE and
+        # register the shared session even if our caller times out.
+        if BrowserTool._launch_lock is None:
+            BrowserTool._launch_lock = asyncio.Lock()
+        async with BrowserTool._launch_lock:
+            # Re-check under the lock — a concurrent waiter may have launched.
+            if BrowserTool._browser and BrowserTool._browser.is_connected():
+                BrowserTool._last_used = time.time()
+                return
+            await self._close_session()
+            task = asyncio.get_running_loop().create_task(BrowserTool._launch())
+            # If we get cancelled, the detached task still finishes; retrieve
+            # its exception so a failed background launch doesn't warn-spam.
+            task.add_done_callback(
+                lambda t: t.exception() if not t.cancelled() else None)
+            await asyncio.shield(task)
+        BrowserTool._last_used = time.time()
 
+    @classmethod
+    async def _launch(cls):
+        """Start playwright + connect/launch the shared browser (call via _ensure_browser)."""
         from playwright.async_api import async_playwright
         BrowserTool._playwright = await async_playwright().start()
 
@@ -289,25 +341,63 @@ class BrowserTool(BaseTool):
         if not cdp_url:
             BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage"],
+                args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
+                      "--disable-blink-features=AutomationControlled"],
             )
             logger.info("[Browser] Launched headless browser")
-
-        BrowserTool._last_used = now
 
     async def _new_context_and_page(self):
         """Create a fresh isolated browser context + page for a single execute() call."""
         context = await BrowserTool._browser.new_context(
-            viewport={"width": 1280, "height": 720},
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+            extra_http_headers={"Accept-Language": "en-US,en;q=0.9"},
             user_agent=(
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                 "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
             ),
         )
+        await context.add_init_script(_STEALTH_INIT_JS)
         context.set_default_timeout(config.BROWSER_TIMEOUT * 1000)
         page = await context.new_page()
         logger.info("[Browser] New isolated context created")
         return context, page
+
+    @staticmethod
+    async def _await_challenge(page, *, tries: int = 8, interval_ms: int = 2000) -> None:
+        """Wait out an anti-bot interstitial (Cloudflare et al.) if present. No-op on a
+        normal page — the first probe finds no challenge marker and returns immediately,
+        so it costs one title+text read. On a challenge page a stealthed browser on a
+        residential IP clears it within a few seconds."""
+        for _ in range(tries):
+            try:
+                blob = ((await page.title()) + " " + (await page.evaluate(
+                    "() => document.body ? document.body.innerText.slice(0, 400) : ''"))).lower()
+            except Exception:
+                await page.wait_for_timeout(interval_ms)
+                continue
+            if not any(m in blob for m in _CF_CHALLENGE_MARKERS):
+                return
+            await page.wait_for_timeout(interval_ms)
+
+    @staticmethod
+    async def _safe_inner_text(page) -> str:
+        """document.body.innerText, robust to a client-side navigation firing mid-read
+        (NYT/WaPo redirect after domcontentloaded destroys the exec context). Retries,
+        then falls back to stripped HTML."""
+        for _ in range(3):
+            try:
+                return await page.evaluate("() => document.body ? document.body.innerText : ''")
+            except Exception:
+                try:
+                    await page.wait_for_timeout(1200)
+                except Exception:
+                    return ""
+        try:
+            import re as _re
+            return _re.sub(r"<[^>]+>", " ", await page.content())
+        except Exception:
+            return ""
 
     @classmethod
     async def _close_session(cls):
@@ -529,8 +619,9 @@ class BrowserTool(BaseTool):
         if err := self._check_url(url):
             return err
         await page.goto(url, wait_until="domcontentloaded")
+        await self._await_challenge(page)
         title = await page.title()
-        text = await page.evaluate("() => document.body.innerText")
+        text = await self._safe_inner_text(page)
         if len(text) > _max_content_length():
             text = text[:_max_content_length()] + "\n[... content truncated]"
         interactive = await self._extract_interactive(page)

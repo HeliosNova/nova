@@ -644,11 +644,29 @@ class DreamConsolidator:
             raw = _re.findall(r"\b[a-z][a-z0-9]{2,}\b", (s or "").lower())
             return {_stem(t) for t in raw if len(t) >= 3}
 
+        def _match(x: str, y: str) -> bool:
+            # Exact, or one a PREFIX of the other at >=4 chars. Suffix stemming
+            # alone missed morphological pairs like math/mathematical and
+            # algebra/algebraic, so three "Mathematical Problem Solving -> use a
+            # calculator" lessons never clustered (manual audit 2026-07-09). The
+            # >=4 floor avoids merging short collisions (art/article, cat/cater).
+            if x == y:
+                return True
+            s, l = (x, y) if len(x) <= len(y) else (y, x)
+            return len(s) >= 4 and l.startswith(s)
+
         def _jaccard(a: set[str], b: set[str]) -> float:
             if not a or not b:
                 return 0.0
-            inter = len(a & b)
-            union = len(a | b)
+            used: set[str] = set()
+            inter = 0
+            for x in a:
+                for y in b:
+                    if y not in used and _match(x, y):
+                        inter += 1
+                        used.add(y)
+                        break
+            union = len(a) + len(b) - inter
             return inter / union if union else 0.0
 
         # Pre-compute tokens once

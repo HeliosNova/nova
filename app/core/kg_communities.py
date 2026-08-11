@@ -157,7 +157,8 @@ async def build_and_store(db, *, max_communities: int = _MAX_COMMUNITIES) -> int
     set. Returns the number of community summaries written."""
     ensure_schema(db)
     rows = db.fetchall(
-        "SELECT subject, predicate, object, confidence FROM kg_facts WHERE valid_to IS NULL"
+        "SELECT subject, predicate, object, confidence FROM kg_facts "
+        "WHERE valid_to IS NULL AND COALESCE(quarantined, 0) = 0"
     )
     facts = [dict(r) for r in rows]
     if len(facts) < _MIN_COMMUNITY_SIZE:

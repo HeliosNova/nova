@@ -252,6 +252,30 @@ async def require_auth(
                 "Set NOVA_API_KEY for production."
             )
             require_auth._warned_no_key = True
+        # Defense-in-depth for the keyless out-of-box path (full-system
+        # exploration 2026-07-09): keyless mode exists so a fresh localhost
+        # install works without a key (ports bind 127.0.0.1 in compose). But if
+        # the owner later exposes the port (bind 0.0.0.0 / a reverse proxy) while
+        # still keyless, the WHOLE API — chat, KG, exports, config-write — is
+        # open. Peer IP is useless here (Docker NAT rewrites it to the bridge
+        # gateway), but the Host header passes through NAT unchanged. Serve
+        # keyless ONLY to a loopback Host; a non-loopback Host means the request
+        # arrived over a network path → refuse and demand a key. Not a hard
+        # boundary (Host is spoofable by a deliberate attacker), but it fails the
+        # exposure CLOSED for drive-by/scanner/browser traffic while keeping
+        # localhost frictionless. Setting NOVA_API_KEY remains the real control.
+        # "testserver" is the ASGI TestClient's default Host — allow it so the
+        # keyless test suite (conftest sets NOVA_API_KEY="") isn't 401'd. No real
+        # HTTP client ever emits it, so allowing it costs zero real protection:
+        # the gate's job is stopping drive-by/scanner/browser traffic, which
+        # carries the server's actual Host, not this sentinel.
+        _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0", "testserver")
+        host = (request.headers.get("host") or "").rsplit(":", 1)[0].strip().lower().strip("[]")
+        if host and host not in _LOCAL_HOSTS:
+            raise HTTPException(
+                status_code=401,
+                detail="Authentication required for non-local access. Set NOVA_API_KEY.",
+            )
         return
 
     ip = _get_client_ip(request)

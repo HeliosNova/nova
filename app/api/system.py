@@ -319,6 +319,13 @@ class ConfigUpdateRequest(BaseModel):
     MULTI_AGENT_TRIGGER_THRESHOLD: int | None = Field(None, ge=1, le=20)
     MAX_AGENT_COUNT: int | None = Field(None, ge=1, le=20)
     AGENT_TASK_TIMEOUT: int | None = Field(None, ge=10, le=600)
+    MONITOR_SYNTHESIS_MODEL: str | None = None
+    # NOTE (audit 2026-07-08): this request model drifted from _MUTABLE_FIELDS —
+    # ~80 mutable fields are absent here, and extra="forbid" 422s any attempt to
+    # set them via the API even though update_config already filters against
+    # _MUTABLE_FIELDS (the security boundary). Fields added on demand; a full
+    # reconciliation (declare all, or extra="allow" + rely on the filter) is a
+    # follow-up.
 
 
 @router.patch("/config", dependencies=[Depends(require_auth)])

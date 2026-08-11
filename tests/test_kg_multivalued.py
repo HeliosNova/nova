@@ -60,12 +60,27 @@ class TestMultiValuedCoexist:
 
     @pytest.mark.asyncio
     async def test_related_to_degrade_target_does_not_collapse(self, db):
-        # Non-canonical predicates degrade to related_to; those must coexist too,
-        # or the degrade-don't-orphan design would merge unrelated facts.
+        # A genuinely non-canonical predicate degrades to related_to; those must
+        # coexist too, or the degrade-don't-orphan design would merge unrelated facts.
         kg = KnowledgeGraph(db)
-        await kg.add_fact("google", "acquired", "youtube")   # -> related_to
-        await kg.add_fact("google", "acquired", "android")   # -> related_to
-        assert _objects(kg, "google", "related_to") == {"youtube", "android"}
+        await kg.add_fact("celebrity", "obsessed_with", "fame")    # -> related_to
+        await kg.add_fact("celebrity", "obsessed_with", "money")   # -> related_to
+        assert _objects(kg, "celebrity", "related_to") == {"fame", "money"}
+
+    @pytest.mark.asyncio
+    async def test_news_relation_predicates_preserved_and_multivalued(self, db):
+        # Fix #2b: the high-value news verbs are PRESERVED (not flattened to
+        # related_to) and accumulate — a company acquires/partners-with/sues MANY.
+        assert kg_module.normalize_predicate("acquired") == "acquired"
+        assert kg_module.normalize_predicate("bought") == "acquired"
+        assert kg_module.normalize_predicate("partners with") == "partnered_with"
+        assert kg_module.normalize_predicate("filed suit against") == "sued"
+        assert kg_module.normalize_predicate("imposed sanctions on") == "sanctioned"
+        kg = KnowledgeGraph(db)
+        await kg.add_fact("google", "acquired", "youtube")
+        await kg.add_fact("google", "acquired", "android")
+        assert _objects(kg, "google", "acquired") == {"youtube", "android"}
+        assert _objects(kg, "google", "related_to") == set()   # NOT degraded anymore
 
     @pytest.mark.asyncio
     async def test_born_in_multiscale_coexists(self, db):
@@ -106,6 +121,17 @@ class TestFunctionalStillSupersedes:
         leaders = {r["subject"].lower() for r in kg.query("apple")
                    if r["predicate"] == "leads"}
         assert leaders == {"tim cook"}, leaders
+
+    @pytest.mark.asyncio
+    async def test_subsidiary_of_supersedes_on_ownership_change(self, db):
+        # Fix #2b: subsidiary_of is functional — a unit has ONE current parent, so a
+        # new parent supersedes the old (the ownership change the bitemporal store
+        # exists to track). Contrast with owns/acquired, which accumulate.
+        kg = KnowledgeGraph(db)
+        await kg.add_fact("instagram", "subsidiary_of", "facebook", source="user")
+        await kg.add_fact("instagram", "subsidiary_of", "meta", source="user")
+        assert _objects(kg, "instagram", "subsidiary_of") == {"meta"}
+        assert "subsidiary_of" not in kg_module.MULTI_VALUED_PREDICATES
 
 
 # ---------------------------------------------------------------------------

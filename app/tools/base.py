@@ -6,6 +6,7 @@ tool descriptions for the system prompt and dispatches execution.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -220,7 +221,12 @@ class ToolRegistry:
                         and result.error_category in (ErrorCategory.NOT_FOUND, ErrorCategory.VALIDATION)
                     )
                     if not is_neutral:
-                        trust_mgr.record_outcome(
+                        # to_thread: record_outcome does sync DB WRITES — on the
+                        # event-loop thread a contended writer lock blocks every
+                        # coroutine (2026-07-03: froze the loop, Discord, health
+                        # checks, and all monitors for 54h).
+                        await asyncio.to_thread(
+                            trust_mgr.record_outcome,
                             name,
                             result.success,
                             action=str(args)[:100],

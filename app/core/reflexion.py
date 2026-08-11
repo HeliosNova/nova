@@ -857,15 +857,25 @@ class ReflexionStore:
         if results:
             ids = tuple(r.id for r in results if getattr(r, "id", None) is not None)
             if ids:
-                try:
-                    placeholders = ",".join("?" for _ in ids)
-                    self._db.execute(
-                        f"UPDATE reflexions SET times_injected = times_injected + 1 "
-                        f"WHERE id IN ({placeholders})",
-                        ids,
-                    )
-                except Exception as e:
-                    logger.debug("times_injected update failed: %s", e)
+                # DEFER the times_injected write off this READ path. get_success_
+                # patterns runs synchronously inside the chat context-gather; the
+                # UPDATE takes the write lock, and when a digest is banking facts
+                # that lock is held, so the write blocked the gather up to its 15s
+                # cap → "reflexions.success_patterns timed out" and chat silently
+                # lost its success-pattern context (manual audit 2026-07-09). A
+                # daemon thread does the analytics write in the background so the
+                # read returns immediately; losing an increment on contention is
+                # acceptable for A/B analytics.
+                def _bump(_ids=ids):
+                    try:
+                        ph = ",".join("?" for _ in _ids)
+                        self._db.execute(
+                            f"UPDATE reflexions SET times_injected = times_injected + 1 "
+                            f"WHERE id IN ({ph})", _ids)
+                    except Exception as e:
+                        logger.debug("times_injected update failed: %s", e)
+                import threading
+                threading.Thread(target=_bump, daemon=True).start()
         return results
 
     def record_post_quality_for_injected(

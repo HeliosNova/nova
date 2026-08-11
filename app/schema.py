@@ -50,6 +50,10 @@ class ChatResponse(BaseModel):
 class EventType(str, Enum):
     THINKING = "thinking"
     TOKEN = "token"
+    # Stream-first refine (2026-07-06): TOKENs carry the validated DRAFT
+    # immediately; if the refine chain then changes the answer, one REVISION
+    # event carries the full final text — consumers replace the draft in place.
+    REVISION = "revision"
     TOOL_USE = "tool_use"
     SOURCES = "sources"
     LESSON_USED = "lesson_used"

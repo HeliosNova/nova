@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.auth import require_auth
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/events", tags=["events"])
+# require_auth: this endpoint queues events that background processing acts on —
+# it was the only mutating router without auth (audit 2026-07-06). No-ops when
+# REQUIRE_AUTH=false, same as every other router.
+router = APIRouter(prefix="/events", tags=["events"], dependencies=[Depends(require_auth)])
 
 _EVENT_TYPE_RE = re.compile(r"^[a-zA-Z0-9_]+:[a-zA-Z0-9_.]+$")
 
@@ -40,7 +45,10 @@ async def trigger_event(req: TriggerEventRequest):
         raise HTTPException(400, "priority must be between 0.0 and 1.0")
 
     db = get_db()
-    db.execute(
+    # to_thread: writer-lock DB call — blocks every coroutine if run on the
+    # event-loop thread while the lock is contended (54h-freeze bug class).
+    await asyncio.to_thread(
+        db.execute,
         "INSERT INTO event_queue (event_type, payload, priority) VALUES (?, ?, ?)",
         (req.event_type, json.dumps(req.payload), req.priority),
     )

@@ -151,7 +151,10 @@ class TelegramBot:
         try:
             tokens = []
             async for event in think(query=query, conversation_id=conv_id, channel="telegram"):
-                if event.type == EventType.TOKEN:
+                if event.type == EventType.REVISION:
+                    # stream-first refine: the final answer replaces the draft
+                    tokens = [event.data.get("text", "")]
+                elif event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:
                         tokens.append(text)
@@ -184,12 +187,12 @@ class TelegramBot:
             text = text[split_at:].lstrip()
         return chunks
 
-    async def send_alert(self, message: str):
+    async def send_alert(self, message: str) -> bool:
         """Send a message to the default chat. Converts Discord-style markdown
         to Telegram HTML so **bold**, *italic*, `code`, and <URL> render
         correctly instead of showing as raw asterisks/brackets."""
         if not self.default_chat_id or not self._app:
-            return
+            return False
         try:
             from app.channels.format_for_channel import to_telegram_html
             html_message = to_telegram_html(message)
@@ -212,8 +215,10 @@ class TelegramBot:
                     await self._app.bot.send_message(
                         chat_id=int(self.default_chat_id), text=chunk,
                     )
+            return True
         except Exception as e:
             logger.error("[Telegram] Alert send failed: %s", e)
+            return False
 
     async def start(self):
         """Start the Telegram bot (polling mode) with outer reconnect loop."""

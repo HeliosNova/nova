@@ -160,8 +160,12 @@ async def chat_sync(request: ChatRequest):
                 # outcomes — return them as a normal refusal answer. Only
                 # genuine faults become 500s. Reproduced by the live audit
                 # (10.2): the injection block was surfacing as a server error.
-                if event.data.get("code") == "blocked":
-                    tokens.append(event.data.get("message", "Query blocked."))
+                # Graceful (non-fault) outcomes returned as a normal answer:
+                #  • blocked          — policy refusal (prompt injection)
+                #  • llm_busy         — transient: model saturated by a digest (retryable)
+                #  • llm_unavailable  — provider down; a friendly message beats a raw 500
+                if event.data.get("code") in ("blocked", "llm_busy", "llm_unavailable"):
+                    tokens.append(event.data.get("message", "Unavailable."))
                     break
                 raise HTTPException(status_code=500, detail=event.data.get("message", "Unknown error"))
     except HTTPException:

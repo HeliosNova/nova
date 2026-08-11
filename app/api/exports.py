@@ -4,13 +4,16 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.auth import require_auth
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/exports", tags=["exports"])
+# require_auth: exports the ENTIRE knowledge base (lessons/KG/skills) and accepts
+# imports — was unauthenticated (audit 2026-07-06). No-ops when REQUIRE_AUTH=false.
+router = APIRouter(prefix="/exports", tags=["exports"], dependencies=[Depends(require_auth)])
 
 
 class ExportRequest(BaseModel):

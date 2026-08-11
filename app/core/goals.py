@@ -198,7 +198,7 @@ async def execute_goal(goal: Goal) -> tuple[bool, str]:
     chunks: list[str] = []
     try:
         async with asyncio.timeout(_cfg.GENERATION_TIMEOUT):
-            async for event in think(query=framed, ephemeral=True):
+            async for event in think(query=framed, ephemeral=True, channel="background"):
                 if event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:

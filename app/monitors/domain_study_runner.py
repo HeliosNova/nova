@@ -23,6 +23,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse
 
@@ -111,12 +112,12 @@ _MONTH_NUM = {
 
 
 def _profile_for(monitor_name: str) -> tuple[str, str, str]:
-    label = monitor_name.replace("Domain Study:", "").strip().lower()
+    label = monitor_name.replace("Domain Study:", "").replace("Auto:", "").strip().lower()
     return _DOMAIN_PROFILES.get(label, ("📰", label.title(), label))
 
 
 def _profile_label_local(monitor_name: str) -> str:
-    return monitor_name.replace("Domain Study:", "").strip().lower()
+    return monitor_name.replace("Domain Study:", "").replace("Auto:", "").strip().lower()
 
 
 # Structured-list monitors: their value is the ranked/dated LIST of actual items
@@ -154,7 +155,15 @@ async def _native_insight(label: str, items: list) -> str:
         return ""
     out = re.sub(r"\s+", " ", (out or "").strip())
     low = out.lower()
-    if len(out) < 30 or low.startswith(("here", "the items", "these", "today's list", "this list")):
+    # Reject meta / self-deprecating non-insights (seen when titles are uniform, e.g.
+    # the DoD "Contracts for <date>" daily rollups: "merely chronological placeholders
+    # with no actual content to analyze") — better no insight line than a vacuous one.
+    _META = ("placeholder", "no actual", "nothing to analyze", "no thematic",
+             "chronological", "no specific content", "cannot analyze", "no meaningful",
+             "lack any", "no discernible", "no clear theme", "do not provide")
+    if (len(out) < 30
+            or low.startswith(("here", "the items", "these", "today's list", "this list"))
+            or any(p in low for p in _META)):
         return ""
     return out[:300].rstrip()
 
@@ -167,13 +176,47 @@ async def _render_native_list(monitor_name: str, label: str, emoji: str) -> str:
     since several (SEC, FDA, contracts) are low-volume."""
     from app.monitors.rss_feeds import fetch_recent_items
 
-    items = await fetch_recent_items(monitor_name, hours=168, max_total=15)
+    is_sec = "sec insider" in monitor_name.lower()
+    is_gh_adv = "github security" in monitor_name.lower()
+    is_contracts = "contract" in monitor_name.lower() and "award" in monitor_name.lower()
+    # Single-source native feeds need a larger per-feed pull; SEC also needs ~3× raw
+    # because its issuer/reporting double-rows collapse on the accession merge.
+    items = await fetch_recent_items(monitor_name, hours=168,
+                                     max_total=(60 if is_sec else 20),
+                                     per_feed=(60 if is_sec else 20))
     items = _drop_non_news(items, label)
+    if is_sec:
+        items = _merge_sec_form4(items)   # collapse EDGAR issuer/reporting double-rows by accession
+    items = items[:15]
     if len(items) < 2:
         return f"No significant {label} items in the past week."
 
+    header_signal = None
+    if is_sec:
+        items = await _enrich_sec_form4(items)          # read each Form 4 XML → buy/sell + $ value
+        clusters = _detect_sec_clusters(items)          # ≥2 insiders buying the same issuer = signal
+        if clusters:
+            c = clusters[0]
+            header_signal = (f"🟢 **CLUSTER BUY** — {c['insiders']} insiders bought "
+                             f"{c['issuer']} (~{_fmt_usd(c['total_value'])})")
+            if len(clusters) > 1:
+                header_signal += f"  ·  +{len(clusters) - 1} more issuer(s)"
+    elif is_gh_adv:
+        header_signal = _rollup_advisories(items)       # N critical · M high · patch now: <pkgs>
+    elif is_contracts:
+        for it in items:
+            d = _parse_dod_contracts(getattr(it, "summary", "") or "")
+            if d:
+                meta = getattr(it, "meta", None) or {}
+                meta["contracts"] = d
+                it.meta = meta
+        header_signal = _contracts_rollup_line(items)   # ~$X across N awards · Army a, Navy b
+
     today_str = datetime.now(timezone.utc).strftime("%B %d, %Y")
     lines = [f"## {emoji} **{label.upper()}**  ·  {today_str}", ""]
+    if header_signal:
+        lines.append(header_signal)
+        lines.append("")
     insight = await _native_insight(label, items)
     if insight:
         lines.append(f"💡 _{insight}_")
@@ -188,6 +231,10 @@ async def _render_native_list(monitor_name: str, label: str, emoji: str) -> str:
         lines.append(f"**`{i}.`** {emoji}  **{title}**")
         clean = _clean_url(it.url)
         lines.append(f"   ↳ **{it.source_host}**  ·  📅 {it.date_str}  ·  <{clean}>")
+        _m = getattr(it, "meta", None) or {}
+        sig = _sec_signal_line(_m.get("form4")) or _advisory_badge(_m.get("advisory"))
+        if sig:
+            lines.append(f"   {sig}")
         # Short summary only when the feed carries real prose (many list feeds —
         # HN, SEC, trending — give an empty/URL-only summary; the title IS the item).
         summ = re.sub(r"\s+", " ", _HTML_TAG_RE.sub(" ", (it.summary or ""))).strip()
@@ -579,7 +626,7 @@ async def run_domain_study(monitor_name: str) -> str:
             _kg = getattr(get_services(), "kg", None)
             # Broad overlook over a deep base: top current stories, each fully
             # read, synthesized into one grounded overview (not a headline skim).
-            _brief = await domain_overview(label, kg=_kg, n_stories=5, feed_key=monitor_name)
+            _brief = await domain_overview(label, kg=_kg, n_stories=7, feed_key=monitor_name)
             if _brief and "No readable credible sources" not in _brief and "synthesis unavailable" not in _brief:
                 return _brief
             logger.info("[DomainRunner] deep research thin for '%s' — RSS fallback", monitor_name)
@@ -1016,6 +1063,292 @@ def _is_newsworthy(item) -> bool:
     if isinstance(item, dict):
         return _newsworthy_title_url(item.get("title", ""), item.get("url", ""))
     return _newsworthy_title_url(getattr(item, "title", ""), getattr(item, "url", ""))
+
+
+_ACCESSION_RE = re.compile(r"\b(\d{10}-\d{2}-\d{6})\b")
+
+
+def _merge_sec_form4(items: list) -> list:
+    """EDGAR's current-Form-4 feed lists a SEPARATE entry per filer — the issuer AND
+    each reporting person — for the SAME filing, so one insider trade showed up 2-3×
+    (the audit's '4 filings shown 8×'). Collapse by accession number into ONE item that
+    names BOTH the company (Issuer) and the insider (Reporting person): 'Kaspi.kz —
+    insider: Kim Vyacheslav (Form 4)'. Recency order preserved; items without an
+    accession (non-Form-4) pass through unchanged."""
+    groups: dict[str, dict] = {}
+    order: list[str] = []
+    passthrough: list = []
+    for it in items:
+        title = (getattr(it, "title", "") or "")
+        m = _ACCESSION_RE.search(getattr(it, "url", "") or "") or _ACCESSION_RE.search(getattr(it, "summary", "") or "")
+        if not m or " - " not in title:
+            passthrough.append(it)
+            continue
+        acc = m.group(1)
+        if acc not in groups:
+            groups[acc] = {"issuer": None, "reporting": [], "carrier": it}
+            order.append(acc)
+        name = re.sub(r"^\s*\d+\s*-\s*", "", title)
+        name = re.sub(r"\s*\(\d+\)\s*\((?:Issuer|Reporting)\)\s*$", "", name).strip()
+        if title.rstrip().endswith("(Issuer)"):
+            groups[acc]["issuer"] = name
+            groups[acc]["carrier"] = it          # prefer the issuer entry as the carrier
+        else:
+            groups[acc]["reporting"].append(name)
+    merged = []
+    for acc in order:
+        g = groups[acc]
+        company, insiders = g["issuer"], g["reporting"]
+        if company and insiders:
+            label = f"{company} — insider: {', '.join(insiders[:2])} (Form 4)"
+        elif company:
+            label = f"{company} — Form 4 insider filing"
+        elif insiders:
+            label = f"Form 4 — {', '.join(insiders[:2])}"
+        else:
+            continue
+        it = g["carrier"]
+        try:
+            it.title = label[:200]
+        except Exception:
+            pass
+        merged.append(it)
+    return merged + passthrough
+
+
+def _fmt_usd(v: float) -> str:
+    """Compact USD: $1.2B / $450M / $87K / $920."""
+    v = abs(float(v or 0))
+    if v >= 1e9:
+        return f"${v / 1e9:.1f}B"
+    if v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    if v >= 1e3:
+        return f"${v / 1e3:.0f}K"
+    return f"${v:.0f}"
+
+
+def _sec_float(s) -> float:
+    try:
+        return float(str(s).replace(",", "").strip())
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _form4_dir(url: str):
+    """(cik, acc_nodash) from an EDGAR URL, e.g.
+    .../Archives/edgar/data/1033767/000119312526291233/0001193125-26-291233-index.htm"""
+    m = re.search(r"/data/(\d+)/(\d{18})", url or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+async def _fetch_form4_txn(url: str, client) -> dict | None:
+    """Fetch + parse a Form 4 ownership XML for its actual transactions. Returns
+    {buy_shares, buy_value, sell_shares, sell_value, direction, codes} or None. Only
+    P (open-market buy) and S (open-market sale) carry a discretionary SIGNAL — grants
+    (A), option exercises (M), tax withholding (F), gifts (G) are recorded in `codes`
+    but not counted as buy/sell $ (they're routine, not a conviction trade)."""
+    dd = _form4_dir(url)
+    if not dd:
+        return None
+    cik, acc = dd
+    base = f"https://www.sec.gov/Archives/edgar/data/{cik}/{acc}"
+    # find the raw ownership XML (skip the xsl-rendered variant)
+    files: list[str] = []
+    try:
+        idx = await client.get(f"{base}/index.json")
+        files = [f.get("name", "") for f in idx.json().get("directory", {}).get("item", [])]
+    except Exception:
+        pass
+    xml_name = (next((f for f in files if f.lower().endswith(".xml") and "xsl" not in f.lower()), None)
+                or next((f for f in files if f.lower().endswith(".xml")), None)
+                or "primary_doc.xml")
+    try:
+        r = await client.get(f"{base}/{xml_name}")
+        root = ET.fromstring(r.text)
+    except Exception:
+        return None
+    buy_sh = sell_sh = buy_v = sell_v = 0.0
+    codes: list[str] = []
+    for txn in root.iter("nonDerivativeTransaction"):
+        code = (txn.findtext(".//transactionCode") or "").strip().upper()
+        if not code:
+            continue
+        codes.append(code)
+        shares = _sec_float(txn.findtext(".//transactionShares/value"))
+        price = _sec_float(txn.findtext(".//transactionPricePerShare/value"))
+        if code == "P":
+            buy_sh += shares
+            buy_v += shares * price
+        elif code == "S":
+            sell_sh += shares
+            sell_v += shares * price
+    # Derivative transactions (options/RSUs) don't carry an open-market buy/sell $ signal,
+    # but their codes let us label an otherwise-blank derivative-only filing (exercise/grant).
+    for txn in root.iter("derivativeTransaction"):
+        code = (txn.findtext(".//transactionCode") or "").strip().upper()
+        if code:
+            codes.append(code)
+    if not codes:
+        return None
+    if buy_v > sell_v or (buy_v == sell_v and buy_sh > sell_sh):
+        direction = "buy" if (buy_v or buy_sh) else "other"
+    elif sell_v > buy_v or sell_sh > buy_sh:
+        direction = "sell"
+    else:
+        direction = "other"
+    return {"buy_shares": buy_sh, "buy_value": buy_v, "sell_shares": sell_sh,
+            "sell_value": sell_v, "direction": direction, "codes": codes}
+
+
+async def _enrich_sec_form4(items: list) -> list:
+    """Attach parsed Form 4 transaction detail to each SEC item's `.meta['form4']`,
+    concurrently but rate-limited (SEC fair-access ~10 req/s). Best-effort — a filing
+    that won't parse just keeps its title+link."""
+    import httpx
+    from app.monitors.rss_feeds import _SEC_USER_AGENT
+    sem = asyncio.Semaphore(4)
+    async with httpx.AsyncClient(timeout=12, follow_redirects=True,
+                                 headers={"User-Agent": _SEC_USER_AGENT}) as client:
+        async def _one(it):
+            async with sem:
+                try:
+                    txn = await _fetch_form4_txn(getattr(it, "url", "") or "", client)
+                    if txn:
+                        meta = getattr(it, "meta", None) or {}
+                        meta["form4"] = txn
+                        it.meta = meta
+                except Exception:
+                    pass
+        await asyncio.gather(*[_one(it) for it in items])
+    return items
+
+
+def _detect_sec_clusters(items: list) -> list:
+    """Group parsed Form 4s by issuer; a cluster BUY = ≥2 distinct insiders making
+    open-market purchases at the same issuer (the classic bullish insider signal).
+    Returns cluster dicts sorted by total $ bought."""
+    by_issuer: dict[str, list] = {}
+    for it in items:
+        f4 = (getattr(it, "meta", None) or {}).get("form4")
+        if not f4 or f4.get("direction") != "buy" or f4.get("buy_value", 0) <= 0:
+            continue
+        issuer = (getattr(it, "title", "") or "").split(" — ")[0].strip() or "?"
+        by_issuer.setdefault(issuer, []).append(f4)
+    clusters = [{"issuer": iss, "insiders": len(fs),
+                 "total_value": sum(f["buy_value"] for f in fs)}
+                for iss, fs in by_issuer.items() if len(fs) >= 2]
+    clusters.sort(key=lambda c: c["total_value"], reverse=True)
+    return clusters
+
+
+_FORM4_CODE_LABEL = {
+    "P": "open-market buy", "S": "open-market sell", "A": "grant/award",
+    "M": "option exercise", "X": "option exercise", "F": "tax withholding",
+    "G": "gift", "C": "conversion", "D": "disposition to issuer", "J": "other",
+}
+
+
+def _sec_signal_line(f4: dict) -> str:
+    """One-line signal for a parsed Form 4: a real 🟢BUY/🔴SELL with $ value when the
+    insider traded on the open market (codes P/S), else an honest routine-event label
+    (grant/exercise/tax) so a comp event isn't mistaken for a conviction trade."""
+    if not f4:
+        return ""
+    if f4.get("direction") == "buy" and f4.get("buy_value", 0) > 0:
+        return f"🟢 **BUY** {_fmt_usd(f4['buy_value'])} ({int(f4['buy_shares']):,} sh)"
+    if f4.get("direction") == "sell" and f4.get("sell_value", 0) > 0:
+        return f"🔴 **SELL** {_fmt_usd(f4['sell_value'])} ({int(f4['sell_shares']):,} sh)"
+    seen, labels = set(), []
+    for c in (f4.get("codes") or []):
+        lab = _FORM4_CODE_LABEL.get(c, c)
+        if lab not in seen:
+            seen.add(lab)
+            labels.append(lab)
+    return f"⚪ {', '.join(labels)}" if labels else ""
+
+
+_SEV_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3}
+_SEV_ICON = {"critical": "🔴", "high": "🟠", "medium": "🟡", "low": "⚪"}
+
+
+def _rollup_advisories(items: list) -> str | None:
+    """Severity roll-up for GitHub advisories: counts by severity + an 'act-on' line
+    naming the CRITICAL/HIGH packages worth patching now — instead of a flat list of 15."""
+    counts: dict[str, int] = {}
+    urgent: list[tuple[str, str]] = []
+    for it in items:
+        adv = (getattr(it, "meta", None) or {}).get("advisory")
+        if not adv:
+            continue
+        sev = (adv.get("severity") or "unknown").lower()
+        counts[sev] = counts.get(sev, 0) + 1
+        if sev in ("critical", "high"):
+            pk = adv.get("packages") or []
+            urgent.append((sev, pk[0] if pk else (adv.get("cve") or adv.get("ghsa") or "?")))
+    if not counts:
+        return None
+    parts = [f"{_SEV_ICON.get(s, '')}{counts[s]} {s}"
+             for s in sorted(counts, key=lambda s: _SEV_ORDER.get(s, 9)) if counts.get(s)]
+    line = "🔺 **" + " · ".join(parts) + "**"
+    urgent.sort(key=lambda u: _SEV_ORDER.get(u[0], 9))
+    if urgent:
+        names = ", ".join(dict.fromkeys(u[1] for u in urgent[:4]))
+        line += f"  —  patch now: {names}"
+    return line
+
+
+def _advisory_badge(adv: dict) -> str:
+    """Per-item CVSS/CVE badge (the severity itself is already in the title)."""
+    if not adv:
+        return ""
+    parts = []
+    if adv.get("cvss"):
+        parts.append(f"CVSS {adv['cvss']}")
+    if adv.get("cve"):
+        parts.append(str(adv["cve"]))
+    return "🔺 " + "  ·  ".join(parts) if parts else ""
+
+
+_USD_AMT_RE = re.compile(r"\$\s?([\d,]+(?:\.\d+)?)\s?(billion|million|thousand)?", re.IGNORECASE)
+_DOD_BRANCHES = ("Army", "Navy", "Air Force", "Marine Corps", "Space Force",
+                 "Defense Logistics Agency", "Missile Defense Agency", "SOCOM")
+
+
+def _parse_dod_contracts(summary: str) -> dict | None:
+    """Parse a DoD daily-contracts post body (already in the feed item, currently
+    discarded) into an aggregate: total $ awarded, award count, and per-branch counts."""
+    if not summary or len(summary) < 200:
+        return None
+    total, n = 0.0, 0
+    for m in _USD_AMT_RE.finditer(summary):
+        try:
+            val = float(m.group(1).replace(",", ""))
+        except ValueError:
+            continue
+        val *= {"billion": 1e9, "million": 1e6, "thousand": 1e3}.get((m.group(2) or "").lower(), 1)
+        if val >= 100_000:        # ignore incidental small numbers (contract line-item refs etc.)
+            total += val
+            n += 1
+    branches = {b: len(re.findall(rf"\b{re.escape(b)}\b", summary)) for b in _DOD_BRANCHES}
+    branches = {b: c for b, c in branches.items() if c}
+    return {"total": total, "count": n, "branches": branches} if n else None
+
+
+def _contracts_rollup_line(items: list) -> str | None:
+    total, n, bt = 0.0, 0, {}
+    for it in items:
+        d = (getattr(it, "meta", None) or {}).get("contracts")
+        if not d:
+            continue
+        total += d["total"]
+        n += d["count"]
+        for b, c in d["branches"].items():
+            bt[b] = bt.get(b, 0) + c
+    if n == 0:
+        return None
+    top = ", ".join(f"{b} {c}" for b, c in sorted(bt.items(), key=lambda x: -x[1])[:4])
+    return f"💵 **~{_fmt_usd(total)} across {n} awards**" + (f"  ·  {top}" if top else "")
 
 
 def _drop_non_news(items: list, label: str) -> list:

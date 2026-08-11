@@ -6,6 +6,7 @@ import ast
 import asyncio
 import logging
 import shutil
+import os
 import subprocess
 import sys
 import tempfile
@@ -239,6 +240,69 @@ class CodeExecTool(BaseTool):
             return output
         return '[...truncated]\n' + output[-1500:]
 
+    async def _execute_via_sidecar(self, code: str, queue: Path) -> ToolResult:
+        """Run code in the network-isolated nova-exec sidecar via the file queue.
+
+        Protocol: write jobs/{id}.json, poll results/{id}.json (the sidecar
+        writes results atomically via rename). Timeout = CODE_EXEC_TIMEOUT
+        plus small scheduling slack; a missing result by then means the
+        sidecar is down — surfaced as a transient error, never a hang.
+        """
+        import json as _json
+        import uuid as _uuid
+
+        job_id = _uuid.uuid4().hex
+        jobs_dir = queue / "jobs"
+        result_path = queue / "results" / f"{job_id}.json"
+        try:
+            jobs_dir.mkdir(parents=True, exist_ok=True)
+            tmp = jobs_dir / f"{job_id}.tmp"
+            tmp.write_text(_json.dumps({
+                "code": code, "timeout": int(config.CODE_EXEC_TIMEOUT),
+            }), encoding="utf-8")
+            tmp.replace(jobs_dir / f"{job_id}.json")  # atomic hand-off
+
+            deadline = asyncio.get_event_loop().time() + config.CODE_EXEC_TIMEOUT + 10
+            while asyncio.get_event_loop().time() < deadline:
+                if result_path.exists():
+                    res = _json.loads(result_path.read_text(encoding="utf-8"))
+                    result_path.unlink(missing_ok=True)
+                    stdout = res.get("stdout", "")
+                    stderr = res.get("stderr", "")
+                    if res.get("timed_out"):
+                        return ToolResult(
+                            output="", success=False,
+                            error=f"Code execution timed out after {config.CODE_EXEC_TIMEOUT}s",
+                            error_category=ErrorCategory.TRANSIENT,
+                        )
+                    if stdout and stderr:
+                        output = f"[stdout]\n{stdout}\n[stderr]\n{stderr}"
+                    else:
+                        output = stdout or (f"[stderr]\n{stderr}" if stderr else "")
+                    if res.get("returncode", 0) != 0:
+                        return ToolResult(
+                            output=output or stderr, success=False,
+                            error=f"Script exited with code {res.get('returncode')}",
+                            error_category=ErrorCategory.INTERNAL,
+                        )
+                    if not output.strip():
+                        output = "[Code executed successfully with no output]"
+                    max_chars = config.TOOL_OUTPUT_MAX_CHARS
+                    if len(output) > max_chars:
+                        total = len(output)
+                        output = output[:max_chars] + f"\n[... truncated: showing {max_chars} of {total} chars]"
+                    return ToolResult(output=output, success=True)
+                await asyncio.sleep(0.2)
+            return ToolResult(
+                output="", success=False,
+                error="exec sidecar did not return a result — is nova-exec running?",
+                error_category=ErrorCategory.TRANSIENT,
+            )
+        except Exception as e:
+            return ToolResult(output="", success=False,
+                              error=f"sidecar execution failed: {e}",
+                              error_category=ErrorCategory.INTERNAL)
+
     async def execute(self, *, code: str = "", **kwargs) -> ToolResult:
         if not code:
             return ToolResult(output="", success=False, error="No code provided", error_category=ErrorCategory.VALIDATION)
@@ -247,6 +311,17 @@ class CodeExecTool(BaseTool):
         safety_error = _check_code_safety(code)
         if safety_error:
             return ToolResult(output="", success=False, error=safety_error, error_category=ErrorCategory.PERMISSION)
+
+        # Network-isolated sidecar path (audit 2026-07-08): when the exec-queue
+        # volume is mounted, jobs run in the nova-exec container (network_mode:
+        # none) — model-written code physically cannot exfiltrate or reach the
+        # in-network Ollama API, regardless of what slips past the AST screen.
+        # The mount's presence is the switch (no config flag); without it (dev,
+        # tests) the legacy in-process subprocess below still applies the
+        # runtime import-hook guard.
+        _queue_dir = Path(os.environ.get("EXEC_QUEUE_DIR", "/exec_queue"))
+        if _queue_dir.is_dir():
+            return await self._execute_via_sidecar(code, _queue_dir)
 
         sandbox_dir = None
         script_path = None

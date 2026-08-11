@@ -195,10 +195,14 @@ async def deep_research(question: str, *, max_rounds: int = 2, max_pages: int = 
     refinement round if the first pass doesn't answer.
     """
     from app.tools import native_search
-    from app.tools.http_fetch import HttpFetchTool
+    # Reuse the monitor engine's reader: http fast-path, then headless-browser
+    # fallback for JS-rendered pages. Without this the interactive tool was
+    # structurally unable to read most quality news (BBC/CNBC/Reuters/Economist
+    # return a CSS shell to a plain GET), reporting "NO ANSWER" on the best sources.
+    from app.monitors.deep_research import _fetch_body
 
-    fetcher = HttpFetchTool()
     query = question
+    browser_budget = [4]   # cap headless-browser renders across this whole research call
     accumulated: list[dict] = []
     seen_urls: set[str] = set()
 
@@ -240,16 +244,17 @@ async def deep_research(question: str, *, max_rounds: int = 2, max_pages: int = 
         if not picks:
             break
 
-        # 3. Fetch in parallel
+        # 3. Fetch in parallel — http fast-path, headless-browser fallback for
+        # JS-rendered pages (bounded by the shared browser_budget). `_fetch_body`
+        # returns clean readable text (or None), junk-gated.
         async def _fetch_one(r):
             try:
-                fetched = await fetcher.execute(url=r.url, method="GET")
+                body = await _fetch_body(r.url, browser_budget=browser_budget)
             except Exception as e:
                 return r, "", f"fetch raised: {e}"
-            if not fetched.success:
-                return r, "", fetched.error or "fetch failed"
-            text = _strip_html(fetched.output or "")
-            return r, text, ""
+            if not body:
+                return r, "", "no readable body"
+            return r, body, ""
 
         fetched = await asyncio.gather(*[_fetch_one(r) for r in picks], return_exceptions=False)
 

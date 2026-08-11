@@ -28,11 +28,27 @@ _SOURCE_CONFIDENCE: dict[str, float] = {
 _DEFAULT_SOURCE_CONFIDENCE = 0.65
 
 
-async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = "") -> None:
+async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = "",
+                              *, max_answer_chars: int = 1000, max_triples: int = 5,
+                              model: str | None = None,
+                              trust: float | None = None) -> None:
     """Extract (subject, predicate, object) triples from a Q&A pair.
 
     Runs as a background task — failures are logged, never raised.
     Includes quality gate (heuristic pre-filter) and contradiction detection.
+
+    `max_answer_chars` / `max_triples` default to the lean chat budget. The monitor
+    digest path passes far larger values: a multi-paragraph domain study is the main
+    KG-growth pipe, and capping it to 5 triples from the first 1000 chars threw away
+    the back half of every briefing (the richer the synthesis, the more was lost).
+
+    `model` routes extraction to a bigger model (the monitor path passes the synthesis
+    model). A controlled 4-arm A/B (2026-06-29, 45 real digests) found the EXTRACTION
+    step — not the cap — was the binding constraint: the 27B yields ~4.6× more grounded
+    facts/digest (1.4→6.5) at 100% entity-grounding vs the 9B. The same A/B REJECTED a
+    "capture actions/events" prompt relaxation — it coerced the 27B into misframed
+    event-relations (direction reversals, spurious competes_with); the CURRENT prompt
+    on the 27B both extracts MORE and keeps relations clean, so the prompt is unchanged.
     """
     from app.core.kg import CANONICAL_PREDICATES, is_garbage_triple
     from app.core.prompt_optimizer import get_active_module
@@ -41,7 +57,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
     _kg_default = (
         "Extract factual (subject, predicate, object) triples from this Q&A.\n"
         "Use ONLY these predicates: {predicates}\n"
-        "Return a JSON array. Max 5 triples. Only verifiable facts, not opinions.\n"
+        "Return a JSON array. Max {max_triples} triples. Only verifiable facts, not opinions.\n"
         "Rate each triple's confidence: 0.3 (uncertain/speculative) to 0.95 (well-established fact).\n\n"
         "DIRECTION RULES — these predicates are NOT symmetric. The subject and object roles are fixed:\n"
         "  capital_of:  subject = CITY,    object = COUNTRY     (e.g., \"Tokyo capital_of Japan\", NEVER \"Japan capital_of Tokyo\")\n"
@@ -53,6 +69,11 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
         "  located_in:  subject = ENTITY,  object = PLACE       (e.g., \"TSMC located_in Taiwan\")\n"
         "  born_in:     subject = PERSON,  object = PLACE       (e.g., \"Einstein born_in Germany\")\n"
         "  member_of:   subject = THING,   object = LARGER_GROUP (NEVER tautological like \"SEC member_of U.S. Securities and Exchange Commission\")\n"
+        "  acquired:    subject = ACQUIRER,  object = ACQUIRED    (e.g., \"Google acquired Wiz\", NEVER reversed)\n"
+        "  subsidiary_of: subject = UNIT,    object = PARENT      (e.g., \"Instagram subsidiary_of Meta\")\n"
+        "  invested_in: subject = INVESTOR,  object = RECIPIENT   (e.g., \"SoftBank invested_in OpenAI\")\n"
+        "  sued:        subject = PLAINTIFF, object = DEFENDANT   (e.g., \"Epic sued Apple\")\n"
+        "  sanctioned:  subject = SANCTIONER, object = TARGET     (e.g., \"US sanctioned Huawei\")\n"
         "Before emitting a triple, check that the roles match the rule. If not, swap them.\n\n"
         "REJECT these triples:\n"
         "  - Tautologies where subject == object semantically (\"SEC member_of Securities and Exchange Commission\")\n"
@@ -69,7 +90,8 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
     prompt = kg_template.format(
         predicates=predicates_str,
         query=clean_query or query,
-        answer=answer[:1000],
+        answer=answer[:max_answer_chars],
+        max_triples=max_triples,
     )
 
     try:
@@ -77,6 +99,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
             [{"role": "user", "content": prompt}],
             json_mode=True,
             json_prefix="[{",
+            model=model,
         )
         if raw is None or not raw:
             return
@@ -88,7 +111,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
             return
 
         added = 0
-        for triple in data[:5]:
+        for triple in data[:max_triples]:
             if not isinstance(triple, dict):
                 continue
             s = str(triple.get("subject", "")).strip()
@@ -114,7 +137,8 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
             except Exception as e:
                 logger.warning("KG contradiction check failed (allowing fact): %s", e)
 
-            if await kg.add_fact(s, p, o, confidence=conf, source="extracted", provenance=source_name):
+            if await kg.add_fact(s, p, o, confidence=conf, source="extracted", provenance=source_name,
+                                 trust=trust):
                 added += 1
 
         if added:

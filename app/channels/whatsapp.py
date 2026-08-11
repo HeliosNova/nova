@@ -109,7 +109,10 @@ class WhatsAppBot:
         try:
             tokens = []
             async for event in think(query=query, conversation_id=conv_id, channel="whatsapp"):
-                if event.type == EventType.TOKEN:
+                if event.type == EventType.REVISION:
+                    # stream-first refine: the final answer replaces the draft
+                    tokens = [event.data.get("text", "")]
+                elif event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:
                         tokens.append(text)
@@ -169,11 +172,11 @@ class WhatsAppBot:
         except Exception as e:
             logger.error("[WhatsApp] Send failed: %s", e)
 
-    async def send_alert(self, message: str) -> None:
+    async def send_alert(self, message: str) -> bool:
         """Send a message to the default chat. Converts Discord markdown to
         WhatsApp's variant (*bold* uses single asterisk; bare URLs auto-link)."""
         if not self.default_chat_id:
-            return
+            return False
         try:
             from app.channels.format_for_channel import to_whatsapp
             wa_message = to_whatsapp(message)
@@ -183,8 +186,10 @@ class WhatsAppBot:
                     if _ci:
                         await asyncio.sleep(0.3)
                     await self._send_message(self.default_chat_id, chunk)
+            return True
         except Exception as e:
             logger.error("[WhatsApp] Alert send failed: %s", e)
+            return False
 
     def get_router(self) -> APIRouter:
         """Return a FastAPI router with webhook endpoints."""
@@ -252,10 +257,12 @@ class WhatsAppBot:
                 msg_type = msg.get("type", "")
                 sender_phone = msg.get("from", "")
 
-                # Dedup — WhatsApp may send the same webhook multiple times (persistent via SQLite)
-                if self._check_dedup(msg_id):
+                # Dedup — WhatsApp may send the same webhook multiple times (persistent
+                # via SQLite). to_thread: writer-lock DB calls stay off the event loop
+                # (54h-freeze bug class, 2026-07-03).
+                if await asyncio.to_thread(self._check_dedup, msg_id):
                     return JSONResponse({"status": "ok"})
-                self._record_dedup(msg_id)
+                await asyncio.to_thread(self._record_dedup, msg_id)
 
                 # Only handle text messages
                 if msg_type != "text":

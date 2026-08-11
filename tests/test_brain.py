@@ -1542,12 +1542,19 @@ class TestCritiqueBrainIntegration:
         )
         set_services(svc)
 
-        with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "Here is a comprehensive comparison of the two approaches. " * 5
-            mock_result.tool_calls = []
+        mock_result = AsyncMock()
+        mock_result.content = "Here is a comprehensive comparison of the two approaches. " * 5
+        mock_result.tool_calls = []
+        _crit = json.dumps({"pass": True, "issues": [], "score": 0.9})
+        # Patch brain.llm AND the source app.core.llm module: the critique/reflexion
+        # sub-paths do `from app.core import llm` (a reference brain's patch does NOT
+        # cover), so without this they reach the dead-port stub and stall on retry
+        # backoff — the cause of the full-suite hang found 2026-06-27.
+        with patch("app.core.brain.llm") as mock_llm, \
+             patch("app.core.llm.invoke_nothink", AsyncMock(return_value=_crit)), \
+             patch("app.core.llm.generate_with_tools", AsyncMock(return_value=mock_result)):
             mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-            mock_llm.invoke_nothink = AsyncMock(return_value=json.dumps({"pass": True, "issues": []}))
+            mock_llm.invoke_nothink = AsyncMock(return_value=_crit)
 
             events = []
             async for event in think("Compare Python and Rust for web development and also analyze their ecosystems"):

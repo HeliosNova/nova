@@ -744,6 +744,34 @@ class EvalHarness:
             except Exception as e:
                 logger.warning("[EvalHarness] Skill seed failed for %r: %s", seed["name"], e)
 
+    def _cleanup_seeded_skills(self) -> None:
+        """Delete every seeded "Eval: *" skill from the live store.
+
+        The "Eval: " name prefix is the seeding convention in evals/suite.yaml,
+        so the sweep also collects leftovers from previously interrupted runs.
+        Uses delete_skill() rather than raw SQL so the ChromaDB vector entry is
+        removed too — a raw row delete leaves a stale vector that semantic
+        matching still surfaces.
+        """
+        from app.core.brain import get_services
+
+        try:
+            svc = get_services()
+            skills = getattr(svc, "skills", None) if svc else None
+            if not skills:
+                return
+            rows = skills._db.fetchall(
+                "SELECT id FROM skills WHERE name LIKE 'Eval:%'"
+            )
+            for row in rows:
+                skills.delete_skill(int(row["id"]))
+            if rows:
+                logger.info(
+                    "[EvalHarness] cleaned up %d seeded eval skill(s)", len(rows)
+                )
+        except Exception as e:
+            logger.warning("[EvalHarness] eval skill cleanup skipped: %s", e)
+
     # --- Document seeding ---
 
     async def _seed_documents(self, tasks: list[EvalTask]) -> None:
@@ -808,7 +836,7 @@ class EvalHarness:
         start = time.monotonic()
         try:
             async with asyncio.timeout(timeout):
-                async for event in think(query=query, ephemeral=True, conversation_id=conversation_id):
+                async for event in think(query=query, ephemeral=True, conversation_id=conversation_id, channel="eval"):
                     if event.type == EventType.TOKEN:
                         tokens.append(event.data.get("text", ""))
                     elif event.type == EventType.TOOL_USE:
@@ -1011,46 +1039,45 @@ class EvalHarness:
         # Defensive: clear any leftover eval lesson for this task id
         self._purge_eval_lessons(learning, marker)
 
-        # 1. BEFORE — lesson absent
-        before = await self._invoke_brain(task.query, task.timeout)
-        before_failed = self._evaluate_assertions(task.assertions, before)
-        before_correct = bool(before.response_text) and not before_failed
-
-        # 2. SEED — context marker makes cleanup safe (never deletes real lessons)
         try:
-            learning.add_knowledge_lesson(
-                topic=seed.get("topic", task.id),
-                correct_answer=seed["correct_answer"],
-                lesson_text=seed.get("lesson_text", ""),
-                context=marker,
-                confidence=float(seed.get("confidence", 0.95)),
-            )
-        except Exception as e:
-            logger.warning("[EvalHarness] memory seed failed for %s: %s", task.id, e)
+            # 1. BEFORE — lesson absent
+            before = await self._invoke_brain(task.query, task.timeout)
+            before_failed = self._evaluate_assertions(task.assertions, before)
+            before_correct = bool(before.response_text) and not before_failed
 
-        # 3. AFTER — lesson present
-        after = await self._invoke_brain(task.query, task.timeout)
-        after_failed = self._evaluate_assertions(task.assertions, after)
-        after_correct = bool(after.response_text) and not after_failed
+            # 2. SEED — context marker makes cleanup safe (never deletes real lessons)
+            try:
+                learning.add_knowledge_lesson(
+                    topic=seed.get("topic", task.id),
+                    correct_answer=seed["correct_answer"],
+                    lesson_text=seed.get("lesson_text", ""),
+                    context=marker,
+                    confidence=float(seed.get("confidence", 0.95)),
+                )
+            except Exception as e:
+                logger.warning("[EvalHarness] memory seed failed for %s: %s", task.id, e)
 
-        # 4. CLEANUP
-        self._purge_eval_lessons(learning, marker)
+            # 3. AFTER — lesson present
+            after = await self._invoke_brain(task.query, task.timeout)
+            after_failed = self._evaluate_assertions(task.assertions, after)
+            after_correct = bool(after.response_text) and not after_failed
+        finally:
+            # 4. CLEANUP — in finally so a cancelled run (client disconnect
+            # cancels the /api/eval/run task) can't leave the seeded lesson
+            # live in the store.
+            self._purge_eval_lessons(learning, marker)
 
         latency = time.monotonic() - start
 
-        # A leg that hit its time budget without proving correctness makes the
-        # pair UNTESTABLE — we can't distinguish "lesson didn't fix it" from
-        # "generation got cut off". Exclude it from causal metrics entirely
-        # rather than letting budget exhaustion masquerade as a failed fix.
-        pair_timed_out = (before.timed_out and not before_correct) or (
-            after.timed_out and not after_correct
-        )
-        if pair_timed_out:
-            legs = []
-            if before.timed_out and not before_correct:
-                legs.append("before")
-            if after.timed_out and not after_correct:
-                legs.append("after")
+        # Only an AFTER-leg timeout makes the pair untestable — an answer that
+        # never completed can't be graded. A timed-out BEFORE leg is evidence,
+        # not noise: with the seed absent the pipeline tool-hunts the unknown
+        # entity and delivers no correct answer within the budget, which is
+        # exactly what before_correct=False asserts. caused_fix stays
+        # inflation-safe because it additionally requires a completed, correct
+        # after leg. (The old both-legs rule dated from when num_ctx truncation
+        # cut the tool block and made before-legs unrealistically fast.)
+        if after.timed_out and not after_correct:
             return TaskResult(
                 task_id=task.id,
                 category=task.category,
@@ -1062,7 +1089,7 @@ class EvalHarness:
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=[
-                    f"memory-learning: {'/'.join(legs)} run timed out — pair untestable"
+                    "memory-learning: after run timed out — pair untestable"
                 ],
                 error=after.error or before.error,
                 decomposed=after.decomposed,
@@ -1078,6 +1105,8 @@ class EvalHarness:
             f"before_correct={before_correct} after_correct={after_correct} "
             f"caused_fix={caused_fix}"
         ]
+        if before.timed_out:
+            notes.append("before leg timed out — counted as before_correct=False")
         report_failures = ([] if after_correct else after_failed) + notes
 
         return TaskResult(
@@ -1149,39 +1178,35 @@ class EvalHarness:
 
         await _clean()  # defensive pre-clean
 
-        # 1. BEFORE — fact absent
-        before = await self._invoke_brain(task.query, task.timeout)
-        before_failed = self._evaluate_assertions(task.assertions, before)
-        before_correct = bool(before.response_text) and not before_failed
-
-        # 2. SEED the KG triple
         try:
-            await kg.add_fact(s, p, o, confidence=float(seed.get("confidence", 0.95)),
-                              source="eval", provenance="eval-kg")
-        except Exception as e:
-            logger.warning("[EvalHarness] kg seed failed for %s: %s", task.id, e)
+            # 1. BEFORE — fact absent
+            before = await self._invoke_brain(task.query, task.timeout)
+            before_failed = self._evaluate_assertions(task.assertions, before)
+            before_correct = bool(before.response_text) and not before_failed
 
-        # 3. AFTER — fact present
-        after = await self._invoke_brain(task.query, task.timeout)
-        after_failed = self._evaluate_assertions(task.assertions, after)
-        after_correct = bool(after.response_text) and not after_failed
+            # 2. SEED the KG triple
+            try:
+                await kg.add_fact(s, p, o, confidence=float(seed.get("confidence", 0.95)),
+                                  source="eval", provenance="eval-kg")
+            except Exception as e:
+                logger.warning("[EvalHarness] kg seed failed for %s: %s", task.id, e)
 
-        # 4. CLEANUP (retire the seeded fact)
-        await _clean()
+            # 3. AFTER — fact present
+            after = await self._invoke_brain(task.query, task.timeout)
+            after_failed = self._evaluate_assertions(task.assertions, after)
+            after_correct = bool(after.response_text) and not after_failed
+        finally:
+            # 4. CLEANUP (retire the seeded fact) — in finally so a cancelled
+            # run can't leave the fictional seeded triple live in the KG,
+            # where it would be retrieved into real chat prompts.
+            await _clean()
 
         latency = time.monotonic() - start
 
-        # Same untestable rule as memory-learning: a timed-out leg means the
-        # pair proves nothing about the seeded fact.
-        pair_timed_out = (before.timed_out and not before_correct) or (
-            after.timed_out and not after_correct
-        )
-        if pair_timed_out:
-            legs = []
-            if before.timed_out and not before_correct:
-                legs.append("before")
-            if after.timed_out and not after_correct:
-                legs.append("after")
+        # Same rule as memory-learning: only an AFTER-leg timeout makes the
+        # pair untestable. A timed-out BEFORE leg (tool-hunting the unknown
+        # entity) IS the no-correct-answer-without-the-fact evidence.
+        if after.timed_out and not after_correct:
             return TaskResult(
                 task_id=task.id,
                 category=task.category,
@@ -1193,7 +1218,7 @@ class EvalHarness:
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=[
-                    f"kg-retrieval: {'/'.join(legs)} run timed out — pair untestable"
+                    "kg-retrieval: after run timed out — pair untestable"
                 ],
                 error=after.error or before.error,
                 decomposed=after.decomposed,
@@ -1208,6 +1233,8 @@ class EvalHarness:
             f"before_correct={before_correct} after_correct={after_correct} "
             f"caused_fix={caused_fix}"
         ]
+        if before.timed_out:
+            notes.append("before leg timed out — counted as before_correct=False")
         report_failures = ([] if after_correct else after_failed) + notes
 
         return TaskResult(
@@ -1247,18 +1274,33 @@ class EvalHarness:
 
         # Run tasks sequentially to avoid confounding latency metrics
         task_results: list[TaskResult] = []
-        for i, task in enumerate(tasks, 1):
-            logger.info(
-                "[EvalHarness] Task %d/%d: %s (%s)", i, len(tasks), task.id, task.category
-            )
-            result = await self.run_task(task)
-            task_results.append(result)
-            status = "PASS" if result.passed else ("TIMEOUT" if result.timed_out else "FAIL")
-            logger.info(
-                "[EvalHarness] %s %s (score=%.2f, %.1fs)",
-                status, task.id,
-                result.reflexion_score or 0.0, result.latency_seconds,
-            )
+        try:
+            for i, task in enumerate(tasks, 1):
+                # GPU-yield checkpoint: if the owner starts chatting mid-run,
+                # wait before launching the next task instead of contending
+                # with their conversation for the whole leg (audit 2026-07-08).
+                from app.core import llm as _llm
+                _waited = await _llm.wait_for_interactive_quiet(max_wait_s=180.0)
+                if _waited:
+                    logger.info("[EvalHarness] yielded GPU to chat for %.0fs", _waited)
+                logger.info(
+                    "[EvalHarness] Task %d/%d: %s (%s)", i, len(tasks), task.id, task.category
+                )
+                result = await self.run_task(task)
+                task_results.append(result)
+                status = "PASS" if result.passed else ("TIMEOUT" if result.timed_out else "FAIL")
+                logger.info(
+                    "[EvalHarness] %s %s (score=%.2f, %.1fs)",
+                    status, task.id,
+                    result.reflexion_score or 0.0, result.latency_seconds,
+                )
+        finally:
+            # Seeded "Eval: *" skills must never outlive the run: leftovers
+            # hijack real queries via semantic skill matching (observed live
+            # 2026-07-07 with "Eval: Crypto Price Probe"). finally covers both
+            # normal completion AND cancellation (client disconnect cancels
+            # the /api/eval/run task).
+            self._cleanup_seeded_skills()
 
         duration = time.monotonic() - start_ts
         passed = sum(1 for r in task_results if r.passed)

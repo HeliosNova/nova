@@ -85,7 +85,10 @@ _MUTABLE_FIELDS = {
     "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
     "ENABLE_RLVR_SIGNALS",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
-    "ENABLE_DEEP_RESEARCH",
+    "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
+    "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
+    "ENABLE_MINICHECK",
+    "MONITOR_SYNTHESIS_MODEL",
     "ENABLE_STORYLINES", "ENABLE_SALIENCE_FILTER", "ENABLE_FORECASTS",
     "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
@@ -103,11 +106,19 @@ class Config:
     LLM_PROVIDER: str = field(default_factory=lambda: _env("LLM_PROVIDER", "ollama"))
     LLM_MODEL: str = field(default_factory=lambda: _env("LLM_MODEL", "qwen3.5:27b"))
     OLLAMA_URL: str = field(default_factory=lambda: _env("OLLAMA_URL", "http://ollama:11434"))
+    # Dedicated CPU-only Ollama for EMBEDDINGS so bge-m3 embeds never queue behind
+    # a 27B generation on the main instance (NUM_PARALLEL=1 serialized them → the
+    # chat context-gather timed out; manual audit 2026-07-09). Falls back to
+    # OLLAMA_URL if the embed instance is unreachable (embedding.py probes both).
+    EMBED_OLLAMA_URL: str = field(default_factory=lambda: _env("EMBED_OLLAMA_URL", "http://embed:11434"))
 
     # Learning / reflexion toggles — these were referenced in code but missing
     # from config, leading to `AttributeError: ??? ` at inspection time.
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
     ENABLE_REFLEXION: bool = field(default_factory=lambda: _env("ENABLE_REFLEXION", "true").lower() == "true")
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
     ENABLE_BACKGROUND_TASKS: bool = field(default_factory=lambda: _env("ENABLE_BACKGROUND_TASKS", "true").lower() == "true")
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
     ENABLE_AUTO_FINETUNE: bool = field(default_factory=lambda: _env("ENABLE_AUTO_FINETUNE", "false").lower() == "true")
 
     # MCP (Model Context Protocol) — client (consume external MCP tools)
@@ -126,8 +137,18 @@ class Config:
     MAX_LESSONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_LESSONS_IN_PROMPT", 5))
     MAX_SKILLS_CHECK: int = field(default_factory=lambda: _env_int("MAX_SKILLS_CHECK", 500))
 
-    # Context window management
-    MAX_CONTEXT_TOKENS: int = field(default_factory=lambda: _env_int("MAX_CONTEXT_TOKENS", 16000))
+    # Context window management (whole-prompt summarization threshold).
+    # HISTORY NOTE: the previous comment claimed the 9B "loads at num_ctx=32768
+    # via the OLLAMA_NUM_CTX server default" — DISPROVEN 2026-07-07 (chat calls
+    # ran at the 4096 model default; prompt_tokens=4096 observed). Chat now
+    # runs at num_ctx=24576 set per-request (providers/ollama.py).
+    # Honest math for this threshold: _manage_context compares
+    # (est × 1.2 + RESPONSE_TOKEN_BUDGET) against this value, but len//4
+    # estimation undercounts real tokens ~35%, not 20%. At 21000 the implied
+    # real ceiling is ~19k prompt + 4k response ≈ 23k < 24576 with margin.
+    # The old 24000 computed to ~24.7k — over the window. Raise only with
+    # _CHAT_NUM_CTX.
+    MAX_CONTEXT_TOKENS: int = field(default_factory=lambda: _env_int("MAX_CONTEXT_TOKENS", 21000))
     RECENT_MESSAGES_KEEP: int = field(default_factory=lambda: _env_int("RECENT_MESSAGES_KEEP", 12))
 
     # Retrieval
@@ -150,9 +171,12 @@ class Config:
     # GSW (Generative Semantic Workspace) — episodic memory layer
     ENABLE_GSW_EPISODIC: bool = field(default_factory=lambda: _env("ENABLE_GSW_EPISODIC", "true").lower() == "true")
     # Continual LoRA merging (TIES) — preserve prior adapter knowledge across fine-tunes
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
     ENABLE_LORA_CONTINUAL_MERGE: bool = field(default_factory=lambda: _env("ENABLE_LORA_CONTINUAL_MERGE", "false").lower() == "true")
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
     LORA_MERGE_ALPHA: float = field(default_factory=lambda: _env_float("LORA_MERGE_ALPHA", 0.5))
     # open-rs SFT pre-DPO bootstrap — short SFT epoch on reasoning traces before DPO
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
     ENABLE_SFT_BOOTSTRAP: bool = field(default_factory=lambda: _env("ENABLE_SFT_BOOTSTRAP", "false").lower() == "true")
     # RLVR — recorded verifiable signals (tool/JSON/math/claim/quiz/code outcomes)
     # ONLY to feed the GRPO/RLVR weight trainer, which was archived 2026-06-12
@@ -178,6 +202,48 @@ class Config:
     # bank cross-source-verified facts — instead of skimming RSS headlines.
     # Heavy (background); the whole point of "monitor the world properly".
     ENABLE_DEEP_RESEARCH: bool = field(default_factory=lambda: _env("ENABLE_DEEP_RESEARCH", "true").lower() == "true")
+    # Paywall/hard-block bypass for QUALITY sources (FT/Bloomberg/WSJ) that return a
+    # verification wall to a normal fetch — the engine otherwise SKIPS them, losing the
+    # best analysis. When the sovereign fetch (http + headless browser) fails on a
+    # tier≥2 source, fall back to the Jina Reader proxy (r.jina.ai), which fetches +
+    # extracts clean article text (verified to return full FT articles). SOVEREIGNTY
+    # NOTE: this routes the URL through an EXTERNAL service — a deliberate exception to
+    # Nova's local-only default, used only for public-news quality sources. Set false
+    # for strict sovereign operation. Optional JINA_API_KEY (env) lifts the rate limit.
+    ENABLE_PAYWALL_BYPASS: bool = field(default_factory=lambda: _env("ENABLE_PAYWALL_BYPASS", "true").lower() == "true")
+    # Lever A: fresh-search verification of the lead's UNCORROBORATED numeric claims —
+    # the only thing that catches a real-but-wrong figure that traces to its cited
+    # source (e.g. a stale "$4,713 gold" widget value). On by default; bounded to the
+    # lead and to figures NOT already ✓-corroborated, so the added GPU/search cost is
+    # proportional to drift-prone single-source numbers. Set false to disable.
+    ENABLE_CLAIM_VERIFICATION: bool = field(default_factory=lambda: _env("ENABLE_CLAIM_VERIFICATION", "true").lower() == "true")
+    # Real deep research: cluster the findings into stories and analyze EACH in depth
+    # (one call per story) before the final synthesis reasons over those analyses +
+    # the full findings. More calls = genuine analysis depth; on by default.
+    ENABLE_DEEP_ANALYSIS: bool = field(default_factory=lambda: _env("ENABLE_DEEP_ANALYSIS", "true").lower() == "true")
+    # Iterative gap loop: after the first gather, reflect on the findings → targeted
+    # follow-up searches → read → merge (≤2 bounded rounds). Later queries conditioned on
+    # what the first read revealed is what single-pass gather can't do (Search-o1/FRAMES).
+    ENABLE_ITERATIVE_GATHER: bool = field(default_factory=lambda: _env("ENABLE_ITERATIVE_GATHER", "true").lower() == "true")
+    # RARR revise-instead-of-delete (ACL 2023): the verification pass minimally EDITS a
+    # partially-supported claim down to its findings-supported core instead of deleting
+    # the whole sentence — recovers coverage the delete-only pass discards. Safe because
+    # the deterministic grounding stack downstream re-checks every kept claim. Default
+    # off pending the measured A/B trial (RACE/FACT harness, 2026-07).
+    ENABLE_RARR: bool = field(default_factory=lambda: _env("ENABLE_RARR", "false").lower() == "true")
+    # MiniCheck entailment gate (#48): verify each cited digest sentence against
+    # its cited source with a CPU sidecar (lytang/MiniCheck-Flan-T5-Large) —
+    # catches the attributions that substring matching can't judge. Unsupported
+    # sentences get re-attributed to a source that DOES entail them, or dropped.
+    # Default off pending the measured A/B; fail-open if the sidecar is down.
+    ENABLE_MINICHECK: bool = field(default_factory=lambda: _env("ENABLE_MINICHECK", "false").lower() == "true")
+    MINICHECK_URL: str = field(default_factory=lambda: _env("MINICHECK_URL", "http://minicheck:8080"))
+    # Lever C: route the monitor SYNTHESIS/ANALYSIS calls (deep-analysis, best-of-N
+    # synthesis, verify) to a BIGGER model than the 9B chat base — the only lever that
+    # attacks the 9B's synthesis-judgment residual at its root. Empty = use the default
+    # model (off). Set to e.g. 'qwen3.6:27b' to enable; it swaps in via VRAM pressure
+    # (the 9B unloads while it runs, reloads for chat). Background/latency-tolerant only.
+    MONITOR_SYNTHESIS_MODEL: str = field(default_factory=lambda: _env("MONITOR_SYNTHESIS_MODEL", ""))
     ENABLE_STORYLINES: bool = field(default_factory=lambda: _env("ENABLE_STORYLINES", "true").lower() == "true")
     ENABLE_SALIENCE_FILTER: bool = field(default_factory=lambda: _env("ENABLE_SALIENCE_FILTER", "true").lower() == "true")
     ENABLE_FORECASTS: bool = field(default_factory=lambda: _env("ENABLE_FORECASTS", "true").lower() == "true")
@@ -187,6 +253,7 @@ class Config:
     # Bumped 20s → 35s after eval-suite analysis (2026-05-09): SearXNG hits
     # multiple upstream engines, slow ones flake the whole call. User mandate:
     # optimize for best, not fastest.
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
     WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 35.0))
     WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "bing,startpage,ecosia,yandex,yahoo"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
@@ -330,18 +397,24 @@ class Config:
     # Voice (local Whisper speech-to-text)
     ENABLE_VOICE: bool = field(default_factory=lambda: _env("ENABLE_VOICE", "false").lower() == "true")
     WHISPER_MODEL_SIZE: str = field(default_factory=lambda: _env("WHISPER_MODEL_SIZE", "base"))
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Enforcement never wired; the 25MB upload cap is the real limit.
     VOICE_MAX_DURATION: int = field(default_factory=lambda: _env_int("VOICE_MAX_DURATION", 300))
     # Text-to-speech (Piper, sovereign/local)
     ENABLE_TTS: bool = field(default_factory=lambda: _env("ENABLE_TTS", "false").lower() == "true")
     TTS_MODEL_PATH: str = field(default_factory=lambda: _env("TTS_MODEL_PATH", "/data/tts/en_US-amy-medium.onnx"))
 
     # Limits
-    # Qwen3.5 supports 128K natively but Ollama's per-VRAM default clamps the
-    # 9B Q8 + 24GB-VRAM combo to num_ctx=32768. The earlier 64000 here oversold
-    # what the runtime delivers — Ollama silently truncated the prompt. Held
-    # at 18000 leaves ~14K for tool results + history + query + response within
-    # the 32K window. Bump only if you also raise Ollama's actual num_ctx.
-    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 18000))
+    # Sized against the REAL context window, with honest token math
+    # (2026-07-08). Chat runs at num_ctx=24576 (providers/ollama.py
+    # _CHAT_NUM_CTX — the compose OLLAMA_NUM_CTX env does NOT apply). This
+    # budget is enforced with estimate_tokens = len//4, which undercounts
+    # real tokens ~35% on our markdown-heavy prompt (measured: 45.3k chars →
+    # est. 11.3k vs Ollama-counted 15.3k). So 13500 estimated ≈ 18.2k real,
+    # leaving ~6.4k real for history (10 msgs) + query + generation inside
+    # 24576. The prior 18000 was sized for a 32K window chat never had —
+    # 18000 est ≈ 24.3k real, alone exceeding num_ctx. Bump only with
+    # _CHAT_NUM_CTX, and only after re-measuring the estimate:real ratio.
+    MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 13500))
     MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
     MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 5000))
     MAX_LESSON_CANDIDATES: int = field(default_factory=lambda: _env_int("MAX_LESSON_CANDIDATES", 5000))
@@ -375,7 +448,11 @@ class Config:
     MAX_QUERY_LENGTH: int = field(default_factory=lambda: _env_int("MAX_QUERY_LENGTH", 50000))
 
     # --- Tuning parameters ---
-    RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 2000))
+    # Tokens reserved for the response when budgeting the prompt against the context
+    # window. Was 2000, but the interactive stream path generates up to max_tokens=4000
+    # — under-reserving risked a near-full prompt + a long answer exceeding num_ctx and
+    # getting head-truncated (dropping identity/early history). Matched to the real cap.
+    RESPONSE_TOKEN_BUDGET: int = field(default_factory=lambda: _env_int("RESPONSE_TOKEN_BUDGET", 4000))
     RETRIEVAL_RELEVANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("RETRIEVAL_RELEVANCE_THRESHOLD", 0.15))
     TEMPERATURE_DEFAULT: float = field(default_factory=lambda: _env_float("TEMPERATURE_DEFAULT", 0.7))
     # Min blended RRF score for a lesson/fact to survive retrieval. Lowered
@@ -404,6 +481,7 @@ class Config:
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
     REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
     ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
@@ -437,6 +515,7 @@ class Config:
     # Max regression allowed (pp) in any non-target category before blocking
     PROMPT_MOD_REGRESSION_TOLERANCE_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_REGRESSION_TOLERANCE_PP", 1.0))
     # Number of consecutive shadow runs required (candidate must pass K out of this many)
+    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
     PROMPT_MOD_STABILITY_RUNS: int = field(default_factory=lambda: _env_int("PROMPT_MOD_STABILITY_RUNS", 3))
     # Max latency overhead before blocking (1.15 = 15% overhead allowed)
     PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))

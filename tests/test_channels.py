@@ -352,7 +352,14 @@ class TestSendSerialization:
         await asyncio.gather(bot.send_alert(msg_a), bot.send_alert(msg_b))
 
         # Every A-chunk must be contiguous (no B between them) and vice-versa.
-        kinds = [c[0] for c in sent]  # first char marks which alert
+        # Continuation chunks carry a '_(cont. i/n)_' prefix — strip it before
+        # reading the marker char that identifies which alert the chunk belongs to.
+        import re as _re
+
+        def _kind(c: str) -> str:
+            return _re.sub(r"^_\(cont\. \d+/\d+\)_\n", "", c)[0]
+
+        kinds = [_kind(c) for c in sent]  # first content char marks which alert
         # find the boundary: kinds should be all-one-letter then all-the-other
         first = kinds[0]
         switches = sum(1 for i in range(1, len(kinds)) if kinds[i] != kinds[i-1])

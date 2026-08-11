@@ -98,6 +98,13 @@ export default function ChatPage() {
             a.appendToken(d.text);
             break;
           }
+          case "revision": {
+            // stream-first refine: the refined final answer replaces the draft
+            const d = event.data as SSETokenData;
+            if (d.text) a.replaceStream(d.text);
+            a.setThinkingStage(null); // clear the "refining" indicator
+            break;
+          }
           case "tool_use": {
             const d = event.data as SSEToolUseData;
             if (d.status === "executing") {

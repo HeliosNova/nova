@@ -710,7 +710,13 @@ class TestErrorRecoveryDuringTools:
             assert EventType.ERROR in event_types
 
             error_event = next(e for e in events if e.type == EventType.ERROR)
-            assert "Connection refused" in error_event.data["message"]
+            # The raw provider error ("Connection refused") must NOT leak to the
+            # user — it's replaced with a friendly message + a code the API layer
+            # returns gracefully (manual audit 2026-07-09). Connect-refused =
+            # provider down → llm_unavailable.
+            assert error_event.data.get("code") == "llm_unavailable"
+            assert "language model" in error_event.data["message"].lower()
+            assert "Connection refused" not in error_event.data["message"]
 
     @pytest.mark.asyncio
     async def test_tool_timeout_still_completes(self, services):

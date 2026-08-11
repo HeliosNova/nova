@@ -334,6 +334,70 @@ class TestKGExtraction:
         assert confs == [0.85, 0.9]  # LLM-scored, not all 0.7
 
     @pytest.mark.asyncio
+    async def test_extract_monitor_budget_lifts_5_triple_cap(self, db):
+        """Fix #2a: the monitor digest path passes a larger budget so a multi-
+        paragraph briefing isn't capped to 5 facts from its first 1000 chars."""
+        from app.core.brain import _extract_kg_triples
+
+        kg = KnowledgeGraph(db)
+        triples = [{"subject": f"company{i}", "predicate": "acquired",
+                    "object": f"target{i}", "confidence": 0.8} for i in range(8)]
+        long_answer = "A long multi-paragraph intelligence briefing. " * 200  # >>1000 chars
+        seen = {}
+
+        async def fake(msgs, **k):
+            seen["prompt"] = msgs[0]["content"]
+            return json.dumps(triples)
+
+        with patch("app.core.brain_kg.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(side_effect=fake)
+            await _extract_kg_triples(kg, "Tech", long_answer, source_name="Tech",
+                                      max_answer_chars=6000, max_triples=15)
+
+        assert kg.get_stats()["total_facts"] == 8        # all 8 stored (old cap was 5)
+        assert len(seen["prompt"]) > 2000                # saw past the old 1000-char cut
+
+    @pytest.mark.asyncio
+    async def test_extract_default_budget_still_caps_at_5(self, db):
+        """The default (chat) path stays lean: the 5-triple cap is preserved."""
+        from app.core.brain import _extract_kg_triples
+
+        kg = KnowledgeGraph(db)
+        triples = [{"subject": f"e{i}", "predicate": "is_a", "object": f"thing{i}",
+                    "confidence": 0.8} for i in range(8)]
+        with patch("app.core.brain_kg.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(return_value=json.dumps(triples))
+            await _extract_kg_triples(kg, "q", "a short answer")
+        assert kg.get_stats()["total_facts"] == 5
+
+    @pytest.mark.asyncio
+    async def test_extract_routes_to_model(self, db):
+        """A/B-proven lever: the monitor path routes extraction to the synthesis
+        model (27B); chat/curiosity stay on the default 9B (model=None)."""
+        from app.core.brain import _extract_kg_triples
+
+        kg = KnowledgeGraph(db)
+        good = json.dumps([{"subject": "cisco", "predicate": "acquired",
+                            "object": "splunk", "confidence": 0.9}])
+        seen = {}
+
+        async def fake(msgs, **k):
+            seen["model"] = k.get("model")
+            return good
+
+        with patch("app.core.brain_kg.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(side_effect=fake)
+            await _extract_kg_triples(kg, "Tech", "Cisco acquired Splunk.",
+                                      max_triples=15, model="qwen3.6:27b")
+        assert seen["model"] == "qwen3.6:27b"
+
+        seen.clear()
+        with patch("app.core.brain_kg.llm") as mock_llm:
+            mock_llm.invoke_nothink = AsyncMock(side_effect=fake)
+            await _extract_kg_triples(kg, "q", "a short answer")   # default chat path
+        assert seen["model"] is None
+
+    @pytest.mark.asyncio
     async def test_extract_rejects_garbage(self, db):
         """Extraction should reject invalid triples."""
         from app.core.brain import _extract_kg_triples

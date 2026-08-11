@@ -29,6 +29,21 @@ from app.core import llm
 logger = logging.getLogger(__name__)
 
 
+async def _invoke_bg(*args, **kwargs):
+    """llm.invoke_nothink with a GPU-yield checkpoint.
+
+    A digest run makes 15+ sequential LLM calls over many minutes; the
+    heartbeat's cycle-start defer can't help once the run has started, so a
+    chat arriving mid-digest used to contend for the GPU the whole time
+    (audit 2026-07-08). Before each background LLM call, wait (capped) while
+    the owner is actively chatting. Quiet case costs one monotonic read.
+    """
+    waited = await llm.wait_for_interactive_quiet(max_wait_s=240.0)
+    if waited:
+        logger.info("[deep-research] yielded GPU to chat for %.0fs", waited)
+    return await llm.invoke_nothink(*args, **kwargs)
+
+
 def _NOW() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -156,6 +171,9 @@ _BLOCKED_HOSTS = {
     # regex would falsely catch legit torontostar/baltimoresun/nytimes/latimes).
     "birminghamstar.com", "britainnews.net", "cambodiantimes.com", "arayonews.com",
     "peopledaily.digital",
+    # same WNN family, caught leaking opinion/PR as fact in the 2026-06-27 audit
+    # (e.g. kenyastar.com syndicating an RT/Pravda 'Pax Silica' op-ed as straight intel)
+    "kenyastar.com", "australiannews.net", "philippinetimes.com", "vietnamtribune.com",
     # more SEO/stock/crypto-signal mills observed in the 2026-06-23 full run
     "candede.com", "inforcapital.com", "robotomated.com", "bullbear.news",
     "ancilar.com", "itbiznews.com", "sahmcapital.com",
@@ -181,7 +199,52 @@ _BLOCKED_HOSTS = {
     # Alibaba HappyHorse's release channel (it was only an early-access partner). The
     # engine's domains are national/international/tech, so these add ~no real value.
     "azcentral.com", "oklahoman.com", "ktvl.com", "hitsfm.net",
+    # Low editorial reliability flagged in the 2026-06-29 output audit: zerohedge
+    # carried the core Iran/market claims (cited ×12 in Geopolitics) that propagated
+    # misframings; coinalertnews pushes crypto presale shill copy as "whale" intel.
+    "zerohedge.com", "coinalertnews.com",
+    # 2026-06-30 LIVE-digest audit: creati.ai is an AI-content mill whose synthesized
+    # narrative ("Claude Mythos / Project Lightwell / Rebel Alliance") anchored an Open
+    # Source lead; counterfire.org is an activist outlet that anchored a Commodities lead
+    # ("largest oil supply shock on record") as a lone weak source. Neither is intel.
+    "creati.ai", "counterfire.org",
+    # 2026-07-09 full-system exploration: the AI/ML digest LED with a fabricated
+    # "OpenAI GPT-5.6 Sol/Terra/Luna" product line (invented tiers + pricing) sourced
+    # entirely to these AI-content farms. The grounding stack made every claim trace
+    # to a read host (fabricated_rate=0) but the hosts themselves manufacture the
+    # "facts" — provenance without credibility. Hard-block the observed offenders;
+    # the _is_content_farm heuristic below catches their unseen siblings generically.
+    "neobitdaily.com", "aitoolly.com", "zglg.work", "n1n.ai", "marketerintel.com",
+    "buildfastwithai.com", "deepusecase.com", "applyingai.com", "banthebots.org",
 }
+
+# Generic AI-content-farm detector — the curated block-list can't keep up with the
+# infinite supply of SEO/AI-generated "news" mills, so this catches their STRUCTURE.
+# Conservative + high-precision: never fires on a tier-1/2 host, and only DOWN-WEIGHTS
+# (0.4 in _source_quality, labelled LOW-CREDIBILITY) rather than hard-blocking, so a
+# false positive merely deprioritises — it never silently drops a real source.
+_FARM_AI_EDGE = ("ai", "gpt", "llm", "genai", "chatgpt")   # AI token at a name edge
+_FARM_CONTENT = ("tool", "usecase", "buildfast", "applying", "mastery", "automate",
+                 "hub", "guide", "insights", "intel", "marketer", "prompt", "bots",
+                 "hacks", "wizard", "genie", "guru", "hype", "daily")
+_FARM_TLDS = (".work", ".online", ".site", ".xyz", ".info", ".click", ".icu",
+              ".top", ".live", ".shop", ".fun", ".biz")
+
+
+def _is_content_farm(url_or_host: str) -> bool:
+    h = url_or_host if ("." in url_or_host and "/" not in url_or_host) else _host(url_or_host)
+    if h in _TIER1_HOSTS or h in _TIER2_HOSTS or any(h.endswith(s) for s in _TIER1_SUFFIX):
+        return False
+    parts = h.split(".")
+    core = parts[-2] if len(parts) >= 2 else parts[0]      # registrable name
+    ai_edge = any(core.startswith(a) or core.endswith(a) for a in _FARM_AI_EDGE)
+    content = any(c in core for c in _FARM_CONTENT)
+    if ai_edge and content:                                 # aitoolly, applyingai, buildfastwithai
+        return True
+    if any(h.endswith(t) for t in _FARM_TLDS):              # cheap farm TLD + weak SLD signal
+        if ai_edge or content or any(ch.isdigit() for ch in core) or len(core) <= 5:
+            return True
+    return False
 
 
 def _host(url: str) -> str:
@@ -220,9 +283,45 @@ def _source_quality(url: str) -> float:
     # curated tier-1 wires, and never rescues a junk/blocked host (handled above).
     if _PRIMARY_URL_RE.search(url):
         return 2.5
+    # Generic AI-content-farm (structural, catches unblocked siblings): below the
+    # 0.5 junk floor so it loses the read budget to real sources and is labelled
+    # LOW-CREDIBILITY — the synthesizer must not lead with or state it as fact.
+    if _is_content_farm(h):
+        return 0.4
     if _JUNK_HOSTS_RE.search(url):
         return 0.5
     return 1.0
+
+
+def _tier_label(url: str) -> str:
+    """Human reliability label for a source, so the synthesizer can CALIBRATE — lead
+    with confirmed material, caveat lone weak-source claims (an intelligence brief must
+    not state a single-blog rumor with the same authority as a wire-confirmed fact)."""
+    q = _source_quality(url)
+    if q >= 3.0:
+        return "wire/primary"
+    if q >= 2.5:
+        return "primary-doc"
+    if q >= 2.0:
+        return "quality"
+    if q <= 0.5:
+        return "LOW-CREDIBILITY"
+    return "single/unverified"
+
+
+def _annotated_evidence(findings: list) -> str:
+    """Each finding tagged '(outlet · reliability · corroboration)' so the synthesizer
+    weights by evidence strength instead of treating every claim as equal fact.
+    Corroboration = distinct hosts among findings sharing ≥2 significant title tokens
+    (a cheap same-story proxy — no extra LLM/clustering call)."""
+    toks = [{w for w in _key_terms(t) if w not in _HEADLINE_STOP and len(w) >= 3}
+            for t, _u, _f in findings]
+    blocks = []
+    for i, (t, u, f) in enumerate(findings):
+        hosts = {_host(findings[j][1]) for j in range(len(findings)) if len(toks[i] & toks[j]) >= 2}
+        corro = f"{len(hosts)} sources" if len(hosts) >= 2 else "1 source"
+        blocks.append(f"[{t}] ({_host(u)} · {_tier_label(u)} · {corro})\n{f}")
+    return "\n\n".join(blocks)
 
 
 _CSS_TOKENS = re.compile(
@@ -230,8 +329,43 @@ _CSS_TOKENS = re.compile(
     re.IGNORECASE)
 
 
+# Crypto-shill / presale promotion — never news. A body with ≥2 of these in its head
+# is marketing copy (the Whale-Watch "Pepeto presale crossed $10M ahead of rumored
+# Binance listings" class the 2026-06-29 audit flagged), not whale activity.
+_PROMO_RE = re.compile(r"(?i)\b("
+    r"presale|pre-sale|token sale|airdrop|whitelist|"
+    r"\d{2,4}x\s+(?:potential|gains?|returns?|profit)|to the moon|"
+    r"next\s+(?:100x|moonshot|big\s+gem|crypto\s+gem|bitcoin|ethereum)|"
+    r"guaranteed\s+(?:returns?|profits?)|don'?t\s+miss\s+(?:out|this)|"
+    r"limited[-\s]time\s+(?:offer|opportunity)|join\s+the\s+(?:presale|whitelist)|"
+    r"get\s+in\s+early|early\s+investors?|rumored\s+(?:to\s+be\s+)?listing|"
+    r"buy\s+(?:now\s+)?before|huge\s+(?:gains?|upside)"
+    r")\b")
+# Evergreen / contact-page / how-to boilerplate — not 'past 24-48h' news (the FDA
+# toll-free number, IRS 'how to file Form 9465', agency mission statements the audit
+# found padding breadth). High-precision; checked only in the HEAD where such pages lead.
+_FILLER_RE = re.compile(r"(?i)("
+    r"\b1-?8(?:00|66|77|88)-?\d{3}-?\d{4}\b|1-?888-?info|"
+    r"is\s+responsible\s+for\s+protecting\s+(?:the\s+)?public\s+health|"
+    r"our\s+mission\s+is\s+to\s+(?:protect|ensure|promote|advance)|"
+    r"\bstep-by-step\s+(?:guide|instructions)\b|"
+    r"\bhow\s+to\s+(?:file|apply\s+for|submit|enroll\s+in|complete)\s+(?:a\s+|an\s+|your\s+)?\w)")
+
+
+def _is_promo_or_filler(b: str) -> bool:
+    """True if the body is crypto-shill promotion or evergreen/contact-page filler —
+    deterministic, drops it before extraction so the shill numbers never enter the
+    grounding corpus and the filler never pads breadth."""
+    head = b[:1200]
+    if len(_PROMO_RE.findall(head)) >= 2:
+        return True
+    return bool(_FILLER_RE.search(head[:600]))
+
+
 def _junk_body(b: str) -> bool:
     if not b or len(b) < 400:
+        return True
+    if _is_promo_or_filler(b):   # crypto-shill presale + evergreen/contact-page filler
         return True
     head = b[:240].lower()
     if ("minimal readable" in head or "%pdf" in head
@@ -269,6 +403,15 @@ _FACT_PROMPT = (
     "From the research briefing below on '{topic}', extract durable factual "
     "(subject, predicate, object) triples — real entities and relationships, not "
     "events or opinions. Short entity names. Max 10.\n"
+    "PREDICATE must be a specific relation (acquired, leads, launched, owns, regulates, "
+    "sanctioned, partnered_with, located_in, price_of) — NEVER a vague 'related_to'.\n"
+    "SUBJECT must be a NAMED entity (a specific company/person/place/product) — NEVER a "
+    "generic category word ('developer', 'the market', 'a study', 'the team', 'users'); "
+    "if you can't name the actor, SKIP the fact.\n"
+    "OBJECT must be a concrete entity or a quantity WITH its meaning ('$160 billion in "
+    "daily clearing volume', not '$160 billion') — NEVER a bare date, month, duration, "
+    "clock time, or standalone measurement ('July 5', 'eight years', '1:00 AM UTC', "
+    "'20 hours daily', '10,000 repetitions' are useless objects; put the thing that happened).\n"
     "Return JSON array: [{{\"subject\":\"...\",\"predicate\":\"...\",\"object\":\"...\"}}]\n\n{evidence}"
 )
 
@@ -298,6 +441,50 @@ async def _headlines(label: str) -> list[str]:
     return list(dict.fromkeys(heads))  # dedup, keep order
 
 
+# Outlet-homepage / feed-channel "headlines" that describe the OUTLET rather than an
+# event ("Associated Press News publishes breaking headlines", "BBC Home reports world
+# news and business updates", "<Outlet> Today covers latest developments in <region>").
+# They leak from homepage search results into the coverage ranking and become vacuous
+# "stories" the engine then researches into vague generic copy (2026-06-29 owner flag).
+_GENERIC_FEED_TITLE_RE = re.compile(r"(?i)("
+    r"\b(?:reports?|publishes?|covers?|brings?|delivers?|provides?|features?)\s+"
+    r"(?:you\s+)?(?:the\s+|its\s+)?(?:latest|breaking|top|daily|world|live)\s+"
+    r"(?:news|headlines|stories|developments|updates|coverage)\b|"
+    r"\b(?:news|home|today|online|daily|live)\s+(?:latest|breaking|top|live)\s+"
+    r"(?:news|updates|headlines|stories|coverage|developments)\b|"   # "BBC News latest updates" (no verb)
+    r"\bworld\s+news\s+(?:and|&)\s+business\b|"
+    r"\bbreaking\s+news,?\s+latest\s+headlines\b|"
+    r"\blatest\s+developments\s+in\s+\w+\s+region\b"
+    r")")
+
+
+_NEWS_META_WORDS = frozenset({
+    "news", "latest", "breaking", "updates", "update", "headlines", "headline",
+    "world", "international", "live", "daily", "top", "stories", "story", "coverage",
+    "home", "homepage", "today", "online", "report", "reports", "section", "video",
+    "videos", "photos", "analysis", "opinion", "global", "us", "uk", "politics",
+    "business", "the", "and", "your", "from",
+})
+
+
+def _is_generic_feed_title(title: str) -> bool:
+    """True for outlet-homepage / section / feed-channel titles that name no event —
+    'World News - The New York Times International', 'World | Latest News & Updates',
+    'BBC News latest updates'. Two signals: (1) the meta-phrase regex; (2) robustly —
+    after stripping a trailing '- Outlet' / '| Outlet', the remainder is ALL news-
+    structure words with no substantive content word, which a real story always has."""
+    t = (title or "").strip()
+    if not t:
+        return True
+    if _GENERIC_FEED_TITLE_RE.search(t):
+        return True
+    core = re.split(r"\s[|\-–—]\s", t)[0]                 # drop a trailing "- Outlet" / "| Outlet"
+    words = re.findall(r"[A-Za-z][A-Za-z0-9'&]+", core.lower())
+    if not words:
+        return True
+    return all(w in _NEWS_META_WORDS or len(w) < 3 for w in words)
+
+
 async def _headlines_with_hosts(label: str) -> list[tuple[str, str]]:
     """Recent headlines as (title, host) pairs across engines — the raw material for
     coverage ranking (how many independent outlets carry each story)."""
@@ -320,6 +507,8 @@ async def _headlines_with_hosts(label: str) -> list[tuple[str, str]]:
         for r in rs:
             if not (r.title and r.url) or _blocked(r.url) or _too_old(getattr(r, "published_date", "")):
                 continue
+            if _article_score(r.url) <= -0.5 or _is_generic_feed_title(r.title):
+                continue   # homepage/section root or outlet self-description — not a story
             key = r.title.strip().lower()
             if key in seen:
                 continue
@@ -344,11 +533,58 @@ _SEO_HEADLINE_RE = re.compile(
     # listicle patterns: leading number-word, "N <plural>", "trends/tips/ways to"
     r"^\s*(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve)\s+\w|"
     r"\b\d+\s+\w+\s+(trends|tips|ways|things|tools|reasons|examples|skills|jobs)\b|"
+    # financial listicles the above missed: "8 Commodity ETFs for …", "5 stocks to buy".
+    # Require a listicle CONTINUATION after the finance-plural noun so real news with a
+    # count ("2 China funds halt redemptions") is NOT caught — only list-headers are.
+    r"\b\d+\s+[\w-]+(?:\s+[\w-]+){0,2}\s+(etfs?|stocks?|shares?|funds?|coins?|tokens?|"
+    r"picks?|plays?|reits?)\s+(to\s+(buy|watch|consider|own|hold|avoid)|for\b|you\b|"
+    r"that\b|worth\b|under\s+\$|right\s+now|now\b|today\b|in\s+20)|"
+    r"\b\d+\s+(?:reasons|ways|things)\s+to\b|"
     r"\btrends?\s+(for|to\s+watch|in\s+20|reshaping)\b|\bthings?\s+(you|to)\b|\bways?\s+to\b)")
+
+# Promotional / pump-and-dump / advertorial headlines — advertising dressed as news.
+# They carry NO reportable event, are pure sentiment bait, and (worse) push the
+# synthesizer toward shill framing. Distinct from SEO: these are stock/crypto promo.
+_PROMO_HEADLINE_RE = re.compile(
+    r"(?i)("
+    r"get in on the ground floor|ground[\s-]?floor|off (wall street'?s?|the|its) radar|"
+    r"under[\s-]the[\s-]radar|hidden gem|emerging giant|the next \w+|next big|"
+    r"set to (soar|explode|skyrocket|surge|rocket|jump|double|triple)|"
+    r"could (make you|turn|soar|explode|double|triple)|"
+    r"millionaire[\s-]?maker|make you (a millionaire|rich)|"
+    r"screaming buy|table[\s-]pounding|strong buy alert|"
+    r"\b(stocks?|coins?|cryptos?|shares?|etfs?|plays?) to buy (now|today|right now)|"
+    r"buy (now|before|this)|before (it'?s too late|the|it)|"
+    r"you (need to|should|must|have to) (buy|own|know|watch)|"
+    r"\b\d+x\b|\b\d+00%\b|moonshot|to the moon|"
+    r"why (i'?m|you should) (buy|bought)|my top (pick|stock|buy)|"
+    r"presale|price prediction|will \w+ (hit|reach|explode|soar))")
 
 
 def _is_seo_headline(title: str) -> bool:
-    return bool(_SEO_HEADLINE_RE.search(title or ""))
+    t = title or ""
+    return bool(_SEO_HEADLINE_RE.search(t) or _PROMO_HEADLINE_RE.search(t))
+
+
+# A "subject" that is really a SECTION / INDEX / market-wrap / meta page, not a story —
+# these produce empty deep-research gathers ("Reuters publishes latest finance news",
+# "ft.com automobiles section", "Bloomberg Markets update", "FedEx shipment tracking").
+_GENERIC_SUBJECT_RE = re.compile(
+    r"(?i)("
+    r"\bpublish(es|ed)\b.{0,30}\b(news|headlines)\b|"
+    r"\blatest\b.{0,25}\b(news|headlines)\b|"
+    r"\b(news|headlines)\s+(today|now|this\s+(week|morning))\b|"
+    r"\bmarkets?\s+(update|movements?|wrap|roundup|report|recap|moves|coverage)\b|"
+    r"\bfutures\s+and\s+commodities\b|"
+    r"\bsection\s*$|\bhomepage\b|\bfront\s+page\b|"
+    r"\blive\s+quotes?\b|\bprice\s+data\b|\breal[\s-]?time\s+(quote|price|data|tracking|market)|"
+    r"\b(shipment|package|order|parcel)\s+tracking\b|\btracking\s+services\b|"
+    r"\bweekly\s+media\s+briefing\b|\bat\s+\d{1,2}:\d{2}\s*[ap]\.?m\b|"    # schedule/listing pages
+    r"\bweekly\s+(technical\s+)?outlook\b)")
+
+
+def _is_generic_subject(s: str) -> bool:
+    return bool(_GENERIC_SUBJECT_RE.search(s or ""))
 
 
 def _cluster_headlines(headlines: list[tuple[str, str]]) -> list[dict]:
@@ -373,6 +609,26 @@ def _cluster_headlines(headlines: list[tuple[str, str]]) -> list[dict]:
     return clusters
 
 
+# Corporate press wires: one release syndicated across all of them is ONE source, not
+# many — don't let that inflate the coverage count.
+_PR_WIRE_HOSTS = {
+    "prnewswire.com", "businesswire.com", "globenewswire.com", "newswire.com",
+    "accesswire.com", "prweb.com", "einnews.com", "24-7pressrelease.com",
+    "prlog.org", "openpr.com", "prunderground.com", "einpresswire.com",
+}
+
+
+def _coverage_score(cluster: dict) -> float:
+    """Quality-weighted cross-source coverage. Each INDEPENDENT outlet adds its tier
+    weight (reuters/AP 3.0, tier-2 2.0, unknown 1.0); all PR-wire hosts collapse to a
+    single +1.0 (same release), so a press release on 5 wires no longer outranks a real
+    story on 3 independent desks. This is the importance signal `_focus_subjects` ranks."""
+    hosts = cluster["hosts"]
+    wires = {h for h in hosts if h in _PR_WIRE_HOSTS}
+    score = sum(_source_quality("https://" + h + "/") for h in (hosts - wires))
+    return score + (1.0 if wires else 0.0)
+
+
 async def _feed_headlines(feed_key: str) -> list[tuple[str, str]]:
     """Headlines from the domain's CURATED feeds — real news (not SEO), so coverage
     counted here is trustworthy. (title, host) pairs."""
@@ -382,7 +638,9 @@ async def _feed_headlines(feed_key: str) -> list[tuple[str, str]]:
     except Exception:
         return []
     return [(it.title.strip(), it.source_host) for it in items
-            if it.title and it.url and not _blocked(it.url)]
+            if it.title and it.url and not _blocked(it.url)
+            and not _is_generic_feed_title(it.title)   # drop feed-channel/outlet self-description titles
+            and _article_score(it.url) > -0.5]
 
 
 async def _focus_subjects(label: str, feed_key: str | None = None, n: int = 5) -> list[str]:
@@ -400,25 +658,39 @@ async def _focus_subjects(label: str, feed_key: str | None = None, n: int = 5) -
     if len(headlines) < 4:
         return [f"{label} latest developments {year}"]
     clusters = _cluster_headlines(headlines)
-    clusters.sort(key=lambda c: (len(c["hosts"]), len(c["titles"])), reverse=True)
-    top = clusters[:n]
+    # Rank by QUALITY-WEIGHTED coverage (PR-wire syndication collapsed), then raw breadth.
+    clusters.sort(key=lambda c: (_coverage_score(c), len(c["hosts"]), len(c["titles"])), reverse=True)
+    top = clusters[: n + 3]           # buffer so generic/meta drops below can backfill
     if not top:
         return [f"{label} latest developments {year}"]
     reps = [max(c["titles"], key=len) for c in top]
     listing = "\n".join(f"{i + 1}. {t}" for i, t in enumerate(reps))
+    from app.config import config as _cfg
+    syn = (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None  # 27B judges on-mission/evergreen better
     try:
-        raw = await llm.invoke_nothink([{"role": "user", "content":
-            f"Today is {today}. Rewrite each {label} headline below (already ranked by importance) as "
-            f"ONE concrete {year} subject phrase — key entities + what happened, no outlet name, no "
-            f"clickbait, no question mark. KEEP THE SAME ORDER AND COUNT.\n" + listing +
-            f"\n\nReturn a JSON array of exactly {len(reps)} strings, same order."}],
-            json_mode=True, json_prefix='["', max_tokens=320, temperature=0.2)
+        raw = await _invoke_bg([{"role": "user", "content":
+            f"Today is {today}. Below are candidate {label} headlines, ranked by importance. For EACH, "
+            f"in the SAME order and count, output one JSON string:\n"
+            f"- If it is a SPECIFIC recent {label} news EVENT, rewrite it as one concrete {year} subject "
+            f"phrase (key entities + what happened; no outlet name, no clickbait, no question mark).\n"
+            f"- Otherwise output exactly \"SKIP\" — use SKIP when it is evergreen/analysis with no dated "
+            f"event, a section/index/market-wrap/quote page, local trivia, a listicle or advert, or "
+            f"OFF-TOPIC for {label}.\n" + listing +
+            f"\n\nReturn a JSON array of exactly {len(reps)} strings (each a rewrite or \"SKIP\"), same order."}],
+            json_mode=True, json_prefix='["', max_tokens=420, temperature=0.2, model=syn)
         subs = [str(s).strip().rstrip("?") for s in _json_array(raw)
-                if isinstance(s, str) and len(str(s).strip()) > 10]
+                if isinstance(s, str) and len(str(s).strip()) > 10
+                and not str(s).strip().upper().startswith("SKIP")]
     except Exception:
         subs = []
-    if len(subs) < len(reps):  # LLM thin/failed → clean the representative headlines deterministically
+    if not subs:  # LLM failed entirely → clean the representative headlines deterministically
         subs = [re.sub(r"\s*[-–|:]\s*[A-Z][\w. '&]{2,30}$", "", t).strip() for t in reps]
+    # Deterministic backstops for anything the semantic SKIP missed: drop section/wrap/
+    # promo garbage, plus bare-label ("Geopolitics") and sub-3-word fragments that carry
+    # no concrete event.
+    lab = label.strip().lower()
+    subs = [s for s in subs if not _is_generic_subject(s) and not _is_seo_headline(s)
+            and s.strip().lower() != lab and len(s.split()) >= 3]
     return subs[:n] or [f"{label} latest developments {year}"]
 
 
@@ -432,14 +704,72 @@ async def _focus_subject(label: str) -> str:
 _BROWSER_SEM = asyncio.Semaphore(3)
 
 
-async def _fetch_body(url: str, *, browser_budget: list[int] | None = None) -> str | None:
-    """Read an article body. Fast path: http_fetch (hard 15s cap). Fallback:
-    headless browser (hard 22s cap) — most quality news sites (BBC, CNBC,
-    Economist, Reuters) are JS-rendered and return a CSS shell to a plain GET, so
-    without this the good sources are unreadable. The browser is the latency
-    bottleneck (a dead URL can sit on a 60s nav timeout), so callers pass a
-    `browser_budget` (mutable [n]) to cap total renders — most reads stay on the
-    fast path and only a few escalate to the browser."""
+_JINA_LINK_RE = re.compile(r"\[([^\]]+)\]\([^)]+\)")
+_PAYWALL_STUB_RE = re.compile(
+    r"(?i)(subscribe to (unlock|read|continue)|try unlimited access|to read this article|"
+    r"sign in to (read|continue)|register to (read|continue)|this (article|content) is for "
+    r"subscribers|\$\d+ for \d+ weeks|create (a )?free account to)")
+
+
+def _reader_main_content(md: str) -> str:
+    """Extract the ARTICLE prose from a reader-proxy markdown (which wraps nav chrome +
+    related-article link-lists + footer around the body). Keep only SUBSTANTIAL prose
+    paragraphs (≥40 words, ≥2 sentences, not a bullet/link list); return '' if there's
+    no real article — so a paywall that yields only nav scraps cleanly fails, not feeds
+    the synthesizer a menu."""
+    good = []
+    for p in re.split(r"\n\s*\n", md):
+        p = re.sub(r"!\[[^\]]*\]\([^)]*\)", " ", p)     # drop images
+        p = _JINA_LINK_RE.sub(r"\1", p)                 # markdown link → its text
+        p = re.sub(r"\s+", " ", p).strip()
+        sents = p.count(". ") + p.count("? ") + p.count("! ")
+        if len(p.split()) >= 40 and sents >= 2 and p.count(" * ") < 2 and not p.startswith(("*", "#", ">")):
+            good.append(p)
+    art = "\n\n".join(good)
+    return art if len(art) >= 500 else ""
+
+
+async def _fetch_via_jina(url: str) -> str | None:
+    """Bypass a paywall/verification wall on a QUALITY source via Jina Reader
+    (r.jina.ai) — a reader proxy that fetches + extracts clean article text (verified
+    to return full FT/Bloomberg articles the sovereign fetch gets a 403 on). External
+    service (gated by ENABLE_PAYWALL_BYPASS; deliberate exception to local-only, public
+    news only). Optional JINA_API_KEY lifts the rate limit."""
+    import os
+    import httpx
+    headers = {"User-Agent": "Mozilla/5.0", "X-Return-Format": "markdown"}
+    key = os.getenv("JINA_API_KEY", "").strip()
+    if key:
+        headers["Authorization"] = f"Bearer {key}"
+    try:
+        async with httpx.AsyncClient(timeout=30, follow_redirects=True, headers=headers) as c:
+            r = await c.get("https://r.jina.ai/" + url)
+        if r.status_code >= 400 or len(r.text) < 400:
+            return None
+        raw = r.text
+        m = re.search(r"(?is)Markdown Content:\s*(.+)$", raw)     # strip the reader preamble
+        raw = m.group(1) if m else raw
+        if _PAYWALL_STUB_RE.search(raw[:2000]):                   # hit the wall, not the article
+            return None
+        body = _reader_main_content(raw)                          # article prose only (nav/related dropped)
+        if body and not _stale_body(body):
+            logger.info("[DeepResearch] paywall bypass (jina) read %s (%d chars)", _host(url), len(body))
+            return body[:5000]
+    except Exception as e:
+        logger.debug("[DeepResearch] jina bypass failed %s: %s", _host(url), e)
+    return None
+
+
+async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
+                      allow_bypass: bool = True) -> str | None:
+    """Read an article body. Fast path: http_fetch (15s). Fallback: headless browser
+    (22s) — most quality news (BBC/CNBC/Economist) is JS-rendered. Final fallback for
+    QUALITY sources that hit a paywall/verification wall: the Jina reader bypass (gated
+    by ENABLE_PAYWALL_BYPASS) — so FT/Bloomberg/WSJ are READ, not skipped. The headless
+    browser is stealth-hardened + residential-IP'd, so it clears Cloudflare interstitials
+    and reads metered/client-side paywalls (NYT/WaPo/BI) from a fresh cookieless context.
+    `browser_budget` (mutable [n]) caps renders; only HARD server-side paywall hosts skip
+    the browser (renders only the wall) and go straight to the bypass."""
     from app.tools.http_fetch import HttpFetchTool
     try:
         res = await asyncio.wait_for(HttpFetchTool().execute(url=url), timeout=15)
@@ -448,10 +778,18 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None) -> s
             return body[:5000]
     except Exception:
         pass
+    from app.config import config as _cfg
+    can_bypass = (allow_bypass and getattr(_cfg, "ENABLE_PAYWALL_BYPASS", True)
+                  and _source_quality(url) >= 2.0)
+    # Hard (server-side) paywall: even past Cloudflare the browser renders only the wall,
+    # so bypass directly (no render cost). Metered/client-side hosts fall through to the
+    # stealth browser below — a fresh cookieless context resets the meter.
+    if _host(url) in _HARD_PAYWALL_HOSTS:
+        return await _fetch_via_jina(url) if can_bypass else None
     # JS-rendered → render with the browser, but only within budget.
     if browser_budget is not None:
         if browser_budget[0] <= 0:
-            return None
+            return await _fetch_via_jina(url) if can_bypass else None
         browser_budget[0] -= 1
     from app.tools.browser import BrowserTool
     async with _BROWSER_SEM:
@@ -459,9 +797,12 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None) -> s
             r = await asyncio.wait_for(
                 BrowserTool().execute(action="navigate", url=url), timeout=22)
             body = (r.output or "") if getattr(r, "success", False) else ""
-            return body[:5000] if (body and not _junk_body(body)) else None
+            if body and not _junk_body(body):
+                return body[:5000]
         except Exception:
-            return None
+            pass
+    # Browser blocked (consent/soft-paywall) → reader bypass for quality sources.
+    return await _fetch_via_jina(url) if can_bypass else None
 
 
 _OLD_YEARS = frozenset(str(y) for y in range(2010, _NOW().year))
@@ -567,11 +908,21 @@ async def _search_candidates(angles: list[str], *, want: int) -> list:
     return picks
 
 
-_PAYWALL_HOSTS = {
-    "bloomberg.com", "ft.com", "wsj.com", "economist.com", "nytimes.com",
-    "washingtonpost.com", "newyorker.com", "theatlantic.com", "barrons.com",
+# Hard, server-side paywalls: the server sends only a stub to non-subscribers, so a
+# browser — even past Cloudflare — renders just the wall. Route straight to the reader
+# bypass; spend no render budget.
+_HARD_PAYWALL_HOSTS = {
+    "bloomberg.com", "ft.com", "wsj.com", "economist.com", "barrons.com",
+}
+# Metered / client-side paywalls: the article IS in the DOM and the meter lives in
+# cookies, so a fresh cookieless STEALTH browser context (which also clears the
+# Cloudflare interstitial) reads them for free — they escalate to the browser, not
+# the bypass. Proven live: businessinsider full article, no wall.
+_METERED_HOSTS = {
+    "nytimes.com", "washingtonpost.com", "newyorker.com", "theatlantic.com",
     "businessinsider.com", "seekingalpha.com",
 }
+_PAYWALL_HOSTS = _HARD_PAYWALL_HOSTS | _METERED_HOSTS
 
 
 async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) -> list:
@@ -581,7 +932,7 @@ async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) ->
     cancellation and a single dead URL can burn 60s, so we minimize and bound it.
     Stale bodies dropped throughout."""
     async def _http(r):
-        body = await _fetch_body(r.url, browser_budget=[0])  # [0] → http only
+        body = await _fetch_body(r.url, browser_budget=[0], allow_bypass=False)  # pure http
         return (r, body)
 
     good, misses = [], []
@@ -591,26 +942,27 @@ async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) ->
         else:
             misses.append(r)
 
-    if len(good) < read_target and browser_budget > 0:
-        # Escalate only HIGH-VALUE misses, and skip hard-paywalled hosts: rendering
-        # them just burns a ~60s nav timeout on a paywall/subscribe stub that the
-        # body gate then drops anyway.
-        hv = [r for r in misses
-              if _source_quality(r.url) >= 2.0 and _host(r.url) not in _PAYWALL_HOSTS][:browser_budget]
+    if len(good) < read_target:
+        # Escalate HIGH-VALUE misses. HARD server-side paywalls (FT/Bloomberg/WSJ) route
+        # to the reader BYPASS (no render cost); everything else — incl. metered hosts the
+        # stealth browser can crack — escalates to the headless browser, capped by budget.
+        hv = [r for r in misses if _source_quality(r.url) >= 2.0]
+        pay = [r for r in hv if _host(r.url) in _HARD_PAYWALL_HOSTS][:12]
+        js = [r for r in hv if _host(r.url) not in _HARD_PAYWALL_HOSTS][:browser_budget]
         budget = [browser_budget]
 
-        async def _br(r):
+        async def _esc(r):
             body = await _fetch_body(r.url, browser_budget=budget)
             return (r.title, r.url, body) if (body and not _stale_body(body)) else None
 
-        good += [a for a in await asyncio.gather(*[_br(r) for r in hv]) if a]
+        good += [a for a in await asyncio.gather(*[_esc(r) for r in (pay + js)]) if a]
     return good[:read_target]
 
 
 async def _gather_sources(subject: str, *, read_target: int, browser_budget: int = 6) -> list:
     """Deep single-story gather: facet-expand the subject, search, read."""
     year = _NOW().strftime("%Y")
-    raw = await llm.invoke_nothink([{"role": "user", "content":
+    raw = await _invoke_bg([{"role": "user", "content":
         f"3 web-search queries digging into this {year} story from different facets "
         f"(what happened, numbers/who, reactions/analysis): '{subject}'. JSON array of 3."}],
         json_mode=True, json_prefix='["', max_tokens=160)
@@ -646,16 +998,32 @@ async def _overview_angles(subjects: list[str]) -> list[str]:
     year = _NOW().strftime("%Y")
     angles = list(subjects)
     try:
-        raw = await llm.invoke_nothink([{"role": "user", "content":
-            f"For each of these {year} news stories, write ONE focused web-search query that would "
-            f"surface actual news ARTICLES (what happened, key numbers/names) — not homepages.\n" +
+        # Multi-MODE sweep (#66, 2026-07-08): at the SAME query budget, ask for
+        # queries spanning DISTINCT retrieval modes — developments, key players,
+        # and risks/opposition — instead of one "what happened" facet per story.
+        # Each mode surfaces sources the others miss (different desks cover the
+        # deal vs the criticism vs the numbers), so the read pool gets broader
+        # WITHOUT more queries (query volume, not depth, is what rate-limits the
+        # engines — the residential-IP reputation constraint from the ops audit).
+        # Query VOLUME is what rate-limits the engines (residential-IP guardrail,
+        # ops audit), so the multi-mode spread is applied only to the SINGLE most
+        # consequential story — three angles that hit different desks (facts /
+        # players / criticism) — while every other story gets one query. ~1.5×
+        # the old volume, not 3×; measured 2026-07-08 after 3× pushed candidates
+        # 8→40 and query load ~2.5-3× with no proven core-coverage gain yet.
+        raw = await _invoke_bg([{"role": "user", "content":
+            f"For these {year} news stories, write focused web-search queries that surface actual "
+            f"news ARTICLES (not homepages). For the FIRST (most consequential) story, give THREE "
+            f"queries, one per angle: (1) what happened + key numbers, (2) the named "
+            f"players/companies/people involved, (3) risks, criticism, or opposition. For every "
+            f"OTHER story, ONE 'what happened' query.\n" +
             "\n".join(f"- {s}" for s in subjects) +
-            "\nReturn one flat JSON array of the query strings."}],
-            json_mode=True, json_prefix='["', max_tokens=300, temperature=0.2)
+            "\nReturn one flat JSON array of all the query strings."}],
+            json_mode=True, json_prefix='["', max_tokens=360, temperature=0.2)
         angles += [a for a in _json_array(raw) if isinstance(a, str) and len(a) > 8]
     except Exception:
         pass
-    return list(dict.fromkeys(angles))[:12]   # cap angles → bounded search load
+    return list(dict.fromkeys(angles))[:16]   # cap angles → bounded search load (query volume is the rate-limit lever)
 
 
 class _Cand:
@@ -767,6 +1135,46 @@ async def _aux_news(queries: list[str]) -> list:
     return [c for lst in results for c in lst]
 
 
+async def _title_relevance(picks: list, subjects: list[str]) -> dict:
+    """Map pick.url -> topic-relevance score in [0,1] via the resident CPU
+    bge-m3 embedder (#38 reranker, 2026-07-08).
+
+    The read-set selection in _gather_overview ranks candidates by REPUTABILITY
+    and article-shape only — a strong wire on a tangential story outranks an
+    on-topic domain specialist when the read budget binds. This adds the missing
+    topic-relevance signal: cosine(subjects, title). ORDERING-ONLY (host caps +
+    budget still apply downstream), so recall is preserved — nothing is dropped
+    by a low score, it just reads later. Fails open (empty dict -> no effect) if
+    the embedder is unreachable, matching the CPU-embed degradation pattern.
+    """
+    titles = [(getattr(r, "url", None), (getattr(r, "title", "") or "").strip()) for r in picks]
+    titles = [(u, t) for u, t in titles if u and t]
+    if not titles or not subjects:
+        return {}
+    try:
+        from app.core.embedding import get_embedding_function
+        ef = get_embedding_function()
+        if ef is None:
+            return {}
+        query = " / ".join(subjects[:5])[:400]
+        texts = [query] + [t for _, t in titles]
+        vecs = await asyncio.to_thread(ef, texts)
+        if not vecs or len(vecs) != len(texts):
+            return {}
+        import math
+        qv = vecs[0]
+        qn = math.sqrt(sum(x * x for x in qv)) or 1.0
+        out: dict = {}
+        for (u, _t), tv in zip(titles, vecs[1:]):
+            tn = math.sqrt(sum(x * x for x in tv)) or 1.0
+            cos = sum(a * b for a, b in zip(qv, tv)) / (qn * tn)
+            out[u] = max(0.0, cos)  # negatives = off-topic → no bonus
+        return out
+    except Exception as e:
+        logger.warning("[DeepResearch] title-relevance rerank skipped: %s", e)
+        return {}
+
+
 async def _gather_overview(subjects: list[str], feed_key: str, *,
                            read_target: int, browser_budget: int) -> list:
     """Pooled breadth gather: merge CURATED FEED articles (reliable, search-
@@ -781,10 +1189,25 @@ async def _gather_overview(subjects: list[str], feed_key: str, *,
         _search_candidates(angles, want=read_target + 12),
         _aux_news(subjects[:3]),
     )
-    # Feeds first (curated), then aux news (GDELT/Bing — search-independent), then
-    # SearXNG search; dedup; ≤3 per host.
+    # Spend the read budget on the STRONGEST readable sources, not just whatever pooled
+    # first: sort the pool by source quality + article-likeness (curated feeds get a
+    # small on-mission bonus so a domain specialist isn't buried under a generic wire).
+    # Weak single-source blogs (techgrid.media-class) get read only if nothing better
+    # remains — the input must be strong, not only the output-calibration.
+    feed_urls = {r.url for r in feed_picks}
+    pool = feed_picks + aux_picks + search_picks
+    # Topic-relevance rerank (#38): blend cosine(subjects, title) into the
+    # reputability prior so on-topic sources win the read budget. Scaled to
+    # ~+1.0 max — meaningful but below a full source-tier gap, so a tier-1 wire
+    # still outranks a tangential blog unless the blog is much more on-topic.
+    _rel = await _title_relevance(pool, subjects)
+    pool.sort(key=lambda r: _source_quality(r.url) + (0.4 if r.url in feed_urls else 0.0)
+                            + _article_score(r.url) + 1.5 * _rel.get(r.url, 0.0),
+              reverse=True)
+    if _rel:
+        logger.info("[DeepResearch] title-relevance rerank applied to %d candidate(s)", len(_rel))
     seen, host_ct, picks = set(), {}, []
-    for r in feed_picks + aux_picks + search_picks:
+    for r in pool:
         u = r.url.split("#")[0].rstrip("/")
         if u in seen:
             continue
@@ -801,6 +1224,41 @@ async def _gather_overview(subjects: list[str], feed_key: str, *,
     return await _read_bodies(picks, read_target=read_target, browser_budget=browser_budget)
 
 
+async def _gap_followup(findings: list, label: str, *, model: str | None = None) -> list[str]:
+    """Reflect on the first-pass findings and return targeted follow-up SEARCH QUERIES for
+    the consequential sub-questions still UNANSWERED or thinly sourced — the engine of the
+    iterative loop (Search-o1 / Jina DeepSearch). Conditioning later queries on what the
+    first read revealed is exactly what single-pass gather can't do. Empty if pool is thin."""
+    if len(findings) < 3:
+        return []
+    have = "\n".join(f"- {t} ({_host(u)})" for t, u, _ in findings[:20])
+    try:
+        raw = await _invoke_bg([{"role": "user", "content":
+            f"Today is {_NOW():%B %d, %Y}. We are compiling a {label} intelligence brief and have "
+            f"gathered these stories so far:\n{have}\n\n"
+            f"Which CONSEQUENTIAL {label} sub-questions are still UNANSWERED or only thinly sourced "
+            f"(a single outlet)? Output 3-5 specific web SEARCH QUERIES that would fill the biggest "
+            f"gaps — missing corroboration, the 'so what' details (exact numbers, named players, "
+            f"outcomes), or a consequential angle not yet covered. Return a JSON array of query "
+            f"strings, most important first; NO commentary."}],
+            json_mode=True, json_prefix='["', max_tokens=220, temperature=0.3, model=model)
+        return [str(q).strip() for q in _json_array(raw)
+                if isinstance(q, str) and 8 < len(str(q).strip()) < 120][:5]
+    except Exception:
+        return []
+
+
+async def _gather_gap(queries: list[str], *, read_target: int = 10, browser_budget: int = 8) -> list:
+    """Search + read the follow-up gap queries (no feeds — these are targeted angles, not a
+    domain sweep). Returns [(title, url, body)] like _gather_overview so results merge in."""
+    if not queries:
+        return []
+    picks = await _search_candidates(queries, want=read_target + 6)
+    if not picks:
+        return []
+    return await _read_bodies(picks, read_target=read_target, browser_budget=browser_budget)
+
+
 _NO_CONTENT_RE = re.compile(
     r"\b(irrelevant|no (?:concrete |specific |relevant |substantive )?(?:information|findings|"
     r"content|facts|details|data)|contains no|no (?:actual )?article|boilerplate|"
@@ -811,7 +1269,7 @@ _NO_CONTENT_RE = re.compile(
 async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
     async def _one(title, url, body):
         try:
-            f = await llm.invoke_nothink([{"role": "user", "content":
+            f = await _invoke_bg([{"role": "user", "content":
                 f"Extract 2-3 concrete findings (facts, numbers, named events) from this article "
                 f"relevant to '{subject}'. Reply IRRELEVANT only if the article is about a COMPLETELY "
                 f"different field. Only what is stated.\n\nTITLE: {title}\n\n{body}"}],
@@ -884,6 +1342,13 @@ _MULT = {"million": 1_000_000, "billion": 1_000_000_000, "trillion": 1_000_000_0
 _COUNT_NOUN_RE = (r"(?:employees?|people|workers?|staff|users?|customers?|patients?|"
                   r"members?|residents?|households?|devices?|firewalls?|servers?|accounts?)")
 _YEAR_COUNT_RE = re.compile(r"\b(19\d\d|20\d\d)\s+(" + _COUNT_NOUN_RE + r")\b", re.IGNORECASE)
+# A 3-digit value (100–999) before a physical MEASUREMENT unit is checkable but slips
+# the magnitude gate (val<1000, unit isn't a money/scale word) — e.g. an altitude
+# '185 miles' that should be 370. Targeted at the hundreds; smaller values are too
+# collision-prone to flag safely.
+_MEASURE_UNIT_RE = re.compile(
+    r"\b(\d{3})\s+(?:miles?|kilometers?|kilometres?|km|meters?|metres?|feet|ft|"
+    r"light-?years?|mph|knots?|acres?|hectares?|tonnes?|tons?)\b", re.IGNORECASE)
 
 
 def _num_variants(num: str, unit: str | None, cur: str | None) -> set[str]:
@@ -932,6 +1397,13 @@ def _unverified_numbers(text: str, corpus: str, corpus_nc: str) -> list[str]:
     for m in _YEAR_COUNT_RE.finditer(text):
         yr, noun = m.group(1), m.group(2).lower()
         if not any(f in corpus for f in (f"{yr} {noun}", f"{int(yr):,} {noun}")):
+            bad.append(m.group(0).strip())
+    # Measurement figures in the hundreds (e.g. '185 miles' vs a real 370): flag when
+    # the bare value is absent from every source. Conservative — only fires if the
+    # digits appear NOWHERE, so a value present in any context is left alone.
+    for m in _MEASURE_UNIT_RE.finditer(text):
+        val_s = m.group(1)
+        if val_s not in corpus and val_s not in corpus_nc:
             bad.append(m.group(0).strip())
     # dedupe, keep order
     return list(dict.fromkeys(bad))
@@ -1001,7 +1473,228 @@ def _tidy_citations(text: str) -> str:
     return text
 
 
-async def _ground_numbers(text: str, bodies: list[str]) -> tuple[str, int]:
+def _is_label_line(s: str) -> bool:
+    """A line that is ONLY a section header / bold lead-label (scaffolding, no
+    inline content): '## Foo', '**Secondary Developments**'. A bold label with
+    text after it ('**Lead** — the paragraph…') is NOT a bare label."""
+    s = s.strip()
+    if not s:
+        return False
+    if s.startswith("#"):
+        return True
+    return s.startswith("**") and s.endswith("**") and s.count("**") == 2
+
+
+# Synthesis-prompt INSTRUCTION text the model occasionally ECHOES verbatim after a
+# section header instead of replacing it with content (seen live in a Physics digest:
+# "**Lead Development** — THE single most consequential … second-order implications.").
+# These are our EXACT prompt fingerprints, so they never occur in real synthesis — strip
+# them; a header left empty is then dropped by _drop_orphan_headers.
+_PROMPT_LEAK_RE = re.compile(
+    r"(?is)(?:\s*—)?\s*(?:"
+    r"THE single most consequential.*?second-order implications\.?"
+    r"|each OTHER genuinely consequential.*?padded with filler\.?"
+    r"|(?:\d[-\s]?\d?\s*sentences?:?\s*)?the throughline across the stories.*?in this section\.?"
+    r")")
+
+
+def _strip_prompt_leak(text: str) -> str:
+    """Drop synthesis-prompt instruction blocks the model echoed instead of following."""
+    return _PROMPT_LEAK_RE.sub("", text or "").strip()
+
+
+def _drop_orphan_headers(text: str) -> str:
+    """Remove a section header / bold-label line that has NO content beneath it.
+    Every correction pass deliberately KEEPS header lines but can drop all the prose
+    under them (`_drop_sentences_with`), leaving a dangling '**Secondary Developments**'
+    with nothing after it — the visible digest misfire. A label is orphaned when the
+    next non-empty line is another label or end-of-text."""
+    lines = text.split("\n")
+    keep = [True] * len(lines)
+    for i, ln in enumerate(lines):
+        if not _is_label_line(ln):
+            continue
+        has_body = False
+        for j in range(i + 1, len(lines)):
+            nxt = lines[j].strip()
+            if not nxt:
+                continue
+            has_body = not _is_label_line(lines[j])   # body iff next non-empty isn't a label
+            break
+        if not has_body:
+            keep[i] = False
+    return "\n".join(l for k, l in zip(keep, lines) if k)
+
+
+def _accept_correction(original: str, fixed: str) -> bool:
+    """Accept an LLM correction pass's output only if it (a) kept the briefing's
+    structure and (b) did NOT collapse its length. A faithful 'change only X, keep
+    everything else' edit stays close in size; a drastic shrink means the pass gutted
+    real content — so fall back to the original. This bounds the erosion risk of the
+    strip stack running downstream of the (stronger) synthesis model."""
+    if not fixed or ("**" not in fixed and "##" not in fixed):
+        return False
+    # Reject a leaked reasoning monologue outright: think tags, or the tell-tale
+    # chain-of-thought preamble a correction pass must never emit. A think block
+    # can contain markdown ** and be long enough to pass the size checks below,
+    # so it slipped through and replaced a good digest (Science incident,
+    # 2026-07-08). Belt-and-suspenders with the invoke_nothink + strip fixes.
+    fl = fixed.lower()
+    if "<think>" in fl or "</think>" in fl or "here's a thinking process" in fl \
+            or "analyze user input" in fl:
+        return False
+    o, f = len(original.strip()), len(fixed.strip())
+    if o >= 400 and f < 0.5 * o:   # lost >half of a substantial briefing → over-stripped
+        return False
+    return True
+
+
+# High-precision signatures of a sentence left grammatically BROKEN when a strip/
+# correction pass (or the model) deleted a load-bearing word. Each is something that
+# is essentially never valid prose, so dropping the carrying sentence is safe.
+_BROKEN_RE = re.compile(
+    r"\bthe\s+(?:by|and|of|to|with)\b(?!-)"                          # noun deleted after an article: "letting down the by failing", "the and on March 12"
+    r"|\b(?:up to|nearly|about|around|roughly|as much as)\s+times\b"  # number deleted before "times": "up to times the legal limit"
+    r"|\bU\.?S\.?\s+of\s+State\b",                                    # title dropped: "US of State confirmed" (was "US Secretary of State")
+    re.IGNORECASE)
+
+
+# A preposition immediately followed by a comma = its object was excised by an
+# upstream strip pass ("implications for, requiring" — the contamination-guard
+# backstop that removed a grafted country name, 2026-07-08). A preposition with
+# NOTHING between it and the comma is essentially never valid prose, so removing
+# the orphaned "<prep>," recovers the sentence ("implications requiring"). The
+# object-bearing case ("for X, Y") never matches — there's text before the comma.
+_DANGLING_PREP_RE = re.compile(
+    r"\b(?:for|in|on|at|to|with|by|of|from|into|onto|over|under|about|against|"
+    r"including|involving|regarding|concerning|amid|amidst|across|between|among|"
+    r"through|during|despite|toward|towards|upon|within|without|per|via)\s*,",
+    re.IGNORECASE,
+)
+# A possessive "'s" with no owner in front (start of line/clause) — the entity
+# name was stripped, leaving "'s small-molecule agonist" (2026-07-08).
+_ORPHAN_POSSESSIVE_RE = re.compile(r"(^|[.!?]\s+|[:;]\s+|\(\s*)'s\s+", re.IGNORECASE)
+
+
+def _repair_dangling_fragments(text: str) -> str:
+    """Recover sentences left grammatically broken when a strip/correction pass
+    deleted a NAMED ENTITY but not its surrounding scaffolding. Runs BEFORE
+    `_repair_broken_sentences` so a repaired sentence isn't needlessly dropped.
+    Two high-precision patterns (both essentially never valid prose):
+      • "<preposition> ,"  → the prep's object was excised → drop the orphan prep
+      • orphan "'s "       → the possessor was excised → drop the orphan "'s"
+    """
+    if not text:
+        return text
+    out = _DANGLING_PREP_RE.sub(",", text)     # "implications for, requiring" → "implications, requiring"
+    out = _ORPHAN_POSSESSIVE_RE.sub(r"\1", out)  # "'s small-molecule" → "small-molecule"
+    # tidy the double punctuation / spacing the excision can leave
+    out = re.sub(r",\s*,", ",", out)
+    out = re.sub(r"\s+,", ",", out)
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out
+
+
+# Sentence-ending: terminal punctuation, optionally followed by a closing
+# quote/paren/citation, at a whitespace or string boundary.
+_SENT_END_RE = re.compile(r"[.!?][)\"'”’]*(?=\s|$)")
+
+
+def _bound_and_clean(text: str, max_chars: int = 11000) -> str:
+    """DETERMINISTIC guarantee that a digest ends on a complete sentence and is
+    length-bounded — the final backstop against BOTH failure modes that dogged
+    the digests (2026-07-08/09): (a) generation hitting a max_tokens cap and
+    ending mid-word (dense text hits 5000 tokens at only ~8.5k chars), and
+    (b) the model ignoring the soft "~8500 char" prompt bound and ballooning
+    past the 12000 storage cap. Chasing token/storage caps was an arms race
+    against variable content density; this ends it. Trims to the last complete
+    sentence within max_chars (< the 12000 storage cap). Applied to the RETURN
+    value so the Discord post AND the stored copy are both clean + bounded.
+    """
+    if not text:
+        return text
+    t = text if len(text) <= max_chars else text[:max_chars]
+    st = t.rstrip()
+    if not st or st[-1] in ".!?)\"'”’":
+        return st                      # already ends cleanly
+    matches = list(_SENT_END_RE.finditer(st))
+    if matches and matches[-1].end() > len(st) * 0.5:
+        return st[:matches[-1].end()]  # drop the trailing incomplete sentence
+    return st                          # no usable boundary (rare) — leave as-is
+
+
+def _repair_broken_sentences(text: str) -> str:
+    """Deterministic LAST-pass cleanup: drop any sentence left grammatically BROKEN by
+    the upstream strip/correction passes deleting a load-bearing word — 'letting down
+    the by failing', 'China adopted the and on March 12', 'up to times the legal limit',
+    'US of State confirmed'. A shipped briefing with a mangled fragment reads as
+    untrustworthy; better to omit the sentence. Conservative + line-by-line so headers,
+    bold labels, and the other sentences in a bullet survive (mirrors
+    `_drop_sentences_with`)."""
+    out_lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip("*-•# ").strip()
+        if not stripped or _is_label_line(line) or stripped.startswith(("#", "**", ">")):
+            out_lines.append(line)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z(\"'])", line)
+        kept = [s for s in sentences if not _BROKEN_RE.search(s)]
+        if len(kept) == len(sentences):
+            out_lines.append(line)                  # nothing broken → untouched
+        elif kept:
+            out_lines.append(" ".join(kept))        # drop only the broken sentence(s)
+        # else: every sentence broken → drop the whole line
+    return "\n".join(out_lines)
+
+
+_BOTTOMLINE_RE = re.compile(r"(?is)(\*\*\s*connections?\b.*?bottom line\s*\*\*.*)$")
+
+
+def _strip_novel_bottomline_figures(text: str) -> str:
+    """The 'Connections & bottom line' must only REFERENCE figures already stated in the
+    developments above — a currency/scale figure that appears ONLY in the bottom line is
+    introduced-in-conclusion, usually invented or a scope error (the audit's US-Policy
+    '$67 billion' vs the body's '$87.6B/$21B'). Deterministically drop the carrying
+    sentence. FP-safe: a real summary adds no new numbers, and bare percentages (often
+    forward-looking thresholds) are deliberately exempt."""
+    m = _BOTTOMLINE_RE.search(text)
+    if not m:
+        return text
+    above, bottom = text[:m.start()], m.group(1)
+    # separate the "**Connections & bottom line**" label (usually inline) from its prose
+    lm = re.match(r"(?is)(\*\*[^*]+\*\*[\s—:\-]*)(.*)", bottom)
+    if not lm:
+        return text
+    label, content = lm.group(1), lm.group(2)
+    above_low = above.lower()
+    above_nc = above_low.replace(",", "")
+    novel = []
+    for fm in _MAGNITUDE_RE.finditer(content):
+        num, unit, cur = fm.group("num"), fm.group("unit"), fm.group("cur")
+        try:
+            val = float(num.replace(",", ""))
+        except ValueError:
+            continue
+        u = (unit or "").lower()
+        if u in ("percent", "per cent", "%"):
+            continue   # exempt bare percentages (forward-looking thresholds)
+        if not ((cur is not None) or ("," in num) or (u in _MULT) or val >= 1000):
+            continue   # only meaningful currency/count magnitudes
+        variants = _num_variants(num, unit, cur)
+        if not any(v in above_low or v in above_nc for v in variants):
+            novel.append(fm.group(0).strip())
+    if not novel:
+        return text
+    sentences = _SENT_SPLIT_RE.split(content)
+    kept = [s for s in sentences if not any(nv in s for nv in novel)]
+    logger.info("[DeepResearch] bottom-line: dropped %d sentence(s) with a novel figure (%s)",
+                len(sentences) - len(kept), ", ".join(novel[:4]))
+    if not kept:
+        return above.rstrip()                        # whole bottom-line was novel → drop it
+    return above + label + " ".join(kept)
+
+
+async def _ground_numbers(text: str, bodies: list[str], *, model: str | None = None) -> tuple[str, int]:
     """Verify every figure in `text` against the raw source bodies. Unsupported
     figures get one focused, source-grounded correction pass (the 9B IS good at
     'find the real number in this text'), then a deterministic backstop drops any
@@ -1016,7 +1709,7 @@ async def _ground_numbers(text: str, bodies: list[str]) -> tuple[str, int]:
         return text, 0
     src = "\n\n".join(b[:4000] for b in bodies)[:14000]
     try:
-        fixed = await llm.invoke_nothink([{"role": "user", "content":
+        fixed = await _invoke_bg([{"role": "user", "content":
             "SOURCE TEXTS and a DRAFT briefing are below. These figures in the draft do NOT appear "
             "in the sources and were likely misread: " + "; ".join(unver[:12]) + ".\n"
             "Rewrite the draft so EVERY number matches the sources exactly: replace each listed "
@@ -1027,14 +1720,14 @@ async def _ground_numbers(text: str, bodies: list[str]) -> tuple[str, int]:
             "or bold line. Do NOT add any preamble, sign-posting, or notes explaining what you "
             "changed (no 'Based on the sources…', no 'here is the rewritten draft', no '*Note:*').\n\n"
             "SOURCES:\n" + src + "\n\nDRAFT:\n" + text}],
-            max_tokens=1400, temperature=0.0, num_ctx=8192)
+            max_tokens=5000, temperature=0.0, num_ctx=16384, model=model)
         fixed = _strip_correction_scaffold((fixed or "").strip())
     except Exception as e:
         logger.warning("[DeepResearch] numeric grounding pass failed: %s", e)
         fixed = ""
-    # Use the correction only if it kept the briefing's structure (didn't collapse
-    # to commentary) — else fall back to the original draft.
-    out = fixed if (fixed and ("**" in fixed or "##" in fixed)) else text
+    # Use the correction only if it kept the structure AND didn't gut the briefing —
+    # else fall back to the original draft.
+    out = fixed if _accept_correction(text, fixed) else text
     still = set(_unverified_numbers(out, corpus, corpus_nc))
     if still:
         out = _drop_sentences_with(out, still)
@@ -1059,15 +1752,35 @@ _COMMON_ACRONYMS = frozenset({
 _ACRONYM_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,5})\b")
 # 2–4 consecutive Capitalized words: a distinctive named entity/phrase.
 _PROPER_PHRASE_RE = re.compile(r"\b([A-Z][a-z]{2,}(?:\s+[A-Z][a-z]+){1,3})\b")
+# A single CamelCase / capitalized-compound coinage ('FortiBleed', 'ParyonUSD',
+# 'OpenAI') — distinctive, hard to paraphrase, and the class the acronym + multi-word
+# patterns BOTH miss. A coined compound absent from every source is a strong garble/
+# fabrication signal (e.g. the 9B writing 'ParyonUSD' for the real 'pUSD').
+_COMPOUND_RE = re.compile(r"\b([A-Z][a-z]{2,}(?:[A-Z][a-z]+|[A-Z]{2,})+)\b")
+# Ubiquitous CamelCase brands/terms — fine even if a given source body didn't happen
+# to spell them out; flagging these would be noise, not fabrication.
+_COMMON_COMPOUNDS = frozenset({
+    "GitHub", "GitLab", "OpenAI", "DeepMind", "DeepSeek", "JavaScript", "TypeScript",
+    "PostgreSQL", "MongoDB", "PayPal", "YouTube", "LinkedIn", "WhatsApp", "PowerShell",
+    "TikTok", "SpaceX", "OnePlus", "PlayStation", "MacBook", "ChatGPT", "BlackRock",
+    "JPMorgan", "MicroStrategy", "CoinDesk", "CoinGecko", "CoinGlass", "PeckShield",
+    "ByteDance", "WeChat", "AirPods", "iCloud", "iPhone", "iPad", "macOS",
+})
+
+
+def _split_compound(tok: str) -> list[str]:
+    """Split a CamelCase compound into its parts ('ParyonUSD' -> ['Paryon','USD'])."""
+    return re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+", tok)
 
 
 def _orphan_terms(text: str, corpus: str) -> list[str]:
     """Distinctive CHECKABLE terms in `text` that appear NOWHERE in the source corpus
     — the qualitative analogue of `_unverified_numbers`. Catches fabricated specifics
     that numeric grounding can't see (e.g. an invented 'LSD therapy' rationale grafted
-    onto a real acquisition). Conservative by design: only ACRONYMS and multi-word
-    PROPER-NOUN phrases (high distinctiveness, hard to paraphrase). Single names are
-    skipped — a body-extraction miss on one name would falsely strip real content."""
+    onto a real acquisition). Conservative by design: ACRONYMS, multi-word PROPER-NOUN
+    phrases, and single CamelCase COMPOUND coinages (all high-distinctiveness, hard to
+    paraphrase). Plain single names are skipped — a body-extraction miss on one name
+    would falsely strip real content."""
     orphans = []
     for line in text.split("\n"):
         s = line.strip()
@@ -1095,10 +1808,24 @@ def _orphan_terms(text: str, corpus: str) -> list[str]:
             if words and all(w in corpus for w in words):
                 continue
             orphans.append(phrase)
+        for m in _COMPOUND_RE.finditer(line):
+            tok = m.group(1)
+            if tok in _COMMON_COMPOUNDS:
+                continue
+            low = tok.lower()
+            if low in corpus or low.rstrip("s") in corpus:
+                continue
+            # Reprieve: if every distinctive part (≥3 chars) is already in the sources,
+            # this is a reformat of a real term ('Black Rock'->'BlackRock'), not a
+            # coinage. Only a part that's truly absent (e.g. 'paryon') signals a garble.
+            parts = [p.lower() for p in _split_compound(tok) if len(p) >= 3]
+            if parts and all(p in corpus for p in parts):
+                continue
+            orphans.append(tok)
     return list(dict.fromkeys(orphans))
 
 
-async def _ground_claims(text: str, bodies: list[str]) -> tuple[str, int]:
+async def _ground_claims(text: str, bodies: list[str], *, model: str | None = None) -> tuple[str, int]:
     """Qualitative grounding: verify distinctive claim-terms against the source bodies,
     not just numbers. Same proven shape as `_ground_numbers` — deterministic detection
     of terms absent from every source, ONE constrained source-grounded correction, then
@@ -1117,7 +1844,7 @@ async def _ground_claims(text: str, bodies: list[str]) -> tuple[str, int]:
         return text, 0
     src = "\n\n".join(b[:4000] for b in bodies)[:14000]
     try:
-        fixed = await llm.invoke_nothink([{"role": "user", "content":
+        fixed = await _invoke_bg([{"role": "user", "content":
             "SOURCE TEXTS and a DRAFT briefing are below. These specific terms in the draft appear "
             "NOWHERE in the sources and may be fabricated or grafted from an unrelated story: "
             + "; ".join(orphans[:14]) + ".\n"
@@ -1128,12 +1855,12 @@ async def _ground_claims(text: str, bodies: list[str]) -> tuple[str, int]:
             "bold line. No preamble, no sign-posting, no notes explaining changes (no 'Based on the "
             "sources…', no 'here is the rewritten draft', no '*Note:*').\n\n"
             "SOURCES:\n" + src + "\n\nDRAFT:\n" + text}],
-            max_tokens=1400, temperature=0.0, num_ctx=8192)
+            max_tokens=5000, temperature=0.0, num_ctx=16384, model=model)
         fixed = _strip_correction_scaffold((fixed or "").strip())
     except Exception as e:
         logger.warning("[DeepResearch] claim grounding pass failed: %s", e)
         fixed = ""
-    out = fixed if (fixed and ("**" in fixed or "##" in fixed)) else text
+    out = fixed if _accept_correction(text, fixed) else text
     # Backstop: drop any sentence that STILL carries an orphan term after correction.
     still = set(_orphan_terms(out, corpus))
     if still:
@@ -1162,7 +1889,7 @@ def _cited_regs(sent: str) -> set:
     return regs
 
 
-async def _check_contamination(text: str, articles: list) -> tuple[str, int]:
+async def _check_contamination(text: str, articles: list, *, model: str | None = None) -> tuple[str, int]:
     """Cross-claim contamination guard: a distinctive term cited to a source that does
     NOT contain it, but which IS explained by a DIFFERENT read source — a detail
     grafted from another story onto this claim. This catches the FortiBleed
@@ -1204,7 +1931,7 @@ async def _check_contamination(text: str, articles: list) -> tuple[str, int]:
         return text, 0
     src = "\n\n".join(b[:4000] for _, _, b in arts)[:14000]
     try:
-        fixed = await llm.invoke_nothink([{"role": "user", "content":
+        fixed = await _invoke_bg([{"role": "user", "content":
             "A DRAFT briefing is below, with its SOURCE TEXTS. Each of these specific details is cited to "
             "a source that does NOT contain it — each was grafted from a different story and must be "
             "removed: " + "; ".join(grafts[:14]) + ".\n"
@@ -1216,12 +1943,12 @@ async def _check_contamination(text: str, articles: list) -> tuple[str, int]:
             "OUTPUT RULES: return ONLY the corrected briefing itself, starting at its first heading or bold "
             "line. No preamble, no sign-posting, no notes explaining changes.\n\n"
             "SOURCES:\n" + src + "\n\nDRAFT:\n" + text}],
-            max_tokens=1400, temperature=0.0, num_ctx=8192)
+            max_tokens=5000, temperature=0.0, num_ctx=16384, model=model)
         fixed = _strip_correction_scaffold((fixed or "").strip())
     except Exception as e:
         logger.warning("[DeepResearch] contamination guard failed: %s", e)
         fixed = ""
-    out = fixed if (fixed and ("**" in fixed or "##" in fixed)) else text
+    out = fixed if _accept_correction(text, fixed) else text
     # Deterministic backstop: the 9B is unreliable at surgical clause removal, so
     # guarantee any graft phrase it left behind is excised (drop the phrase + a
     # leading comma/space, then tidy stray whitespace/punctuation). The detail is
@@ -1234,6 +1961,89 @@ async def _check_contamination(text: str, articles: list) -> tuple[str, int]:
         out = re.sub(r"\s+([.,;)])", r"\1", out)
     logger.info("[DeepResearch] contamination guard: %d grafted detail(s) removed (%s)",
                 len(grafts), ", ".join(grafts[:8]))
+    return out, len(grafts)
+
+
+def _numeric_grafts(text: str, articles: list) -> list[str]:
+    """Distinctive figures in a SINGLE-cited sentence that are absent from the CITED
+    source's body but present ELSEWHERE in the corpus — a real number mis-attributed
+    to the wrong source (the '$107.8B' that should be '$104.3B', where 107.8 is a
+    different/earlier value living in another body). Whole-corpus grounding can't see
+    it because the digit string exists somewhere. Pure detection (numeric analogue of
+    `_orphan_terms` used by `_check_contamination`). Conservative: only DISTINCTIVE
+    figures (decimal-scale, comma-grouped, or ≥10000) — round numbers collide."""
+    arts = [(t, u, b) for (t, u, b) in articles if b]
+    if not text or len(arts) < 2:
+        return []
+    host_corpus: dict[str, str] = {}
+    for t, u, b in arts:
+        h = _reg_domain(_host(u))
+        host_corpus[h] = host_corpus.get(h, "") + " " + f"{t} {b}".lower()
+    host_nc = {h: c.replace(",", "") for h, c in host_corpus.items()}
+    full = " ".join(host_corpus.values())
+    full_nc = full.replace(",", "")
+    suspects: list[str] = []
+    for line in text.split("\n"):
+        s = line.strip()
+        if not s or s.startswith(("#", ">")) or (s.startswith("**") and s.endswith("**")):
+            continue
+        for sent in _SENT_SPLIT_RE.split(line):
+            cited = _cited_regs(sent) & set(host_corpus)
+            if len(cited) != 1:                 # exactly one resolvable cited source
+                continue
+            ch = next(iter(cited))
+            for m in _MAGNITUDE_RE.finditer(sent):
+                num, unit, cur = m.group("num"), m.group("unit"), m.group("cur")
+                try:
+                    val = float(num.replace(",", ""))
+                except ValueError:
+                    continue
+                u = (unit or "").lower()
+                distinctive = ("," in num) or (u in _MULT and "." in num) or val >= 10000
+                if not distinctive:
+                    continue
+                variants = _num_variants(num, unit, cur)
+                in_cited = any(v in host_corpus[ch] or v in host_nc[ch] for v in variants)
+                in_full = any(v in full or v in full_nc for v in variants)
+                if (not in_cited) and in_full:   # present elsewhere, not in cited src
+                    suspects.append(m.group(0).strip())
+    return list(dict.fromkeys(suspects))
+
+
+async def _check_numeric_attribution(text: str, articles: list, *, model: str | None = None) -> tuple[str, int]:
+    """Cited-source-anchored numeric correction. Detects figures mis-attributed to a
+    source that doesn't state them (`_numeric_grafts`), then ONE constrained pass that
+    replaces each with the value the cited source actually gives — or drops that
+    specific claim. Correction-only with fallback-to-original (the figure names a real
+    quantity, so we fix it, never nuke the line). Returns (text, n_misattributed)."""
+    arts = [(t, u, b) for (t, u, b) in articles if b]
+    if not text or len(arts) < 2:
+        return text, 0
+    if len(" ".join(b for _, _, b in arts)) < 500:   # too little source text to judge
+        return text, 0
+    grafts = _numeric_grafts(text, arts)
+    if not grafts:
+        return text, 0
+    src = "\n\n".join(b[:4000] for _, _, b in arts)[:14000]
+    try:
+        fixed = await _invoke_bg([{"role": "user", "content":
+            "SOURCE TEXTS and a DRAFT briefing are below. Each of these figures is cited to a source "
+            "that does NOT state it — the number was taken from a different story and mis-attributed: "
+            + "; ".join(grafts[:12]) + ".\n"
+            "For EACH figure: replace it with the value the CITED source actually states for that exact "
+            "quantity, or delete that specific claim if the cited source gives no such figure. Change "
+            "nothing else — keep every correct number, wording, structure, and citation intact.\n"
+            "OUTPUT RULES: return ONLY the corrected briefing, starting at its first heading or bold "
+            "line. No preamble, no sign-posting, no notes.\n\n"
+            "SOURCES:\n" + src + "\n\nDRAFT:\n" + text}],
+            max_tokens=5000, temperature=0.0, num_ctx=16384, model=model)
+        fixed = _strip_correction_scaffold((fixed or "").strip())
+    except Exception as e:
+        logger.warning("[DeepResearch] numeric attribution pass failed: %s", e)
+        fixed = ""
+    out = fixed if _accept_correction(text, fixed) else text
+    logger.info("[DeepResearch] numeric attribution: %d mis-attributed figure(s) (%s)",
+                len(grafts), ", ".join(grafts[:6]))
     return out, len(grafts)
 
 
@@ -1269,61 +2079,205 @@ def _figure_support(text: str, articles: list) -> dict[str, tuple[int, set]]:
     return out
 
 
-async def _corroborate_numbers(text: str, articles: list) -> tuple[str, int]:
-    """Cross-source numeric corroboration — RELIABLE version. The LLM-judgment
-    approach (have the 9B decide which figures 'contradict for the same quantity')
-    was built and tested and it does the judgment BACKWARDS — it missed a genuine
-    50-vs-200 contradiction and falsely flagged the FortiBleed targeted-vs-compromised
-    figures (different quantities). So we don't ask the model to judge: we
-    DETERMINISTICALLY count how many independent sources state each figure's value
-    and badge the ones ≥2 sources confirm with a ✓. Reliable, only adds a positive
-    mark to genuinely-corroborated numbers (never a false accusation), and gives the
-    reader real confidence calibration."""
+# --- Currency-unit grounding: catch a NON-USD figure stamped with "$" -------------
+# The deepest residual class (2026-06-29 audit): synthesis prints "$1.185 trillion" for
+# Alibaba revenue the sources actually state in CNY ("1.185 trillion yuan") — the VALUE
+# traces (so `_ground_numbers` passes) but the CURRENCY is wrong, an ~8× error. Purely
+# DETERMINISTIC (no model — the LLM contradiction-judgment approach was proven backwards
+# 2026-06-23): if a distinctive $-figure's value appears in the sources ONLY beside a
+# non-USD currency marker (never USD), re-stamp it to the source currency.
+_CUR_WORDS = [
+    ("renminbi", "CNY"), ("yuan", "CNY"), ("rmb", "CNY"), ("cny", "CNY"),
+    ("hk$", "HK$"), ("hkd", "HK$"), ("hong kong dollar", "HK$"),
+    ("euros", "EUR"), ("euro", "EUR"), ("eur", "EUR"), ("€", "EUR"),
+    ("pounds", "GBP"), ("pound", "GBP"), ("gbp", "GBP"), ("£", "GBP"),
+    ("yen", "JPY"), ("jpy", "JPY"),
+    ("rupees", "INR"), ("rupee", "INR"), ("inr", "INR"), ("₹", "INR"),
+    ("won", "KRW"), ("krw", "KRW"), ("₩", "KRW"),
+]
+_CUR_PREFIX = {"CNY": "CNY ", "HK$": "HK$", "EUR": "€", "GBP": "£", "JPY": "¥", "INR": "₹", "KRW": "₩"}
+
+
+def _nearest_currency(window: str) -> str | None:
+    """Currency implied by the text around a value. Explicit words/codes first
+    (unambiguous), bare '¥' last (yuan/yen — default CNY since 'yen' is caught above),
+    USD only on a $/dollar marker."""
+    for marker, code in _CUR_WORDS:
+        if marker in window:
+            return code
+    if "¥" in window:
+        return "CNY"
+    if "$" in window or "usd" in window or "dollar" in window:
+        return "USD"
+    return None
+
+
+def _currency_mislabels(text: str, articles: list) -> list[tuple[str, str]]:
+    """$-stamped DISTINCTIVE figures whose value appears in the sources ONLY in a
+    non-USD currency (never USD) → list of (figure, currency_code)."""
+    corpus = " ".join(f"{t} {b}" for t, _u, b in articles if b).lower()
+    if len(corpus) < 400:
+        return []
+    out, seen = [], set()
+    for m in _MAGNITUDE_RE.finditer(text):
+        if m.group("cur") != "$":
+            continue
+        cs = m.start("cur")
+        if cs > 0 and text[cs - 1].isalnum():   # already a qualified currency (HK$, US$, A$, C$) → skip
+            continue
+        num, unit = m.group("num"), m.group("unit")
+        try:
+            val = float(num.replace(",", ""))
+        except ValueError:
+            continue
+        u = (unit or "").lower()
+        if not (("," in num) or (u in _MULT and "." in num) or val >= 10000):   # distinctive only
+            continue
+        fig = m.group(0).strip()
+        if fig in seen:
+            continue
+        # bare value forms (no $), keep only the distinctive ones (with a unit word or
+        # ≥7 digits) — a bare "1.185" is too collision-prone to window on.
+        variants = [v for v in _num_variants(num, unit, None)
+                    if " " in v or len(v.replace(",", "")) >= 7]
+        nonusd: dict[str, int] = {}
+        usd = 0
+        for v in variants:
+            i = corpus.find(v)
+            while i >= 0:
+                code = _nearest_currency(corpus[max(0, i - 20):i + len(v) + 20])
+                if code == "USD":
+                    usd += 1
+                elif code:
+                    nonusd[code] = nonusd.get(code, 0) + 1
+                i = corpus.find(v, i + len(v))
+        if nonusd and usd == 0:
+            seen.add(fig)
+            out.append((fig, max(nonusd, key=nonusd.get)))
+    return out
+
+
+def _correct_currency_mislabels(text: str, articles: list) -> str:
+    """Re-stamp $-figures the sources state in a non-USD currency. Deterministic."""
+    arts = [(t, u, b) for (t, u, b) in articles if b]
+    if not text or not arts:
+        return text
+    mis = _currency_mislabels(text, arts)
+    for fig, code in mis:
+        if fig.startswith("$") and fig in text:
+            text = text.replace(fig, _CUR_PREFIX.get(code, code + " ") + fig[1:])
+    if mis:
+        logger.info("[DeepResearch] currency mislabel: re-stamped %d $-figure(s) to source currency (%s)",
+                    len(mis), ", ".join(f"{f}→{c}" for f, c in mis[:6]))
+    return text
+
+
+async def _corroborate_numbers(text: str, articles: list) -> tuple[str, set]:
+    """Cross-source numeric corroboration — DETERMINISTIC. Counts how many independent
+    sources state each distinctive figure's value (the LLM-judgment approach did this
+    BACKWARDS — 2026-06-23 — so we never ask the model). Returns the SET of figures
+    that ≥2 sources confirm, WITHOUT mutating the text.
+
+    It USED to badge each corroborated figure with an inline ' ✓'. A 2026-06-29 output
+    audit (4 independent reads) found that badge (a) read as scaffold cruft in the
+    shipped prose, and worse (b) rubber-stamped MISFRAMED figures that two sources
+    happened to share (e.g. a CNY value both outlets printed with a '$') — cross-source
+    AGREEMENT is not correctness, so the ✓ laundered false confidence. The badge is
+    gone; the set is still returned so Lever A can skip fresh-checking figures that are
+    already corroborated (drift hides in SINGLE-source numbers)."""
     if not text or len(articles) < 2:
-        return text, 0
+        return text, set()
     support = _figure_support(text, articles)
-    confirmed = [f for f, (c, _h) in support.items() if c >= 2]
-    if not confirmed:
-        return text, 0
-    badged = 0
-    for fig in sorted(confirmed, key=len, reverse=True):  # longest first → no substring collisions
-        idx = text.find(fig)
-        if idx < 0:
-            continue
-        after = idx + len(fig)
-        if text[after:after + 2] == " ✓":          # already badged
-            continue
-        text = text[:after] + " ✓" + text[after:]
-        badged += 1
-    if badged:
-        logger.info("[DeepResearch] numeric corroboration: %d figure(s) confirmed by ≥2 sources", badged)
-    return text, badged
+    confirmed = {f for f, (c, _h) in support.items() if c >= 2}
+    if confirmed:
+        logger.info("[DeepResearch] numeric corroboration: %d figure(s) confirmed by ≥2 sources", len(confirmed))
+    return text, confirmed
+
+
+_COMMON_ANALYSIS_CAP = 18000   # chars of deep analyses in the shared block
+_COMMON_EVIDENCE_CAP = 9000    # chars of findings in the shared block
+# Worst case COMMON ≈ 27k chars ≈ ~6.8k tokens — leaves room in the 12288 ctx for
+# the per-stage suffix (instructions + draft) + generation on every chain stage.
+
+
+def _common_context(today: str, label: str, analysis_block: str, evidence: str) -> str:
+    """The invariant evidence pack shared as the BYTE-IDENTICAL PREFIX of every
+    synthesis-chain call (synthesis → judge → enrich → verify). llama.cpp reuses
+    the KV cache of the longest common prefix across consecutive requests on a
+    slot, so every stage after the first skips re-processing the (large) evidence
+    — only the per-stage instructions + draft that come AFTER this block are new
+    tokens. Byte-identity is the contract: same caps, same wording, built once.
+    (Phase 1 #34; MAX_CONCURRENT_LLM_MONITORS=1 keeps the chain uninterleaved.)"""
+    return (f"Today is {today}. {label} intelligence — evidence pack. The DEEP ANALYSES "
+            "and SOURCE FINDINGS below are the ONLY admissible facts for every task that "
+            "follows.\n\n"
+            + analysis_block[:_COMMON_ANALYSIS_CAP]
+            + "SOURCE FINDINGS (cite these inline):\n" + evidence[:_COMMON_EVIDENCE_CAP]
+            + "\n\n")
 
 
 async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
-                          temps: tuple = (0.2, 0.55), max_tokens: int = 1900) -> str:
+                          temps: tuple = (0.2, 0.55), max_tokens: int = 5000,
+                          model: str | None = None,
+                          context_block: str | None = None) -> str:
     """Parallel best-of-N synthesis: generate N full candidate briefings (varied
     temperature → different framings), then an external grounded JUDGE picks the
     sharpest. This is the research-backed way to get more analytical depth from a
     small model — N independent shots + external selection, NOT self-refine (which
-    degrades the 9B) and NOT decomposition (which proved lossy here). One judge call."""
+    degrades the 9B) and NOT decomposition (which proved lossy here). One judge call.
+    `model` (Lever C) routes the candidate generation to a bigger synthesis model.
+    `context_block` (prefix-cache #34): the caller's shared evidence prefix — the
+    judge prompt starts with the same bytes so its KV cache is reused."""
     temps = list(temps)[:max(1, n)]
     raw = await asyncio.gather(*[
-        llm.invoke_nothink([{"role": "user", "content": prompt}],
-                           max_tokens=max_tokens, temperature=t, num_ctx=8192)
+        _invoke_bg([{"role": "user", "content": prompt}],
+                           max_tokens=max_tokens, temperature=t, num_ctx=12288, model=model)
         for t in temps], return_exceptions=True)
     cands = [(c or "").strip() for c in raw if isinstance(c, str) and (c or "").strip()]
     if len(cands) <= 1:
         return cands[0] if cands else ""
-    listing = "\n\n".join(f"=== CANDIDATE {i + 1} ===\n{c[:2600]}" for i, c in enumerate(cands))
+    judge_ctx = context_block if context_block else f"SOURCE FINDINGS:\n{evidence[:12000]}\n\n"
+
+    # AGGREGATION over selection (2026-07-08, task #62): a same-model judge
+    # PICKING one candidate plateaus near 55% selection accuracy (CMU, arXiv
+    # 2602.18998 — even a frontier external verifier underperformed); treating
+    # the N drafts as SOURCES and merging them measured +10.3% on deep-research
+    # tasks (AggAgent, arXiv 2604.11753; Tongyi's Heavy Mode is the same shape:
+    # parallel drafts → one synthesis pass, HLE 32.9→38.3). The merge sees the
+    # same evidence prefix (KV-cache reuse) and the full drafts — the judge's
+    # 3800-char preview cap would amputate what the merge must keep.
+    listing = "\n\n".join(f"=== DRAFT {i + 1} ===\n{c[:6000]}" for i, c in enumerate(cands))
     try:
-        pick = await llm.invoke_nothink([{"role": "user", "content":
-            "SOURCE FINDINGS and candidate briefings are below. Pick the SINGLE best candidate — the "
+        merged = (await _invoke_bg([{"role": "user", "content":
+            judge_ctx +
+            f"Below are {len(cands)} DRAFT briefings independently written from the "
+            "SOURCE FINDINGS above. Write the single FINAL briefing by aggregating "
+            "them: cover every distinct story any draft covers; where drafts overlap, "
+            "keep the version with the more specific numbers, names, and dates; keep "
+            "inline (outlet.tld) citations exactly as written next to the claims they "
+            "support; keep the sharpest analysis and 'so what'. Do NOT introduce any "
+            "claim that is not in the SOURCE FINDINGS. Output ONLY the final briefing "
+            "in the same format as the drafts.\n\n" + listing}],
+            max_tokens=max_tokens, temperature=0.15, num_ctx=12288, model=model) or "").strip()
+        # A valid merge must be briefing-sized; a refusal/fragment falls back.
+        if len(merged) >= 0.5 * max(len(c) for c in cands):
+            return merged
+        logger.warning("[DeepResearch] aggregation merge too short (%d chars) — falling back to judge-pick",
+                       len(merged))
+    except Exception as e:
+        logger.warning("[DeepResearch] aggregation merge failed (%s) — falling back to judge-pick", e)
+
+    # Fallback: legacy judge-pick.
+    pick_listing = "\n\n".join(f"=== CANDIDATE {i + 1} ===\n{c[:3800]}" for i, c in enumerate(cands))
+    try:
+        pick = await _invoke_bg([{"role": "user", "content":
+            judge_ctx +
+            "Candidate briefings are below. Pick the SINGLE best candidate — the "
             "one that is (a) best grounded in the findings (nothing beyond them), (b) most specific "
             "(concrete numbers, names, dates), (c) sharpest on analysis and the 'so what', (d) covers "
             "the most distinct stories, (e) cleanest structure. Reply with ONLY the candidate number.\n\n"
-            f"SOURCE FINDINGS:\n{evidence[:9000]}\n\n{listing}"}],
-            max_tokens=6, temperature=0.0)
+            + pick_listing}],
+            max_tokens=6, temperature=0.0, num_ctx=12288, model=model)
         m = re.search(r"\d+", pick or "")
         idx = (int(m.group()) - 1) if m else 0
     except Exception:
@@ -1331,16 +2285,25 @@ async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
     return cands[idx] if 0 <= idx < len(cands) else cands[0]
 
 
-async def _learn_facts(topic: str, brief: str, findings: list, kg) -> int:
+async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
+                       articles: list | None = None, model: str | None = None) -> int:
     """Bank grounded facts from the verified briefing — kept only if they trace to
-    what was actually read (anti-hallucination), garbage-gated."""
+    what was actually read (anti-hallucination), garbage-gated.
+
+    Grounding corpus fix (2026-07-06): the gate used to check only the FINDINGS
+    text, but the synthesis elaborates from the FULL article bodies — so facts
+    from abstract domains (geopolitics, AI/ML) failed the substring gate and
+    banked 0 while concrete domains (crypto) passed. Ground against the bodies
+    the synthesis actually read (`articles`), findings as fallback.
+    `model`: route extraction to the synthesis model — the default-model call
+    forced a 27B→9B swap mid-chain (VRAM can't hold both), costing a reload."""
     if kg is None or not brief or len(findings) < 1:
         return 0
     from app.core.kg import is_garbage_triple
     try:
-        raw = await llm.invoke_nothink(
+        raw = await _invoke_bg(
             [{"role": "user", "content": _FACT_PROMPT.format(topic=topic, evidence=brief[:4500])}],
-            json_mode=True, json_prefix='[{', max_tokens=600)
+            json_mode=True, json_prefix='[{', max_tokens=600, num_ctx=8192, model=model)
         cands = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(cands, dict):
             cands = cands.get("facts") or cands.get("triples") or []
@@ -1348,30 +2311,559 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg) -> int:
         return 0
     if not isinstance(cands, list):
         return 0
-    combined = " ".join(f.lower() for _, _, f in findings)
+    bodies_blob = " ".join((b or "").lower() for _, _, b in (articles or []))
+    combined = (bodies_blob + " " + " ".join(f.lower() for _, _, f in findings)).strip()
     src_texts = [f.lower() for _, _, f in findings]
-    stored = 0
+    stored = gate_rejected = garbage = 0
     for c in cands[:10]:
         if not isinstance(c, dict):
             continue
         s, p, o = (str(c.get("subject", "")).strip(), str(c.get("predicate", "")).strip(),
                    str(c.get("object", "")).strip())
         if not (s and p and o) or is_garbage_triple(s, p, o):
+            garbage += 1
             continue
         st, ot = _key_terms(s), _key_terms(o)
         if not st or not ot:
+            gate_rejected += 1
             continue
         if not (any(t in combined for t in st) and any(t in combined for t in ot)):
+            gate_rejected += 1
             continue
-        support = sum(1 for txt in src_texts
-                      if any(t in txt for t in st) and any(t in txt for t in ot))
+        # A fact is trustworthy if it is CORROBORATED (≥2 findings) OR sourced
+        # from a CREDIBLE outlet (tier ≥2 — reuters/AP/BBC/etc). Keying trust on
+        # corroboration COUNT alone false-positived on obviously-true single-
+        # source facts ("Zelensky leads Ukraine" from a grounded current-events
+        # digest) and quarantined them out of chat — regressing the #49 payoff
+        # (found 2026-07-08). Source credibility is the right poisoning signal:
+        # a single reputable outlet is not the AgentPoison attack surface; a
+        # single unknown blog is. Only the latter stays quarantined-until-
+        # corroborated (and now also auto-promotes by age — kg.promote_aged).
+        support = 0
+        credible = False
+        for _t, _u, _f in findings:
+            fl = (_f or "").lower()
+            if any(t in fl for t in st) and any(t in fl for t in ot):
+                support += 1
+                if _source_quality(_u) >= 2.0:
+                    credible = True
         try:
             if await kg.add_fact(s, p, o, confidence=min(0.9, 0.6 + 0.1 * max(1, support)),
-                                 source="researched", provenance=f"deep_research:{topic[:60]}"):
+                                 source="researched", provenance=f"deep_research:{topic[:60]}",
+                                 trust=0.8 if (support >= 2 or credible) else 0.5):
                 stored += 1
         except Exception:
             pass
+    logger.info("[DeepResearch] fact banking (%s): %d candidate(s) → %d stored, %d gate-rejected, %d garbage",
+                topic[:40], len(cands) if isinstance(cands, list) else 0, stored, gate_rejected, garbage)
     return stored
+
+
+async def _ensure_citations(text: str, findings: list, *, model: str | None = None) -> tuple[str, int]:
+    """Deterministic citation-coverage backstop. The synthesis + verify prompts ASK
+    for an inline (outlet.tld) citation on every claim, but the 9B sometimes ignores
+    that and ships an ENTIRELY uncited briefing (observed live: World Awareness,
+    Finance — ~5% of synthesized digests). Citation enforcement can't be left to the
+    model. When density is near-zero on a substantial digest, run ONE focused
+    re-citation pass that adds the correct outlet to each sentence by matching it to
+    the source findings (or drops a sentence matching none). Fallback-to-original, and
+    used ONLY if it actually adds citations — so it can never make a good digest worse,
+    and the deterministic gate means it's a no-op on the 95% that are already cited."""
+    if not text or not findings:
+        return text, 0
+    body = "\n".join(l for l in text.split("\n") if not l.strip().startswith(("#", "_")))
+    n_cites = len(_PAREN_CITE_RE.findall(body))
+    if n_cites >= 2 or len(body.strip()) < 400:   # already cited, or too thin to bother
+        return text, 0
+    src = "\n\n".join(f"[{t}] ({_host(u)})\n{(b or '')[:900]}" for t, u, b in findings)[:12000]
+    try:
+        fixed = await _invoke_bg([{"role": "user", "content":
+            "A DRAFT briefing below is MISSING its inline source citations. Using the SOURCE FINDINGS "
+            "(each tagged with its outlet), add the correct '(outlet.tld)' citation at the end of EACH "
+            "sentence and bullet, matched to the finding that supports it. If a sentence matches NO "
+            "finding, DELETE it. Change nothing else — keep all supported wording, numbers, and "
+            "structure; only ADD citations (or drop unsupported sentences).\n"
+            "OUTPUT RULES: return ONLY the corrected briefing, starting at its first heading or bold "
+            "line. No preamble, no notes.\n\n"
+            "SOURCE FINDINGS:\n" + src + "\n\nDRAFT:\n" + text}],
+            max_tokens=5000, temperature=0.0, num_ctx=16384, model=model)
+        fixed = _strip_correction_scaffold((fixed or "").strip())
+    except Exception as e:
+        logger.warning("[DeepResearch] citation backstop failed: %s", e)
+        return text, 0
+    # NOTE: no length-floor guard here (unlike the correction passes) — re-citing a
+    # near-uncited digest legitimately DROPS the unsupported sentences, so a large
+    # shrink is expected. The cite-increase check below is the real guard.
+    if fixed and ("**" in fixed or "##" in fixed):
+        new_cites = len(_PAREN_CITE_RE.findall(fixed))
+        if new_cites > n_cites:
+            logger.info("[DeepResearch] citation backstop: re-cited an uncited digest (%d→%d)", n_cites, new_cites)
+            return fixed, new_cites - n_cites
+    return text, 0
+
+
+# --- Deterministic per-sentence citation attribution ------------------------------
+# Autopsy 2026-07-06 (full-length digests, post storage-cap fix): ~28% of factual
+# sentences carry NO inline citation — multi-sentence bullets cite the fact-densest
+# sentence while sibling sentences of the SAME story go uncited (bullet openers,
+# elaborations, the lead's first sentence). The synthesis/verify prompts already
+# demand per-sentence cites and demonstrably don't deliver them — so, like the rest
+# of the grounding stack, enforce it in code: attribute each factual-uncited
+# sentence to the ONE read source whose body actually contains its distinctive
+# tokens, and append that host's citation. No match / ambiguous match → leave the
+# sentence untouched (never guess an attribution).
+
+_ATTR_STOPWORDS = frozenset({
+    "the", "this", "that", "these", "those", "while", "after", "before", "following",
+    "meanwhile", "notably", "however", "although", "despite", "beyond", "across",
+    "western", "eastern", "northern", "southern", "global", "new", "for", "with",
+})
+
+
+def _attribution_tokens(sent: str) -> set[str]:
+    """Distinctive, source-checkable tokens of a sentence: magnitude figures and
+    proper-noun phrases (ubiquitous acronyms + capitalized connectives excluded).
+    These are what must appear in a source body to credit it as the citation."""
+    toks: set[str] = set()
+    for m in re.finditer(r"\$?\d[\d,.]*\s?(?:%|billion|million|trillion)?", sent):
+        t = m.group(0).strip().rstrip(".,").lower()
+        if any(ch.isdigit() for ch in t):
+            toks.add(t)
+    for m in re.finditer(r"\b[A-Z][a-zA-Z0-9&'’\-]{2,}(?:\s+[A-Z][a-zA-Z0-9&'’\-]{2,}){0,3}", sent):
+        t = m.group(0)
+        if t.upper() in _COMMON_ACRONYMS or t.lower() in _ATTR_STOPWORDS:
+            continue
+        toks.add(t.lower())
+    return toks
+
+
+def _tok_in(tok: str, blob: str, blob_nc: str) -> bool:
+    return tok in blob or tok.replace(",", "") in blob_nc
+
+
+async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tuple[str, int]:
+    """MiniCheck entailment gate (#48, gated by ENABLE_MINICHECK, fail-open).
+
+    For each cited factual sentence, ask the CPU sidecar whether the CITED
+    source's text actually entails the claim — the check substring matching
+    cannot make. A sentence its cited source does NOT entail is re-attributed
+    to a read source that DOES entail it (deterministic re-cite), else dropped
+    (a fabricated attribution is exactly what this stack exists to catch).
+    Bounded (max_checks) and fail-open: sidecar down → text unchanged."""
+    from app.config import config as _cfg
+    if not getattr(_cfg, "ENABLE_MINICHECK", False) or not text or not arts:
+        return text, 0
+    url = (getattr(_cfg, "MINICHECK_URL", "") or "").rstrip("/")
+    if not url:
+        return text, 0
+    per_host: dict[str, str] = {}
+    for t, u, b in arts:
+        if b:
+            h = _host(u)
+            # 4000 chars ≈ CPU-tractable: the T5 chunks each doc internally, so
+            # doc size drives latency (8000-char docs × 30 pairs blew the first
+            # live run past any sane timeout — observed 2026-07-07).
+            per_host[h] = (per_host.get(h, "") + " " + (t or "") + " " + b)[:4000]
+    # collect (line_idx, sentence, cited_hosts) for cited factual sentences
+    lines = text.split("\n")
+    checks: list[tuple[int, str, list[str]]] = []
+    for li, line in enumerate(lines):
+        stripped = line.lstrip("*-• ").strip()
+        if (not stripped or stripped.startswith(("#", "_"))
+                or (stripped.startswith("**") and stripped.endswith("**"))):
+            continue
+        for seg in _SENT_SPLIT_RE.split(line):
+            st = seg.strip()
+            if len(st) <= 40 or len(checks) >= max_checks:
+                continue
+            cited = [h for h in _DOMAIN_TOKEN_RE.findall(" ".join(_PAREN_CITE_RE.findall(st)))
+                     if h in per_host or _reg_domain(h) in {_reg_domain(k) for k in per_host}]
+            if cited:
+                checks.append((li, st, cited))
+    if not checks:
+        return text, 0
+
+    def _doc_for(hosts: list[str]) -> str:
+        parts = []
+        for h in hosts:
+            if h in per_host:
+                parts.append(per_host[h])
+            else:
+                rd = _reg_domain(h)
+                parts.extend(v for k, v in per_host.items() if _reg_domain(k) == rd)
+        return " ".join(parts)[:8000]
+
+    def _claim_of(st: str) -> str:
+        return _PAREN_CITE_RE.sub("", st).strip()
+
+    import httpx
+    # Chunked posts (8 pairs/request, generous per-chunk timeout): a partial
+    # verification beats an all-or-nothing timeout. Chunks that fail are treated
+    # as supported (fail-open per sentence).
+    pairs = [{"doc": _doc_for(hosts), "claim": _claim_of(st)} for _, st, hosts in checks]
+    results: list[dict] = []
+    try:
+        async with httpx.AsyncClient(timeout=240) as client:
+            for i in range(0, len(pairs), 8):
+                try:
+                    r = await client.post(f"{url}/check_batch", json={"pairs": pairs[i:i + 8]})
+                    r.raise_for_status()
+                    results.extend(r.json()["results"])
+                except Exception as e:
+                    logger.warning("[DeepResearch] entailment chunk %d failed (%r) — fail-open", i // 8, e)
+                    results.extend({"supported": True, "prob": -1.0} for _ in pairs[i:i + 8])
+    except Exception as e:
+        logger.warning("[DeepResearch] entailment gate unavailable (%r) — skipping", e)
+        return text, 0
+    if all(r.get("prob") == -1.0 for r in results):
+        logger.warning("[DeepResearch] entailment gate: every chunk failed — skipping")
+        return text, 0
+
+    unsupported = [(li, st, hosts) for (li, st, hosts), res in zip(checks, results)
+                   if not res.get("supported")]
+    if not unsupported:
+        logger.info("[DeepResearch] entailment gate: %d/%d cited sentences entailed by their source",
+                    len(checks), len(checks))
+        return text, 0
+
+    # second chance: does ANY other read source entail the claim? (re-cite, don't drop)
+    recite: dict[int, tuple[str, str]] = {}   # check-index → (sentence, new_host)
+    drop: list[tuple[int, str]] = []
+    alt_pairs, alt_meta = [], []
+    for li, st, hosts in unsupported:
+        others = [h for h in per_host if h not in hosts]
+        for h in others:
+            alt_pairs.append({"doc": per_host[h], "claim": _claim_of(st)})
+            alt_meta.append((li, st, h))
+    alt_results = []
+    if alt_pairs:
+        try:
+            async with httpx.AsyncClient(timeout=240) as client:
+                for i in range(0, len(alt_pairs), 8):
+                    r = await client.post(f"{url}/check_batch", json={"pairs": alt_pairs[i:i + 8]})
+                    r.raise_for_status()
+                    alt_results.extend(r.json()["results"])
+        except Exception as e:
+            logger.warning("[DeepResearch] entailment re-cite pass unavailable (%r)", e)
+            alt_results = []
+    entailed_by: dict[tuple[int, str], str] = {}
+    for (li, st, h), res in zip(alt_meta, alt_results):
+        if res.get("supported") and (li, st) not in entailed_by:
+            entailed_by[(li, st)] = h
+    n_changed = 0
+    for li, st, hosts in unsupported:
+        if (li, st) in entailed_by:
+            new_host = entailed_by[(li, st)]
+            new_st = _PAREN_CITE_RE.sub("", st).rstrip()
+            if new_st.endswith((".", "!", "?")):
+                new_st = f"{new_st[:-1].rstrip()} ({new_host}){new_st[-1]}"
+            else:
+                new_st = f"{new_st} ({new_host})"
+            lines[li] = lines[li].replace(st, new_st)
+            n_changed += 1
+        else:
+            drop.append((li, st))
+    for li, st in drop:
+        lines[li] = lines[li].replace(st, "").rstrip()
+        n_changed += 1
+    logger.info("[DeepResearch] entailment gate: %d checked, %d unsupported → %d re-cited, %d dropped",
+                len(checks), len(unsupported), len(entailed_by), len(drop))
+    out = "\n".join(l for l in lines)
+    return out, n_changed
+
+
+def _cite_uncited_sentences(text: str, arts: list, *, max_added: int = 12) -> tuple[str, int]:
+    """Append '(host)' to factual sentences that lack a citation, when EXACTLY ONE
+    read source strongly contains the sentence's distinctive tokens (≥2 token hits,
+    ≥60% of tokens, and a clear margin over the runner-up host). Deterministic —
+    no model, no network; ambiguous or unmatched sentences are left alone."""
+    per_host: dict[str, str] = {}
+    for t, u, b in arts:
+        if b:
+            h = _host(u)
+            per_host[h] = per_host.get(h, "") + " " + (t or "").lower() + " " + b.lower()
+    if not text or not per_host:
+        return text, 0
+    host_nc = {h: blob.replace(",", "") for h, blob in per_host.items()}
+    added = 0
+    out_lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip("*-• ").strip()
+        if (not stripped or stripped.startswith(("#", "_"))
+                or (stripped.startswith("**") and stripped.endswith("**"))):
+            out_lines.append(line)
+            continue
+        segs = _SENT_SPLIT_RE.split(line)
+        new_segs = []
+        for seg in segs:
+            st = seg.strip()
+            factual = (len(st) > 40 and (any(c.isdigit() for c in st)
+                       or re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+", st)))
+            if added >= max_added or not factual or _PAREN_CITE_RE.search(st):
+                new_segs.append(seg)
+                continue
+            toks = _attribution_tokens(st)
+            if len(toks) < 2:
+                new_segs.append(seg)
+                continue
+            scores = sorted(
+                ((sum(1 for t in toks if _tok_in(t, blob, host_nc[h])) / len(toks), h)
+                 for h, blob in per_host.items()), reverse=True)
+            best, host = scores[0]
+            second = scores[1][0] if len(scores) > 1 else 0.0
+            hits = round(best * len(toks))
+            if best >= 0.6 and hits >= 2 and (best - second >= 0.25 or best == 1.0):
+                seg_r = seg.rstrip()
+                tail = seg[len(seg_r):]
+                if seg_r and seg_r[-1] in ".!?":
+                    seg = f"{seg_r[:-1].rstrip()} ({host}){seg_r[-1]}{tail}"
+                else:
+                    seg = f"{seg_r} ({host}){tail}"
+                added += 1
+            new_segs.append(seg)
+        out_lines.append(" ".join(new_segs))
+    if added:
+        logger.info("[DeepResearch] cite-uncited: attributed %d uncited sentence(s) to their source", added)
+    return "\n".join(out_lines), added
+
+
+# --- Lever A: bounded per-claim verification against a FRESH independent search ---
+# The deep residual is a real fact mis-framed (wrong unit/scope/date) from a good
+# source — invisible to corpus grounding. The only thing that catches it is a fresh,
+# independent check of the specific claim, which is what manual verification does.
+# Kept bounded (lead development's top numeric claims, one search each) so the GPU
+# cost stays sane, and advisory-only (appends a caveat, never rewrites the body —
+# the 9B is unreliable at prose rewriting). Gated by ENABLE_CLAIM_VERIFICATION.
+# Matches the digest's LEAD section across the real header formats the synthesizer
+# actually emits — "**Lead Development: <title>**", "### LEAD DEVELOPMENT: …",
+# "**LEAD DEVELOPMENT …**" (case-insensitive). The OLD regex required the bold to
+# close immediately after the word ("**Lead development**") which NO real digest
+# does, so _lead_claims silently fell back to "first long block" and the fresh-
+# check ran on the wrong text (full-system exploration 2026-07-09). Group 1 is the
+# lead PROSE, ending right before the next section header (**Secondary… / ###…).
+_LEAD_RE = re.compile(
+    r"(?is)(?:\*{1,3}|#{1,4})\s*lead\s+development\b[^\n]*\n+"
+    r"(.*?)(?=\n[ \t]*(?:\*\*[A-Z0-9]|#{1,4}\s)|\Z)")
+
+
+def _lead_claims(text: str, *, corroborated=frozenset(), max_claims: int = 3) -> list[str]:
+    """The lead development's most checkable claims — sentences carrying a DISTINCTIVE
+    magnitude figure (highest-salience, most search-decisive). Bounded to the lead so
+    fresh verification stays cheap. Pure/deterministic."""
+    m = _LEAD_RE.search(text or "")
+    lead = m.group(1).strip() if m else ""
+    if not lead:
+        for block in (text or "").split("\n\n"):
+            b = block.strip()
+            if len(b) > 200 and not b.startswith(("#", "_", "**Secondary", "**Connections")):
+                lead = b
+                break
+    if not lead:
+        return []
+    claims: list[str] = []
+    for sent in _SENT_SPLIT_RE.split(lead.replace("\n", " ")):
+        sent = sent.strip()
+        if len(sent) < 40:
+            continue
+        distinctive = False
+        for mm in _MAGNITUDE_RE.finditer(sent):
+            num, unit, cur = mm.group("num"), (mm.group("unit") or "").lower(), mm.group("cur")
+            try:
+                val = float(num.replace(",", ""))
+            except ValueError:
+                continue
+            # Skip figures already corroborated by ≥2 sources — fresh-checking them is
+            # wasted; drift hides in SINGLE-source figures (e.g. one stale widget).
+            if mm.group(0).strip() in corroborated:
+                continue
+            if ("," in num) or (unit in _MULT and "." in num) or val >= 10000 or cur:
+                distinctive = True
+                break
+        if not distinctive:
+            continue
+        c = re.sub(r"\([^()]*\.[a-z]{2,}[^()]*\)", "", sent)   # drop inline citations
+        c = re.sub(r"[*_✓]", "", c).strip()                    # drop markdown/badges
+        if c:
+            claims.append(c)
+        if len(claims) >= max_claims:
+            break
+    return claims
+
+
+async def _verify_lead_claims(text: str, label: str, *, corroborated=frozenset(), max_claims: int = 3) -> tuple[str, int]:
+    """Run a FRESH independent web search for each top lead claim and have the model
+    judge — grounded ONLY in those fresh results — whether the claim's figure/framing
+    holds. Contradicted claims get a concise '🔎 Fresh-check' caveat appended; the
+    body is never rewritten. Returns (text, n_flagged)."""
+    claims = _lead_claims(text, corroborated=corroborated, max_claims=max_claims)
+    if not claims:
+        return text, 0
+    from app.tools import native_search
+    flagged: list[tuple[str, str]] = []
+    for claim in claims:
+        try:
+            results = await native_search.search(claim[:200], max_results=6, mode="news")
+        except Exception as e:
+            logger.debug("[DeepResearch] fresh-check search failed: %s", e)
+            continue
+        ev = []
+        for r in (results or [])[:6]:
+            t = (getattr(r, "title", "") or "").strip()
+            sn = (getattr(r, "snippet", "") or "").strip()
+            if t or sn:
+                ev.append(f"- {t}: {sn[:240]}")
+        if len(ev) < 2:
+            continue   # too little fresh evidence to judge — do NOT guess
+        try:
+            raw = await _invoke_bg([{"role": "user", "content":
+                "Judge a CLAIM strictly against FRESH web evidence — use ONLY the evidence, not prior "
+                "knowledge.\n\n"
+                f"CLAIM: {claim}\n\nFRESH EVIDENCE:\n" + "\n".join(ev) + "\n\n"
+                "Does the fresh evidence CONTRADICT the claim's specific figure or framing (wrong value, "
+                "wrong unit, wrong scope, or out of date)? Reply JSON only: "
+                "{\"verdict\": \"supported\"|\"contradicted\"|\"unaddressed\", "
+                "\"note\": \"<one short sentence giving the value the evidence states, ONLY if "
+                "contradicted>\"}."}],
+                json_mode=True, json_prefix='{"', max_tokens=160, temperature=0.0)
+            data = llm.extract_json_object(raw) if raw else {}
+        except Exception as e:
+            logger.debug("[DeepResearch] fresh-check judge failed: %s", e)
+            continue
+        if str(data.get("verdict", "")).lower() == "contradicted":
+            flagged.append((claim, str(data.get("note", "")).strip()[:200]))
+    if not flagged:
+        return text, 0
+    # Build the caveat block. ENFORCEMENT (full-system exploration 2026-07-09):
+    # previously this was appended at the very BOTTOM as an "advisory" — so a
+    # fabricated/unconfirmed figure LED the digest while its contradiction sat in
+    # a footnote most readers never reach (the live AI/ML digest led with an
+    # invented "GPT-5.6" price the fresh-check had flagged). Now the caveat is
+    # spliced in DIRECTLY AFTER THE LEAD, with UNVERIFIED wording, so the flag is
+    # impossible to miss at the point of the claim. Mid-text placement also
+    # survives the trailing _bound_and_clean trim (a bottom footnote could be cut).
+    cav = ["",
+           f"⚠️ _Fresh-check: {len(flagged)} of {len(claims)} lead claim(s) could NOT be "
+           f"confirmed by an independent search — treat the flagged figure(s) as UNVERIFIED:_"]
+    for claim, note in flagged:
+        snip = claim[:90] + ("…" if len(claim) > 90 else "")
+        cav.append(f"  ⚠ \"{snip}\" — {note}" if note else
+                   f"  ⚠ \"{snip}\" — not supported by current sources")
+    caveat = "\n".join(cav)
+    m = _LEAD_RE.search(text)
+    if m:
+        cut = m.end(1)
+        out_text = text[:cut].rstrip() + "\n" + caveat + "\n" + text[cut:]
+    else:
+        out_text = text + "\n" + caveat   # no parseable lead → fall back to append
+    logger.info("[DeepResearch] %s fresh-check: %d/%d lead claims flagged (inline)", label, len(flagged), len(claims))
+    return out_text, len(flagged)
+
+
+_LEAD_CITE_RE = re.compile(r"\(([a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\)")
+
+
+def _gate_lead_credibility(text: str) -> tuple[str, bool]:
+    """CORROBORATION-GATED LEAD: a headline that rests on a SINGLE lower-credibility
+    source with no independent corroboration gets an inline sourcing caveat.
+
+    This is the robust complement to the farm blocklist (full-system exploration
+    2026-07-09): the blocklist can only stop farms we've named, but an UNKNOWN weak
+    host (e.g. winzheng.com) can still anchor a lead. Rather than chase an endless
+    denylist, we gate on EVIDENCE STRENGTH — the lead must be anchored by a credible
+    outlet (tier ≥2) OR corroborated by ≥2 distinct sources. A lead standing on one
+    unknown/weak source is flagged, not deleted (deterministic, low-harm). Returns
+    (text, gated)."""
+    m = _LEAD_RE.search(text or "")
+    if not m:
+        return text, False
+    lead = m.group(1)
+    hosts = {_host("http://" + h) for h in _LEAD_CITE_RE.findall(lead.lower())}
+    hosts = {h for h in hosts if "." in h}
+    if not hosts:
+        return text, False                      # uncited lead — _ensure_citations' job
+    if max(_source_quality("http://" + h) for h in hosts) >= 2.0 or len(hosts) >= 2:
+        return text, False                      # credible anchor OR ≥2 independent sources
+    caveat = ("\n⚠️ _Sourcing note: this lead rests on a single lower-credibility source "
+              "and is not independently corroborated — treat as unconfirmed._")
+    cut = m.end(1)
+    return text[:cut].rstrip() + "\n" + caveat + "\n" + text[cut:], True
+
+
+def _count_content_sentences(text: str) -> int:
+    """Content sentences in a briefing (headers/metadata lines excluded; same split as
+    `_drop_sentences_with`, >40 chars so bold section labels don't count). The
+    deterministic before/after unit for measuring what the verify pass deletes."""
+    n = 0
+    for line in (text or "").split("\n"):
+        stripped = line.lstrip("*-• ").strip()
+        if not stripped or stripped.startswith("#") or stripped.startswith("_"):
+            continue
+        n += sum(1 for s in re.split(r"(?<=[.!?])\s+(?=[A-Z(])", stripped)
+                 if len(s.strip()) > 40)
+    return n
+
+
+def _verify_prompt(evidence: str, draft: str, *, overview: bool, rarr: bool,
+                   common: str | None = None) -> str:
+    """Build the verification-pass instruction.
+
+    Legacy mode DELETES unsupported/uncited sentences — cheap but lossy: a claim
+    whose core IS in the findings dies for one stray detail. RARR mode
+    (ENABLE_RARR; Gao et al., ACL 2023) revises a partial-support claim down to
+    its findings-supported core and deletes only claims with NO support. Safe to
+    be lenient here: the deterministic grounding stack downstream re-checks every
+    kept claim (figures, orphan terms, contamination, attribution).
+
+    `common` (prefix-cache #34): when given, the prompt STARTS with the caller's
+    shared evidence prefix (which already carries the findings) so the KV cache
+    from the earlier chain stages is reused; instructions + draft follow it."""
+    if rarr:
+        core = (
+            "1. For EVERY statement not fully supported by the findings: if the findings support "
+            "its CORE claim, MINIMALLY EDIT the sentence so it asserts only what the findings "
+            "state — fix or remove the unsupported number, name, or detail, keep the rest and its "
+            "citation. DELETE a sentence ONLY if the findings contain nothing supporting its core "
+            "claim.\n")
+        cite_rule = (
+            "2. Any sentence or bullet lacking an inline outlet citation like (cnbc.com): if the "
+            "findings support it, append the correct outlet citation from the findings; if they "
+            "don't, delete it.\n")
+    else:
+        core = (
+            "1. Remove or correct EVERY statement not directly supported by the findings (invented "
+            "numbers, names, events).\n")
+        cite_rule = (
+            "2. DELETE any sentence or bullet that lacks an inline outlet citation like (cnbc.com) — "
+            "an uncited claim is where fabrication hides; cut it.\n")
+    if overview:
+        rules = (
+            core + cite_rule +
+            "3. Keep ALL supported, cited claims, their specifics, and the FULL structure — do NOT "
+            "shorten, condense, merge, or drop any development; preserve every sourced detail.\n"
+            "Output the corrected overview only.\n\n")
+        if common:
+            # prefix-cache layout: shared evidence pack first (carries the findings),
+            # per-stage instructions + draft after.
+            return (common +
+                    "Below is a DRAFT domain overview. Verify it against the DEEP ANALYSES and "
+                    "SOURCE FINDINGS above ('the findings'). Do all of:\n"
+                    + rules + f"DRAFT:\n{draft}")
+        return (
+            "Below are SOURCE FINDINGS and a DRAFT domain overview. Do all of:\n"
+            + rules + f"SOURCE FINDINGS:\n{evidence}\n\nDRAFT:\n{draft}")
+    if rarr:
+        return (
+            "Below are SOURCE FINDINGS and a DRAFT briefing. For every statement not fully "
+            "supported by the findings: if the findings support its CORE claim, MINIMALLY EDIT it "
+            "to assert only what the findings state (fix or remove the unsupported number, name, "
+            "or detail); DELETE it ONLY if the findings contain nothing supporting its core claim. "
+            "Keep all supported claims and the structure. Output the corrected briefing only.\n\n"
+            f"SOURCE FINDINGS:\n{evidence}\n\nDRAFT:\n{draft}")
+    return (
+        "Below are SOURCE FINDINGS and a DRAFT briefing. Remove or correct EVERY statement in the "
+        "draft that is not directly supported by the findings (invented numbers, names, events). "
+        "Keep only supported claims; preserve structure. Output the corrected briefing only.\n\n"
+        f"SOURCE FINDINGS:\n{evidence}\n\nDRAFT:\n{draft}")
 
 
 async def research_and_brief(label: str, topic: str | None = None, kg=None) -> str:
@@ -1390,15 +2882,17 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
                 f"nothing reported rather than speculation.")
 
     hosts = sorted({_host(u) for _, u, _ in findings})
-    evidence = "\n\n".join(f"[{t}] ({_host(u)})\n{f}" for t, u, f in findings)
+    evidence = _annotated_evidence(findings)
+    from app.config import config as _cfg
+    syn_model = (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None  # Lever C
 
     try:
-        draft = await llm.invoke_nothink([{"role": "user", "content":
+        draft = await _invoke_bg([{"role": "user", "content":
             f"Today is {today}. You READ {len(findings)} credible sources on '{subject}'. Findings below.\n\n"
             "Write a sharp intelligence briefing: the situation, key facts/numbers, what's genuinely new, "
             "and what it means. Cite outlets inline. Use ONLY information present in the findings — never "
             "invent a company, number, person, or event not present.\n\n" + evidence}],
-            max_tokens=700, temperature=0.25)
+            max_tokens=700, temperature=0.25, model=syn_model, num_ctx=8192)
     except Exception as e:
         logger.warning("[DeepResearch] draft failed: %s", e)
         draft = ""
@@ -1406,31 +2900,425 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     if not draft:
         return f"## 🔬 {label} — researched briefing\n_subject: {subject}_\n\n(synthesis unavailable)"
 
-    # VERIFICATION PASS — strip any claim the findings don't support.
+    # VERIFICATION PASS — strip any claim the findings don't support (RARR mode:
+    # revise partial-support claims to their supported core instead of deleting).
+    from app.config import config as _cfg_v
+    _rarr = bool(getattr(_cfg_v, "ENABLE_RARR", False))
     try:
-        final = await llm.invoke_nothink([{"role": "user", "content":
-            "Below are SOURCE FINDINGS and a DRAFT briefing. Remove or correct EVERY statement in the "
-            "draft that is not directly supported by the findings (invented numbers, names, events). "
-            "Keep only supported claims; preserve structure. Output the corrected briefing only.\n\n"
-            f"SOURCE FINDINGS:\n{evidence}\n\nDRAFT:\n{draft}"}],
-            max_tokens=750, temperature=0.1)
+        final = await _invoke_bg([{"role": "user", "content":
+            _verify_prompt(evidence, draft, overview=False, rarr=_rarr)}],
+            max_tokens=750, temperature=0.1, model=syn_model, num_ctx=8192)
         final = (final or "").strip() or draft
     except Exception:
         final = draft
+    logger.info("[DeepResearch] verify pass (%s): %d→%d content sentences%s",
+                label, _count_content_sentences(draft), _count_content_sentences(final),
+                " [RARR]" if _rarr else "")
 
+    final = _strip_prompt_leak(final)   # drop any synthesis-prompt instructions the model echoed
     final = _strip_fake_citations(final, hosts)   # drop fabricated-attribution lines
-    final, _ = await _ground_numbers(final, [b for _, _, b in articles])  # every figure traces to a source
-    final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles])   # distinctive terms trace too (titles incl.)
-    final, _ = await _check_contamination(final, articles)   # details trace to their CITED source, not a grafted one
-    final, _ = await _corroborate_numbers(final, articles)   # ✓ badge figures ≥2 sources confirm
+    final, _ = await _ensure_citations(final, findings, model=syn_model)   # backstop: re-cite an uncited misfire
+    final, _ = await _ground_numbers(final, [b for _, _, b in articles], model=syn_model)  # every figure traces to a source
+    final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
+    final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
+    final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
+    final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
+    final, _ = await _entailment_gate(final, articles)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
+    final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
+    final, _corr = await _corroborate_numbers(final, articles)   # set of figures ≥2 sources confirm (for Lever A)
     final = _tidy_citations(final)   # strip $-wrapped citations + leaked title fragments
-    learned = await _learn_facts(subject, final, findings, kg)
+    final = _strip_novel_bottomline_figures(final)   # drop a figure introduced only in the bottom line
+    final = _drop_orphan_headers(final)   # remove any section header left empty by the strip passes
+    final = _repair_dangling_fragments(final)  # recover sentences broken by an excised entity (prep/possessive)
+    final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
+    learned = await _learn_facts(subject, final, findings, kg, articles=articles, model=syn_model)
     logger.info("[DeepResearch] %s: read %d sources (%s), learned %d facts",
                 label, len(findings), ", ".join(hosts[:6]), learned)
 
+    # Lever A: fresh independent verification of the lead's top claims (gated, bounded).
+    try:
+        from app.config import config as _cfg
+        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", False):
+            final, _ = await _verify_lead_claims(final, label, corroborated=_corr)
+    except Exception as e:
+        logger.warning("[DeepResearch] claim verification failed: %s", e)
+
+    # Corroboration-gated lead: caveat a headline resting on a single low-credibility
+    # source (robust to unknown farms the blocklist misses). Deterministic, always on.
+    final, _gated = _gate_lead_credibility(final)
+    if _gated:
+        logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
+
+    final = _bound_and_clean(final, max_chars=10800)
     header = (f"## 🔬 {label} — researched briefing\n"
               f"_subject: {subject}\nread {len(findings)} sources: {', '.join(hosts[:6])}"
               f"{' +more' if len(hosts) > 6 else ''} · {learned} facts learned · {today}_\n\n")
+    return header + final
+
+
+async def _deep_analyze(findings: list, label: str, today: str, *,
+                        bodies: dict | None = None, model: str | None = None) -> str:
+    """REAL deep research: cluster the findings into their distinct stories, then
+    analyze EACH story in depth with its own call (concurrent), so the final
+    synthesis reasons over ANALYZED material — not raw snippets. Crucially the
+    synthesis still receives the full findings too, so this ADDS a layer of analysis
+    without the lossy compression that sank the earlier decomposition attempt
+    (2026-06-21): more calls to dig into everything, one call to synthesize.
+
+    Depth comes from the SOURCE TEXT, not a pre-summary: when `bodies` (a url→full
+    article-body map) is given, each story is analyzed from the FULL bodies of its
+    top sources. The 240-token findings are a lossy compression of what was read —
+    and the per-story analysis is exactly the step where the model must see the
+    actual article text, or the upgraded synthesis model is reasoning over stubs.
+    Findings still drive the cheap clustering pass and the final synthesis breadth.
+    Per-story input is bounded (top sources by authority, each capped) to stay within
+    the 8192 ctx. Returns a '### story\\n<analysis>' block (or '' to fall back)."""
+    if len(findings) < 3:
+        return ""
+    bodies = bodies or {}
+    numbered = "\n".join(f"[{i}] [{t}] ({_host(u)})\n{(f or '')[:600]}"
+                         for i, (t, u, f) in enumerate(findings))
+    # 1) one cheap pass to group findings into distinct stories (findings suffice)
+    try:
+        raw = await _invoke_bg([{"role": "user", "content":
+            f"Group these {label} findings into the distinct ongoing STORIES they cover. Merge findings "
+            "about the SAME event into one story; aim for 5-9 stories. Return JSON only: "
+            '[{"title": "...", "items": [0, 3, 7]}].\n\n' + numbered}],
+            json_mode=True, json_prefix="[{", max_tokens=600, temperature=0.1, model=model, num_ctx=8192)
+        groups = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(groups, dict):
+            groups = groups.get("stories") or groups.get("items") or []
+    except Exception:
+        groups = []
+    stories = []
+    for g in (groups or [])[:10]:
+        if not isinstance(g, dict):
+            continue
+        idxs = [i for i in (g.get("items") or []) if isinstance(i, int) and 0 <= i < len(findings)]
+        title = str(g.get("title", "")).strip()
+        if title and idxs:
+            stories.append((title, idxs))
+    if not stories:   # clustering failed — analyze the whole pool as one story
+        stories = [(label, list(range(len(findings))))]
+
+    # 2) analyze EACH story in depth, concurrently — the "enough calls" layer.
+    # Feed the FULL article bodies of the story's most authoritative sources (capped
+    # for the context budget); fall back to the finding text when a body is missing.
+    async def _an(title, idxs):
+        ranked = sorted(idxs, key=lambda i: _source_quality(findings[i][1]), reverse=True)
+        parts = []
+        for i in ranked[:8]:
+            t, u, f = findings[i]
+            txt = bodies.get(u) or f or ""
+            parts.append(f"[{t}] ({_host(u)})\n{txt[:4500]}")
+        ev = "\n\n".join(parts)[:28000]
+        try:
+            a = await _invoke_bg([{"role": "user", "content":
+                f"Today is {today}. Analyze this {label} story IN DEPTH from its sources — be a sharp "
+                "intelligence analyst, not a summarizer:\n"
+                "- the key facts, EXACT numbers, named players, and what is genuinely NEW;\n"
+                "- WHY it matters and the second-order implications;\n"
+                "- any tension, disagreement, or uncertainty across the sources;\n"
+                "- what to watch next.\n"
+                f"STORY: {title}\n\nSOURCES:\n{ev}"}],
+                max_tokens=1400, temperature=0.3, model=model, num_ctx=12288)
+            return (title, (a or "").strip())
+        except Exception:
+            return (title, "")
+    analyses = await asyncio.gather(*[_an(t, ix) for t, ix in stories])
+    blocks = [f"### {t}\n{a}" for t, a in analyses if a]
+    if blocks:
+        logger.info("[DeepResearch] %s deep-analysis: %d stories analyzed (%d calls)",
+                    label, len(blocks), len(stories) + 1)
+    return "\n\n".join(blocks)
+
+
+async def _enrich_overview(draft: str, analysis_block: str, common: str, label: str,
+                           *, model: str | None = None) -> str:
+    """Completeness + depth pass (owner directive: output-at-its-best, more calls fine).
+    Re-reads the DEEP ANALYSES + FINDINGS against the draft and (a) ADDS any consequential
+    development the synthesis omitted, (b) DEEPENS thin ones — strictly from the sources.
+    The verification pass + grounding guards downstream re-check every added claim, so this
+    can only add GROUNDED richness; invented additions are stripped there. `common` is the
+    shared evidence prefix from `_common_context` (prefix-cache #34) — it carries the
+    analyses + findings; instructions and draft come after it."""
+    if not draft or not analysis_block:
+        return draft
+    try:
+        out = await _invoke_bg([{"role": "user", "content":
+            common +
+            f"Below is a DRAFT overview. Return an IMPROVED overview that is more COMPLETE "
+            f"and DEEPER, changing nothing already correct:\n"
+            f"1. ADD any genuinely consequential {label} development present in the DEEP ANALYSES "
+            f"or SOURCE FINDINGS above but MISSING from the draft — as a new Secondary bullet with "
+            f"its inline (outlet.com) citation.\n"
+            f"2. DEEPEN any thin development using specifics FROM THE SOURCES: exact numbers, the "
+            f"mechanism, named players, dates, and the second-order implication.\n"
+            f"3. KEEP every existing development and the structure (Lead / Secondary Developments / "
+            f"Connections & bottom line). Longer is fine — comprehensiveness is the goal.\n"
+            f"Add ONLY what the analyses/findings above support; invent NOTHING; cite every new "
+            f"sentence inline.\n\n"
+            f"DRAFT:\n{draft}"}],
+            max_tokens=5000, temperature=0.35, num_ctx=16384, model=model)
+        out = (out or "").strip()
+        return out if _accept_correction(draft, out) else draft   # keep only a structure-preserving, non-shrinking result
+    except Exception as e:
+        logger.debug("[DeepResearch] enrich pass failed: %s", e)
+        return draft
+
+
+async def _gather_evidence(label: str, n_stories: int, feed_key: str | None):
+    """Story selection + pooled deep read + iterative gap loop -> (subjects, findings,
+    articles). Split out of domain_overview (2026-07-10) so the ceiling A/B harness can
+    capture evidence ONCE and replay synthesis on it. Behavior-preserving move."""
+    subjects = await _focus_subjects(label, feed_key=feed_key or label, n=n_stories)
+    logger.info("[DeepResearch] %s → %d stories: %s", label, len(subjects), subjects)
+
+    # Read DEEP: broad/meta domains (World Awareness, Current Events) spread their
+    # reads across many disparate stories, so a low target leaves each story SINGLE-
+    # sourced — which reads vague and risks single-source errors (the 2026-06-29 audit
+    # found World Awareness at 8 sources across 7 stories). Higher read_target +
+    # browser_budget gets multiple sources PER story (most quality world feeds — BBC,
+    # Guardian, France24, DW — are JS-rendered, so depth is gated by browser_budget).
+    # Latency-tolerant (background); richer > faster per the owner.
+    articles = await _gather_overview(subjects, feed_key or label, read_target=28, browser_budget=20)
+    # Relevance anchor = the DOMAIN (broad), NOT the seed subjects. The feeds
+    # surface many on-domain stories beyond the seed subjects; gating findings on
+    # the specific subjects made the 9B reject them as "irrelevant" (the bug that
+    # forced the overview to keep falling back). Broad anchor keeps every
+    # on-domain finding → real breadth. Subjects still seed the search + synthesis.
+    findings = await _findings(articles, label) if articles else []
+
+    # ITERATIVE gap loop (Phase 3): reflect on the first-pass findings → targeted follow-up
+    # searches → read → merge. Later queries conditioned on what the first read revealed is
+    # what single-pass gather cannot do; measured to lift coverage/corroboration (Search-o1,
+    # FRAMES 0.40→0.66). Bounded: ≤2 rounds, stop when a round adds <2 new sources. The
+    # reflection runs on the fast default model; only the extra reads add cost (network, not GPU).
+    from app.config import config as _cfg_iter
+    if getattr(_cfg_iter, "ENABLE_ITERATIVE_GATHER", True) and len(findings) >= 3:
+        from app.monitors.report_grader import _anchors as _anchor_fn
+        _seen = {u for _, u, _ in findings}
+        _seen_anchors = _anchor_fn(" ".join(f for _, _, f in findings))
+        # Loop-until-dry (#67): keep gathering while a round surfaces NEW
+        # distinct ENTITIES (not just new URLs — a round can add sources that
+        # merely re-cover known stories). Bounded to 3 rounds so a hot domain
+        # can't run away; stops early when a round is entity-dry OR source-thin.
+        # The yield latch (#54) defers this whole loop while the owner chats.
+        for _round in range(3):
+            try:
+                gaps = await _gap_followup(findings, label)
+            except Exception:
+                gaps = []
+            if not gaps:
+                break
+            more = await _gather_gap(gaps, read_target=10, browser_budget=8)
+            new_arts = [a for a in more if a[1] not in _seen and not _stale_body(a[2])]
+            if len(new_arts) < 2:
+                break
+            _seen.update(a[1] for a in new_arts)
+            new_findings = await _findings(new_arts, label)
+            round_anchors = _anchor_fn(" ".join(f for _, _, f in new_findings))
+            fresh_anchors = round_anchors - _seen_anchors
+            articles = articles + new_arts
+            findings = findings + new_findings
+            logger.info("[DeepResearch] gap-round %d (%s): +%d sources, +%d new entities",
+                        _round + 1, label, len(new_arts), len(fresh_anchors))
+            if len(fresh_anchors) < 2:   # entity-dry → stop even if URLs were new
+                break
+            _seen_anchors |= round_anchors
+            logger.info("[DeepResearch] %s gap-round %d: +%d sources (%d findings total)",
+                        label, _round + 1, len(new_arts), len(findings))
+    return subjects, findings, articles
+
+
+async def _synthesize_from_evidence(label: str, findings: list, articles: list, today: str, *, kg=None, syn_model: str | None = None) -> str:
+    """Deep analysis -> best-of-N synthesis -> grounding stack -> fact-banking -> bound.
+    Split out of domain_overview (2026-07-10) so the ceiling harness replays the EXACT
+    production synthesis on captured evidence with any (model, config). syn_model=None
+    -> config.MONITOR_SYNTHESIS_MODEL."""
+    hosts = sorted({_host(u) for _, u, _ in findings})
+    evidence = _annotated_evidence(findings)
+
+    # REAL deep research: analyze each story in depth FIRST (many calls), then let the
+    # final synthesis (this call) reason over those analyses + the full findings.
+    # Lever C: route the analysis/synthesis reasoning to a bigger model when set.
+    from app.config import config as _cfg
+    if syn_model is None:
+        syn_model = (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
+    if syn_model:
+        logger.info("[DeepResearch] %s synthesis on %s (Lever C)", label, syn_model)
+    deep = ""
+    try:
+        if getattr(_cfg, "ENABLE_DEEP_ANALYSIS", True):
+            body_map = {u: b for _t, u, b in articles if b}
+            deep = await _deep_analyze(findings, label, today, bodies=body_map, model=syn_model)
+    except Exception as e:
+        logger.warning("[DeepResearch] deep analysis failed: %s", e)
+    analysis_block = (
+        "DEEP ANALYSES — each story already reasoned over by an analyst; draw on these for the "
+        f"insight, the 'so what', and the connections:\n{deep}\n\n" if deep else "")
+
+    # Prefix-cache (#34): ONE byte-identical evidence pack leads every chain stage
+    # (synthesis → judge → enrich → verify) so its KV cache is computed once and
+    # reused; only each stage's instructions + draft are new tokens. The synthesis
+    # call appends any evidence overflow past the shared cap AFTER the pack — the
+    # cache reuses up to the divergence point and synthesis still sees everything.
+    common = _common_context(today, label, analysis_block, evidence)
+    _extra = evidence[_COMMON_EVIDENCE_CAP:]
+    # Coverage checklist (#67b): the distinct entity anchors surfaced in the
+    # findings. Synthesis-recall was dropping found stories (the DeepResearch
+    # Bench II failure: agents "miss key sources"); listing the surfaced players
+    # as a to-cover checklist keeps them in. Fabrication-safe — it only names
+    # entities already IN the findings and still requires source support.
+    try:
+        from app.monitors.report_grader import _anchors as _anchor_fn
+        _cov_anchors = sorted(_anchor_fn(" ".join(f for _, _, f in findings)),
+                              key=len, reverse=True)[:18]
+    except Exception:
+        _cov_anchors = []
+    _checklist = (
+        "COVERAGE CHECKLIST — these named players/entities surfaced in the findings; "
+        "make sure every consequential one is addressed somewhere in the brief IF the "
+        "findings support it (do NOT invent detail for one that is only named in "
+        f"passing): {', '.join(_cov_anchors)}.\n\n" if _cov_anchors else "")
+    _syn_prompt = (
+        common
+        + (f"MORE SOURCE FINDINGS (continued):\n{_extra}\n\n" if _extra else "")
+        + _checklist
+        + f"You READ {len(findings)} credible {label} sources — the deep analyses and findings "
+        f"above are everything you read. Write the overview from THESE ONLY "
+        f"(do not add stories you remember but did not read here).\n\n"
+        f"You are a sharp {label} intelligence analyst writing for an expert who will ACT on this. "
+        f"Be substantive, analytical, and ruthlessly ON-MISSION.\n"
+        f"CALIBRATE by evidence strength: each finding is tagged '(outlet · reliability · "
+        f"corroboration)'. Lead with developments that are CONFIRMED (multiple sources, or a "
+        f"wire/primary/quality outlet); a claim resting on a SINGLE 'single/unverified' or "
+        f"'LOW-CREDIBILITY' source must be caveated in-line ('per a single unverified report,') or "
+        f"dropped — NEVER lead with one. Cite only the outlet name, not the reliability tag.\n"
+        f"**Lead Development** — THE single most consequential {label} development: a full paragraph "
+        f"(5-8 sentences) with the key facts, EXACT numbers, named players, what is genuinely new, "
+        f"and — critically — WHY it matters and the second-order implications.\n"
+        f"**Secondary Developments** — each OTHER genuinely consequential {label} development as its "
+        f"own bullet (3-5 sentences of concrete specifics — numbers, names, dates, the mechanism, and "
+        f"the 'so what' / second-order implication). Rank by importance and lead with the biggest. Cover "
+        f"the FIVE TO SEVEN MOST CONSEQUENTIAL developments — prioritize ruthlessly; a focused brief that "
+        f"leads with what matters beats an exhaustive list. Keep the FULL briefing UNDER ~8500 characters "
+        f"(a 12k-char digest overruns both the generation budget and Discord readability, 2026-07-08). "
+        f"EXCLUDE anything that "
+        f"is not real {label} intelligence: sports results, celebrity/personal gossip, individual "
+        f"salary/appointment trivia, routine scheduling, promotional/press-release fluff, and off-topic "
+        f"tangents — even if a source mentioned them. Prefer developments confirmed by MULTIPLE sources; "
+        f"never pad with filler, but richness from REAL sourced detail is the goal.\n"
+        "**Connections & bottom line** — 2-3 sentences: the throughline across the stories and the "
+        "single MOST CONSEQUENTIAL thing to watch next — a real open question with stakes, NOT a "
+        "routine scheduling detail (e.g. a minor earnings date). Draw ONLY on facts already stated "
+        "above; introduce NO new number, figure, or named entity in this section.\n"
+        "EVERY sentence and bullet MUST cite its outlet inline like (cnbc.com). If you cannot cite "
+        "a claim from the findings, OMIT it. Use ONLY information present in the analyses/findings "
+        "above — never invent a company, number, person, or event.")
+    try:
+        # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
+        # (owner directive: maximize the best output; extra generations are fine.)
+        draft = await _best_synthesis(_syn_prompt, evidence, n=4,
+                                      temps=(0.15, 0.35, 0.55, 0.8), model=syn_model,
+                                      context_block=common)
+    except Exception as e:
+        logger.warning("[DeepResearch] overview draft failed: %s", e)
+        draft = ""
+    draft = (draft or "").strip()
+    if not draft:
+        return f"## 🌐 {label} — domain overview\n_{today}_\n\n(synthesis unavailable)"
+
+    # ENRICHMENT: add consequential developments the synthesis omitted + deepen thin ones,
+    # strictly from the sources (verification + grounding guards below re-check every claim).
+    draft = await _enrich_overview(draft, analysis_block, common, label, model=syn_model)
+
+    # VERIFICATION PASS — ground every claim AND require a citation on each (RARR
+    # mode: revise partial-support claims to their supported core instead of deleting).
+    from app.config import config as _cfg_v
+    _rarr = bool(getattr(_cfg_v, "ENABLE_RARR", False))
+    try:
+        final = await _invoke_bg([{"role": "user", "content":
+            _verify_prompt(evidence, draft, overview=True, rarr=_rarr, common=common)}],
+            # 3600 (was 2800) + num_ctx 16384 (was 12288): 2800 tokens = ~7168
+            # chars truncated full digests MID-SENTENCE ("$47 billion revenue"
+            # then stop), silently — the recall levers made digests longer and
+            # pushed them over. num_ctx raised so prompt+output both fit (2026-07-08).
+            max_tokens=5000, temperature=0.1, num_ctx=16384, model=syn_model)
+        final = (final or "").strip() or draft
+    except Exception:
+        final = draft
+    logger.info("[DeepResearch] verify pass (%s): %d→%d content sentences%s",
+                label, _count_content_sentences(draft), _count_content_sentences(final),
+                " [RARR]" if _rarr else "")
+
+    final = _strip_prompt_leak(final)   # drop any synthesis-prompt instructions the model echoed
+    final = _strip_fake_citations(final, hosts)   # drop fabricated-attribution lines
+    final, _ = await _ensure_citations(final, findings, model=syn_model)   # backstop: re-cite an uncited misfire
+    final, _ = await _ground_numbers(final, [b for _, _, b in articles], model=syn_model)  # every figure traces to a source
+    final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
+    final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
+    final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
+    final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
+    final, _ = await _entailment_gate(final, articles)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
+    final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
+    final, _corr = await _corroborate_numbers(final, articles)   # set of figures ≥2 sources confirm (for Lever A)
+    final = _tidy_citations(final)   # strip $-wrapped citations + leaked title fragments
+    final = _strip_novel_bottomline_figures(final)   # drop a figure introduced only in the bottom line
+    final = _drop_orphan_headers(final)   # remove any section header left empty by the strip passes
+    final = _repair_dangling_fragments(final)  # recover sentences broken by an excised entity (prep/possessive)
+    final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
+    learned = await _learn_facts(label, final, findings, kg, articles=articles, model=syn_model)
+    logger.info("[DeepResearch] %s overview: read %d sources (%s), learned %d facts",
+                label, len(findings), ", ".join(hosts[:6]), learned)
+    # Recall/coverage signal (task #65): of the distinct entity anchors surfaced
+    # during gather, what fraction reached the digest? pool_anchors = gather
+    # breadth; coverage = synthesis recall. The before/after metric for the
+    # multi-angle sweep (#66) and coverage-driven gap loop (#67).
+    try:
+        from app.monitors.report_grader import coverage_score
+        _cov = coverage_score(final, findings)
+        logger.info("[DeepResearch] coverage (%s): CORE %d/%d (%.0f%%) · all %d/%d (%.0f%%) · pool=%d%s",
+                    label, _cov["core_covered"], _cov["core_anchors"], _cov["core_coverage"] * 100,
+                    _cov["covered"], _cov["pool_anchors"], _cov["coverage"] * 100, _cov["pool_anchors"],
+                    (" · missed-core: " + "; ".join(_cov["missed"][:5])) if _cov["missed"] else "")
+    except Exception as e:
+        logger.warning("[DeepResearch] coverage score failed: %s", e)
+
+    # Lever A: fresh independent verification of the lead's top claims (gated, bounded).
+    try:
+        from app.config import config as _cfg
+        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", False):
+            final, _ = await _verify_lead_claims(final, label, corroborated=_corr)
+    except Exception as e:
+        logger.warning("[DeepResearch] claim verification failed: %s", e)
+
+    # Corroboration-gated lead: caveat a headline resting on a single low-credibility
+    # source (robust to unknown farms the blocklist misses). Deterministic, always on.
+    final, _gated = _gate_lead_credibility(final)
+    if _gated:
+        logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
+
+    # Think-leak tripwire (2026-07-08): a `<think>` reaching here means a model
+    # pass leaked raw reasoning past the invoke_nothink + strip + accept guards.
+    # Never post it — strip to the last close (or drop an unterminated tail) and
+    # log ERROR so the failure is loud, not a broken digest on Discord.
+    if "<think>" in final.lower() or "</think>" in final.lower():
+        logger.error("[DeepResearch] THINK-LEAK in %s digest — stripping before post", label)
+        from app.core.llm import _strip_think_tags
+        final = _strip_think_tags(final).strip()
+        if len(final) < 200:   # strip left nothing usable → this run is unpublishable
+            logger.error("[DeepResearch] %s digest empty after think-strip — suppressing", label)
+            return f"## 🌐 {label} — domain overview\n_{today}_\n\n(synthesis unavailable this cycle)"
+
+    # Deterministic final bound: guarantee a complete-sentence ending + length
+    # under the storage/generation caps (both the Discord post and the stored
+    # copy use this return value). Ends the truncation/overrun arms race.
+    final = _bound_and_clean(final, max_chars=10800)
+
+    header = (f"## 🌐 {label} — domain overview\n"
+              f"_read {len(findings)} sources: {', '.join(hosts[:7])}"
+              f"{' +more' if len(hosts) > 7 else ''} · {learned} facts learned · {today}_\n\n")
     return header + final
 
 
@@ -1444,17 +3332,7 @@ async def domain_overview(label: str, kg=None, n_stories: int = 5, feed_key: str
     the lossy collapse. Verified, cited, fact-banking. Falls back to a single deep
     briefing when the pool is thin; honest when there are no readable sources."""
     today = _NOW().strftime("%B %d, %Y")
-    subjects = await _focus_subjects(label, feed_key=feed_key or label, n=n_stories)
-    logger.info("[DeepResearch] %s → %d stories: %s", label, len(subjects), subjects)
-
-    articles = await _gather_overview(subjects, feed_key or label, read_target=18, browser_budget=10)
-    # Relevance anchor = the DOMAIN (broad), NOT the seed subjects. The feeds
-    # surface many on-domain stories beyond the seed subjects; gating findings on
-    # the specific subjects made the 9B reject them as "irrelevant" (the bug that
-    # forced the overview to keep falling back). Broad anchor keeps every
-    # on-domain finding → real breadth. Subjects still seed the search + synthesis.
-    findings = await _findings(articles, label) if articles else []
-
+    subjects, findings, articles = await _gather_evidence(label, n_stories, feed_key)
     if len(findings) < 2:
         # Breadth pool came up thin — fall back to a single strong deep-dive on
         # the top story (proven good), rather than a hollow overview.
@@ -1465,63 +3343,5 @@ async def domain_overview(label: str, kg=None, n_stories: int = 5, feed_key: str
         return (f"## 🌐 {label} — domain overview\n_no readable credible sources today · {today}_\n\n"
                 f"No readable credible sources were found across the top {label} stories today; "
                 f"nothing reported rather than speculation.")
+    return await _synthesize_from_evidence(label, findings, articles, today, kg=kg)
 
-    hosts = sorted({_host(u) for _, u, _ in findings})
-    evidence = "\n\n".join(f"[{t}] ({_host(u)})\n{f}" for t, u, f in findings)
-
-    _syn_prompt = (
-        f"Today is {today}. You READ {len(findings)} credible {label} sources. Their findings are "
-        f"below — write the overview from THESE FINDINGS ONLY (do not add stories you remember but "
-        f"did not read here).\n\n"
-        "Write a thorough DOMAIN INTELLIGENCE OVERVIEW — this is the full picture, be substantive:\n"
-        "**Lead Development** — the single most significant story: a full paragraph (5-8 sentences) "
-        "with all the key facts, numbers, named players, what is genuinely new, and why it matters.\n"
-        "**Secondary Developments** — EVERY other distinct story the findings support, each as its "
-        "own bullet with 2-4 sentences of concrete specifics (numbers, names, dates). Cover as "
-        "many distinct stories as the findings support — do NOT stop at two or three.\n"
-        "**Connections & bottom line** — 2-3 sentences: the throughline across the stories and the "
-        "single thing to watch next.\n"
-        "EVERY sentence and bullet MUST cite its outlet inline like (cnbc.com). If you cannot cite "
-        "a claim from the findings, OMIT it. Group findings into stories yourself. Use ONLY "
-        "information present in the findings — never invent a company, number, person, or event.\n\n"
-        + evidence)
-    try:
-        # best-of-N: two framings, judge picks the sharpest grounded one
-        draft = await _best_synthesis(_syn_prompt, evidence, n=2, temps=(0.2, 0.55))
-    except Exception as e:
-        logger.warning("[DeepResearch] overview draft failed: %s", e)
-        draft = ""
-    draft = (draft or "").strip()
-    if not draft:
-        return f"## 🌐 {label} — domain overview\n_{today}_\n\n(synthesis unavailable)"
-
-    # VERIFICATION PASS — ground every claim AND require a citation on each.
-    try:
-        final = await llm.invoke_nothink([{"role": "user", "content":
-            "Below are SOURCE FINDINGS and a DRAFT domain overview. Do all of:\n"
-            "1. Remove or correct EVERY statement not directly supported by the findings (invented "
-            "numbers, names, events).\n"
-            "2. DELETE any sentence or bullet that lacks an inline outlet citation like (cnbc.com) — "
-            "an uncited claim is where fabrication hides; cut it.\n"
-            "3. Keep all supported, cited claims, their specifics, and the structure.\n"
-            "Output the corrected overview only.\n\n"
-            f"SOURCE FINDINGS:\n{evidence}\n\nDRAFT:\n{draft}"}],
-            max_tokens=1900, temperature=0.1, num_ctx=8192)
-        final = (final or "").strip() or draft
-    except Exception:
-        final = draft
-
-    final = _strip_fake_citations(final, hosts)   # drop fabricated-attribution lines
-    final, _ = await _ground_numbers(final, [b for _, _, b in articles])  # every figure traces to a source
-    final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles])   # distinctive terms trace too (titles incl.)
-    final, _ = await _check_contamination(final, articles)   # details trace to their CITED source, not a grafted one
-    final, _ = await _corroborate_numbers(final, articles)   # ✓ badge figures ≥2 sources confirm
-    final = _tidy_citations(final)   # strip $-wrapped citations + leaked title fragments
-    learned = await _learn_facts(label, final, findings, kg)
-    logger.info("[DeepResearch] %s overview: read %d sources (%s), learned %d facts",
-                label, len(findings), ", ".join(hosts[:6]), learned)
-
-    header = (f"## 🌐 {label} — domain overview\n"
-              f"_read {len(findings)} sources: {', '.join(hosts[:7])}"
-              f"{' +more' if len(hosts) > 7 else ''} · {learned} facts learned · {today}_\n\n")
-    return header + final

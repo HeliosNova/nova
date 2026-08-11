@@ -52,6 +52,12 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("NOVA_API_KEY", "")
     monkeypatch.setenv("SYSTEM_ACCESS_LEVEL", "sandboxed")
     monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
+    # Isolate from the container's ambient production ENABLE_* overrides so
+    # default-config tests are deterministic regardless of the runtime env (the
+    # container bakes these true; tests assert the code defaults).
+    monkeypatch.setenv("ENABLE_VOICE", "false")
+    monkeypatch.setenv("ENABLE_TWO_PHASE_DREAM", "false")
+    monkeypatch.setenv("ENABLE_DESKTOP_AUTOMATION", "false")
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_MULTI_AGENT", "false")  # opt-in per test
@@ -66,6 +72,10 @@ def _test_env(tmp_path, monkeypatch):
 
     # Tuning parameters — deterministic values for tests
     monkeypatch.setenv("MAX_SYSTEM_TOKENS", "6000")
+    # Unit tests exercise the IN-PROCESS code_exec path (mocked subprocess);
+    # in the deployed container /exec_queue exists and would route execution
+    # to the nova-exec sidecar, bypassing every mock (audit 2026-07-08).
+    monkeypatch.setenv("EXEC_QUEUE_DIR", "/nonexistent-exec-queue")
     monkeypatch.setenv("RESPONSE_TOKEN_BUDGET", "600")
     monkeypatch.setenv("RETRIEVAL_RELEVANCE_THRESHOLD", "0.15")
     monkeypatch.setenv("TEMPERATURE_DEFAULT", "0.7")
@@ -80,6 +90,35 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("REFLEXION_SUCCESS_THRESHOLD", "0.8")
     monkeypatch.setenv("KG_GRAPH_MAX_FRONTIER", "1000")
     monkeypatch.setenv("AUTH_MAX_TRACKED_IPS", "10000")
+
+    # Force LLM provider retries to 0 in tests. The dead-port redirect above is
+    # meant to give "instant connection-refused", but retry_on_transient's default
+    # 3x exponential backoff turns every UNMOCKED llm call into ~14s of sleeps —
+    # silently slowing the suite and able to stall a multi-call path (the cause of
+    # the 2026-06-27 full-suite hang in TestCritiqueBrainIntegration). A properly
+    # mocked test never reaches this; an unmocked one now fails fast and loud.
+    import app.core.providers._retry as _retry_mod
+    import app.core.providers.ollama as _ollama_mod
+    _orig_retry = _retry_mod.retry_on_transient
+
+    async def _fast_retry(client, method, url, **kwargs):
+        kwargs["max_retries"] = 0
+        return await _orig_retry(client, method, url, **kwargs)
+
+    monkeypatch.setattr(_retry_mod, "retry_on_transient", _fast_retry)
+    monkeypatch.setattr(_ollama_mod, "retry_on_transient", _fast_retry)
+
+    # Fail-fast on the headless browser too. The container ships Playwright, so
+    # BrowserTool tests that assume "no Playwright" actually launch a real Chromium
+    # and hang (no display / CDP). execute() wraps _ensure_browser in try/except and
+    # every BrowserTool test asserts failure, so raising here gives them a fast,
+    # correct error. A test that mocks the browser itself overrides this.
+    import app.tools.browser as _browser_mod
+
+    async def _no_browser(*_a, **_k):
+        raise RuntimeError("browser launch disabled in tests")
+
+    monkeypatch.setattr(_browser_mod.BrowserTool, "_ensure_browser", _no_browser)
 
     # Recreate config from current env — the _ConfigProxy ensures all
     # modules that imported `config` automatically see the new values.

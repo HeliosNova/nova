@@ -50,6 +50,13 @@ CANONICAL_PREDICATES = frozenset({
     "works_at", "employed_by", "lives_in", "studied_at",
     "married_to", "member_of", "invented_by", "successor_of",
     "succeeded_by", "price_of", "version_of", "has_status",
+    # News/business/geopolitics relations (2026-06-29): the analytical verbs the
+    # monitors ingest constantly that USED to flatten to `related_to` — discarding
+    # the relationship and disabling change-tracking for the bulk of monitor facts.
+    # Preserving the verb makes the KG queryable by real relationship ("what did X
+    # acquire", "who partnered with Y", "who sued Z").
+    "acquired", "owns", "subsidiary_of", "invested_in", "partnered_with",
+    "competes_with", "supplies", "sued", "sanctioned", "launched", "regulates",
 })
 
 # Predicates where a subject legitimately holds MANY simultaneous objects, so a
@@ -73,6 +80,15 @@ MULTI_VALUED_PREDICATES = frozenset({
     "spoken_in", "developed_by", "written_by", "caused_by", "contains",
     "produces", "works_at", "employed_by", "studied_at", "member_of",
     "invented_by",
+    # News relations that legitimately accumulate — a company acquires MANY
+    # firms, invests in many, partners with many, sues many; a regulator
+    # regulates many domains. A new object is an ADDITIONAL fact, never a
+    # supersession. (subsidiary_of is deliberately NOT here: a company has one
+    # current parent, so a new parent SUPERSEDES — the ownership-change the
+    # bitemporal store exists to track. owns stays multi-valued: a holder owns
+    # many things.)
+    "acquired", "owns", "invested_in", "partnered_with", "competes_with",
+    "supplies", "sued", "sanctioned", "launched", "regulates",
 })
 
 # Predicates where only ONE subject may hold the relation to a given object, so
@@ -82,6 +98,32 @@ MULTI_VALUED_PREDICATES = frozenset({
 # that normalize_predicate degrades to `related_to` — so they never matched and
 # the inverse-functional guard was effectively dead for everything but `leads`.
 INVERSE_FUNCTIONAL_PREDICATES = frozenset({"leads", "capital_of", "married_to"})
+
+# Natural verb phrases for prompt rendering (task #63). Every phrase keeps
+# strict "SUBJECT <phrase> OBJECT" order — brain._kg_answers_query parses
+# "SUBJECT <verb>" from these lines (see format_for_prompt). Extend the gate's
+# verb alternation when adding phrases here.
+_PRED_PHRASES = {
+    "price_of": "is currently priced at",
+    "located_in": "is located in",
+    "based_in": "is based in",
+    "capital_of": "is the capital of",
+    "leads": "leads",
+    "married_to": "is married to",
+    "works_for": "works for",
+    "created_by": "was created by",
+    "developed_by": "was developed by",
+    "owned_by": "is owned by",
+    "acquired": "acquired",
+    "acquired_by": "was acquired by",
+    "member_of": "is a member of",
+    "part_of": "is part of",
+    "has_status": "currently has status",
+    "related_to": "is connected to",
+    "lives_in": "lives in",
+    "currency_of": "is the currency of",
+    "version_of": "is a version of",
+}
 
 _PREDICATE_ALIASES: dict[str, str] = {
     "is a": "is_a", "is an": "is_a", "type of": "is_a",
@@ -116,6 +158,27 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "version of": "version_of", "variant of": "version_of",
     "has status": "has_status", "status of": "has_status", "status": "has_status",
     "current status": "has_status", "state of": "has_status",
+    # News/business/geopolitics verbs (2026-06-29)
+    "acquired": "acquired", "acquires": "acquired", "bought": "acquired",
+    "purchased": "acquired", "to acquire": "acquired", "acquisition of": "acquired",
+    "owns": "owns", "owner of": "owns",
+    "subsidiary of": "subsidiary_of", "unit of": "subsidiary_of",
+    "division of": "subsidiary_of", "owned by": "subsidiary_of",
+    "invested in": "invested_in", "invests in": "invested_in", "backed": "invested_in",
+    "funded": "invested_in", "stake in": "invested_in",
+    "partnered with": "partnered_with", "partners with": "partnered_with",
+    "partnership with": "partnered_with", "teamed up with": "partnered_with",
+    "collaborates with": "partnered_with",
+    "competes with": "competes_with", "competitor of": "competes_with",
+    "rival of": "competes_with", "rivals": "competes_with",
+    "supplies": "supplies", "supplier of": "supplies", "supplies to": "supplies",
+    "sued": "sued", "sues": "sued", "lawsuit against": "sued",
+    "filed suit against": "sued",
+    "sanctioned": "sanctioned", "sanctions": "sanctioned",
+    "imposed sanctions on": "sanctioned",
+    "launched": "launched", "launches": "launched", "unveiled": "launched",
+    "rolled out": "launched",
+    "regulates": "regulates",
 }
 
 
@@ -149,7 +212,7 @@ def normalize_predicate(pred: str) -> str:
     # Permissive custom-predicate matching was removed 2026-05-13: LLM
     # extractions like "founded_in_year" or "custom_metric_v2" would orphan
     # facts (stored under a unique key that no canonical query ever hits).
-    # The 31 canonical predicates + ~50 alias phrases cover the common shapes;
+    # The 43 canonical predicates + alias phrases cover the common shapes;
     # anything else degrades to `related_to`, preserving the relationship
     # without splintering the predicate space.
     return "related_to"
@@ -316,6 +379,64 @@ def _looks_like_fragment(x: str) -> bool:
     return False
 
 
+# Bare dates, months, years, and durations — meaningless as a related_to
+# subject/object (the actual fact got lost in extraction).
+_DATE_FRAGMENT_RE = re.compile(
+    r"^(?:(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)(?:\s+\d{1,2})?(?:,?\s+\d{4})?"
+    r"|\d{4}"
+    r"|(?:a|an|one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+    r"(?:second|minute|hour|day|week|month|year|decade)s?)$",
+    re.IGNORECASE,
+)
+# A related_to endpoint that is really a QUANTITY / TIME / MEASUREMENT with no
+# named-entity anchor — the extraction lost the actual fact and kept the number.
+# Broader than _DATE_FRAGMENT_RE (which only anchors bare dates/simple durations):
+# catches clock times ("1:00 AM UTC"), compound/suffixed durations ("1 hour 10
+# minutes", "20 hours daily"), and quantity+unit heads ("10,000 repetitions per
+# skill", "140 npm packages"). Anchored at START only (\b, not $) so trailing
+# qualifiers don't let it escape. related_to-only, so specific predicates keep
+# their legit numeric objects (price_of $95k, founded_in 1998). These were the
+# dominant surviving junk class in the live KG (full-system exploration 2026-07-09:
+# top-retrieved related_to facts were "Match ~ 1:00 AM UTC", "GLM-5.2 ~ 1 hour 10
+# minutes", "training centers ~ 10,000 repetitions per skill").
+_QUANTITY_ENDPOINT_RE = re.compile(
+    r"^(?:>|~|<|≈|over|under|more\s+than|at\s+least|nearly|about|around|roughly|"
+    r"approximately)?\s*(?:"
+    r"\$?[€£]?\d[\d,.]*\s*(?:billion|million|trillion|thousand|bn|mn|k|%|percent|"
+    r"units?|repetitions?|packages?|points?|times|teams?|people|users?)\b"
+    r"|\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?\s*(?:utc|gmt|est|pst|cet|cst|edt|pdt|bst)?\b"
+    r"|\d[\d,.]*\s*(?:second|minute|hour|day|week|month|year|decade)s?\b"
+    r")", re.IGNORECASE,
+)
+# An endpoint that is really an EVENT reference pinned to a date ("Russia attack
+# on June 22", "hackers on June 19, 2026", "voltage fluctuation in July 2024") —
+# not a durable entity. The durable fact would use a specific predicate + real
+# object; as a related_to endpoint it's a lost event fragment (the two top-
+# retrieved live junk facts, 780×/438×, full-system exploration 2026-07-09).
+# Requires a PREPOSITION before the date so named events survive ("Iraq 2026
+# tournament", "July 2026 trading app" — no leading on/in/by → kept).
+_EMBEDDED_EVENT_DATE_RE = re.compile(
+    r"\b(?:on|in|by|since|during|after|before)\s+(?:"
+    r"(?:january|february|march|april|may|june|july|august|september|october|"
+    r"november|december)"
+    r"|monday|tuesday|wednesday|thursday|friday|saturday|sunday"
+    r"|\d{1,2}[/-]\d{1,2})", re.IGNORECASE,
+)
+# Single generic CATEGORY word as a related_to endpoint — carries no identity, so
+# the association is meaningless ("developer ~ coding tools daily" was retrieved
+# 1081×). A real entity is NAMED; these are the bucket the news extractor reaches
+# for when it can't name the actor. Exact single-token match only → high precision.
+_GENERIC_ENTITY = frozenset({
+    "developer", "developers", "match", "duration", "user", "users", "customer",
+    "customers", "company", "companies", "researcher", "researchers", "study",
+    "report", "market", "markets", "system", "systems", "project", "projects",
+    "team", "teams", "event", "events", "product", "products", "service",
+    "services", "technology", "data", "platform", "feature", "features", "update",
+    "updates", "price", "rate", "level", "value", "growth", "increase", "decline",
+})
+
+
 def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     """Return True if a triple is obvious garbage that should not be stored."""
     s, o = subject.strip().lower(), object_.strip().lower()
@@ -359,6 +480,28 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
         # Two orgs in created_by is almost always wrong (acquisitions/parents
         # use different predicates — part_of, owned_by, contains)
         return True
+
+    # Degraded-predicate + date-fragment pairing: '(FIFA Committee, related_to,
+    # July 5)' or '(X, related_to, eight years)' carries no retrievable meaning —
+    # the sentence's actual fact was lost in extraction (audit 2026-07-06, the
+    # dominant junk class in newly-banked research facts). Specific predicates
+    # keep their date objects (founded_in 1998 is a real fact).
+    if p == "related_to" and (_DATE_FRAGMENT_RE.match(s) or _DATE_FRAGMENT_RE.match(o)):
+        return True
+
+    # related_to with a QUANTITY/TIME/MEASUREMENT endpoint, or a single generic
+    # category word for either endpoint — the extraction kept a number or a
+    # bucket-noun instead of the real relationship (the dominant surviving junk
+    # class, full-system exploration 2026-07-09). Also runs in daily curation, so
+    # this retroactively purges the ~900 such facts already banked. related_to
+    # ONLY — specific predicates keep legit numeric/quantity objects.
+    if p == "related_to":
+        if _QUANTITY_ENDPOINT_RE.match(s) or _QUANTITY_ENDPOINT_RE.match(o):
+            return True
+        if s in _GENERIC_ENTITY or o in _GENERIC_ENTITY:
+            return True
+        if _EMBEDDED_EVENT_DATE_RE.search(s) or _EMBEDDED_EVENT_DATE_RE.search(o):
+            return True
 
     return False
 
@@ -443,6 +586,14 @@ class KnowledgeGraph:
             # logically deleted by Y. created_at is the partner column (transaction
             # time of insertion).
             ("superseded_at", "TIMESTAMP"),
+            # Memory-poisoning defense (2026-07-08, OWASP ASI06): facts banked
+            # from untrusted web content carry a trust weight, and weakly-
+            # trusted single-source facts are QUARANTINED -- stored and usable
+            # for corroboration, but excluded from prompt injection until an
+            # independent observation promotes them (AgentPoison-class attacks
+            # reach >=80% success at <0.1% poison rate on unguarded stores).
+            ("trust", "REAL DEFAULT 0.5"),
+            ("quarantined", "INTEGER DEFAULT 0"),
         ]:
             try:
                 self._db.execute(f"ALTER TABLE kg_facts ADD COLUMN {col} {typedef}")
@@ -543,7 +694,7 @@ class KnowledgeGraph:
                 metadatas=[{"subject": subject, "predicate": predicate}],
             )
         except Exception as e:
-            logger.debug("Failed to add KG fact %d to vector store: %s", fact_id, e)
+            logger.warning("Failed to add KG fact %d to vector store — paraphrase retrieval degrades silently: %s", fact_id, e)
 
     def _remove_from_vector(self, fact_id: int) -> None:
         """Remove a fact from the vector collection (on supersession/deletion)."""
@@ -617,7 +768,7 @@ class KnowledgeGraph:
                         (clean, low),
                     )
                 except Exception as e:
-                    logger.debug("canonical upgrade failed for %r: %s", clean, e)
+                    logger.warning("canonical upgrade failed for %r: %s", clean, e)
                 return clean
             return current
         if register:
@@ -627,7 +778,7 @@ class KnowledgeGraph:
                     "VALUES (?, ?)", (low, clean),
                 )
             except Exception as e:
-                logger.debug("alias register failed for %r: %s", clean, e)
+                logger.warning("alias register failed for %r: %s", clean, e)
         return clean
 
     # --- Core operations ---
@@ -642,6 +793,7 @@ class KnowledgeGraph:
         valid_from: str | None = None,
         valid_to: str | None = None,
         provenance: str = "",
+        trust: float | None = None,
     ) -> bool:
         """Add or update a fact. Returns True if added/updated.
 
@@ -670,27 +822,63 @@ class KnowledgeGraph:
             result = await asyncio.to_thread(
                 self._sync_add_fact, subject, predicate, object_,
                 confidence, source, fact_valid_from, valid_to, provenance, now,
+                trust,
             )
         return result
+
+    # Source-default trust weights. Web-derived sources ("extracted" from
+    # monitor digests, "researched" from deep-research banking) default low;
+    # owner statements and internal derivations default high.
+    _SOURCE_TRUST = {
+        "user": 0.9, "correction": 0.9, "eval": 0.95,
+        "principle": 0.75, "cross_synthesis": 0.7, "storyline": 0.65,
+    }
+    _WEB_SOURCES = frozenset({"extracted", "researched"})
 
     def _sync_add_fact(
         self, subject, predicate, object_, confidence, source,
         fact_valid_from, valid_to, provenance, now,
+        trust=None,
     ) -> bool:
         """Sync helper for add_fact — all DB operations happen here (off event loop)."""
+        if trust is None:
+            trust = self._SOURCE_TRUST.get(source, 0.5)
+        trust = max(0.0, min(1.0, float(trust)))
+        # Quarantine gate: web-derived, weakly-trusted, pipeline-attributed
+        # facts don't reach prompts until independently corroborated. Empty
+        # provenance = manual/local add (tests, API) — never quarantined.
+        quarantined = 1 if (
+            trust < 0.7 and source in self._WEB_SOURCES and provenance
+        ) else 0
         # Canonicalize entities (under the write lock) so casing variants collapse
         # to one form before storage — no fragmented graph nodes or dup facts.
         subject = self._canonical_entity(subject, register=True)
         object_ = self._canonical_entity(object_, register=True)
         # Check for exact duplicate
         existing = self._db.fetchone(
-            "SELECT id, confidence FROM kg_facts "
+            "SELECT id, confidence, COALESCE(trust, 0.5) AS trust, "
+            "COALESCE(quarantined, 0) AS quarantined, provenance FROM kg_facts "
             "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
             "AND valid_to IS NULL",
             (subject, predicate, object_),
         )
 
         if existing:
+            # Corroboration promotion: the same triple observed again from a
+            # DIFFERENT pipeline (provenance differs) is independent evidence —
+            # lift trust and release any quarantine. This is the promotion
+            # path recommended by the 2026 memory-poisoning literature:
+            # corroborate-before-inject, never age-alone.
+            corroborated = bool(
+                provenance and existing["provenance"]
+                and provenance != existing["provenance"]
+            )
+            if corroborated and (existing["quarantined"] or existing["trust"] < 0.9):
+                new_trust = max(float(existing["trust"]), min(0.9, float(existing["trust"]) + 0.2))
+                self._db.execute(
+                    "UPDATE kg_facts SET quarantined = 0, trust = ? WHERE id = ?",
+                    (new_trust, existing["id"]),
+                )
             if confidence > existing["confidence"]:
                 self._db.execute(
                     "UPDATE kg_facts SET confidence = ?, source = ?, "
@@ -699,7 +887,7 @@ class KnowledgeGraph:
                     (confidence, source, provenance, provenance, existing["id"]),
                 )
                 return True
-            return False
+            return corroborated
 
         # Forward contradiction: a DIFFERENT object for the same subject+predicate.
         # Only supersede when the predicate is single-valued (functional) — a
@@ -756,8 +944,10 @@ class KnowledgeGraph:
                 tx.execute(
                     "UPDATE kg_facts SET valid_from = ?, valid_to = NULL, "
                     "superseded_by = NULL, superseded_at = NULL, created_at = ?, "
-                    "confidence = ?, source = ?, provenance = ? WHERE id = ?",
-                    (fact_valid_from, now, confidence, source, provenance, old_superseded["id"]),
+                    "confidence = ?, source = ?, provenance = ?, "
+                    "trust = ?, quarantined = ? WHERE id = ?",
+                    (fact_valid_from, now, confidence, source, provenance,
+                     trust, quarantined, old_superseded["id"]),
                 )
                 new_id = old_superseded["id"]
             else:
@@ -768,10 +958,10 @@ class KnowledgeGraph:
                 tx.execute(
                     "INSERT INTO kg_facts "
                     "(subject, predicate, object, confidence, source, "
-                    " created_at, valid_from, valid_to, provenance) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    " created_at, valid_from, valid_to, provenance, trust, quarantined) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (subject, predicate, object_, confidence, source,
-                     now, fact_valid_from, valid_to, provenance),
+                     now, fact_valid_from, valid_to, provenance, trust, quarantined),
                 )
                 new_row = tx.fetchone(
                     "SELECT id FROM kg_facts "
@@ -1091,7 +1281,8 @@ class KnowledgeGraph:
             placeholders = ",".join("?" for _ in frontier)
             params = tuple(frontier) + tuple(frontier)
             rows = self._db.fetchall(
-                f"SELECT id, subject, predicate, object, confidence, source "
+                f"SELECT id, subject, predicate, object, confidence, source, "
+                f"COALESCE(quarantined, 0) AS quarantined "
                 f"FROM kg_facts "
                 f"WHERE (LOWER(subject) IN ({placeholders}) OR LOWER(object) IN ({placeholders})) "
                 f"{validity_filter}",
@@ -1110,6 +1301,7 @@ class KnowledgeGraph:
                     "object": r["object"],
                     "confidence": r["confidence"],
                     "source": r["source"],
+                    "quarantined": r["quarantined"],
                     "depth": depth,
                 })
                 next_entities.add(r["subject"].lower())
@@ -1188,6 +1380,48 @@ class KnowledgeGraph:
 
         return results
 
+    def entity_subgraph(self, entity: str, limit: int = 40) -> list[Fact]:
+        """All current facts touching an entity (subject OR object) plus a
+        1-hop expansion — the query-time answer to "what do you know about X".
+
+        LazyGraphRAG-style (2026-07-08, task #63): domain-level questions are
+        served poorly by top-8 per-fact retrieval, but PREcomputed community
+        summaries are the wrong fix (indexing cost, and the GraphRAG-family
+        win-rate evidence largely collapsed under judge-bias correction —
+        arXiv 2506.06331). Pull the live subgraph at query time and let the
+        generation synthesize over it. Quarantined facts stay excluded.
+        """
+        ent = (entity or "").strip()
+        if len(ent) < 2:
+            return []
+        # Reuse the existing BFS (query handles canonicalization, hop
+        # traversal, frontier caps); it predates the quarantine column, so
+        # re-check eligibility on the collected ids here.
+        hits = self.query(ent, hops=1, max_results=limit * 3)
+        if not hits:
+            return []
+        hits.sort(key=lambda r: (r.get("depth", 0), -(r.get("confidence") or 0)))
+        ids = [r["id"] for r in hits[: limit * 2]]
+        placeholders = ",".join("?" for _ in ids)
+        rows = self._db.fetchall(
+            f"SELECT * FROM kg_facts WHERE id IN ({placeholders}) "
+            "AND COALESCE(quarantined, 0) = 0 "
+            "ORDER BY confidence DESC LIMIT ?",
+            tuple(ids) + (limit,),
+        )
+        return [
+            Fact(
+                id=r["id"], subject=r["subject"], predicate=r["predicate"],
+                object=r["object"], confidence=r["confidence"], source=r["source"],
+                created_at=r["created_at"],
+                valid_from=r["valid_from"] if "valid_from" in r.keys() else None,
+                valid_to=r["valid_to"] if "valid_to" in r.keys() else None,
+                provenance=r["provenance"] if "provenance" in r.keys() else "",
+                superseded_by=r["superseded_by"] if "superseded_by" in r.keys() else None,
+            )
+            for r in rows
+        ]
+
     def get_relevant_facts(self, query: str, limit: int = 8) -> list[Fact]:
         """Get facts relevant to a query by hybrid keyword + semantic search.
 
@@ -1202,8 +1436,13 @@ class KnowledgeGraph:
         # Use the KG cap so every valid fact is a candidate; keyword/vector/PPR
         # then rank by actual query relevance, not by a confidence pre-truncation.
         _cand_limit = int(getattr(_config, "MAX_KG_FACTS", 5000))
+        # Quarantine gate (memory-poisoning defense, 2026-07-08): facts banked
+        # from untrusted web content stay OUT of prompt injection until
+        # independently corroborated — this retrieval path feeds the system
+        # prompt, so it is exactly the surface a poisoned fact targets.
         all_facts = self._db.fetchall(
             "SELECT * FROM kg_facts WHERE valid_to IS NULL "
+            "AND COALESCE(quarantined, 0) = 0 "
             "ORDER BY confidence DESC LIMIT ?",
             (_cand_limit,),
         )
@@ -1260,7 +1499,7 @@ class KnowledgeGraph:
                             if dist <= _STRONG_DISTANCE:
                                 vector_strong.add(rid)
             except Exception as e:
-                logger.debug("KG vector search failed: %s", e)
+                logger.warning("KG vector search failed — retrieval degraded to keyword/PPR only: %s", e)
 
         # --- PPR (HippoRAG 2 style graph walk) ---
         # Adds a third signal: facts whose endpoints are reachable from query
@@ -1573,8 +1812,16 @@ class KnowledgeGraph:
             if src and src not in ("extracted", "inferred"):
                 src_tag = f", src: {src[:40]}"
 
+            # Natural-language rendering (2026-07-08, task #63): paraphrased
+            # evidence measurably increases small-model receptiveness vs
+            # bare templated triples (ACL 2025, arXiv 2409.10955). CONTRACT
+            # with brain._kg_answers_query: every sentence starts with the
+            # SUBJECT immediately followed by its verb phrase — the gate
+            # parses "SUBJECT <verb>" to fire tool-less generation, so no
+            # leading adverbs or inverted forms here.
+            phrase = _PRED_PHRASES.get(f.predicate, pred)
             lines.append(
-                f"- {new_tag}{label} {f.subject} {pred} {f.object} "
+                f"- {new_tag}{label} {f.subject} {phrase} {f.object} "
                 f"[confidence: {conf:.2f}{src_tag}]"
             )
         return "\n".join(lines)
@@ -1691,12 +1938,20 @@ class KnowledgeGraph:
                 return cursor.rowcount
             return await asyncio.to_thread(_do_decay)
 
-    async def hard_prune_dead_facts(self, days: int = 60, max_count: int = 1000) -> int:
-        """Permanently retire facts that have NEVER been retrieved and are
-        older than `days`. Runtime audit (2026-05-06) found 92% of KG facts
-        are never retrieved — they dilute the useful signal and grow the DB
-        without payoff. Conservative: only marks valid_to (soft retire), not
-        physical delete; max_count caps per-cycle work.
+    async def hard_prune_dead_facts(self, days: int = 120, max_count: int = 1000) -> int:
+        """Soft-retire facts that have NEVER been retrieved and are older
+        than `days`.
+
+        RECALIBRATED 2026-07-08: the original 60-day policy was justified by a
+        2026-05-06 audit stat ("92% of KG facts never retrieved") measured
+        while the retrieval stack was BROKEN (LIMIT-500 window + discarded RRF
+        fusion, both fixed 2026-05-30). Re-measured on the working stack:
+        51% of live facts HAVE been retrieved, and 40% of facts get their
+        first retrieval within 14 days of banking. Never-retrieved-at-120d is
+        real evidence of dead weight; never-retrieved-at-60d was mostly
+        evidence the product's payoff horizon (storylines, forecasts) is
+        longer than the window. Soft retire only (valid_to set), capped per
+        cycle.
         """
         async with self._write_lock:
             def _do_prune():
@@ -1713,6 +1968,118 @@ class KnowledgeGraph:
                 )
                 return cursor.rowcount
             return await asyncio.to_thread(_do_prune)
+
+    async def prune_related_to_junk(self, days: int = 45, max_count: int = 1000) -> int:
+        """Retire low-value `related_to` facts — the KG's biggest quality drag.
+
+        `related_to` is the DEGRADE TARGET for any relation the extractor
+        couldn't normalize to a specific predicate, so it accumulates vague
+        associations ("Trump related_to Zelensky") that dilute retrieval. Manual
+        audit 2026-07-09 found it was 61% of the live store. Two targeted rules,
+        both safe (soft-retire, never touches a specific predicate):
+          1. SUPERSEDED-BY-SPECIFIC: a `related_to` (s,o) where a specific
+             predicate already links the SAME s→o (or o→s) is pure redundancy —
+             the specific fact carries the real relation. Retire the vague one.
+          2. STALE + UNUSED: a `related_to` never retrieved and older than
+             `days` (shorter than the 120d generic prune — related_to earns its
+             keep faster or not at all).
+        Specific-predicate facts are never affected.
+        """
+        async with self._write_lock:
+            def _do():
+                # Rule 1: related_to redundant with a specific predicate on the same pair
+                c1 = self._db.execute(
+                    "UPDATE kg_facts SET valid_to = datetime('now') "
+                    "WHERE predicate = 'related_to' AND valid_to IS NULL AND id IN ("
+                    "  SELECT r.id FROM kg_facts r JOIN kg_facts s "
+                    "    ON s.valid_to IS NULL AND s.predicate != 'related_to' "
+                    "    AND ((LOWER(s.subject)=LOWER(r.subject) AND LOWER(s.object)=LOWER(r.object)) "
+                    "      OR (LOWER(s.subject)=LOWER(r.object) AND LOWER(s.object)=LOWER(r.subject))) "
+                    "  WHERE r.predicate='related_to' AND r.valid_to IS NULL "
+                    "  LIMIT ?)", (max_count,)).rowcount
+                # Rule 2: stale + never-retrieved related_to
+                c2 = self._db.execute(
+                    "UPDATE kg_facts SET valid_to = datetime('now') "
+                    "WHERE predicate = 'related_to' AND valid_to IS NULL "
+                    "AND last_retrieved_at IS NULL AND created_at < datetime('now', ?) "
+                    "AND id IN (SELECT id FROM kg_facts WHERE predicate='related_to' "
+                    "  AND valid_to IS NULL AND last_retrieved_at IS NULL "
+                    "  AND created_at < datetime('now', ?) ORDER BY created_at ASC LIMIT ?)",
+                    (f"-{days} days", f"-{days} days", max_count)).rowcount
+                return c1 + c2
+            return await asyncio.to_thread(_do)
+
+    async def promote_aged_quarantine(self, days: int = 21, max_count: int = 500) -> int:
+        """Age-release quarantined facts — to a NON-AUTHORITATIVE surfaced state.
+
+        Quarantine (memory-poisoning defense) holds uncorroborated web-derived
+        facts out of prompts UNTIL corroborated — but a fact never re-observed
+        would stay a permanent grave, starving chat of real single-source intel
+        (the #49 regression, 2026-07-08).
+
+        HARDENED 2026-07-09 (full-system exploration): trust is keyed on source
+        CREDIBILITY at banking time, so a credible single-source fact is NEVER
+        quarantined in the first place (add_fact / deep_research._learn_facts).
+        Everything still in quarantine is therefore, by construction, a LOW-
+        CREDIBILITY single-source claim — exactly the patient-poisoner surface
+        (bank one uncontradicted fabrication, wait for auto-release). The old
+        7-day → trust 0.7 release handed that attacker an injected fact with the
+        SAME authority as corroborated intel. Two changes close the hole without
+        re-graving legit intel:
+          • window 7 → 21 days (3× the cost of a patient poison; chat can still
+            web-search in the meantime, so intel is delayed, not lost);
+          • release to trust 0.6 (NOT 0.7) — it surfaces but renders sub-
+            authoritative ([MED]/[LOW]), never stated as established fact.
+        Corroboration still promotes to full trust immediately (add_fact). This
+        is only the time-based backstop for the never-re-observed tail.
+        Returns count released.
+        """
+        async with self._write_lock:
+            def _do():
+                cur = self._db.execute(
+                    "UPDATE kg_facts SET quarantined = 0, trust = MIN(COALESCE(trust,0.5), 0.6) "
+                    "WHERE COALESCE(quarantined,0) = 1 AND valid_to IS NULL "
+                    "AND superseded_at IS NULL AND created_at < datetime('now', ?) "
+                    "AND id IN (SELECT id FROM kg_facts WHERE COALESCE(quarantined,0)=1 "
+                    "           AND valid_to IS NULL AND superseded_at IS NULL "
+                    "           AND created_at < datetime('now', ?) LIMIT ?)",
+                    (f"-{days} days", f"-{days} days", max_count),
+                )
+                return cur.rowcount
+            return await asyncio.to_thread(_do)
+
+    async def retire_stale_snapshots(self, days: int = 7, max_count: int = 500) -> int:
+        """Soft-retire POINT-IN-TIME research facts whose truth has an expiry:
+        prices, percentages, counts, and other magnitude objects banked from
+        monitors ('Bitcoin price_of $97,500'). Without this they stay marked
+        current forever and the KG silently fills with stale "truths" (audit
+        2026-07-06; the fact-banking fix accelerates the inflow). Timeless facts
+        (is_a, located_in, non-numeric objects) are untouched; retirement sets
+        valid_to (recoverable), matching hard_prune_dead_facts.
+        """
+        volatile_predicates = (
+            "price_of", "trading_at", "worth", "valued_at", "costs", "priced_at",
+            "market_cap", "holds", "rate_of", "yield_of",
+        )
+        pred_sql = " OR ".join("predicate = ?" for _ in volatile_predicates)
+        async with self._write_lock:
+            def _do_retire():
+                cursor = self._db.execute(
+                    "UPDATE kg_facts SET valid_to = datetime('now') "
+                    "WHERE id IN ("
+                    "  SELECT id FROM kg_facts "
+                    "  WHERE valid_to IS NULL "
+                    "  AND provenance LIKE 'deep_research%' "
+                    "  AND created_at < datetime('now', ?) "
+                    "  AND (" + pred_sql + " "
+                    "       OR object GLOB '*$[0-9]*' OR object GLOB '*[0-9]%*' "
+                    "       OR object GLOB '[0-9][0-9,.]*[0-9]') "
+                    "  ORDER BY created_at ASC LIMIT ?"
+                    ")",
+                    (f"-{days} days", *volatile_predicates, max_count),
+                )
+                return cursor.rowcount
+            return await asyncio.to_thread(_do_retire)
 
     def get_provenance_usage_stats(self, provenance: str) -> dict:
         """Return usage stats for facts with a given provenance.

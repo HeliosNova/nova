@@ -520,7 +520,14 @@ class _GenerationResult:
 # ---------------------------------------------------------------------------
 
 
-_CONTEXT_GATHER_TIMEOUT_S = 5.0  # per-subsystem cap; tuned for healthy SQLite/ChromaDB
+# Per-subsystem cap. 5s was tuned for healthy SQLite/ChromaDB, but the semantic
+# arms (kg/reflexions/lessons) embed the query through Ollama, and when the 27B
+# is mid-digest those embed calls queue behind generation — chronic 5s timeouts
+# observed all day 2026-07-07/08, silently zeroing knowledge injection for any
+# chat that coincides with monitor activity (three eval after-legs lost their
+# seeded facts this way). 15s trades worst-case TTFT for keeping the memory
+# loop alive under load; healthy-path latency is unchanged (arms return <1s).
+_CONTEXT_GATHER_TIMEOUT_S = 15.0
 
 
 async def _run_context_io(name: str, awaitable, default):
@@ -530,7 +537,8 @@ async def _run_context_io(name: str, awaitable, default):
     workspace) calls SQLite/ChromaDB via asyncio.to_thread. Before this
     wrapper, a slow query (lock contention, broken connection) would
     stall the WHOLE pipeline because the gather is sequential within
-    _gather_context. Now each call has a 5-second cap; on timeout we
+    _gather_context. Now each call has a hard per-call cap (see
+    _CONTEXT_GATHER_TIMEOUT_S); on timeout we
     degrade gracefully by returning `default` and logging the loss.
     The pipeline continues with whatever context succeeded.
     """
@@ -691,8 +699,31 @@ async def _gather_context(
             # (Helios Protocol = blockchain, Nova Lake = Intel CPU, Supernova =
             # astronomy) when the query is about Nova/Helios as the project.
             kg_facts = _filter_confused_kg_facts(query, kg_facts)
+            # Domain-level queries ("what do you know about X") are served
+            # poorly by top-8 per-fact retrieval — swap in the live entity
+            # subgraph at query time (LazyGraphRAG pattern, task #63; never
+            # precomputed — arXiv 2506.06331 showed the GraphRAG-family
+            # win rates were largely judge-bias artifact).
+            _dm = _DOMAIN_QUERY_RE.search(query)
+            if _dm and svc.kg:
+                _entity = _dm.group(1).strip(" ?.!\"'")
+                try:
+                    _sub = await asyncio.to_thread(svc.kg.entity_subgraph, _entity, 40)
+                except Exception as _e:
+                    logger.warning("[context] entity_subgraph failed for %r: %s", _entity, _e)
+                    _sub = []
+                if len(_sub) > len(kg_facts):
+                    kg_facts = _sub
+                    logger.info("[context] domain query — %d-fact subgraph for %r",
+                                len(_sub), _entity)
             ctx.kg_facts_text = svc.kg.format_for_prompt(kg_facts)
             ctx.kg_facts_count = len(kg_facts)
+        # Context visibility: silent knowledge loss cost a full debugging day
+        # (2026-07-07: embedder starvation → empty context → "I don't know"
+        # answers with the facts sitting in the DB). One line per query keeps
+        # this failure class diagnosable from logs alone.
+        logger.info("[context] kg_facts=%d kg_text_chars=%d for %r",
+                    ctx.kg_facts_count, len(ctx.kg_facts_text or ""), query[:70])
 
     # --- Global/thematic query route (GraphRAG community summaries) ---
     # "What are the big themes across your monitors?" can't be answered from
@@ -1023,6 +1054,19 @@ async def _build_messages(
         user_msg["images"] = [image]
     messages.append(user_msg)
 
+    # Debug instrument: `touch /data/debug_prompt_flag` dumps the EXACT messages
+    # the model receives to /data/debug_last_prompt.json. Added 2026-07-07 while
+    # chasing injected-facts-ignored — isolated repros of the prompt kept
+    # passing while the real pipeline failed; only the real assembly shows why.
+    try:
+        from pathlib import Path as _P
+        if _P("/data/debug_prompt_flag").exists():
+            import json as _json
+            _P("/data/debug_last_prompt.json").write_text(
+                _json.dumps(messages, indent=1)[:300000], encoding="utf-8")
+    except Exception:
+        pass
+
     # Honor EXPLICIT tool requests: if the user asked to run code / use the
     # calculator, the answer must come from the tool's output, not from memory.
     # (Narrowly gated — implicit math like "what is 15% of 840" is unaffected.)
@@ -1094,6 +1138,61 @@ def _round_all_succeeded(results: list[tuple]) -> bool:
         if any(m in lower for m in _TOOL_FAILURE_MARKERS):
             return False
     return True
+
+
+# Domain-summary query detector (task #63): captures the entity after common
+# "tell me what you know" phrasings; the KG block is swapped for the entity's
+# live 1-hop subgraph so the model can synthesize a domain overview.
+_DOMAIN_QUERY_RE = re.compile(
+    r"\b(?:what do you know about|tell me (?:everything|all(?: you know)?) about|"
+    r"summarize (?:your knowledge (?:of|on|about)|what you know about))\s+"
+    r"([^?.!]{2,60})",
+    re.IGNORECASE,
+)
+
+
+_TOOL_ACTION_RE = re.compile(
+    r"\b(search|fetch|browse|look up|check (?:the )?(?:web|internet|online)|latest|"
+    r"current(?:ly)?|today|news|run|execute|calculate|compute|price now)\b",
+    re.IGNORECASE,
+)
+
+
+def _kg_answers_query(query: str, kg_facts_text: str) -> bool:
+    """True when a retrieved KG fact's SUBJECT strongly matches the query — the
+    answer is already in the prompt. Deterministic facts-first gate (2026-07-07):
+    with full context restored, the 9B tool-calls on unknown-entity questions
+    instead of reading Known Facts, then punts when the tool finds nothing. Two
+    prompt-instruction attempts failed to change that; this enforces it in code
+    (the codebase's proven pattern): the first generation runs TOOL-LESS, so the
+    model answers from the facts it was given. Narrow: only for tool-implying-
+    free queries whose entities appear in a fact subject."""
+    if not kg_facts_text or _TOOL_ACTION_RE.search(query):
+        return False
+    q_tokens = {t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", query)}
+    for line in kg_facts_text.split("\n"):
+        # Verb alternation kept in sync with kg._PRED_PHRASES (natural-language
+        # rendering, task #63): every rendered line is "SUBJECT <verb...>", and
+        # "is"/"was" prefix-match the expanded forms ("is currently priced at",
+        # "was created by", ...).
+        m = re.search(r"\]\s*([^\[]+?)\s+(?:related to|is|was|has|makes|leads|develops|"
+                      r"regulates|produces|created|owns|acquired|developed|works|lives|"
+                      r"currently)", line)
+        subject = (m.group(1) if m else line[:60]).strip()
+        s_tokens_raw = re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", subject)
+        s_tokens = [t.lower() for t in s_tokens_raw]
+        distinctive = [t for t in s_tokens if len(t) >= 4]
+        if len(distinctive) >= 2 and all(t in q_tokens for t in distinctive[:3]):
+            return True
+        # Single-token proper-noun subjects ("Nimbus", "Kestrel"): the ≥2
+        # distinctive-token rule above can never fire for them — observed
+        # 2026-07-08, kg_runs_paraphrase failed with its fact in-prompt. One
+        # capitalized ≥5-char subject token appearing in the query is as
+        # strong a match as two common ones.
+        if (len(s_tokens_raw) == 1 and len(s_tokens_raw[0]) >= 5
+                and s_tokens_raw[0][0].isupper() and s_tokens[0] in q_tokens):
+            return True
+    return False
 
 
 async def _run_generation_loop(
@@ -1716,9 +1815,24 @@ async def _run_generation_loop(
 
     except LLMUnavailableError as e:
         logger.error("LLM unavailable: %s", e)
-        gen.final_content = "I can't reach the language model right now. Please check that the LLM provider is running and try again."
+        # Distinguish a transient BUSY model (timeout — the provider is up, just
+        # saturated by a background digest) from a provider that is genuinely
+        # DOWN (connection refused). The busy case is retryable and common when a
+        # 27B digest holds the GPU; surfacing either as a raw HTTP 500 was poor
+        # UX (manual audit 2026-07-09). Both now return a friendly message as a
+        # normal answer, with a code the API layer maps to a graceful 200/503.
+        _busy = "timed out" in str(e).lower() or "timeout" in str(e).lower()
+        if _busy:
+            gen.final_content = ("The model is busy right now (a background research job is "
+                                 "using the GPU). Please try again in a moment.")
+            _code = "llm_busy"
+        else:
+            gen.final_content = ("I can't reach the language model right now — the provider "
+                                 "appears to be down. Please check it's running and try again.")
+            _code = "llm_unavailable"
         gen.is_error = True
-        yield StreamEvent(type=EventType.ERROR, data={"message": str(e)})
+        yield StreamEvent(type=EventType.ERROR,
+                          data={"message": gen.final_content, "code": _code})
     finally:
         try:
             _amq.reset(_amq_token)
@@ -2538,7 +2652,7 @@ async def _refine_response(
                 except Exception as e:
                     logger.warning("Reflexion refinement failed: %s", e)
         except Exception as e:
-            logger.debug("Reflexion pre-stream critique failed: %s", e)
+            logger.warning("Reflexion pre-stream critique failed: %s", e)
 
     # --- Constraint-coverage verifier ---
     # Extract "must-address" components from the original question and verify
@@ -2626,7 +2740,7 @@ async def _refine_response(
                         )
                         return (resp or "").strip()
                     except Exception as e:
-                        logger.debug("[BEST-OF-N] sample at temp=%.1f failed: %s", temp, e)
+                        logger.warning("[BEST-OF-N] sample at temp=%.1f failed: %s", temp, e)
                         return ""
 
                 alternatives = await asyncio.gather(*[_sample_one(t) for t in temps])
@@ -2642,7 +2756,7 @@ async def _refine_response(
                         if alt_q is not None:
                             candidates.append((alt, alt_q))
                     except Exception as e:
-                        logger.debug("[BEST-OF-N] scoring failed: %s", e)
+                        logger.warning("[BEST-OF-N] scoring failed: %s", e)
 
                 if len(candidates) > 1:
                     best_text, best_q = max(candidates, key=lambda c: c[1])
@@ -2786,7 +2900,7 @@ async def _detect_capability_gap(
         )
         logger.info("[CAPABILITY_GAP] Logged gap: %s", query[:80])
     except Exception as e:
-        logger.debug("Capability gap logging failed: %s", e)
+        logger.warning("Capability gap logging failed: %s", e)
 
 
 async def _run_post_processing(
@@ -2928,7 +3042,7 @@ async def _run_post_processing(
                                     if refined:
                                         logger.info("Skill #%d refined after correction", sid)
                                 except Exception as e:
-                                    logger.debug("Skill refinement failed: %s", e)
+                                    logger.warning("Skill refinement failed: %s", e)
                             _task = asyncio.create_task(
                                 _safe_refine(svc.skills, degraded_skill.id, query[:300])
                             )
@@ -3046,7 +3160,7 @@ async def _run_post_processing(
                     lambda _g=gap: svc.curiosity.add(_g["topic"], source=_g["source"], urgency=_g["urgency"])
                 )
         except Exception as e:
-            logger.debug("Curiosity gap detection failed: %s", e)
+            logger.warning("Curiosity gap detection failed: %s", e)
 
     # --- Curiosity: queue failed responses for research ---
     # Same ephemeral gate as above.
@@ -3060,7 +3174,7 @@ async def _run_post_processing(
                         lambda _t=topic: svc.curiosity.add(_t, source="reflexion_failure", urgency=0.7)
                     )
         except Exception as e:
-            logger.debug("Curiosity failure queueing failed: %s", e)
+            logger.warning("Curiosity failure queueing failed: %s", e)
 
     # --- Reflexion-to-Action: promote recurring failures to lessons ---
     if svc.reflexions and svc.learning and intent == "general" and final_content:
@@ -3078,7 +3192,7 @@ async def _run_post_processing(
                 _background_tasks.add(_task)
                 _task.add_done_callback(_background_tasks.discard)
         except Exception as e:
-            logger.debug("Reflexion-to-action setup failed: %s", e)
+            logger.warning("Reflexion-to-action setup failed: %s", e)
 
     # --- Topic tracking for auto-monitor creation ---
     if config.ENABLE_CURIOSITY and svc.topic_tracker and intent == "general":
@@ -3461,6 +3575,11 @@ def clear_ephemeral_history(conversation_id: str) -> None:
 # The Brain — think()
 # ---------------------------------------------------------------------------
 
+# Channels that must NOT refresh the interactive-priority latch (they ARE the
+# background work the latch defers).
+_BACKGROUND_CHANNELS = frozenset({"monitor", "eval", "background"})
+
+
 async def think(
     query: str,
     conversation_id: str | None = None,
@@ -3474,6 +3593,16 @@ async def think(
       _gather_context → _build_messages → _run_generation_loop →
       _refine_response → _run_post_processing
     """
+    # --- Step 0a: GPU-yield latch ---
+    # Owner-facing surfaces mark interactive activity so the heartbeat defers
+    # background LLM monitors. Audit 2026-07-08: only the HTTP API latched;
+    # Discord/Telegram/Signal/WhatsApp called think() directly and bypassed it,
+    # leaving the flagship latency fix inert on the owner's primary surface.
+    # Background callers tag themselves via channel= so they never self-latch.
+    if channel not in _BACKGROUND_CHANNELS:
+        from app.core import llm as _latch_llm
+        _latch_llm.note_interactive_activity()
+
     # --- Step 0: Query length validation ---
     if len(query) > config.MAX_QUERY_LENGTH:
         yield StreamEvent(
@@ -3694,9 +3823,17 @@ async def think(
                 current_depth, sorted(t["name"] for t in tools),
             )
 
+        # Facts-first gate: the answer is already in the Known Facts block →
+        # generate WITHOUT tools so the model reads its facts instead of
+        # searching the web for an entity it thinks it doesn't know.
+        _gen_tools = tools
+        if intent == "general" and _kg_answers_query(query, ctx.kg_facts_text or ""):
+            logger.info("[facts-first] KG subject matches query — tool-less generation")
+            _gen_tools = []
+
         gen = _GenerationResult()
         async for event in _run_generation_loop(
-            messages, tools, svc, conversation_id, image, intent,
+            messages, _gen_tools, svc, conversation_id, image, intent,
             was_planned, ephemeral, gen, query=query,
         ):
             yield event
@@ -3758,10 +3895,52 @@ async def think(
             )
             return
 
-        # --- Step 9: Refine (critique + reflexion) ---
-        # Skip the full critique chain at structural depth >= 2 — sub-sub-agents
-        # should produce raw fast output; the parent will critique the merged
-        # result. Cuts ~30-90s of latency per leaf agent in recursive cases.
+        # --- Step 9: STREAM-FIRST — emit the validated DRAFT now, refine after ---
+        # Time-to-first-token used to include EVERY refine LLM pass (self-critique,
+        # adversarial, polish, best-of-N: 30-60s of blank screen — the single
+        # biggest reason chat felt unusable; audit 2026-07-06). The draft the user
+        # sees first is still sanitized + claim-validated (deterministic, fast);
+        # the refine chain runs after, and when it actually changes the answer a
+        # REVISION event replaces the draft in place. All quality machinery is
+        # preserved — only the ORDER changed.
+        evidence = build_evidence(
+            retrieved_context=ctx.retrieved_context,
+            kg_facts_text=ctx.kg_facts_text,
+            user_facts_text=ctx.user_facts_text,
+            lessons_text=ctx.lessons_text,
+            tool_results=gen.tool_results,
+            query=query,
+        )
+        if ctx.retrieved_sources:
+            yield StreamEvent(type=EventType.SOURCES, data={"sources": ctx.retrieved_sources})
+
+        draft = gen.final_content or ""
+        if draft:
+            draft = _sanitize_answer(draft)
+            _pre_draft = draft
+            draft, _draft_stripped = validate_claims(
+                draft, evidence, current_model_tag=config.LLM_MODEL,
+            )
+            draft = _guard_validated_content(_pre_draft, draft)
+            chunk_size = 20
+            for i in range(0, len(draft), chunk_size):
+                yield StreamEvent(type=EventType.TOKEN, data={"text": draft[i:i + chunk_size]})
+            # Draft-complete signal: consumers can deliver the draft now (Discord
+            # sends its message here and edits it when the REVISION lands); the
+            # web UI shows a "refining" indicator under the already-visible text.
+            yield StreamEvent(type=EventType.THINKING, data={"stage": "refining"})
+        # Refresh the GPU-yield latch at draft time: a generation longer than
+        # the 45s window would otherwise let background monitors start right
+        # as the refine phase (and the owner's follow-up) needs the GPU.
+        if channel not in _BACKGROUND_CHANNELS:
+            from app.core import llm as _latch_llm2
+            _latch_llm2.note_interactive_activity()
+        _timer.mark("draft_emit")
+
+        # Refine (critique + reflexion) — unchanged semantics; operates on the raw
+        # generation exactly as before. Skip the full critique chain at structural
+        # depth >= 2 — sub-sub-agents should produce raw fast output; the parent
+        # critiques the merged result.
         if current_depth >= 2:
             final_content = gen.final_content
             reflexion_quality, reflexion_reason = None, ""
@@ -3776,25 +3955,14 @@ async def think(
             )
         _timer.mark("refine")
 
-        # --- Step 10: Emit sources + stream tokens ---
+        # --- Step 10: validate the refined answer + emit a REVISION if it changed ---
         # Guard against None content from LLM (would cause IntegrityError on NOT NULL column)
         if final_content is None:
             logger.warning("final_content is None after LLM generation — defaulting to empty string (conv=%s)", conversation_id)
             final_content = ""
 
-        if ctx.retrieved_sources:
-            yield StreamEvent(type=EventType.SOURCES, data={"sources": ctx.retrieved_sources})
-
         if final_content:
             final_content = _sanitize_answer(final_content)
-            evidence = build_evidence(
-                retrieved_context=ctx.retrieved_context,
-                kg_facts_text=ctx.kg_facts_text,
-                user_facts_text=ctx.user_facts_text,
-                lessons_text=ctx.lessons_text,
-                tool_results=gen.tool_results,
-                query=query,
-            )
             _pre_validate_content_main = final_content
             final_content, stripped_reasons = validate_claims(
                 final_content, evidence, current_model_tag=config.LLM_MODEL,
@@ -3824,9 +3992,13 @@ async def think(
                         )
             except Exception:
                 pass
-            chunk_size = 20
-            for i in range(0, len(final_content), chunk_size):
-                yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
+        # Refine catastrophically emptied the answer → keep the validated draft
+        # the user already saw (never blank a shown message).
+        if not final_content and draft:
+            final_content = draft
+        # The refine chain changed the answer → replace the streamed draft in place.
+        if final_content != draft:
+            yield StreamEvent(type=EventType.REVISION, data={"text": final_content})
         _timer.mark("validate+emit")
         saved_msg_id = await asyncio.to_thread(
             lambda: svc.conversations.add_message(
@@ -3999,7 +4171,10 @@ async def think(
                         try:
                             if svc.kg:
                                 await _extract_kg_triples(
-                                    svc.kg, _query, _answer, source_name="chat"
+                                    svc.kg, _query, _answer, source_name="chat",
+                                    # Owner conversation is a trusted origin —
+                                    # chat facts skip the web-content quarantine.
+                                    trust=0.85,
                                 )
                         except Exception as e:
                             logger.warning("KG bridge from chat failed: %s", e)

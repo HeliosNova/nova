@@ -396,6 +396,9 @@ def create_mcp_server(
             return _mcp_error("entity is required", "validation", False)
 
         facts = _kg.query(entity, hops=hops)
+        # Never expose quarantined (uncorroborated web-derived) facts to
+        # external MCP clients — same poisoning surface as the chat prompt.
+        facts = [f for f in facts if not f.get('quarantined')]
         result = {
             "entity": entity,
             "hops": hops,

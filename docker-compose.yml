@@ -1,12 +1,17 @@
 services:
   ollama:
-    image: ollama/ollama:0.17.5
+    image: ollama/ollama:0.30.11
     container_name: nova-ollama
     ports:
       - "127.0.0.1:11434:11434"
     environment:
       OLLAMA_MAX_LOADED_MODELS: "3"
       OLLAMA_FLASH_ATTENTION: "1"
+      # Q8 K/V cache ≈ halves KV-cache VRAM at <0.1% quality loss (needs flash-attn,
+      # which is on above). Frees headroom for a side process + lets us hold more
+      # grounding context. q8_0 is the safe choice — do NOT Q4 the V-cache (quality
+      # drop). (owner 2026-07-01: GPU headroom + richer context.)
+      OLLAMA_KV_CACHE_TYPE: "q8_0"
       OLLAMA_KEEP_ALIVE: "24h"
       # Default load timeout is 5m. A 27B Q4 (~17GB) loading fully onto the GPU
       # from this volume's disk takes ~10m; 20m gives headroom. Once loaded,
@@ -21,15 +26,26 @@ services:
       # until proven; tests have to set num_parallel themselves if they care.
       OLLAMA_NEW_ENGINE: "true"
       # NEW_ENGINE=true honors NUM_PARALLEL for qwen35; old engine silently
-      # ignored it. 4 lets multi-agent + parallel tool calls actually run
-      # concurrently on the GPU instead of queuing serially.
-      OLLAMA_NUM_PARALLEL: "4"
-      # OLLAMA_NUM_CTX is also silently clamped by VRAM budget. The 9B Q8
-      # model on 24GB lands at num_ctx=32768. Asking for 65536 is a no-op —
-      # the model loads with 32K and Ollama logs a vram-default-context line.
-      # Leaving the setting documents the ceiling we'd hit if we dropped to
-      # Q4 or moved to a 48GB card; today the runtime delivers 32K.
-      OLLAMA_NUM_CTX: "32768"
+      # ignored it. NUM_PARALLEL slots each carve out their own KV-cache VRAM and
+      # SPLIT the context budget, so 4 both multiplied VRAM pressure and starved
+      # each generation of context. Set to 1 (owner 2026-06-30: leave GPU headroom
+      # for a side process): one generation at a time gets the FULL context and the
+      # smallest VRAM footprint. Monitors/best-of-N still run — they just queue.
+      OLLAMA_NUM_PARALLEL: "1"
+      # OLLAMA_NUM_CTX is the default context for any request that doesn't pass
+      # num_ctx explicitly. At 32768 a stray no-ctx call (e.g. the report grader)
+      # loaded the 27B with a ~6GB KV cache → 185 MiB free on the whole GPU
+      # (measured 2026-07-06) — zero headroom for the owner's side processes.
+      # 16384 halves the worst-case stray load; the monitor synthesis chain pins
+      # num_ctx=12288 per call and chat never needs 32K. (owner: more headroom)
+      OLLAMA_NUM_CTX: "16384"
+      # Hard VRAM reserve for the owner's side processes (owner 2026-07-06: "a bit
+      # more headroom"). Ollama plans model loads as if this much VRAM doesn't
+      # exist, auto-offloading a few 27B layers to CPU when needed — the ctx cap
+      # alone left only ~1.2 GB free (27B is a ~23 GB resident). Cost: ~15-25%
+      # slower 27B generation, which only affects latency-tolerant monitors.
+      # 3 GiB = 3221225472 bytes.
+      OLLAMA_GPU_OVERHEAD: "3221225472"
       # Required models (pull manually or via entrypoint):
       #   ollama pull qwen3.5:27b      (main model)
       #   ollama pull qwen3.5:9b       (vision model)
@@ -65,6 +81,35 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  # Dedicated CPU-only Ollama for EMBEDDINGS (bge-m3). Isolating embeds onto
+  # their own instance + request queue means a query embed never waits behind a
+  # 27B generation on the main GPU instance (NUM_PARALLEL=1 there serialized
+  # them → the chat context-gather timed out; manual audit 2026-07-09). No GPU
+  # reservation = CPU inference; bge-m3 is small (~1.2GB) so CPU embeds are fast
+  # (~100-300ms) and never touch VRAM.
+  embed:
+    image: ollama/ollama:0.30.11
+    container_name: nova-embed
+    environment:
+      OLLAMA_KEEP_ALIVE: "24h"      # keep bge-m3 resident
+      OLLAMA_NUM_PARALLEL: "4"      # cheap CPU embeds — allow concurrency
+      OLLAMA_MAX_LOADED_MODELS: "1"
+    volumes:
+      - embed_data:/root/.ollama
+    healthcheck:
+      test: ["CMD-SHELL", "ollama list | grep -q '^bge-m3'"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    mem_limit: 4g
+    cpus: 4.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+    restart: unless-stopped
+
   nova:
     build: .
     image: nova-app:latest
@@ -80,7 +125,16 @@ services:
     env_file: .env
     environment:
       OLLAMA_URL: http://ollama:11434
+      EMBED_OLLAMA_URL: http://embed:11434
       SEARXNG_URL: http://searxng:8080
+      MINICHECK_URL: http://minicheck:8080
+      # Independent cross-family grounded judge (reflexion + output-eval).
+      # A/B 2026-07-08 (4 real digests, ref=qwen3.6:27b): gemma4:e4b was
+      # schema-valid 4/4 with 0.625 mean RACE error vs the documented gemma3:4b
+      # at 1/4 valid / 1.75 error — gemma3:4b silently floored 75% of grades.
+      # Fits beside the 9B during chat (27B is latch-deferred); critique_response
+      # falls back to self-critique on any judge failure, so this is safe.
+      JUDGE_MODEL: gemma4:e4b
       DB_PATH: /data/nova.db
       CHROMADB_PATH: /data/chromadb
       ANONYMIZED_TELEMETRY: "false"
@@ -96,7 +150,6 @@ services:
       # Auto-finetune: heartbeat fires DPO training when ≥50 new pairs accumulate.
       # Stops Ollama for 30-60 min during training; the script reruns A/B and
       # rolls back on regression so chat is unavailable but never gets worse.
-      ENABLE_AUTO_FINETUNE: "true"
       # MCP: expose Nova as MCP server (for Claude Code/Cursor) and consume
       # external MCP tools. Both default-on now that auto-finetune protects model quality.
       ENABLE_MCP: "true"
@@ -116,6 +169,9 @@ services:
       # so they survive loss/corruption of the nova_data volume itself.
       # Lives on the host filesystem next to the compose tree (gitignored).
       - ./backups:/backups
+      # Job hand-off to the network-isolated exec sidecar (audit 2026-07-08).
+      # Presence of this mount routes code_exec through nova-exec.
+      - exec_queue:/exec_queue
       # /home/nova/.cache as tmpfs mounted with mode 1777 so nova (uid 1000)
       # can write ChromaDB's internal cache. Short-form tmpfs defaults to mode
       # 755/root — use long-form volume syntax instead.
@@ -175,6 +231,109 @@ services:
         max-file: "3"
     restart: unless-stopped
 
+  minicheck:
+    build:
+      context: .
+      dockerfile: Dockerfile.minicheck
+    image: nova-minicheck:latest
+    container_name: nova-minicheck
+    # CPU-only entailment verifier (#48) — the GPU is committed to the 27B +
+    # the owner's reserve. No published ports: nova-app reaches it on the
+    # internal network at http://minicheck:8080. Fail-open by design: if this
+    # service is down, the entailment gate in deep_research skips itself.
+    volumes:
+      - minicheck_cache:/cache
+    mem_limit: 6g
+    cpus: 4.0
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    restart: unless-stopped
+
+  # Network-isolated code-execution sidecar (audit 2026-07-08): model-written
+  # Python runs HERE, in a container with no network stack at all — exfiltration
+  # and SSRF against the in-network Ollama API are structurally impossible,
+  # regardless of what slips past the AST screen. 2026 consensus: static
+  # screens are pre-filters; the boundary must be structural.
+  exec-runner:
+    image: nova-app:latest
+    container_name: nova-exec
+    command: ["python", "-m", "app.exec_runner"]
+    network_mode: "none"
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      # Fresh named volumes are root-owned; the image runs as nova (uid
+      # 1000). One-time fix on a new host: docker run --rm -v
+      # nova__exec_queue:/q alpine chown 1000:1000 /q
+      - exec_queue:/exec_queue
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    pids_limit: 128
+    restart: unless-stopped
+    depends_on:
+      - nova
+
+  # Least-privilege gate in front of the docker socket (audit 2026-07-08):
+  # a raw docker.sock mount is unrestricted root on the host. The proxy
+  # whitelists ONLY what the watchdog needs — container list/inspect and
+  # restart; exec/build/images/volumes/networks are denied by default.
+  # Isolated on its own network so nova-app can never reach it.
+  socket-proxy:
+    image: tecnativa/docker-socket-proxy:latest
+    container_name: nova-socket-proxy
+    environment:
+      CONTAINERS: 1       # GET /containers/* (list + inspect/health)
+      POST: 1             # required for the restart POST
+      ALLOW_RESTARTS: 1   # /containers/{id}/restart|stop|kill only
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    networks:
+      - watchdog_net
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.25
+    restart: unless-stopped
+
+  watchdog:
+    build:
+      context: .
+      dockerfile: Dockerfile.watchdog
+    image: nova-watchdog:latest
+    container_name: nova-watchdog
+    # Out-of-process guardian for nova-app: restarts it on sustained-unhealthy or
+    # a stale heartbeat and alerts on Discord (owner-approved 2026-07-06 after the
+    # 54h silent freeze — Docker flagged unhealthy but nothing acted). Talks to
+    # the docker API through socket-proxy (list+restart only) — the raw socket
+    # is no longer mounted here (audit 2026-07-08).
+    env_file: .env   # DISCORD_TOKEN / DISCORD_CHANNEL_ID for out-of-band alerts
+    environment:
+      WATCHDOG_DOCKER_API: http://socket-proxy:2375
+    networks:
+      - default        # Discord alerts need egress
+      - watchdog_net   # docker API via the proxy
+    volumes:
+      - nova_data:/data   # read-only queries of monitors.last_check_at (WAL-safe)
+    read_only: true
+    tmpfs:
+      - /tmp
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 64m
+    cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
+    restart: unless-stopped
+
   searxng:
     image: searxng/searxng:latest
     container_name: nova-searxng
@@ -197,5 +356,13 @@ services:
     restart: unless-stopped
 
 volumes:
+  exec_queue:
   ollama_data:
+  embed_data:
   nova_data:
+  minicheck_cache:
+
+networks:
+  default:
+  watchdog_net:
+    internal: true

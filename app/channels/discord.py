@@ -94,21 +94,12 @@ class DiscordBot:
                 return
 
             async with message.channel.typing():
-                answer = await self._handle_query(content, message.author.id)
+                await self._stream_reply(message, content)
 
-            _reply_chunks = self._split_message(answer)
-            async with self._send_lock:
-                for i, chunk in enumerate(_reply_chunks):
-                    await message.reply(chunk)
-                    if i + 1 < len(_reply_chunks):
-                        await asyncio.sleep(0.3)
-
-    async def _handle_query(self, query: str, user_id: int) -> str:
-        """Run query through think() and collect the response."""
-        from app.core.brain import think
+    async def _get_conversation_id(self, user_id: int) -> str:
+        """Get or create the conversation for this user (memory cache + DB fallback)."""
         from app.core.brain import get_services
 
-        # Get or create conversation for this user (memory cache + DB fallback)
         async with self._conv_lock:
             conv_id = self._conversations.get(user_id)
             if conv_id:
@@ -126,11 +117,75 @@ class DiscordBot:
                 self._conversations[user_id] = conv_id
                 while len(self._conversations) > 1000:  # LRU cap for personal bot
                     self._conversations.popitem(last=False)
+        return conv_id
 
+    async def _stream_reply(self, message: "discord.Message", query: str) -> None:
+        """Stream-first delivery (#47): send the DRAFT the moment it's complete
+        (the 'refining' stage signal), then EDIT it in place when the refine
+        chain's REVISION lands — the reader gets an answer in generation time,
+        not generation+refine time. Long multi-chunk drafts fall back to a
+        single send at the end (editing a chunk train isn't worth the states)."""
+        from app.core.brain import think
+
+        conv_id = await self._get_conversation_id(message.author.id)
+        _REFINING = "\n\n-# refining…"
+        tokens: list[str] = []
+        draft_msg = None
+        final: str | None = None
+        error: str | None = None
+        try:
+            async for event in think(query=query, conversation_id=conv_id, channel="discord"):
+                if event.type == EventType.TOKEN:
+                    text = event.data.get("text", "")
+                    if text:
+                        tokens.append(text)
+                elif (event.type == EventType.THINKING
+                      and event.data.get("stage") == "refining" and draft_msg is None):
+                    draft = "".join(tokens).strip()
+                    if draft and len(draft) + len(_REFINING) <= 2000:
+                        try:
+                            async with self._send_lock:
+                                draft_msg = await message.reply(draft + _REFINING)
+                        except Exception as e:
+                            logger.warning("[Discord] draft send failed: %s — deliver at end", e)
+                            draft_msg = None
+                elif event.type == EventType.REVISION:
+                    final = event.data.get("text", "")
+                elif event.type == EventType.ERROR:
+                    error = f"Error: {event.data.get('message', 'unknown error')}"
+        except Exception as e:
+            logger.error("[Discord] Query failed: %s", e, exc_info=True)
+            error = "Sorry, something went wrong while processing your message."
+
+        answer = (error or (final if final is not None else "".join(tokens))).strip()
+        if not answer:
+            answer = "I processed your message but had no response."
+        chunks = self._split_message(answer)
+        async with self._send_lock:
+            if draft_msg is not None:
+                try:
+                    await draft_msg.edit(content=chunks[0])
+                    chunks = chunks[1:]
+                except Exception as e:
+                    logger.warning("[Discord] draft edit failed (%s) — sending fresh", e)
+            for i, chunk in enumerate(chunks):
+                await message.reply(chunk)
+                if i + 1 < len(chunks):
+                    await asyncio.sleep(0.3)
+
+    async def _handle_query(self, query: str, user_id: int) -> str:
+        """Run query through think() and collect the final response (non-streaming
+        fallback; on_message uses _stream_reply for live draft delivery)."""
+        from app.core.brain import think
+
+        conv_id = await self._get_conversation_id(user_id)
         try:
             tokens = []
             async for event in think(query=query, conversation_id=conv_id, channel="discord"):
-                if event.type == EventType.TOKEN:
+                if event.type == EventType.REVISION:
+                    # stream-first refine: the final answer replaces the draft
+                    tokens = [event.data.get("text", "")]
+                elif event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:
                         tokens.append(text)
@@ -164,11 +219,15 @@ class DiscordBot:
             text = text[split_at:].lstrip()
         return chunks
 
-    async def send_alert(self, message: str):
-        """Send a message to the default channel."""
+    async def send_alert(self, message: str) -> bool:
+        """Send a message to the default channel.
+
+        Returns True only when the message was actually delivered — callers
+        record delivery, so a swallowed failure here becomes a permanently
+        lost digest (audit 2026-07-08)."""
         if not self.default_channel_id:
             logger.warning("[Discord] Skipping alert — no default channel configured")
-            return
+            return False
         if not self._client.is_ready():
             # Wait briefly for the client to become ready (e.g. during startup)
             for _ in range(10):
@@ -177,18 +236,28 @@ class DiscordBot:
                     break
             if not self._client.is_ready():
                 logger.warning("[Discord] Skipping alert — client not ready after 10s wait")
-                return
+                return False
         try:
             channel = self._client.get_channel(int(self.default_channel_id))
             if channel:
-                chunks = self._split_message(message)
+                # Reserve headroom for a continuation marker so split chunks 2..n
+                # aren't orphaned fragments (a reader otherwise can't tell a
+                # continuation from a new monitor's message).
+                chunks = self._split_message(message, limit=1960)
+                n = len(chunks)
                 async with self._send_lock:
                     for i, chunk in enumerate(chunks):
+                        if n > 1 and i > 0:
+                            chunk = f"_(cont. {i + 1}/{n})_\n{chunk}"
                         await channel.send(chunk)
-                        if i + 1 < len(chunks):
+                        if i + 1 < n:
                             await asyncio.sleep(0.3)  # pace multi-part posts
+                return True
+            logger.warning("[Discord] Skipping alert — channel %s not found", self.default_channel_id)
+            return False
         except Exception as e:
             logger.error("[Discord] Alert send failed: %s", e)
+            return False
 
     async def start(self):
         """Start the Discord bot with reconnection and exponential backoff."""

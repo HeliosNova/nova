@@ -194,6 +194,10 @@ _FEEDS: dict[str, list[str]] = {
         "https://spectrum.ieee.org/feeds/topic/robotics.rss",
         "https://techcrunch.com/tag/robotics/feed/",
         "https://www.therobotreport.com/category/news/feed/",
+        # fatten thin domain (2026-06-29): reputable robotics/autonomy outlets
+        "https://roboticsandautomationnews.com/feed/",
+        "https://www.therobotreport.com/category/research/feed/",
+        "https://techxplore.com/rss-feed/robotics-news/",
     ],
     "biotech and genetics": [
         "https://www.fiercebiotech.com/rss/xml",
@@ -210,6 +214,10 @@ _FEEDS: dict[str, list[str]] = {
         "https://github.blog/feed/",
         "https://stackoverflow.blog/feed/",
         "https://www.infoq.com/feed/",
+        # fatten thin domain (2026-06-29): major developer-news outlets
+        "https://thenewstack.io/feed/",
+        "https://devops.com/feed/",
+        "https://www.theregister.com/software/headlines.atom",
     ],
     "earnings and corporate events": [
         "https://www.cnbc.com/id/100003114/device/rss/rss.html",  # CNBC Top News
@@ -265,10 +273,13 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.fool.com/feeds/index.aspx",
     ],
     "sec insider trading": [
-        # owner=only returns actual Form 4 INSIDER trades; the bare type=4 feed
-        # ignores the filter and returns generic 424B2 prospectuses (verified).
-        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb=&owner=only&count=40&output=atom",
-        "https://www.sec.gov/news/pressreleases.rss",
+        # owner=only returns actual Form 4 INSIDER trades (the bare type=4 feed returns
+        # generic 424B2 prospectuses). EDGAR lists a SEPARATE entry per filer (issuer +
+        # each reporting person) for the SAME filing — merged by accession in
+        # _render_native_list (was showing one trade 2-3×). count bumped 40→80 so there
+        # are enough UNIQUE filings after the merge. (Dropped pressreleases.rss — it
+        # added the non-trade SEC personnel/RFC items the 2026-06-29 audit flagged.)
+        "https://www.sec.gov/cgi-bin/browse-edgar?action=getcurrent&type=4&company=&dateb=&owner=only&count=80&output=atom",
     ],
     "fomc and fed watch": [
         "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -277,14 +288,20 @@ _FEEDS: dict[str, list[str]] = {
         "https://feeds.bloomberg.com/economics/news.rss",
     ],
     "fda drug approvals": [
-        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",        "https://www.fiercebiotech.com/rss/xml",
-        "https://www.statnews.com/category/biotech/feed/",
+        # Drug-SPECIFIC FDA feeds. The drugs feed carries Novel Drug Approvals + Drug
+        # Trials Snapshots (the approved drugs); press-releases carries the "FDA Approves
+        # ..." announcements. (Dropped statnews/fiercebiotech — biotech BUSINESS feeds
+        # that were the source of the off-topic "STAT+" funding/opinion filler the
+        # 2026-06-29 audit found instead of actual approvals.)
+        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/drugs/rss.xml",
+        "https://www.fda.gov/about-fda/contact-fda/stay-informed/rss-feeds/press-releases/rss.xml",
     ],
     "government contract awards": [
+        # The DoD daily "Contracts for <date>" rollup IS the contract-award feed (each
+        # item is a day's awarded contracts, $7.5M+). (Dropped fedscoop/federalnewsnetwork/
+        # gao — generic federal-news feeds that diluted awards with RIFs, GAO reports, and
+        # commentary so only ~4/15 items were actually awards in the 2026-06-29 audit.)
         "https://www.defense.gov/DesktopModules/ArticleCS/RSS.ashx?ContentType=400",
-        "https://fedscoop.com/feed/",
-        "https://federalnewsnetwork.com/feed/",
-        "https://www.gao.gov/rss/reports.xml",
     ],
     "hacker news top stories": [
         "https://news.ycombinator.com/rss",
@@ -295,8 +312,13 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.producthunt.com/feed",
     ],
     "github security advisories": [
-        "https://github.com/advisories.atom",
-        "https://www.cisa.gov/cybersecurity-advisories/all.xml",    ],
+        # GitHub's advisories.atom is Cloudflare-blocked server-side (HTTP 406) — which
+        # is why this monitor shipped 100% off-topic CISA ICS advisories in the
+        # 2026-06-29 audit. The REST API returns the real REVIEWED GHSA database (package
+        # CVEs) unauthenticated (60/hr); handled by the JSON branch in _fetch_one_feed.
+        # (CISA's ICS/OT feed removed — different domain; the monitor name promises GitHub.)
+        "https://api.github.com/advisories?per_page=20&sort=published&type=reviewed",
+    ],
     "github stargazer counts": [
         # GitHub killed its official trending.atom (returns empty); this
         # community-maintained feed gives the actual daily trending repos.
@@ -354,10 +376,25 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.scmp.com/rss/2/feed",    # SCMP china
         "https://pandaily.com/feed/",          # China tech, reduce SCMP over-weight
     ],
+    # NEW region (2026-06-29): East Asia ex-China — Japan / Korea / Taiwan / ASEAN,
+    # an economically major blind spot (semis, BOJ/BOK, supply chains) with only
+    # China + India covered before.
+    "east asia": [
+        "https://www.japantimes.co.jp/feed/",
+        "https://english.kyodonews.net/rss/news.xml",
+        "https://en.yna.co.kr/RSS/news.xml",
+        "https://www.koreatimes.co.kr/www/rss/nation.xml",
+        "https://focustaiwan.tw/rss",
+        "https://asia.nikkei.com/rss/feed/nar",
+    ],
     "russia and eastern europe": [
         "https://meduza.io/rss/en/all",
         "https://www.kyivpost.com/feed",
         "https://www.themoscowtimes.com/rss/news",
+        # fatten thin domain (2026-06-29)
+        "https://kyivindependent.com/feed/",
+        "https://www.intellinews.com/feed",
+        "https://jamestown.org/feed/",
     ],
     "europe and eu": [
         "https://www.politico.eu/feed/",
@@ -381,6 +418,10 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.theafricareport.com/feed/",
         "https://restofworld.org/feed/",
         "https://www.aljazeera.com/xml/rss/all.xml",
+        # fatten thin domain (2026-06-29)
+        "https://african.business/feed/",
+        "https://mg.co.za/feed/",
+        "https://www.premiumtimesng.com/feed",
     ],
     "latin america": [
         "https://restofworld.org/feed/",
@@ -435,10 +476,17 @@ class FeedItem:
     # reported the same story. Items reported by ≥2 outlets get a
     # ✓ verified badge in the rendered output and rank higher.
     corroborating_sources: list[str] = None  # type: ignore
+    # Structured, parsed metadata for specialized monitors that carry more than a
+    # headline — e.g. SEC Form 4 transaction detail (buy/sell, shares, $ value),
+    # GitHub-advisory severity/CVSS, parsed gov-contract awards. Kept generic so the
+    # native-list renderer can surface real signal instead of just a title + link.
+    meta: dict = None  # type: ignore
 
     def __post_init__(self):
         if self.corroborating_sources is None:
             self.corroborating_sources = []
+        if self.meta is None:
+            self.meta = {}
 
     @property
     def date_str(self) -> str:
@@ -548,6 +596,13 @@ _TOPIC_FILTERS: dict[str, tuple[str, ...]] = {
         "taiwan", "xi jinping", "ccp", "pboc", "yuan",
         "alibaba", "baidu", "tencent", "huawei", "byd", "bytedance",
         "deepseek", "qwen", "tiktok", "wechat", "didi", "jd.com",
+    ),
+    "east asia": (
+        "japan", "japanese", "tokyo", "korea", "korean", "seoul", "north korea",
+        "pyongyang", "kim jong", "taiwan", "taipei", "samsung", "sk hynix", "tsmc",
+        "softbank", "toyota", "sony", "nintendo", "boj", "bank of japan", "yen",
+        "won", "nikkei", "kospi", "asean", "vietnam", "indonesia", "philippines",
+        "thailand", "singapore", "malaysia",
     ),
     "india": (
         "india", "indian", "modi", "mumbai", "delhi", "bangalore",
@@ -784,8 +839,65 @@ def _strip_xmlns(tag: str) -> str:
     return tag
 
 
+async def _fetch_github_advisories(url: str, *, max_items: int = 8) -> list[FeedItem]:
+    """GitHub's advisories.atom is server-blocked (HTTP 406); the REST API returns the
+    same REVIEWED GHSA database (package CVEs) as JSON, unauthenticated. Map each to a
+    FeedItem so the monitor delivers actual GitHub advisories, not the wrong feed."""
+    try:
+        async with httpx.AsyncClient(timeout=_TIMEOUT, follow_redirects=True) as client:
+            resp = await client.get(url, headers={"User-Agent": _USER_AGENT,
+                                                  "Accept": "application/vnd.github+json"})
+        if resp.status_code >= 400:
+            logger.info("[RSS] github advisories API HTTP %d", resp.status_code)
+            return []
+        data = resp.json()
+    except Exception as e:
+        logger.info("[RSS] github advisories API failed: %s", str(e)[:120])
+        return []
+    if not isinstance(data, list):
+        return []
+    out: list[FeedItem] = []
+    for a in data[:max_items]:
+        if not isinstance(a, dict):
+            continue
+        ghsa = (a.get("ghsa_id") or "").strip()
+        summary = (a.get("summary") or "").strip()
+        sev = (a.get("severity") or "").strip().lower()
+        pub = _parse_date(a.get("published_at") or a.get("updated_at") or "")
+        link = (a.get("html_url") or (f"https://github.com/advisories/{ghsa}" if ghsa else "")).strip()
+        if not (summary and link and pub):
+            continue
+        pkgs = []
+        for v in (a.get("vulnerabilities") or []):
+            name = ((v.get("package") or {}) if isinstance(v, dict) else {}).get("name")
+            if name and name not in pkgs:
+                pkgs.append(name)
+        title = (f"[{sev.upper()}] " if sev else "") + summary
+        body = (a.get("description") or summary)
+        if pkgs:
+            body = f"Affected: {', '.join(pkgs[:6])}. " + body
+        if ghsa:
+            body = f"{ghsa} · {body}"
+        # Keep the structured signal (severity/CVSS/CVE/packages) so the renderer can
+        # roll up "N critical · M high · patch now: <pkgs>" instead of a flat list.
+        cvss = a.get("cvss") if isinstance(a.get("cvss"), dict) else {}
+        meta = {"advisory": {
+            "severity": sev,
+            "cvss": (cvss or {}).get("score"),
+            "cve": (a.get("cve_id") or "").strip(),
+            "ghsa": ghsa,
+            "packages": pkgs[:6],
+        }}
+        out.append(FeedItem(title=_clean_text(title)[:200], url=link,
+                            summary=_clean_text(body)[:1500], published=pub,
+                            source_host="github.com", meta=meta))
+    return out
+
+
 async def _fetch_one_feed(url: str, *, max_items: int = 8) -> list[FeedItem]:
     """Fetch one RSS/Atom feed and return parsed items."""
+    if "api.github.com/advisories" in url:          # JSON REST API (the atom feed is 406-blocked)
+        return await _fetch_github_advisories(url, max_items=max_items)
     # SEC requires a UA with real contact info or 403s the request
     ua = _SEC_USER_AGENT if "sec.gov" in url else _USER_AGENT
     try:
@@ -868,11 +980,16 @@ async def _fetch_one_feed(url: str, *, max_items: int = 8) -> list[FeedItem]:
 
 
 async def fetch_recent_items(
-    monitor_name: str, *, hours: int = 72, max_total: int = 8,
+    monitor_name: str, *, hours: int = 72, max_total: int = 8, per_feed: int = 8,
 ) -> list[FeedItem]:
     """Fetch recent items from all curated feeds for this monitor's topic.
     Returns deduped, sorted-newest-first list. Empty if no feeds configured
     or all feeds returned nothing fresh.
+
+    `per_feed` caps items pulled from EACH feed (default 8). Single-authoritative-
+    source native-list monitors (SEC Form-4, DoD contracts, GHSA) pass a larger value
+    so one feed can fill the whole list — and SEC needs the headroom because its
+    issuer/reporting double-rows collapse ~3:1 after the accession merge.
     """
     feeds = feeds_for(monitor_name)
     if not feeds:
@@ -880,7 +997,7 @@ async def fetch_recent_items(
 
     # Fan out — fetch all feeds in parallel
     results = await asyncio.gather(
-        *[_fetch_one_feed(u) for u in feeds],
+        *[_fetch_one_feed(u, max_items=per_feed) for u in feeds],
         return_exceptions=False,
     )
 

@@ -102,9 +102,11 @@ class SignalBot:
             timestamp = str(data_message.get("timestamp", ""))
             content_hash = hashlib.sha256(text.encode()).hexdigest()[:16]
             dedup_key = f"{timestamp}:{source}:{content_hash}"
-            if self._check_dedup(dedup_key):
+            # to_thread: dedup does writer-lock DB calls (insert + cleanup) — never
+            # run those on the event-loop thread (54h-freeze bug class, 2026-07-03).
+            if await asyncio.to_thread(self._check_dedup, dedup_key):
                 return
-            self._record_dedup(dedup_key)
+            await asyncio.to_thread(self._record_dedup, dedup_key)
 
             if not self._is_allowed(source):
                 await self._send_message(source, "Sorry, you're not authorized to use this bot.")
@@ -172,7 +174,10 @@ class SignalBot:
         try:
             tokens = []
             async for event in think(query=query, conversation_id=conv_id, channel="signal"):
-                if event.type == EventType.TOKEN:
+                if event.type == EventType.REVISION:
+                    # stream-first refine: the final answer replaces the draft
+                    tokens = [event.data.get("text", "")]
+                elif event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:
                         tokens.append(text)
@@ -222,11 +227,11 @@ class SignalBot:
         except Exception as e:
             logger.error("[Signal] Send failed to %s: %s", recipient, e)
 
-    async def send_alert(self, message: str) -> None:
+    async def send_alert(self, message: str) -> bool:
         """Send a message to the default recipient. Strips Discord markdown
         since Signal doesn't reliably render it."""
         if not self.default_recipient or not self._client:
-            return
+            return False
         try:
             from app.channels.format_for_channel import to_signal
             sig_message = to_signal(message)
@@ -236,8 +241,10 @@ class SignalBot:
                     if _ci:
                         await asyncio.sleep(0.3)
                     await self._send_message(self.default_recipient, chunk)
+            return True
         except Exception as e:
             logger.error("[Signal] Alert send failed: %s", e)
+            return False
 
     async def start(self) -> None:
         """Start the Signal bot (polling mode, blocks until cancelled/closed)."""

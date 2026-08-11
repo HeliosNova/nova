@@ -133,7 +133,15 @@ class OllamaEmbeddingFunction:
                 done.set()
 
     def _embed(self, chunk: list[str]) -> list[list[float]]:
-        payload = json.dumps({"model": self._model, "input": chunk}).encode()
+        # num_gpu=0: run the embedder on CPU. With the 27B + the owner's VRAM
+        # reserve resident, the 1.2GB embedder became UNLOADABLE on GPU — every
+        # embed call waited on VRAM that never freed, all four knowledge
+        # retrievals (kg/lessons/reflexions/patterns) hit their 5s context
+        # timeout, and chat answered with ZERO injected knowledge (found
+        # 2026-07-07: kg-retrieval causal-fix 0.83→0.0). A 1024-dim embed costs
+        # ~100-300ms on CPU and never competes with generation.
+        payload = json.dumps({"model": self._model, "input": chunk,
+                              "options": {"num_gpu": 0}}).encode()
         req = urllib.request.Request(
             self._url, data=payload, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=self._timeout) as r:
@@ -166,11 +174,31 @@ def get_embedding_function(force: bool = False):
         _CACHED = None
         return None
 
-    base_url = getattr(config, "OLLAMA_URL", "http://ollama:11434")
+    # Prefer the dedicated CPU embed instance (isolated request queue → never
+    # waits behind a 27B generation); fall back to the main Ollama if it isn't
+    # reachable yet (e.g. still pulling bge-m3, or single-instance dev).
+    _main = getattr(config, "OLLAMA_URL", "http://ollama:11434")
+    _embed = (getattr(config, "EMBED_OLLAMA_URL", "") or "").strip() or _main
     _, doc_prefix = _prefixes_for(model)
+
+    def _try(url):
+        e = OllamaEmbeddingFunction(model, url, doc_prefix=doc_prefix)
+        e(["probe"])   # a model can be "present" yet 400 on /api/embed
+        return e
+
+    base_url = _embed
     ef = OllamaEmbeddingFunction(model, base_url, doc_prefix=doc_prefix)
     # Probe: a model can be "present" yet fail on /api/embed (nomic-v2-moe 400s).
     try:
+        if _embed != _main:
+            try:
+                ef = _try(_embed)
+                logger.info("[embedding] using dedicated embed instance %s", _embed)
+            except Exception as _e:
+                logger.warning("[embedding] embed instance %s unreachable (%s) — falling back to %s",
+                               _embed, _e, _main)
+                base_url = _main
+                ef = OllamaEmbeddingFunction(model, base_url, doc_prefix=doc_prefix)
         vec = ef(["probe"])
         if not vec or not isinstance(vec[0], (list, tuple)) or len(vec[0]) < 8:
             raise RuntimeError("probe returned no usable vector")

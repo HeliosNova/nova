@@ -39,6 +39,9 @@ logger = logging.getLogger(__name__)
 # lets every upstream engine have time to respond, and the tool round-trip
 # is still well under the GENERATION_TIMEOUT ceiling.
 DEFAULT_TIMEOUT = 30.0
+# Search queries fail fast so one hung aggregator engine can't stall a whole
+# concurrent gather; article-body fetches keep DEFAULT_TIMEOUT (slow reads OK).
+SEARCH_TIMEOUT = 12.0
 DEFAULT_MAX_RESULTS = 10
 
 # Rotating User-Agents to avoid being fingerprinted as a bot from a fixed UA.
@@ -380,7 +383,13 @@ async def _search_searxng(
     if not base:
         return []
     try:
-        async with httpx.AsyncClient(timeout=DEFAULT_TIMEOUT) as client:
+        # Fail-FAST on search (vs the 30s fetch timeout): SearXNG waits on all its
+        # engines, and one hung engine (CAPTCHA/rate-limited Google/DDG/Brave) can
+        # stall a query the full 30s — blocking the whole multi-angle gather, since
+        # angles run concurrently and the slowest gates the batch (manual audit
+        # 2026-07-09). At ~12s the healthy engines have long since answered; a
+        # laggard is dropped rather than allowed to stall the digest.
+        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
             params: dict = {
                 "q": query,
                 "format": "json",

@@ -28,12 +28,17 @@ class BaseChannel:
         """
         from app.core.brain import think, get_services
 
-        # Track user activity for idle detection (dream mode)
+        # Track user activity for idle detection (dream mode). to_thread: this is
+        # a sync WRITER-LOCK DB call fired on EVERY message — on the event-loop
+        # thread it stalls all coroutines whenever the writer lock is contended
+        # (the exact bug class behind the 54h freeze of 2026-07-03).
         try:
+            import asyncio
             from datetime import datetime
             svc = get_services()
             if svc.monitor_store:
-                svc.monitor_store.db.execute(
+                await asyncio.to_thread(
+                    svc.monitor_store.db.execute,
                     "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
                     ("last_user_activity", datetime.utcnow().isoformat()),
                 )
@@ -43,7 +48,10 @@ class BaseChannel:
         try:
             tokens = []
             async for event in think(query=query, conversation_id=conversation_id):
-                if event.type == EventType.TOKEN:
+                if event.type == EventType.REVISION:
+                    # stream-first refine: the final answer replaces the draft
+                    tokens = [event.data.get("text", "")]
+                elif event.type == EventType.TOKEN:
                     text = event.data.get("text", "")
                     if text:
                         tokens.append(text)

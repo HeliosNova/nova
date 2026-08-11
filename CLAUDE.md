@@ -260,10 +260,13 @@ pre-stream LLM round-trips on every general answer ≥200 chars. Owner decision
   conversational/opinion/greeting answers skip it (one fewer pass); knowledge-only
   factual answers still trip it, so grounding holds.
 
-Note on streaming: true token streaming stays OFF by design — `validate_claims`
-strips unsupported claims and `_refine_response` can rewrite the whole answer, so
-the pipeline generates fully, grounds, then emits. The TOKEN events are a
-post-grounding chunking of the final text, not live generation.
+Note on streaming (updated 2026-07-08): the pipeline is STREAM-FIRST — the
+draft is generated fully, sanitized + claim-validated, then emitted as TOKEN
+chunks immediately; `_refine_response` runs AFTER emission and, when it changes
+the text, a REVISION event replaces the draft in place (Discord edits its
+message; adapters handle REVISION). A `THINKING{stage:"refining"}` event is the
+draft-complete signal. TOKEN events are still post-validation chunks of the
+draft, not live generation — TTFT is bounded by draft generation time.
 Tests: `tests/test_refine_gating.py`.
 
 ### Self-Improvement Pipeline
@@ -299,7 +302,7 @@ Tests: `tests/test_refine_gating.py`.
 7. Lessons must have all fields: `topic`, `correct_answer`, `wrong_answer`, `lesson_text`.
 8. Training pairs: query=original question, chosen=correct, rejected=wrong. Used for SimPO (default) or DPO fine-tuning.
 9. Facts are extracted, not hallucinated. Only extract from explicit user statements.
-10. Context budget: 6000 tokens max (MAX_SYSTEM_TOKENS in prompt.py). Summarize older messages, keep 6 recent.
+10. Context budget: MAX_SYSTEM_TOKENS=13500 estimated tokens (config.py; enforced in prompt.py with len//4 estimation, which undercounts real tokens ~35%) inside chat's num_ctx=24576 (providers/ollama.py _CHAT_NUM_CTX — the compose OLLAMA_NUM_CTX env does NOT apply). prompt_tokens >= num_ctx in the LLM-usage log means Ollama silently truncated the prompt (an ERROR tripwire in ollama.py now catches this). Summarize older messages, keep recent.
 
 ## Dependencies
 
@@ -317,7 +320,10 @@ docker compose up          # Start all services
 docker compose stop ollama # Free VRAM for fine-tuning
 ```
 
-Services: nova-ollama (11434), nova-app (8000), nova-searxng (8888)
+Services: nova-ollama (11434), nova-app (8000), nova-searxng (8888), nova-watchdog
+(no port — out-of-process guardian: restarts nova-app on sustained-unhealthy or a
+90-min-stale heartbeat and posts a Discord alert; scripts/watchdog.sh + Dockerfile.watchdog,
+added after the 2026-07-03→06 54h silent write-lock freeze)
 
 ### Container freshness — IMPORTANT
 

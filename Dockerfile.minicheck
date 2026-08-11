@@ -1,0 +1,14 @@
+# MiniCheck entailment sidecar (#48): CPU-only torch + the official minicheck
+# package (exact trained input format) + a tiny FastAPI wrapper. Weights land
+# in the /cache volume on first request — restarts don't re-download.
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu \
+    && pip install --no-cache-dir "minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main" \
+       accelerate fastapi uvicorn \
+    && python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')"
+COPY minicheck_service/app.py /srv/app.py
+ENV HF_HOME=/cache
+EXPOSE 8080
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--app-dir", "/srv"]

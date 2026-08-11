@@ -519,10 +519,8 @@ def build_system_prompt(
         )
         blocks.append(("context", ctx_block, True))
 
-    # Block 5c: Knowledge graph facts (TRUNCATE LAST)
-    if kg_facts:
-        kg_block = "\n\n## Known Facts\n\nThese are verified facts from your knowledge graph:\n\n" + kg_facts
-        blocks.append(("kg_facts", kg_block, True))
+    # Block 5c: Knowledge graph facts — appended LATER (after tools/examples) so
+    # the facts sit CLOSEST to the user's question; see below.
 
     # Block 5d: Reflexions / past failure warnings (truncate late)
     if reflexions:
@@ -581,6 +579,25 @@ def build_system_prompt(
         examples_text = _build_tool_examples(registered_tool_names)
         if examples_text:
             blocks.append(("tool_examples", examples_text, True))
+
+    # Block 5c: Knowledge graph facts (TRUNCATE LAST) — placed at the END of the
+    # prompt, after the ~15k-char tool block, so the facts sit ADJACENT to the
+    # user's question. Found 2026-07-07: with the facts buried mid-prompt the
+    # 9B answered "I don't have information about X" while X's facts sat in
+    # context (kg-retrieval causal-fix 0.83→0.0); the same facts adjacent to
+    # the question are used correctly. Recency dominates for small models.
+    # Framing must also OVERRIDE the model's training-cutoff prior for
+    # unrecognized entities.
+    if kg_facts:
+        kg_block = (
+            "\n\n## Known Facts — your own verified research (CURRENT, newer than your training data)\n\n"
+            "These facts were gathered and verified by YOUR research monitors after your training "
+            "cutoff. They are trustworthy and current. CHECK THESE FACTS FIRST, before considering "
+            "any tool: if the user's question is answered by a fact below, answer directly from it "
+            "— do NOT call web_search or memory_search for something already stated here, and never "
+            "claim you have no information about something listed here.\n\n" + kg_facts
+        )
+        blocks.append(("kg_facts", kg_block, True))
 
     # Block 7: Conversation summary (truncate first)
     if conversation_summary:

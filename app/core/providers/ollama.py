@@ -25,6 +25,18 @@ from app.core.providers._retry import retry_on_transient
 
 logger = logging.getLogger(__name__)
 
+# Context window for CHAT generations. Without an explicit num_ctx Ollama loads
+# the model at its Modelfile default (4096) and SILENTLY TRUNCATES the prompt —
+# found 2026-07-07: the ~11k-token system prompt (identity + lessons + KG facts
+# + tools) was cut to 4096 tokens on every chat call, so injected knowledge
+# never reached the model (kg-retrieval causal-fix 0.83→0.0, "I don't know X"
+# with X's facts in-prompt). The compose OLLAMA_NUM_CTX env demonstrably did
+# NOT apply. 24576 (was 16384): the system prompt alone measures ~15.3k real
+# tokens, so 16384 left <1.1k for history + generation — one long multi-turn
+# conversation re-entered silent truncation (quantified 2026-07-07). 24k fits
+# the 9B Q8 with q8 KV + flash attention; Ollama clamps to VRAM if needed.
+_CHAT_NUM_CTX = 24576
+
 
 class OllamaProvider:
     """Ollama LLM provider — raw HTTP, no LangChain.
@@ -88,17 +100,20 @@ class OllamaProvider:
     ) -> str:
         model = model or self._llm_model
         client = self._get_client()
-        is_qwen = "qwen" in model.lower()
 
         ollama_messages = list(messages)
 
-        # Assistant prefix trick: force model to skip thinking
-        if is_qwen:
-            prefix_content = "<think>\n\n</think>\n"
-            if json_mode and json_prefix:
-                prefix_content += json_prefix
-            ollama_messages.append({"role": "assistant", "content": prefix_content})
-        elif json_mode and json_prefix:
+        # Thinking suppression: rely on the native `think: false` payload param
+        # below. The old "<think>\n\n</think>" assistant-prefill trick is now
+        # HARMFUL on the Ollama 0.30 engine (2026-07-08): the qwen3.x renderer
+        # echoes the injected tags back into the output AND, on complex rewrite
+        # prompts, the prefilled assistant turn made qwen3.6:27b RE-OPEN thinking
+        # and blow its token budget mid-<think> — the unterminated block then
+        # leaked a whole raw reasoning monologue into a posted digest (the Science
+        # digest incident). Probe: `think:false` alone returns clean output;
+        # `think:false` + the prefix echoes/leaks. So only prefill the json_prefix
+        # for JSON-continuation models, nothing else.
+        if json_mode and json_prefix:
             ollama_messages.append({"role": "assistant", "content": json_prefix})
 
         payload = {
@@ -143,6 +158,13 @@ class OllamaProvider:
                 if not content.lstrip().startswith(json_prefix.lstrip()):
                     content = json_prefix + content
 
+            # Silent-truncation tripwire: invoke_nothink (the deep_research
+            # grounding/synthesis path) never checked done_reason, so a digest
+            # hitting max_tokens was cut MID-SENTENCE with no signal (2026-07-08).
+            if data.get("done_reason") == "length":
+                logger.warning("[truncation] invoke_nothink hit max_tokens (%d) — output cut mid-generation "
+                               "(model=%s, %d chars)", max_tokens, model, len(content))
+
             content = _strip_think_tags(content)
 
             if json_mode:
@@ -186,9 +208,13 @@ class OllamaProvider:
                     send_messages[i] = {**send_messages[i], "images": images}
                     break
 
-        # Assistant prefix trick: suppress thinking for Qwen models (only when extended thinking is disabled)
-        if is_qwen and not config.ENABLE_EXTENDED_THINKING:
-            send_messages.append({"role": "assistant", "content": "<think>\n\n</think>\n"})
+        # Thinking suppression is via the native `think: False` payload param
+        # below. The old "<think>\n\n</think>" assistant-prefill trick was
+        # REMOVED 2026-07-08: on the Ollama 0.30 engine the qwen3.x renderer
+        # echoes the injected tags into the output and can make the model
+        # re-open thinking (see invoke_nothink for the full write-up + the
+        # Science-digest leak it caused on the background passes).
+        _ = is_qwen  # retained for readability; no longer gates a prefill
 
         # Build payload with native tool calling
         payload: dict = {
@@ -201,6 +227,12 @@ class OllamaProvider:
                 "temperature": temperature,
                 # repeat_penalty 1.1 — see streaming path comment.
                 "repeat_penalty": 1.1,
+                # num_ctx: WITHOUT this, chat runs at the model's 4096 default and
+                # Ollama silently drops ~2/3 of the ~11k-token system prompt —
+                # observed 2026-07-07 (prompt_tokens=4096): injected KG facts and
+                # lessons never reached the model, so it denied knowing entities
+                # whose facts sat in its own prompt (kg-retrieval 0.83→0.0).
+                "num_ctx": _CHAT_NUM_CTX,
             },
         }
         # Pass tools for native tool calling (Ollama 0.17+)
@@ -229,6 +261,17 @@ class OllamaProvider:
         usage = None
         if "eval_count" in data or "prompt_eval_count" in data:
             usage = {"completion_tokens": data.get("eval_count", 0), "prompt_tokens": data.get("prompt_eval_count", 0)}
+            # Truncation tripwire: Ollama reports the prompt tokens it actually
+            # processed, so prompt_tokens reaching num_ctx is PROOF the prompt
+            # was silently cut — the failure class that ran undetected for
+            # months at the 4096 default. Loud, deterministic, no estimates.
+            if usage["prompt_tokens"] >= _CHAT_NUM_CTX:
+                logger.error(
+                    "[num_ctx] prompt_tokens=%d hit num_ctx=%d — Ollama silently "
+                    "TRUNCATED this prompt; injected context was lost. Shrink the "
+                    "system prompt or raise _CHAT_NUM_CTX.",
+                    usage["prompt_tokens"], _CHAT_NUM_CTX,
+                )
 
         # Detect truncation due to token limit
         done_reason = data.get("done_reason", "")
@@ -313,6 +356,9 @@ class OllamaProvider:
                                 # block repeated 6 times). 1.1 is mild — doesn't
                                 # damage normal text. Higher values mangle JSON.
                                 "repeat_penalty": 1.1,
+                                # num_ctx: see generate_with_tools — the 4096
+                                # default silently truncated the system prompt.
+                                "num_ctx": _CHAT_NUM_CTX,
                             },
                         }
                     if ollama_tools and self.capabilities.supports_native_tools:

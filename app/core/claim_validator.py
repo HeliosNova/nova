@@ -113,6 +113,33 @@ def _evidence_contains(evidence_norm: str, token: str) -> bool:
     return token_norm in evidence_norm
 
 
+# Honorifics carry no factual content — "Dr. Sarah Chen" must not fail grounding
+# because the evidence (a lesson the memory loop just taught) says "Sarah Chen".
+# The all-parts substring rule was stripping exactly those answers (audit 2026-07-06).
+_HONORIFICS = frozenset({
+    "dr", "mr", "mrs", "ms", "mx", "prof", "professor", "sir", "dame", "lord",
+    "rev", "fr", "st", "hon", "gen", "col", "capt", "sgt", "sen", "rep",
+})
+_POSSESSIVE_RE = re.compile(r"[’']s$")
+
+
+def _claim_parts(name: str, *, min_len: int = 2, stop: frozenset = frozenset()) -> list[str]:
+    """The tokens of a claimed name/org that must ALL appear in evidence.
+    Decorations that aren't factual content are removed before the check:
+    honorifics, surrounding punctuation, and possessive 's — so "OpenAI's"
+    matches evidence saying "OpenAI" and "Dr. Sarah Chen" matches "Sarah Chen".
+    The entity tokens themselves stay strictly required (anti-hallucination)."""
+    out: list[str] = []
+    for p in (name or "").split():
+        core = _POSSESSIVE_RE.sub("", p.strip(".,;:!?()[]{}\"'"))
+        if len(core) < min_len:
+            continue
+        if core.lower() in stop or core.lower().rstrip(".") in _HONORIFICS:
+            continue
+        out.append(core)
+    return out
+
+
 def _drop_sentence(text: str, start: int, end: int) -> tuple[str, str]:
     left_candidates: list[int] = []
     for sep in (". ", "! ", "? "):
@@ -217,11 +244,12 @@ def validate_claims(
     evidence_norm = _normalize(evidence)
     to_drop: list[tuple[int, int, str]] = []
 
+    _STOP_WORDS = frozenset({"the", "and", "of", "a", "an"})
     for m in _PERSON_TITLE_ORG.finditer(answer):
         name = m.group(1)
         org = m.group(2).strip().rstrip(".")
-        name_parts = [p for p in name.split() if len(p) > 1]
-        org_parts = [p for p in org.split() if len(p) > 2 and p.lower() not in {"the", "and", "of"}]
+        name_parts = _claim_parts(name)
+        org_parts = _claim_parts(org, min_len=3, stop=_STOP_WORDS)
         name_supported = name_parts and all(_evidence_contains(evidence_norm, p) for p in name_parts)
         org_supported = org_parts and all(_evidence_contains(evidence_norm, p) for p in org_parts)
         if not (name_supported and org_supported):
@@ -229,7 +257,7 @@ def validate_claims(
 
     for m in _PERSON_BY_ATTRIB.finditer(answer):
         name = m.group(1)
-        name_parts = [p for p in name.split() if len(p) > 1]
+        name_parts = _claim_parts(name)
         name_supported = name_parts and all(_evidence_contains(evidence_norm, p) for p in name_parts)
         if not name_supported:
             to_drop.append((m.start(), m.end(), f"attribution: by {name!r}"))
@@ -239,7 +267,7 @@ def validate_claims(
         if any(m.start() >= s and m.end() <= e for s, e, _ in to_drop):
             continue
         name = m.group(1)
-        name_parts = [p for p in name.split() if len(p) > 1]
+        name_parts = _claim_parts(name)
         name_supported = name_parts and all(_evidence_contains(evidence_norm, p) for p in name_parts)
         if not name_supported:
             to_drop.append((m.start(), m.end(), f"bare-titled-person: {name!r}"))
@@ -247,7 +275,7 @@ def validate_claims(
     for m in _SPEC_CLAIM.finditer(answer):
         org = m.group(1).strip()
         number = m.group(2).strip()
-        org_parts = [p for p in org.split() if len(p) > 2 and p.lower() not in {"the", "and", "of"}]
+        org_parts = _claim_parts(org, min_len=3, stop=_STOP_WORDS)
         org_supported = org_parts and all(_evidence_contains(evidence_norm, p) for p in org_parts)
         number_supported = _evidence_contains(evidence_norm, number) or _evidence_contains(
             evidence_norm, number.replace(",", "")
@@ -258,7 +286,6 @@ def validate_claims(
     # _PROPER_NOUN_ROLE_OF and _PROPER_NOUN_VERB_ATTRIB share the same
     # grounding rule as _PERSON_TITLE_ORG: both name AND org tokens must
     # appear in evidence. Skip if a wider pattern already flagged this span.
-    _STOP_ORG_WORDS = {"the", "and", "of", "a", "an"}
     for pat, label in (
         (_PROPER_NOUN_ROLE_OF, "proper-noun-role-of"),
         (_PROPER_NOUN_VERB_ATTRIB, "proper-noun-verb-attrib"),
@@ -268,8 +295,8 @@ def validate_claims(
                 continue
             name = m.group(1)
             org = m.group(2).strip().rstrip(".")
-            name_parts = [p for p in name.split() if len(p) > 1]
-            org_parts = [p for p in org.split() if len(p) > 2 and p.lower() not in _STOP_ORG_WORDS]
+            name_parts = _claim_parts(name)
+            org_parts = _claim_parts(org, min_len=3, stop=_STOP_WORDS)
             name_supported = name_parts and all(_evidence_contains(evidence_norm, p) for p in name_parts)
             org_supported = org_parts and all(_evidence_contains(evidence_norm, p) for p in org_parts)
             if not (name_supported and org_supported):

@@ -245,3 +245,67 @@ class TestChatSearchAuthority:
         from app.tools.native_search import format_results
         out = format_results([self._r("https://reuters.com/b")])
         assert "Do not state" not in out
+
+
+class TestSecForm4Merge:
+    """#3 native-list fix: collapse EDGAR's issuer/reporting double-rows by accession."""
+
+    def _it(self, title, url, summary=""):
+        from types import SimpleNamespace
+        return SimpleNamespace(title=title, url=url, summary=summary)
+
+    def test_merges_issuer_and_reporting_by_accession(self):
+        from app.monitors.domain_study_runner import _merge_sec_form4
+        base = "https://www.sec.gov/Archives/edgar/data/{cik}/000121390026073329/0001213900-26-073329-index.htm"
+        items = [
+            self._it("4 - Kim Vyacheslav (0002029485) (Reporting)", base.format(cik=2029485)),
+            self._it("4 - Joint Stock Co Kaspi.kz (0001985487) (Issuer)", base.format(cik=1985487)),
+        ]
+        out = _merge_sec_form4(items)
+        assert len(out) == 1                                      # 2 rows → 1 filing
+        assert "Kaspi.kz" in out[0].title and "Kim Vyacheslav" in out[0].title
+        assert "Form 4" in out[0].title
+
+    def test_distinct_accessions_stay_separate(self):
+        from app.monitors.domain_study_runner import _merge_sec_form4
+        items = [
+            self._it("4 - A Corp (1) (Issuer)", "https://www.sec.gov/x/0001111111-26-000001-index.htm"),
+            self._it("4 - B Corp (2) (Issuer)", "https://www.sec.gov/x/0002222222-26-000002-index.htm"),
+        ]
+        assert len(_merge_sec_form4(items)) == 2
+
+    def test_non_form4_items_pass_through(self):
+        from app.monitors.domain_study_runner import _merge_sec_form4
+        items = [self._it("Some SEC press release", "https://www.sec.gov/news/pr.htm")]
+        out = _merge_sec_form4(items)
+        assert len(out) == 1 and out[0].title == "Some SEC press release"
+
+
+class TestNativeInsightGuard:
+    """#3 fix: suppress vacuous/meta 'insight' lines (the DoD daily-rollup case)."""
+
+    def _items(self, titles):
+        from types import SimpleNamespace
+        return [SimpleNamespace(title=t) for t in titles]
+
+    def test_rejects_meta_non_insight(self, monkeypatch):
+        import app.core.llm as _llm
+        from app.monitors.domain_study_runner import _native_insight
+
+        async def fake(*a, **k):
+            return "The listed items are merely chronological placeholders with no actual content to analyze."
+        monkeypatch.setattr(_llm, "invoke_nothink", fake)
+        out = asyncio.run(_native_insight(
+            "government contracts", self._items([f"Contracts for June {d}, 2026" for d in range(20, 26)])))
+        assert out == ""
+
+    def test_keeps_substantive_insight(self, monkeypatch):
+        import app.core.llm as _llm
+        from app.monitors.domain_study_runner import _native_insight
+
+        async def fake(*a, **k):
+            return "Quantum error-correction milestones dominate, with three labs reporting logical-qubit gains."
+        monkeypatch.setattr(_llm, "invoke_nothink", fake)
+        out = asyncio.run(_native_insight(
+            "quantum", self._items([f"Quantum result {i} on logical qubits" for i in range(5)])))
+        assert "Quantum error-correction" in out

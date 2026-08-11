@@ -166,8 +166,8 @@ def get_provider() -> LLMProvider:
 # ---------------------------------------------------------------------------
 # Interactive-priority GPU coordination
 # ---------------------------------------------------------------------------
-# Measured 2026-06-11: interactive chat is fast (~13s) when the GPU is idle but
-# 60-85s when the 79 background monitors are firing 19K-token generations — the
+# Measured 2026-06-11: interactive chat is fast when the GPU is idle but
+# 60-85s+ when background monitors (~50 seeded, some hourly) fire 19K-token generations — the
 # models are co-resident (~23/24GB) so Ollama can't truly run NUM_PARALLEL=4 and
 # a monitor generation holds a slot 10-40s, serializing interactive work. We
 # can't preempt a running generation, but we CAN stop STARTING new background
@@ -191,6 +191,25 @@ def interactive_active() -> bool:
     """True if an interactive chat happened within the priority window — used by
     the heartbeat loop to defer background LLM monitors so chat keeps the GPU."""
     return (_time.monotonic() - _last_interactive_monotonic) < INTERACTIVE_PRIORITY_WINDOW_S
+
+
+async def wait_for_interactive_quiet(max_wait_s: float = 300.0, poll_s: float = 5.0) -> float:
+    """Yield-checkpoint for long background LLM pipelines (digests, evals).
+
+    The cycle-start defer in heartbeat_loop only helps if chat arrives BEFORE
+    a monitor starts; a deep-research run makes 15+ sequential LLM calls over
+    many minutes, and a chat arriving mid-run used to contend for the GPU the
+    whole time (audit 2026-07-08). Call this between LLM calls: it sleeps
+    while the owner is actively chatting, capped at max_wait_s so a long
+    conversation can't stall background intelligence forever. Returns seconds
+    waited (0.0 in the common quiet case — one monotonic read).
+    """
+    import asyncio as _asyncio
+    waited = 0.0
+    while interactive_active() and waited < max_wait_s:
+        await _asyncio.sleep(poll_s)
+        waited += poll_s
+    return waited
 
 
 def get_capabilities() -> ProviderCapabilities:
@@ -299,18 +318,25 @@ def _strip_think_tags(text: str) -> str:
     as warnings rather than silently dropping content.
     """
     # Non-greedy: strip each matched <think>...</think> block individually
-    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text)
+    text = re.sub(r"<think>[\s\S]*?</think>\s*", "", text, flags=re.IGNORECASE)
     # Strip content before an unmatched </think> tag (model continuing reasoning after prefix)
-    last_close = text.rfind("</think>")
+    _low = text.lower()
+    last_close = _low.rfind("</think>")
     if last_close != -1:
         text = text[last_close + len("</think>"):]
-    # Warn about unclosed <think> tag instead of stripping everything after it
-    open_idx = text.find("<think>")
+    # Unterminated <think> (open tag, no close anywhere): the model ran its whole
+    # token budget still reasoning and never produced a deliverable answer. Strip
+    # from the tag to end — an incomplete thinking monologue is NEVER content, and
+    # leaving it "intact" is how a raw reasoning block leaked into a posted digest
+    # (Science digest incident, 2026-07-08). Callers get "" and their accept-guard
+    # keeps the prior good text.
+    open_idx = text.lower().find("<think>")
     if open_idx != -1:
         logger.warning(
-            "Unclosed <think> tag at position %d — leaving content intact (len=%d)",
-            open_idx, len(text),
+            "Unterminated <think> tag at position %d — stripping runaway thinking "
+            "(dropped %d chars, no answer emitted)", open_idx, len(text) - open_idx,
         )
+        text = text[:open_idx]
     return text
 
 

@@ -1,0 +1,6 @@
+# Watchdog sidecar: tiny, dependency-pinned, no runtime network needs beyond
+# the Discord alert POST. See scripts/watchdog.sh for the logic.
+FROM alpine:3.20
+RUN apk add --no-cache curl sqlite jq
+COPY scripts/watchdog.sh /watchdog.sh
+ENTRYPOINT ["sh", "/watchdog.sh"]

@@ -28,7 +28,11 @@ from app.monitors.monitor_store import (
 
 logger = logging.getLogger(__name__)
 
-_MAX_CONCURRENT_LLM_MONITORS = 2
+_MAX_CONCURRENT_LLM_MONITORS = 1  # one monitor's GPU work at a time — leaves the 3090 free for a side process (owner 2026-06-30)
+# Post digests progressively as monitors finish, so a large due-batch (or a restart
+# mid-batch) can't strand every update behind the slowest monitor. Small groups keep
+# most of the digest-bundling benefit while making the feed timely + restart-resilient.
+_DIGEST_FLUSH_EVERY = 3
 
 # Monitors whose output is non-factual — skip KG extraction for these
 _NO_KG_MONITORS = frozenset({"Morning Check-in", "Self-Reflection"})
@@ -171,6 +175,11 @@ class HeartbeatLoop:
         # single briefing instead of 80 interleaving messages.
         self._digest_enabled = bool(getattr(config, "ENABLE_MONITOR_DIGEST", True))
         self._digest_buffer: list[tuple[frozenset, str, str, str]] = []
+        # Per-monitor delivery-failure retry counts: a digest whose broadcast
+        # failed on EVERY channel is re-buffered for the next flush instead of
+        # being silently dropped (audit 2026-07-08); capped so a permanently
+        # broken channel can't grow the buffer without bound.
+        self._alert_retry_counts: dict[str, int] = {}
 
     def start(self) -> asyncio.Task:
         """Start the heartbeat loop as a background task."""
@@ -238,6 +247,14 @@ class HeartbeatLoop:
 
                             overdue = [m for m in slow if _badly_overdue(m)]
                             deferred = [m for m in slow if not _badly_overdue(m)]
+                            # Post-restart, EVERY monitor is badly overdue (or has
+                            # no last_check_at), so the escape hatch used to flood
+                            # the GPU with the whole catch-up queue exactly while
+                            # the owner was chatting (audit 2026-07-08). Cap the
+                            # bypass; the rest catch up once chat goes quiet.
+                            if len(overdue) > 2:
+                                deferred.extend(overdue[2:])
+                                overdue = overdue[:2]
                             if deferred:
                                 logger.info(
                                     "[Heartbeat] owner is chatting — deferring %d LLM monitor(s); "
@@ -290,6 +307,12 @@ class HeartbeatLoop:
                                             monitor.id, "error",
                                             message=f"Exception — retry in ~{_retry_delay // 60} min: {e}",
                                         )
+                                # Progressive flush (OUTSIDE the semaphore — Discord I/O must
+                                # not hold a monitor concurrency slot): post as soon as a few
+                                # updates buffer, so nothing waits behind the slowest run and a
+                                # restart mid-batch keeps what already completed.
+                                if len(self._digest_buffer) >= _DIGEST_FLUSH_EVERY:
+                                    await self._flush_digest()
 
                             await asyncio.gather(*[_limited_check(m) for m in slow], return_exceptions=True)
 
@@ -401,7 +424,7 @@ class HeartbeatLoop:
             )
             await asyncio.to_thread(
                 self.store.add_result,
-                monitor.id, "error", value=new_value[:4000] if new_value else "",
+                monitor.id, "error", value=new_value[:12000] if new_value else "",
                 message=f"LLM failure — retry in ~{_retry_delay // 60} min")
             logger.warning("[Heartbeat] '%s' LLM failure (streak=%d), retry in ~%d min: %s",
                            monitor.name, recent_errors + 1, _retry_delay // 60, (new_value or "")[:100])
@@ -412,7 +435,7 @@ class HeartbeatLoop:
             await asyncio.to_thread(self.store.record_check, monitor.id, new_value)
             await asyncio.to_thread(
                 self.store.add_result,
-                monitor.id, "ok", value=new_value[:4000] if new_value else "")
+                monitor.id, "ok", value=new_value[:12000] if new_value else "")
             return
 
         # Only record check (update last_check_at) on successful results
@@ -430,8 +453,19 @@ class HeartbeatLoop:
                 from app.core.brain import get_services, _extract_kg_triples
                 svc = get_services()
                 if svc.kg:
+                    # Monitor digests are the main KG-growth pipe and are multi-
+                    # paragraph: give the extractor the whole briefing and a higher
+                    # triple budget (the lean 1000-char/5-triple chat default threw
+                    # away the back half of every domain study). Route extraction to
+                    # the synthesis model when set — a 4-arm A/B (2026-06-29) showed the
+                    # 27B yields ~4.6× more grounded facts/digest at 100% grounding vs
+                    # the 9B; the 27B is already loaded from this monitor's synthesis.
+                    _syn = (getattr(config, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
                     _kg_task = asyncio.create_task(
-                        _extract_kg_triples(svc.kg, monitor.name, new_value[:2000], source_name=monitor.name)
+                        _extract_kg_triples(svc.kg, monitor.name, new_value[:12000],
+                                            source_name=monitor.name,
+                                            max_answer_chars=12000, max_triples=22,
+                                            model=_syn, trust=0.7)
                     )
                     self._kg_bg_tasks.add(_kg_task)
 
@@ -446,7 +480,16 @@ class HeartbeatLoop:
 
                     _kg_task.add_done_callback(_on_kg_done)
             except Exception:
-                pass
+                # This except used to be a bare `pass` — an import/services
+                # error here silently killed the MAIN KG-growth pipe forever
+                # (every digest banking zero facts, no log line). Audit
+                # 2026-07-08: silent kill switches on the memory loop are the
+                # same failure class as the 2026-05-30 postmortem.
+                logger.error(
+                    "[KG bg] failed to schedule KG extraction for %r — "
+                    "digest facts NOT banked", getattr(monitor, "name", "?"),
+                    exc_info=True,
+                )
 
         # Determine if we should alert (non-results already returned above)
         should_alert = False
@@ -482,7 +525,7 @@ class HeartbeatLoop:
         if not should_alert:
             await asyncio.to_thread(
                 self.store.add_result,
-                monitor.id, "ok", value=new_value[:4000] if new_value else "")
+                monitor.id, "ok", value=new_value[:12000] if new_value else "")
             return
 
         # Check cooldown
@@ -493,7 +536,7 @@ class HeartbeatLoop:
                 logger.info("[Heartbeat] '%s' in cooldown, skipping alert", monitor.name)
                 await asyncio.to_thread(
                     self.store.add_result,
-                    monitor.id, "ok", value=new_value[:4000] if new_value else "",
+                    monitor.id, "ok", value=new_value[:12000] if new_value else "",
                     message="in cooldown")
                 return
 
@@ -506,7 +549,7 @@ class HeartbeatLoop:
         else:
             # Send the raw result directly — channel adapters handle their own
             # message splitting (Discord splits at 2000, Telegram at 4096)
-            analysis = new_value[:4000] if new_value else ""
+            analysis = new_value[:12000] if new_value else ""
 
         # Empty-body gate: if Nova returned nothing meaningful, don't broadcast
         # a silent/placeholder message to the user's alert channels. Nothing
@@ -518,7 +561,7 @@ class HeartbeatLoop:
             )
             await asyncio.to_thread(
                 self.store.add_result,
-                monitor.id, "ok", value=new_value[:4000] if new_value else "",
+                monitor.id, "ok", value=new_value[:12000] if new_value else "",
                 message="empty_body_suppressed")
             return
 
@@ -553,7 +596,7 @@ class HeartbeatLoop:
         await asyncio.to_thread(self.store.record_alert, monitor.id)
         await asyncio.to_thread(
             self.store.add_result,
-            monitor.id, status, value=new_value[:4000] if new_value else "",
+            monitor.id, status, value=new_value[:12000] if new_value else "",
             message=analysis[:500] if analysis else "")
 
     # Registry: check_type -> handler. Adding a new check type is one method
@@ -638,7 +681,11 @@ class HeartbeatLoop:
         # filings and dates for these niche topics — the runner pulls
         # real items from real RSS sources.
         from app.monitors.rss_feeds import feeds_for
-        if monitor.name.startswith("Domain Study:") or feeds_for(monitor.name):
+        # "Auto:*" monitors (created by the Auto-Monitor Detector for frequently-asked
+        # topics) route through the SAME rich deep-research pipeline as Domain Studies,
+        # so every current AND future topic gets the full synthesized overview — not the
+        # thin brain.think() bullet list. (owner: "on every topic and future topics too")
+        if monitor.name.startswith(("Domain Study:", "Auto:")) or feeds_for(monitor.name):
             from app.monitors.domain_study_runner import run_domain_study
             try:
                 result = await run_domain_study(monitor.name)
@@ -963,7 +1010,7 @@ class HeartbeatLoop:
         tokens = []
         try:
             async with asyncio.timeout(config.GENERATION_TIMEOUT):
-                async for event in think(query=enriched_query, ephemeral=True):
+                async for event in think(query=enriched_query, ephemeral=True, channel="monitor"):
                     if event.type == EventType.TOKEN:
                         text = event.data.get("text", "")
                         if text:
@@ -990,7 +1037,7 @@ class HeartbeatLoop:
         tokens: list[str] = []
         try:
             async with asyncio.timeout(float(config.GENERATION_TIMEOUT)):
-                async for event in think(inst.instruction, ephemeral=True):
+                async for event in think(inst.instruction, ephemeral=True, channel="monitor"):
                     if event.type == EventType.TOKEN:
                         text = event.data.get("text", "")
                         if text:
@@ -1435,7 +1482,8 @@ class HeartbeatLoop:
                 if svc.kg and len(result) > 50:
                     from app.core.brain import _extract_kg_triples
                     try:
-                        await _extract_kg_triples(svc.kg, item.topic, result)
+                        await _extract_kg_triples(svc.kg, item.topic, result, trust=0.55,
+                                                  source_name="Curiosity Research")
                     except Exception:
                         pass
 
@@ -1701,12 +1749,37 @@ class HeartbeatLoop:
             # retrieval quality. Soft retire (valid_to set), not delete, so
             # they're still recoverable.
             try:
-                pruned = await svc.kg.hard_prune_dead_facts(days=60, max_count=500)
+                pruned = await svc.kg.hard_prune_dead_facts(days=120, max_count=500)
                 if pruned:
                     parts.append(f"KG dead-fact retire: {pruned}")
             except Exception as e:
                 parts.append(f"KG hard-prune failed: {e}")
                 logger.warning("[Heartbeat] KG hard-prune failed: %s", e)
+            # related_to junk (61% of the store, audit 2026-07-09): retire the
+            # vague associations that a specific predicate already covers + the
+            # stale never-retrieved ones.
+            try:
+                rel = await svc.kg.prune_related_to_junk(days=45, max_count=1000)
+                if rel:
+                    parts.append(f"KG related_to junk retired: {rel}")
+            except Exception as e:
+                logger.warning("[Heartbeat] KG related_to prune failed: %s", e)
+            # Point-in-time research facts (prices/percentages) expire after a
+            # week — without this the KG fills with stale "current" truths.
+            try:
+                # 21-day window + release to sub-authoritative trust (0.6): the
+                # quarantine holds only low-credibility single-source claims, so
+                # age-release must not hand a patient poisoner an authoritative
+                # fact (full-system exploration 2026-07-09).
+                promoted = await svc.kg.promote_aged_quarantine(days=21, max_count=500)
+                if promoted:
+                    parts.append(f"KG quarantine age-released (low-trust): {promoted}")
+                snap = await svc.kg.retire_stale_snapshots(days=7, max_count=500)
+                if snap:
+                    parts.append(f"KG stale snapshots retired: {snap}")
+            except Exception as e:
+                parts.append(f"KG snapshot-retire failed: {e}")
+                logger.warning("[Heartbeat] KG snapshot-retire failed: %s", e)
             # Aggressively decay speculative cross_synthesis facts that no
             # query ever retrieved — closes the loop on synthesis quality.
             try:
@@ -1856,6 +1929,25 @@ class HeartbeatLoop:
                                     old.unlink()
                                 except OSError:
                                     pass
+                            # Disaster-recovery extras (2026-07-08): 30GB of
+                            # model weights are re-pullable — a MANIFEST is the
+                            # backup. Config overrides are tiny and essential.
+                            try:
+                                import httpx as _httpx
+                                async with _httpx.AsyncClient(timeout=10) as _c:
+                                    _tags = (await _c.get(f"{config.OLLAMA_URL}/api/tags")).json()
+                                _names = [m.get("name", "?") for m in _tags.get("models", [])]
+                                (off_dir / "models_manifest.txt").write_text(
+                                    "\n".join(sorted(_names)) + "\n", encoding="utf-8")
+                            except Exception as _e:
+                                logger.warning("[Heartbeat] models manifest failed: %s", _e)
+                            try:
+                                _ov = Path("/data/config_overrides.json")
+                                if _ov.exists():
+                                    await asyncio.to_thread(
+                                        shutil.copyfile, _ov, off_dir / "config_overrides.json")
+                            except Exception as _e:
+                                logger.warning("[Heartbeat] config override copy failed: %s", _e)
                         else:
                             logger.error(
                                 "[Heartbeat] Off-volume backup verification FAILED: %s", off_detail)
@@ -2367,8 +2459,13 @@ class HeartbeatLoop:
         for ch in ("discord", "telegram", "whatsapp", "signal"):
             if ch in targets and bots[ch]:
                 try:
-                    await bots[ch].send_alert(text)
-                    sent = True
+                    # send_alert returns True only on actual delivery; adapters
+                    # used to swallow failures, so `sent` lied and the digest
+                    # was recorded delivered while nothing reached the owner.
+                    ok = await bots[ch].send_alert(text)
+                    sent = sent or bool(ok)
+                    if not ok:
+                        logger.error("[Heartbeat] %s alert NOT delivered", ch)
                 except Exception as e:
                     logger.error("[Heartbeat] %s alert failed: %s", ch, e)
         return sent
@@ -2425,6 +2522,29 @@ class HeartbeatLoop:
                 if await self._broadcast(digest, set(tgt)):
                     logger.info("[Heartbeat] digest sent: %d update(s) → %s",
                                 len(items), ",".join(sorted(tgt)))
+                    for name, _ in items:
+                        self._alert_retry_counts.pop(name, None)
+                else:
+                    # Every channel failed — re-buffer for the next flush so
+                    # the intelligence isn't silently lost (record_check has
+                    # already advanced, so the monitor won't refire on its own).
+                    kept = 0
+                    for name, msg in items:
+                        n = self._alert_retry_counts.get(name, 0) + 1
+                        self._alert_retry_counts[name] = n
+                        if n <= 3:
+                            self._digest_buffer.append((tgt, name, msg, cats.get(name, "")))
+                            kept += 1
+                        else:
+                            logger.error(
+                                "[Heartbeat] digest for '%s' undelivered after %d attempts — dropped",
+                                name, n,
+                            )
+                    if kept:
+                        logger.warning(
+                            "[Heartbeat] delivery failed on all channels — re-buffered %d item(s)",
+                            kept,
+                        )
             except Exception as e:
                 logger.error("[Heartbeat] digest flush failed: %s", e)
 

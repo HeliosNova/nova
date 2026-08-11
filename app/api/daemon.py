@@ -45,7 +45,11 @@ async def ingest_event(event: EventIn):
         raise HTTPException(503, "Monitor store not initialized")
 
     db = svc.monitor_store.db
-    db.execute(
+    # to_thread: writer-lock DB call — never block the event loop on it
+    # (54h-freeze bug class, 2026-07-03).
+    import asyncio
+    await asyncio.to_thread(
+        db.execute,
         "INSERT INTO event_queue (event_type, payload, priority) VALUES (?, ?, ?)",
         (event.event_type, json.dumps(event.payload), event.priority),
     )
