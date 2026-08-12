@@ -132,6 +132,22 @@ ALL background tasks (correction extraction, fact extraction, title generation, 
 Main responses use `generate_with_tools()` (thinking suppressed for speed) or `stream_with_thinking()`
 (thinking enabled for extended reasoning, controlled by `ENABLE_EXTENDED_THINKING`).
 
+### num_ctx discipline (background LLM calls)
+`invoke_nothink` runs at the MODEL DEFAULT context (typically 4096) unless the
+caller passes `num_ctx` — Ollama then **silently truncates the prompt** to fit,
+and the model answers from a mangled fragment. This killed storylines invisibly
+for 5 weeks (2026-08-11: its ~20k-char cluster prompt returned hallucinated
+garbage → `[]` → "no ongoing stories identified" every cycle). Any call whose
+prompt can exceed ~12k chars MUST pass an explicit `num_ctx` sized for
+prompt + max_tokens. Two tripwires in `providers/ollama.py` now make both
+failure modes loud: `[num_ctx]` ERROR when prompt_eval_count hits the effective
+ctx, and `[truncation]` warns carry eval/prompt_eval counts (a low chars-per-
+token ratio fingerprints budget burned outside visible content). The
+deep_research chain's ctx lattice was re-sized for the 27B synthesis model
+2026-08-11 (per-story 16384, enrich/verify 20480, candidates/merge 24576 —
+all measured 100% GPU on the 3090); if `ollama ps` ever shows CPU spill, dial
+the 24576 stages down before touching the content caps.
+
 ### JSON from LLM
 - `repeat_penalty` is **1.1 everywhere** (`ollama.py`, 2026-06-12). It must be 1.1 for
   `json_mode=True` (higher mangles JSON); the non-JSON path used to default to 1.5, which

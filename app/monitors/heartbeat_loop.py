@@ -632,6 +632,7 @@ class HeartbeatLoop:
         "goal_derivation": lambda self, m, cfg: self._execute_goal_derivation(),
         "synthesis": lambda self, m, cfg: self._execute_cross_synthesis(),
         "storyline": lambda self, m, cfg: self._execute_storyline_tracker(),
+        "consolidation": lambda self, m, cfg: self._execute_knowledge_consolidation(),
         "forecast_resolve": lambda self, m, cfg: self._execute_forecast_resolve(),
         "auto_tool": lambda self, m, cfg: self._execute_auto_tool_synthesis(),
         "output_eval": lambda self, m, cfg: self._execute_output_eval(),
@@ -742,6 +743,20 @@ class HeartbeatLoop:
         except Exception as e:
             logger.exception("[Heartbeat] Storyline tracker failed")
             return f"STORYLINE ERROR: {e}"
+
+    async def _execute_knowledge_consolidation(self) -> str:
+        """Distill recent digests + moved storylines into standing DOSSIERS —
+        the knowing tier (2026-08-12). Runs daily, before the 30-day
+        monitor_results retention can shred the analytical content."""
+        if not getattr(config, "ENABLE_DOSSIERS", True):
+            return "KNOWING | disabled (ENABLE_DOSSIERS=false)"
+        from app.database import get_db
+        from app.core.dossiers import consolidate_dossiers
+        try:
+            return await consolidate_dossiers(get_db())
+        except Exception as e:
+            logger.exception("[Heartbeat] Knowledge consolidation failed")
+            return f"KNOWING ERROR: {e}"
 
     async def _execute_forecast_resolve(self) -> str:
         """Grade falsifiable forecasts whose horizon has passed (hit/miss), and

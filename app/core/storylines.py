@@ -143,11 +143,19 @@ async def _cluster_into_stories(items: list[dict], existing_titles: list[str] | 
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": prompt}],
             json_mode=True, json_prefix="[{", max_tokens=700, temperature=0.2,
+            # num_ctx REQUIRED (2026-08-11): 120 items × ~300 chars ≈ 20-36k chars
+            # (~5-9k tokens) — far past the 4096 model default. Without it Ollama
+            # silently truncated the prompt and the model returned hallucinated
+            # garbage → parse fail → [] → "no ongoing stories identified" every
+            # cycle since the 7/6 monitor_store un-truncation fix ballooned the
+            # items. Repro'd red (garbage) / green (8 clean stories) 2026-08-11.
+            num_ctx=16384,
         )
     except Exception as e:
         logger.warning("[Storyline] cluster LLM failed: %s", e)
         return []
     if not raw:
+        logger.warning("[Storyline] cluster returned EMPTY for %d items — storylines will not update this cycle", len(items))
         return []
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
@@ -169,6 +177,12 @@ async def _cluster_into_stories(items: list[dict], existing_titles: list[str] | 
                 "monitors": sorted({items[i]["monitor"] for i in idxs}),
                 "developments": [items[i]["text"] for i in idxs],
             })
+    if not stories:
+        # Un-silenced (2026-08-11): a zero-story parse on real items is the
+        # signature of an upstream failure (prompt truncation, malformed JSON),
+        # not a quiet news day — it killed storylines invisibly for 5 weeks.
+        logger.warning("[Storyline] cluster parse yielded 0 stories from %d items — raw head: %r",
+                       len(items), (raw or "")[:200])
     return stories
 
 

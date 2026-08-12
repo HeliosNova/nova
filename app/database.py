@@ -1012,6 +1012,49 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 25 (2026-08-12): the KNOWING tier — living dossiers.
+        # Durable, revisable understanding distilled from digests (which expire
+        # on a 30-day retention) + mature storylines. `dossier_revisions` keeps
+        # every prior body (valid_from/valid_to) so "what did Nova understand
+        # about X on date D" is queryable — same bitemporal philosophy as kg_facts.
+        if 25 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS dossiers ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  kind TEXT NOT NULL,"                    # 'domain' | 'storyline'
+                    "  dkey TEXT NOT NULL,"                    # stable slug within kind
+                    "  title TEXT NOT NULL,"
+                    "  body TEXT DEFAULT '',"                  # structured md understanding
+                    "  changed_note TEXT DEFAULT '',"          # last CHANGED: line
+                    "  update_count INTEGER DEFAULT 0,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  UNIQUE(kind, dkey)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dossiers_kind_updated ON dossiers (kind, updated_at)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS dossier_revisions ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  dossier_id INTEGER REFERENCES dossiers(id) ON DELETE CASCADE,"
+                    "  body TEXT NOT NULL,"
+                    "  valid_from TIMESTAMP,"                  # prior body's updated_at
+                    "  valid_to TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dossier_revisions_d ON dossier_revisions (dossier_id, valid_to)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (25,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

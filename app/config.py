@@ -90,6 +90,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
     "ENABLE_STORYLINES", "ENABLE_SALIENCE_FILTER", "ENABLE_FORECASTS",
+    "ENABLE_DOSSIERS",
     "ENABLE_TWO_PHASE_DREAM", "DREAM_REM_TIMEOUT_SECONDS",
     # Prompt self-modification
     "ENABLE_PROMPT_SELF_MOD",
@@ -247,6 +248,9 @@ class Config:
     ENABLE_STORYLINES: bool = field(default_factory=lambda: _env("ENABLE_STORYLINES", "true").lower() == "true")
     ENABLE_SALIENCE_FILTER: bool = field(default_factory=lambda: _env("ENABLE_SALIENCE_FILTER", "true").lower() == "true")
     ENABLE_FORECASTS: bool = field(default_factory=lambda: _env("ENABLE_FORECASTS", "true").lower() == "true")
+    # Knowing tier (2026-08-12): living dossiers — durable understanding distilled
+    # from digests before their 30-day expiry; primes digest synthesis + chat.
+    ENABLE_DOSSIERS: bool = field(default_factory=lambda: _env("ENABLE_DOSSIERS", "true").lower() == "true")
 
     # Tools
     SEARXNG_URL: str = field(default_factory=lambda: _env("SEARXNG_URL", "http://searxng:8080"))

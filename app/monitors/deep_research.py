@@ -2194,23 +2194,39 @@ async def _corroborate_numbers(text: str, articles: list) -> tuple[str, set]:
     return text, confirmed
 
 
-_COMMON_ANALYSIS_CAP = 18000   # chars of deep analyses in the shared block
+_COMMON_ANALYSIS_CAP = 30000   # chars of deep analyses in the shared block
 _COMMON_EVIDENCE_CAP = 9000    # chars of findings in the shared block
-# Worst case COMMON ≈ 27k chars ≈ ~6.8k tokens — leaves room in the 12288 ctx for
-# the per-stage suffix (instructions + draft) + generation on every chain stage.
+# ANALYSIS_CAP 18000→30000 (2026-08-11): 7 stories × ~4.3k chars of self-bounded
+# 27B analysis ≈ 30k — at 18k, stories 4-7's analyses were silently dropped from
+# every synthesis. Worst case COMMON ≈ 39k chars ≈ ~10k tokens; the chain stages'
+# num_ctx were re-sized for it (candidates/merge 24576, enrich/verify 20480,
+# pick 16384) — the prefix cache (#34) makes the bigger shared pack near-free
+# after the first stage. If `ollama ps` ever shows CPU spill on the 27B, dial
+# the 24576 stages down before touching the caps.
 
 
-def _common_context(today: str, label: str, analysis_block: str, evidence: str) -> str:
+# Knowing tier (2026-08-12): the synthesis is asked to count today's developments
+# against the PRIOR UNDERSTANDING dossier; the line is logged (instrumentation of
+# knowing) and stripped before the digest is stored/posted.
+_KNOWN_VS_NEW_RE = re.compile(r"(?im)^\s*KNOWN-VS-NEW:\s*(.+?)\s*$")
+
+
+def _common_context(today: str, label: str, analysis_block: str, evidence: str,
+                    prior_block: str = "") -> str:
     """The invariant evidence pack shared as the BYTE-IDENTICAL PREFIX of every
     synthesis-chain call (synthesis → judge → enrich → verify). llama.cpp reuses
     the KV cache of the longest common prefix across consecutive requests on a
     slot, so every stage after the first skips re-processing the (large) evidence
     — only the per-stage instructions + draft that come AFTER this block are new
     tokens. Byte-identity is the contract: same caps, same wording, built once.
-    (Phase 1 #34; MAX_CONCURRENT_LLM_MONITORS=1 keeps the chain uninterleaved.)"""
+    (Phase 1 #34; MAX_CONCURRENT_LLM_MONITORS=1 keeps the chain uninterleaved.)
+    `prior_block` (knowing tier, 2026-08-12): the domain dossier — per-run stable,
+    so it lives inside the shared prefix and every chain stage can judge
+    new-vs-known and contradictions against it."""
     return (f"Today is {today}. {label} intelligence — evidence pack. The DEEP ANALYSES "
             "and SOURCE FINDINGS below are the ONLY admissible facts for every task that "
             "follows.\n\n"
+            + prior_block
             + analysis_block[:_COMMON_ANALYSIS_CAP]
             + "SOURCE FINDINGS (cite these inline):\n" + evidence[:_COMMON_EVIDENCE_CAP]
             + "\n\n")
@@ -2229,9 +2245,14 @@ async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
     `context_block` (prefix-cache #34): the caller's shared evidence prefix — the
     judge prompt starts with the same bytes so its KV cache is reused."""
     temps = list(temps)[:max(1, n)]
+    # num_ctx 12288→24576 (2026-08-11): the synthesis prompt = common pack (~10k
+    # tokens after the ANALYSIS_CAP raise) + evidence overflow + checklist +
+    # instructions (~5-6k) + 5000 gen — 12288 was silently head-truncating the
+    # evidence pack on big domains. 27B KV at 24576 extrapolates to ~19.4GB total
+    # on the 3090 (measured 18.6GB at 16384) — verified post-deploy via ollama ps.
     raw = await asyncio.gather(*[
         _invoke_bg([{"role": "user", "content": prompt}],
-                           max_tokens=max_tokens, temperature=t, num_ctx=12288, model=model)
+                           max_tokens=max_tokens, temperature=t, num_ctx=24576, model=model)
         for t in temps], return_exceptions=True)
     cands = [(c or "").strip() for c in raw if isinstance(c, str) and (c or "").strip()]
     if len(cands) <= 1:
@@ -2258,7 +2279,10 @@ async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
             "support; keep the sharpest analysis and 'so what'. Do NOT introduce any "
             "claim that is not in the SOURCE FINDINGS. Output ONLY the final briefing "
             "in the same format as the drafts.\n\n" + listing}],
-            max_tokens=max_tokens, temperature=0.15, num_ctx=12288, model=model) or "").strip()
+            # 12288→24576 (2026-08-11): common (~10k tok) + 4×6k-char drafts (~6k
+            # tok) + 5000 gen ≈ 21k — the FINAL-briefing writer was running with a
+            # silently amputated prompt at 12288.
+            max_tokens=max_tokens, temperature=0.15, num_ctx=24576, model=model) or "").strip()
         # A valid merge must be briefing-sized; a refusal/fragment falls back.
         if len(merged) >= 0.5 * max(len(c) for c in cands):
             return merged
@@ -2277,7 +2301,10 @@ async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
             "(concrete numbers, names, dates), (c) sharpest on analysis and the 'so what', (d) covers "
             "the most distinct stories, (e) cleanest structure. Reply with ONLY the candidate number.\n\n"
             + pick_listing}],
-            max_tokens=6, temperature=0.0, num_ctx=12288, model=model)
+            # 12288→16384 (2026-08-11): common + 4×3800-char previews overflowed
+            # 12288 (the 5× "max_tokens (6)" truncation warns were this call
+            # generating against a truncated prompt).
+            max_tokens=6, temperature=0.0, num_ctx=16384, model=model)
         m = re.search(r"\d+", pick or "")
         idx = (int(m.group()) - 1) if m else 0
     except Exception:
@@ -2916,6 +2943,7 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
                 " [RARR]" if _rarr else "")
 
     final = _strip_prompt_leak(final)   # drop any synthesis-prompt instructions the model echoed
+    final = _KNOWN_VS_NEW_RE.sub("", final).strip()   # belt-and-braces: knowing marker must never post
     final = _strip_fake_citations(final, hosts)   # drop fabricated-attribution lines
     final, _ = await _ensure_citations(final, findings, model=syn_model)   # backstop: re-cite an uncited misfire
     final, _ = await _ground_numbers(final, [b for _, _, b in articles], model=syn_model)  # every figure traces to a source
@@ -3020,8 +3048,16 @@ async def _deep_analyze(findings: list, label: str, today: str, *,
                 "- WHY it matters and the second-order implications;\n"
                 "- any tension, disagreement, or uncertainty across the sources;\n"
                 "- what to watch next.\n"
+                "Write a COMPLETE analysis of ~500-650 words covering ALL four points — "
+                "finish cleanly with a complete final sentence; never stop mid-thought.\n"
                 f"STORY: {title}\n\nSOURCES:\n{ev}"}],
-                max_tokens=1400, temperature=0.3, model=model, num_ctx=12288)
+                # 2200 (was 1400) + num_ctx 16384 (was 12288), 2026-08-11: Lever C
+                # routed this to the 27B, which writes ~6k chars — the 1400 cap cut
+                # it mid-generation on ~90% of stories (689 [truncation] warns in
+                # 2.5 days), always amputating the tail sections (tension / what to
+                # watch). The word-target above makes the model self-bound; the cap
+                # is now a backstop with headroom, not the editor.
+                max_tokens=2200, temperature=0.3, model=model, num_ctx=16384)
             return (title, (a or "").strip())
         except Exception:
             return (title, "")
@@ -3059,7 +3095,9 @@ async def _enrich_overview(draft: str, analysis_block: str, common: str, label: 
             f"Add ONLY what the analyses/findings above support; invent NOTHING; cite every new "
             f"sentence inline.\n\n"
             f"DRAFT:\n{draft}"}],
-            max_tokens=5000, temperature=0.35, num_ctx=16384, model=model)
+            # 16384→20480 (2026-08-11): common grew to ~10k tokens with the
+            # ANALYSIS_CAP raise; + draft (~2.2k) + 5000 gen ≈ 18k.
+            max_tokens=5000, temperature=0.35, num_ctx=20480, model=model)
         out = (out or "").strip()
         return out if _accept_correction(draft, out) else draft   # keep only a structure-preserving, non-shrinking result
     except Exception as e:
@@ -3158,12 +3196,31 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "DEEP ANALYSES — each story already reasoned over by an analyst; draw on these for the "
         f"insight, the 'so what', and the connections:\n{deep}\n\n" if deep else "")
 
+    # Knowing tier (2026-08-12): write today's digest AGAINST what Nova already
+    # understands. The domain dossier primes novelty + contradiction detection
+    # instead of amnesiac re-reporting. Gated + fail-open; no dossier = no block.
+    prior_block = ""
+    if getattr(_cfg, "ENABLE_DOSSIERS", True):
+        try:
+            from app.core.dossiers import get_domain_dossier
+            from app.database import get_db
+            _d = get_domain_dossier(get_db(), label)
+            if _d and _d["body"]:
+                prior_block = (
+                    "PRIOR UNDERSTANDING — what Nova already knew about this domain "
+                    "BEFORE today (its standing dossier). Use it to judge what is "
+                    "genuinely NEW vs already known. It is context, NOT today's "
+                    "evidence — never cite it as the source for a new claim:\n"
+                    + _d["body"][:2500] + "\n\n")
+        except Exception as e:
+            logger.debug("[Knowing] dossier priming unavailable: %s", e)
+
     # Prefix-cache (#34): ONE byte-identical evidence pack leads every chain stage
     # (synthesis → judge → enrich → verify) so its KV cache is computed once and
     # reused; only each stage's instructions + draft are new tokens. The synthesis
     # call appends any evidence overflow past the shared cap AFTER the pack — the
     # cache reuses up to the divergence point and synthesis still sees everything.
-    common = _common_context(today, label, analysis_block, evidence)
+    common = _common_context(today, label, analysis_block, evidence, prior_block=prior_block)
     _extra = evidence[_COMMON_EVIDENCE_CAP:]
     # Coverage checklist (#67b): the distinct entity anchors surfaced in the
     # findings. Synthesis-recall was dropping found stories (the DeepResearch
@@ -3216,6 +3273,16 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "EVERY sentence and bullet MUST cite its outlet inline like (cnbc.com). If you cannot cite "
         "a claim from the findings, OMIT it. Use ONLY information present in the analyses/findings "
         "above — never invent a company, number, person, or event.")
+    if prior_block:
+        # Knowing tier: novelty + contradiction discipline against the dossier.
+        _syn_prompt += (
+            "\nA PRIOR UNDERSTANDING block is present above. LEAD with what is genuinely "
+            "NEW or CHANGED relative to it — do not re-report known context except where "
+            "needed for sense. Where today's findings CONTRADICT the prior understanding, "
+            "write 'CONTRADICTS PRIOR UNDERSTANDING:' inline and state the correction "
+            "plainly. After the final section, append exactly one line "
+            "'KNOWN-VS-NEW: <n> new | <n> updates | <n> contradictions' counting today's "
+            "developments against the prior understanding.")
     try:
         # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
         # (owner directive: maximize the best output; extra generations are fine.)
@@ -3228,6 +3295,13 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     draft = (draft or "").strip()
     if not draft:
         return f"## 🌐 {label} — domain overview\n_{today}_\n\n(synthesis unavailable)"
+
+    # Knowing instrumentation: log how today's reading scored against prior
+    # understanding, then strip the marker line from the digest body.
+    _kvn = _KNOWN_VS_NEW_RE.search(draft)
+    if _kvn:
+        logger.info("[Knowing] %s KNOWN-VS-NEW: %s", label, _kvn.group(1).strip())
+        draft = _KNOWN_VS_NEW_RE.sub("", draft).strip()
 
     # ENRICHMENT: add consequential developments the synthesis omitted + deepen thin ones,
     # strictly from the sources (verification + grounding guards below re-check every claim).
@@ -3244,7 +3318,9 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
             # chars truncated full digests MID-SENTENCE ("$47 billion revenue"
             # then stop), silently — the recall levers made digests longer and
             # pushed them over. num_ctx raised so prompt+output both fit (2026-07-08).
-            max_tokens=5000, temperature=0.1, num_ctx=16384, model=syn_model)
+            # 16384→20480 (2026-08-11): common ~10k tokens post-ANALYSIS_CAP raise
+            # + draft + 5000 gen ≈ 18k.
+            max_tokens=5000, temperature=0.1, num_ctx=20480, model=syn_model)
         final = (final or "").strip() or draft
     except Exception:
         final = draft
@@ -3253,6 +3329,7 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
                 " [RARR]" if _rarr else "")
 
     final = _strip_prompt_leak(final)   # drop any synthesis-prompt instructions the model echoed
+    final = _KNOWN_VS_NEW_RE.sub("", final).strip()   # belt-and-braces: knowing marker must never post
     final = _strip_fake_citations(final, hosts)   # drop fabricated-attribution lines
     final, _ = await _ensure_citations(final, findings, model=syn_model)   # backstop: re-cite an uncited misfire
     final, _ = await _ground_numbers(final, [b for _, _, b in articles], model=syn_model)  # every figure traces to a source

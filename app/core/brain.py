@@ -772,6 +772,31 @@ async def _gather_context(
         except Exception as e:
             logger.debug("[storylines] chat retrieval failed: %s", e)
 
+    # --- Standing dossiers (the knowing tier, 2026-08-12) ---
+    # Questions get answered FROM Nova's accumulated understanding: the matched
+    # dossier's 'Current understanding' prose retrieves into context (prose is
+    # native language to the model where raw KG triples were denied — forward-
+    # queue 2026-07-07). Cheap keyword match; gated; degrades silently.
+    if getattr(config, "ENABLE_DOSSIERS", True):
+        try:
+            from app.core.dossiers import get_relevant_dossiers
+            from app.database import get_db
+            _dossiers = await _run_context_io(
+                "dossiers",
+                asyncio.to_thread(get_relevant_dossiers, get_db(), query, limit=1),
+                default=None,
+            )
+            if _dossiers:
+                _dtext = "Standing knowledge dossier (Nova's accumulated understanding):\n" + "\n".join(
+                    f"### {d['title']}\n{d['excerpt']}" for d in _dossiers
+                )
+                ctx.kg_facts_text = (
+                    (_dtext + "\n\n" + ctx.kg_facts_text) if ctx.kg_facts_text else _dtext
+                )
+                logger.info("[dossiers] injected %d dossier(s) into context", len(_dossiers))
+        except Exception as e:
+            logger.debug("[dossiers] chat retrieval failed: %s", e)
+
     # --- Reflexions (past failure warnings) ---
     if svc.reflexions:
         reflexions = await _t_reflexions

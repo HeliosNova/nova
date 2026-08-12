@@ -433,6 +433,7 @@ class MonitorStore:
         "KG Growth Rate",
         # Meta / self-improvement (telegram-only)
         "Storyline Tracker",
+        "Knowledge Consolidation",
         "Forecast Resolution",
         "Dream Consolidation",
         "Capability Review",
@@ -646,6 +647,14 @@ class MonitorStore:
                 "check_config": {},
                 "schedule_seconds": 28800,   # every 8h — track evolving threads, surface what moved
                 "cooldown_minutes": 420,
+                "notify_condition": "on_change",
+            },
+            {
+                "name": "Knowledge Consolidation",
+                "check_type": "consolidation",
+                "check_config": {},
+                "schedule_seconds": 86400,   # daily — distill digests into standing dossiers (knowing tier)
+                "cooldown_minutes": 720,
                 "notify_condition": "on_change",
             },
             {

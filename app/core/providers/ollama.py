@@ -161,9 +161,27 @@ class OllamaProvider:
             # Silent-truncation tripwire: invoke_nothink (the deep_research
             # grounding/synthesis path) never checked done_reason, so a digest
             # hitting max_tokens was cut MID-SENTENCE with no signal (2026-07-08).
+            # eval/prompt_eval counts included (2026-08-11): a low chars-per-token
+            # ratio in this warning is the fingerprint of budget burned outside
+            # visible content (e.g. thinking tokens despite think:false).
             if data.get("done_reason") == "length":
                 logger.warning("[truncation] invoke_nothink hit max_tokens (%d) — output cut mid-generation "
-                               "(model=%s, %d chars)", max_tokens, model, len(content))
+                               "(model=%s, %d chars, eval=%s, prompt_eval=%s)",
+                               max_tokens, model, len(content),
+                               data.get("eval_count"), data.get("prompt_eval_count"))
+
+            # Silent PROMPT-truncation tripwire (2026-08-11): without an explicit
+            # num_ctx this endpoint runs at the model default (typically 4096) and
+            # Ollama drops prompt tokens to fit — the model then answers from a
+            # mangled fragment (proven: the Storyline Tracker's 19k-char cluster
+            # prompt returned hallucinated garbage for 5 weeks, "no ongoing
+            # stories identified" every cycle). Mirrors the generate_with_tools
+            # num_ctx tripwire.
+            _effective_ctx = num_ctx or 4096
+            if data.get("prompt_eval_count", 0) >= _effective_ctx:
+                logger.error("[num_ctx] invoke_nothink prompt_eval_count=%d hit num_ctx=%d (model=%s) — "
+                             "Ollama silently truncated the PROMPT; the caller must pass num_ctx sized "
+                             "for its prompt", data.get("prompt_eval_count", 0), _effective_ctx, model)
 
             content = _strip_think_tags(content)
 
