@@ -189,6 +189,11 @@ def export_kg_fact(fact, key_path: str | None = None) -> dict:
             "valid_from": fact.valid_from or "" if hasattr(fact, "valid_from") else "",
             "valid_to": fact.valid_to or "" if hasattr(fact, "valid_to") else "",
             "provenance": fact.provenance or "" if hasattr(fact, "provenance") else "",
+            # created_at + trust carried so a restore preserves bitemporal
+            # history + credibility (restore-drill finding 2026-08-20; the
+            # /api/export path already carried these).
+            "created_at": getattr(fact, "created_at", "") or "",
+            "trust": getattr(fact, "trust", 0.5),
         }
     else:
         data = {
@@ -200,6 +205,8 @@ def export_kg_fact(fact, key_path: str | None = None) -> dict:
             "valid_from": fact.get("valid_from", ""),
             "valid_to": fact.get("valid_to", ""),
             "provenance": fact.get("provenance", ""),
+            "created_at": fact.get("created_at", ""),
+            "trust": fact.get("trust", 0.5),
         }
     data.update(_export_meta())
 
@@ -249,14 +256,22 @@ def import_kg_fact(data: dict, db, verify_key_path: str | None = None) -> int:
         return -1
 
     cursor = db.execute(
-        """INSERT INTO kg_facts (subject, predicate, object, confidence, source, valid_from, provenance)
-           VALUES (?, ?, ?, ?, ?, datetime('now'), ?)""",
+        """INSERT INTO kg_facts (subject, predicate, object, confidence, source,
+           valid_from, created_at, trust, provenance)
+           VALUES (?, ?, ?, ?, ?, COALESCE(NULLIF(?, ''), datetime('now')),
+           COALESCE(NULLIF(?, ''), datetime('now')), ?, ?)""",
         (
             data["subject"],
             data["predicate"],
             data["object"],
             data.get("confidence", 0.8),
             data.get("source", "imported"),
+            # Preserve original validity/record time so a restore keeps the
+            # bitemporal trail (restore-drill 2026-08-20) instead of stamping
+            # every restored fact "true as of now".
+            data.get("valid_from", "") or "",
+            data.get("created_at", "") or "",
+            data.get("trust", 0.5),
             data.get("provenance", "import"),
         ),
     )
@@ -280,7 +295,10 @@ def export_bundle(db, key_path: str | None = None, *, include_skills: bool = Tru
         "kg_facts": export_all_kg_facts(db),
     }
     if include_skills:
-        bundle["skills"] = export_all_skills(db)
+        # Sign per-item too (not just the envelope): import_skill enforces
+        # REQUIRE_SIGNED_SKILLS per item, so envelope-only signing made every
+        # bundled skill unimportable (audit 2026-08-19).
+        bundle["skills"] = export_all_skills(db, key_path)
 
     if key_path:
         key = load_key(key_path)
@@ -299,10 +317,12 @@ def import_bundle(data: dict, db, verify_key_path: str | None = None) -> dict:
 
     # Verify bundle-level signature first
     signature = data.get("signature")
+    envelope_verified = False
     if signature and verify_key_path:
         key = load_key(verify_key_path)
         if not verify_data(data, signature, key):
             raise SignatureError("Invalid bundle signature")
+        envelope_verified = True
         logger.info("Bundle signature verified")
     elif signature and not verify_key_path:
         logger.warning("Bundle has signature but no verification key — skipping verification")
@@ -331,12 +351,16 @@ def import_bundle(data: dict, db, verify_key_path: str | None = None) -> dict:
             logger.warning("Skipping KG fact: %s", e)
             counts["errors"] += 1
 
-    # Import skills
+    # Import skills — a verified ENVELOPE signature covers its items, so
+    # unsigned per-item skills inside a verified bundle are acceptable even
+    # under REQUIRE_SIGNED_SKILLS (previously every bundled skill was
+    # rejected, audit 2026-08-19).
     if "skills" in data:
         from app.core.skill_export import import_skill
         for item in data["skills"]:
             try:
-                result = import_skill(item, db, verify_key_path)
+                result = import_skill(item, db, verify_key_path,
+                                      envelope_verified=envelope_verified)
                 if result > 0:
                     counts["skills"] += 1
             except Exception as e:

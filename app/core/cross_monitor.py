@@ -26,6 +26,24 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
+async def _bg_invoke(*args, **kwargs):
+    """llm.invoke_nothink with the GPU-yield checkpoint (parity with
+    deep_research._invoke_bg, added 2026-08-19): this module's background
+    chains make many sequential 27B calls — without the checkpoint an owner
+    chat arriving mid-chain contends for the GPU for the whole run (probe:
+    350 tokens at ~2 tok/s during a consolidation cycle)."""
+    try:
+        from app.core.llm import wait_for_interactive_quiet as _w
+        waited = await _w(max_wait_s=240.0)
+        if waited:
+            logger.info("[gpu-yield] %s yielded to chat for %.0fs", __name__, waited)
+    except Exception:
+        pass
+    from app.core.llm import invoke_nothink as _invoke
+    return await _invoke(*args, **kwargs)
+
+
+
 # Stopwords + low-signal tokens we don't want as cluster keys.
 _STOPWORDS = frozenset({
     "the", "a", "an", "and", "or", "but", "of", "in", "on", "at", "to", "for",
@@ -296,7 +314,7 @@ async def _validate_cluster_keys(keys: list[str]) -> set[str]:
         tokens="\n".join(f"- {k}" for k in keys)
     )
     try:
-        text = await invoke_nothink(
+        text = await _bg_invoke(
             [{"role": "user", "content": prompt}],
             json_mode=True,
             json_prefix="{",
@@ -313,9 +331,15 @@ async def _validate_cluster_keys(keys: list[str]) -> set[str]:
         import json as _json
         parsed = _json.loads(text)
     except (ValueError, TypeError):
+        # Log the fail-open (2026-08-18): a silently-dead validator lets every
+        # candidate cluster through, so the expensive synthesis + causal-probe pass
+        # runs on filler the validator was supposed to gate — with no signal.
+        logger.warning("[Synthesis] cluster-key validation unparseable — failing open (%d keys)", len(keys))
         return set(keys)  # fail-open
 
     if not isinstance(parsed, dict):
+        logger.warning("[Synthesis] cluster-key validation returned non-dict %s — failing open",
+                       type(parsed).__name__)
         return set(keys)
 
     keep: set[str] = set()
@@ -335,11 +359,13 @@ _CAUSAL_PROMPT = (
     "These excerpts about '{theme}' come from {n} different intelligence domains "
     "({domains}). Identify the single most-likely CAUSAL CHAIN connecting them — "
     "how a development in one domain drives another (e.g. 'export controls' → "
-    "'chip revenue' → 'AI buildout'). Only if there is a REAL causal link.\n\n"
+    "'chip revenue' → 'AI buildout').\n\n"
     "{evidence}\n\n"
     'Return JSON only: {{"chain": [{{"cause": "short entity", "effect": "short entity"}}], '
     '"confidence": 0.0-0.85}}. Use SHORT entity names (1-4 words), never sentences. '
-    'If the connection is coincidental return {{"chain": []}}.'
+    "Evidence that genuinely spans domains almost always carries at least one "
+    "causal link — extract the STRONGEST one. Return an empty chain ONLY when "
+    "the overlap is purely coincidental keyword usage with no plausible mechanism."
 )
 
 
@@ -353,15 +379,23 @@ async def _causal_probe(cluster: ThemeCluster, *, hours: int) -> list[dict]:
     domains = ", ".join(sorted({re.sub(r"^Domain Study:\s*", "", m) for m in cluster.monitors})[:6])
     evidence = "\n".join(f"- [{m}] {s}" for m, s in cluster.snippets[:8])
     prompt = _CAUSAL_PROMPT.format(theme=cluster.key, n=cluster.breadth, domains=domains, evidence=evidence)
+    # Route to the synthesis 27B (2026-08-14): the 9B returned {"chain": []} on
+    # a probe with a TEXTBOOK causal chain (Iran threat → oil → equities) — the
+    # KG-banking arm was silently dead since Jun 23 while the narrative shipped.
+    # Same remedy as KG extraction (4.6× grounded yield on the 27B).
+    from app.config import config as _cfg
+    _syn = (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
     try:
-        raw = await invoke_nothink(
+        raw = await _bg_invoke(
             [{"role": "user", "content": prompt}],
-            json_mode=True, json_prefix='{"', max_tokens=300, temperature=0.1,
+            json_mode=True, json_prefix="{", max_tokens=300, temperature=0.1,
+            model=_syn,
         )
     except Exception as e:
         logger.warning("[Synthesis] causal probe failed for '%s': %s", cluster.key, e)
         return []
     if not raw:
+        logger.info("[Synthesis] causal probe returned nothing for '%s'", cluster.key)
         return []
     try:
         data = json.loads(raw) if isinstance(raw, str) else raw
@@ -403,7 +437,7 @@ async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
     )
 
     try:
-        text = await invoke_nothink(
+        text = await _bg_invoke(
             [{"role": "user", "content": prompt}],
             max_tokens=320,
             temperature=0.2,
@@ -423,6 +457,20 @@ async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
             return text
         return ""
     return text[:1200]
+
+
+def _preview(text: str, cap: int = 280) -> str:
+    """A short digest preview that never cuts mid-word — the 2026-08-15 overnight
+    watch caught a cross-monitor preview shipping '…Leinweber Foundat…'. Trims to
+    the last whole word within `cap` and appends an ellipsis only when it actually
+    truncated."""
+    t = (text or "").strip()
+    if len(t) <= cap:
+        return t
+    head = t[:cap]
+    if " " in head:
+        head = head.rsplit(None, 1)[0]
+    return head.rstrip(" ,;:—-") + "…"
 
 
 async def synthesize_across_monitors(
@@ -501,7 +549,7 @@ async def synthesize_across_monitors(
             monitors_label += f" (+{len(c.monitors)-5} more)"
         summaries.append(
             f"  • [{c.key}] across {c.breadth} monitors ({monitors_label}):\n"
-            f"    {synth[:280]}{'...' if len(synth) > 280 else ''}"
+            f"    {_preview(synth, 280)}"
         )
 
         # Reject meta-commentary syntheses where the LLM concluded "no real
@@ -613,7 +661,7 @@ async def meta_synthesis(db, *, hours: int = 36) -> str:
         return ""
     blob = "\n\n".join(f"[{lbl}] {ld}" for lbl, ld in leads)[:13000]
     try:
-        out = await invoke_nothink([{"role": "user", "content":
+        out = await _bg_invoke([{"role": "user", "content":
             f"Below are today's LEAD developments from {len(leads)} domain-intelligence monitors "
             "(each tagged with its domain).\n"
             "Find the 2-3 dominant THREADS that connect MULTIPLE domains — a single force or event "

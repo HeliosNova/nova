@@ -380,8 +380,12 @@ async def maybe_update_summary(db: SafeDB, conversation_id: str) -> bool:
     if not is_enabled() or not conversation_id:
         return False
     try:
-        # Fetch messages
-        msg_rows = db.fetchall(
+        import asyncio
+        # Fetch messages — off the event loop (2026-08-20 sweep): this runs as a
+        # coroutine on the loop and did its reads + save_summary's two writes
+        # inline, blocking every coroutine under writer-lock contention.
+        msg_rows = await asyncio.to_thread(
+            db.fetchall,
             "SELECT id, role, content FROM messages "
             "WHERE conversation_id = ? "
             "ORDER BY created_at ASC LIMIT 200",
@@ -411,7 +415,8 @@ async def maybe_update_summary(db: SafeDB, conversation_id: str) -> bool:
             return False
 
         last_id = messages[-1]["id"] if messages else None
-        save_summary(
+        await asyncio.to_thread(
+            save_summary,
             db,
             conversation_id=conversation_id,
             summary_dict=summary,

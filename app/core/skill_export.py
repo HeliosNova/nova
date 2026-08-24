@@ -107,13 +107,17 @@ def export_all_skills(db, private_key_path: str | None = None) -> list[dict]:
 _REQUIRED_FIELDS = ("name", "trigger", "steps")
 
 
-def import_skill(data: dict, db, verify_key_path: str | None = None) -> int:
+def import_skill(data: dict, db, verify_key_path: str | None = None,
+                 *, envelope_verified: bool = False) -> int:
     """Import a single skill dict into the database.
 
     Args:
         data: Skill dict with at least name, trigger, steps.
         db: SafeDB instance.
         verify_key_path: Optional path to hex-encoded HMAC key for verification.
+        envelope_verified: True when this item arrived inside a bundle whose
+            envelope signature was already verified — the envelope covers its
+            items, so an unsigned item is acceptable under REQUIRE_SIGNED_SKILLS.
 
     Returns:
         New skill ID on success, -1 if skipped (duplicate).
@@ -143,7 +147,7 @@ def import_skill(data: dict, db, verify_key_path: str | None = None) -> int:
         raise SkillSignatureError(
             f"Skill '{data['name']}' has signature but no verification key path provided"
         )
-    elif not signature and require_signed:
+    elif not signature and require_signed and not envelope_verified:
         raise SkillSignatureError(
             f"Skill '{data['name']}' is unsigned but REQUIRE_SIGNED_SKILLS is enabled"
         )

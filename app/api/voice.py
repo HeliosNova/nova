@@ -74,6 +74,9 @@ async def transcribe_audio(
             "duration": result.duration,
             "model": config.WHISPER_MODEL_SIZE,
         }
+    except ValueError as e:
+        # Duration-limit rejection — client error, and the message is safe to show.
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         logger.error("[Voice] Transcription runtime error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail="Transcription failed due to an internal error")

@@ -69,9 +69,23 @@ _log_formatter = _CorrelationIDFormatter(
 )
 _log_handler = logging.StreamHandler()
 _log_handler.setFormatter(_log_formatter)
+# Persist logs under /data so delivery-truth (`digest sent` lines) survives
+# container recreation — json-file container logs are destroyed on every rebuild,
+# which left 61/63 of a day's deliveries unverifiable (2026-08-14 audit).
+_log_handlers: list[logging.Handler] = [_log_handler]
+try:
+    from logging.handlers import RotatingFileHandler
+    os.makedirs("/data/logs", exist_ok=True)
+    _file_handler = RotatingFileHandler(
+        "/data/logs/nova-app.log", maxBytes=20_000_000, backupCount=5, encoding="utf-8"
+    )
+    _file_handler.setFormatter(_log_formatter)
+    _log_handlers.append(_file_handler)
+except Exception:
+    pass  # best-effort; never block startup on file logging
 logging.basicConfig(
     level=getattr(logging, os.environ.get("LOG_LEVEL", "INFO").upper(), logging.INFO),
-    handlers=[_log_handler],
+    handlers=_log_handlers,
 )
 # Silence ChromaDB's noisy "Delete of nonexisting embedding" + "Add of existing"
 # warnings. They fire on every prune or upsert when ChromaDB IDs don't match SQLite,
@@ -82,6 +96,10 @@ logging.getLogger("chromadb.segment.impl.vector.local_persistent_hnsw").setLevel
 # ("capture() takes 1 positional argument but 3 were given"). Silence the logger
 # itself so we stop seeing dozens of these per hour.
 logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
+# httpx logs every request URL at INFO; for the Telegram bot that URL embeds the
+# bot TOKEN (…/bot<token>/getUpdates), leaking it into every log sink ~2×/min
+# (2026-08-14 audit: 381 hits in 3h). Silence to WARNING. (Rotate the token — owner.)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 
@@ -139,14 +157,15 @@ async def lifespan(app: FastAPI):
     except Exception as _e:
         logger.warning("Skill embedding sync failed (ChromaDB may be unavailable): %s", _e)
 
-    # Knowledge graph
+    # Knowledge graph + reflexion store. to_thread: their first construction
+    # runs schema DDL (write lock) — keep it off the event-loop thread
+    # (audit 2026-08-23; later constructions skip DDL via the SafeDB memo).
     from app.core.kg import KnowledgeGraph
-    kg = KnowledgeGraph(db)
+    kg = await asyncio.to_thread(KnowledgeGraph, db)
     logger.info("Knowledge graph initialized")
 
-    # Reflexion store
     from app.core.reflexion import ReflexionStore
-    reflexions = ReflexionStore(db)
+    reflexions = await asyncio.to_thread(ReflexionStore, db)
     logger.info("Reflexion store initialized")
 
     # KG auto-curation (heuristic pass runs inline, LLM pass runs in background)
@@ -207,8 +226,11 @@ async def lifespan(app: FastAPI):
     _tool_instances.append(("ContextDetailTool", lambda: ContextDetailTool()))
 
     # Background task manager — persists to SQLite so restarts leave an audit trail.
+    # to_thread: first construction runs persist-table DDL + interrupted-task
+    # hydration (write lock) — keep it off the event-loop thread.
     from app.database import get_db as _get_db
-    task_manager = TaskManager(
+    task_manager = await asyncio.to_thread(
+        TaskManager,
         max_concurrent=config.MAX_BACKGROUND_TASKS,
         task_timeout=config.BACKGROUND_TASK_TIMEOUT,
         db=_get_db(),
@@ -282,7 +304,8 @@ async def lifespan(app: FastAPI):
     trust_manager = None
     try:
         from app.core.trust import TrustManager
-        trust_manager = TrustManager(db)
+        # to_thread: first construction runs DDL + singleton bootstrap (write lock)
+        trust_manager = await asyncio.to_thread(TrustManager, db)
         registry.trust_manager = trust_manager  # Attach to registry for tool gating
         logger.info("Trust system initialized (score: %.0f)", trust_manager.get_score())
     except Exception as e:
@@ -308,8 +331,9 @@ async def lifespan(app: FastAPI):
     topic_tracker = None
     if config.ENABLE_CURIOSITY:
         from app.core.curiosity import CuriosityQueue, TopicTracker
-        curiosity_queue = CuriosityQueue(db)
-        topic_tracker = TopicTracker(db)
+        # to_thread: first construction runs schema DDL (write lock)
+        curiosity_queue = await asyncio.to_thread(CuriosityQueue, db)
+        topic_tracker = await asyncio.to_thread(TopicTracker, db)
         logger.info("Curiosity engine initialized")
 
     # External skills loader (AgentSkills format)
@@ -461,6 +485,13 @@ async def lifespan(app: FastAPI):
 
     heartbeat_loop = None
     daily_digest = None
+    # Hoisted to lifespan scope (2026-08-20 sweep) so shutdown can stop them:
+    # both own a background loop with a working stop() that was never called,
+    # so on shutdown close_all() closed the DB connections while the daemon
+    # kept ticking → "closed database" error spam + no draining of in-flight
+    # goal/dream work. The delete-side-of-lifecycle-rots pattern.
+    daemon_orch = None
+    event_trigger = None
     if config.ENABLE_HEARTBEAT and monitor_store:
         try:
             from app.monitors.heartbeat import HeartbeatLoop
@@ -485,6 +516,8 @@ async def lifespan(app: FastAPI):
                     whatsapp_bot=whatsapp_bot,
                     signal_bot=signal_bot,
                     learning_engine=learning,
+                    db=db,  # without this _save/_load_last_digest silently no-op:
+                            # no durable liveness record + restart double-send/skip
                 )
                 dtask = daily_digest.start()
                 dtask.add_done_callback(_on_bg_task_done)
@@ -523,6 +556,11 @@ async def lifespan(app: FastAPI):
     _warm_task = asyncio.create_task(_warmup())
     _warm_task.add_done_callback(_on_bg_task_done)
 
+    # Startup init is done — from here, a sync DB call on the loop thread is a
+    # genuine steady-state offender and the tripwire should be loud.
+    from app.database import SafeDB
+    SafeDB.end_startup_grace()
+
     logger.info("Nova ready.")
 
     yield
@@ -542,6 +580,18 @@ async def lifespan(app: FastAPI):
         heartbeat_loop.stop()
     if daily_digest:
         daily_digest.stop()
+    # Stop the daemon orchestrator + event trigger BEFORE close_all() (2026-08-20
+    # sweep) so their loops aren't ticking against closed DB connections.
+    if daemon_orch:
+        try:
+            await daemon_orch.stop()
+        except Exception as e:
+            logger.warning("Daemon orchestrator stop failed: %s", e)
+    if event_trigger:
+        try:
+            event_trigger.stop()
+        except Exception as e:
+            logger.warning("Event trigger stop failed: %s", e)
 
     # Stop channel bots
     if discord_bot:
@@ -565,6 +615,16 @@ async def lifespan(app: FastAPI):
     # Cancel background tasks
     await task_manager.cancel_all()
 
+    # Cancel the model-warmup task if still running — it was the one startup
+    # background task without a shutdown handler, so close_all() below could
+    # close the DB out from under an in-flight warmup gen (audit 2026-08-23).
+    if _warm_task and not _warm_task.done():
+        _warm_task.cancel()
+        try:
+            await _warm_task
+        except (asyncio.CancelledError, Exception):
+            pass
+
     # Close MCP sessions
     if mcp_manager:
         await mcp_manager.close()
@@ -576,6 +636,16 @@ async def lifespan(app: FastAPI):
     # Close HTTP fetch connection pool
     from app.tools.http_fetch import close_http_client
     await close_http_client()
+
+    # Close the headless browser (2026-08-20 sweep): the class-level chromium
+    # process tree relied solely on the 10-min idle timeout, which only fires
+    # on the NEXT browser call — so shutdown leaked a chromium subprocess
+    # (the 2026-07-06 13-zombie incident class).
+    try:
+        from app.tools.browser import BrowserTool
+        await BrowserTool._close_session()
+    except Exception as e:
+        logger.warning("Browser close on shutdown failed: %s", e)
 
     await close_client()
     from app.database import close_all
@@ -762,6 +832,9 @@ app.include_router(daemon_router, prefix="/api")
 from app.api.exports import router as exports_router
 app.include_router(exports_router, prefix="/api")
 
+from app.api.dossiers import router as dossiers_router
+app.include_router(dossiers_router, prefix="/api")
+
 from app.api.agent import router as agent_router
 app.include_router(agent_router, prefix="/api")
 
@@ -771,8 +844,27 @@ app.include_router(events_router, prefix="/api")
 if config.ENABLE_VOICE or getattr(config, "ENABLE_TTS", False):
     from app.api.voice import router as voice_router
     app.include_router(voice_router, prefix="/api")
+    # Liveness, not just the flag (2026-08-19): TTS was announced "on" while
+    # piper wasn't installed AND the voice model file was missing — every
+    # synthesize call 503'd. Optional pathways must verify they can actually run.
+    _tts_state = "off"
+    if getattr(config, "ENABLE_TTS", False):
+        try:
+            from app.core.voice import _HAS_PIPER
+            from pathlib import Path as _P
+            _model_ok = _P(getattr(config, "TTS_MODEL_PATH", "") or "").exists()
+            if _HAS_PIPER and _model_ok:
+                _tts_state = "on"
+            else:
+                _tts_state = (f"BROKEN (piper installed: {_HAS_PIPER}, "
+                              f"model file exists: {_model_ok}) — synthesize will 503; "
+                              "install piper-tts + model or set ENABLE_TTS=false")
+        except Exception as _e:
+            _tts_state = f"BROKEN ({_e})"
     logger.info(
         "Voice API enabled (STT model: %s, TTS: %s)",
         config.WHISPER_MODEL_SIZE,
-        "on" if getattr(config, "ENABLE_TTS", False) else "off",
+        _tts_state,
     )
+    if _tts_state.startswith("BROKEN"):
+        logger.warning("TTS liveness check failed: %s", _tts_state)

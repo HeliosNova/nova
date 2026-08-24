@@ -141,3 +141,28 @@ def test_related_to_date_fragments_are_garbage():
     assert not is_garbage_triple("Google", "founded_in", "September 1998")
     # related_to with a REAL entity object stays valid
     assert not is_garbage_triple("CLARITY Act", "related_to", "Senate Banking Committee")
+
+
+def test_related_to_bare_measurements_are_garbage():
+    # 2026-08-14: physical-measurement endpoints ("Swift Observatory ~ 363
+    # miles") are attribute values that lost their predicate — junk AS a
+    # related_to edge. The gate caught $-amounts but missed miles/km/GHz/%,
+    # and the trailing \b never fired after the % symbol.
+    from app.core.kg import is_garbage_triple
+    for obj in ("363 miles", "4.5%", "50 km", "3.2 GHz", "800 megawatts", "12 feet"):
+        assert is_garbage_triple("Some Entity", "related_to", obj), obj
+    # entities that merely CONTAIN a number are not measurements
+    for obj in ("Boeing 747", "iPhone 15", "Section 232", "363 Wilshire Boulevard"):
+        assert not is_garbage_triple("Some Entity", "related_to", obj), obj
+    # specific predicates keep legitimate measurement objects
+    assert not is_garbage_triple("Swift Observatory", "orbits_at", "363 miles")
+
+
+def test_related_to_underscore_numeric_artifacts_are_garbage():
+    # 2026-08-14: underscore-joined numerics ("20_percent",
+    # "2.6_million_barrels_per_day") are machine-mangled attribute values.
+    from app.core.kg import is_garbage_triple
+    for obj in ("20_percent", "53.5_percent", "2.6_million_barrels_per_day", "100_million"):
+        assert is_garbage_triple("Some Entity", "related_to", obj), obj
+    # a real snake_case identifier that isn't digit-led stays valid
+    assert not is_garbage_triple("Some Entity", "related_to", "open_source_coalition")

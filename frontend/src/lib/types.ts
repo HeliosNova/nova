@@ -35,7 +35,10 @@ export type EventType =
   | "agent_meta"
   | "agent_start"
   | "agent_done"
-  | "agent_merge";
+  | "agent_merge"
+  // Stream-first pipeline (2026-07-08): a post-emission refine that changed the
+  // draft replaces it in place. ChatPage already handled it; the union lagged.
+  | "revision";
 
 export interface SSEAgentMetaData {
   strategy?: string;
@@ -308,7 +311,10 @@ export interface ReflexionInfo {
   outcome: string;
   reflection: string;
   quality_score: number;
-  tools_used: string[];
+  // The API returns a comma-joined STRING, not an array (2026-08-21 field
+  // audit). ReflexionsSection already splits defensively; typing it honestly
+  // stops future code from an unguarded .map() that would crash at runtime.
+  tools_used: string | string[];
   created_at: string;
 }
 
@@ -473,6 +479,14 @@ export interface KGGraphNode {
   label: string;
   val: number;
   group?: string;
+  // kg_communities id — the color dimension (2026-08-12 graph rebuild)
+  community?: number | null;
+}
+
+export interface KGCommunityLegend {
+  id: number;
+  title: string;
+  members: number;
 }
 
 export interface KGGraphLink {
@@ -485,6 +499,7 @@ export interface KGGraphLink {
 export interface KGGraphData {
   nodes: KGGraphNode[];
   links: KGGraphLink[];
+  communities?: KGCommunityLegend[];
 }
 
 export interface KGStats {
@@ -553,11 +568,14 @@ export interface CustomToolInfo {
 
 export interface CuriosityItem {
   id: number;
-  question: string;
+  topic: string;
   source: string;
-  priority: number;
-  status: string;
+  urgency: number;          // 0–1 (the API field; was mis-typed as `priority`)
+  status: string;           // pending | resolved | dismissed | failed
+  attempts?: number;
+  resolution?: string | null;
   created_at: string;
+  resolved_at?: string | null;
 }
 
 // ── Fine-tune Trigger Response ──
@@ -565,4 +583,88 @@ export interface CuriosityItem {
 export interface FinetuneTriggerResponse {
   status: string;
   message?: string;
+}
+
+// ── Knowing tier: dossiers (2026-08-12) ──
+
+export interface StorylineSummary {
+  id: number;
+  title: string;
+  status: "active" | "closed";
+  summary: string;
+  monitors: string[];
+  first_seen: string;
+  last_updated: string;
+  update_count: number;
+  event_count: number;
+}
+
+export interface StorylineEvent {
+  id: number;
+  summary: string;
+  source: string | null;
+  url: string | null;
+  is_new: boolean;
+  published: string | null;
+  created_at: string;
+}
+
+export interface StorylineDetail extends StorylineSummary {
+  story_key: string;
+  events: StorylineEvent[];
+}
+
+export interface StorylineData {
+  stats: { active: number; closed: number };
+  storylines: StorylineSummary[];
+}
+
+export interface Forecast {
+  id: number;
+  claim: string;
+  confidence: number;
+  status: "open" | "hit" | "miss";
+  created_at: string;
+  resolves_at: string | null;
+  resolved_at: string | null;
+  resolution: string | null;
+  source: string | null;
+}
+
+export interface ForecastData {
+  stats: { open: number; hit: number; miss: number; graded: number; accuracy: number | null };
+  open: Forecast[];
+  resolved: Forecast[];
+}
+
+export interface DossierSummary {
+  id: number;
+  kind: "domain" | "entity" | "storyline" | "meta";
+  dkey: string;
+  title: string;
+  changed_note: string;
+  update_count: number;
+  body_chars: number;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface DossierDetail extends DossierSummary {
+  body: string;
+  revision_count: number;
+}
+
+export interface DossierRevision {
+  id: number;
+  valid_from: string | null;
+  valid_to: string;
+  body_chars: number;
+}
+
+export interface DossierRevisionDetail {
+  id: number;
+  dossier_id: number;
+  body: string;
+  valid_from: string | null;
+  valid_to: string;
 }

@@ -28,8 +28,9 @@ import {
   Skeleton,
 } from "../components/ui";
 import DaemonSection from "./monitors/DaemonSection";
+import DigestsSection from "./monitors/DigestsSection";
 
-type PageTab = "monitors" | "system";
+type PageTab = "monitors" | "digests" | "system";
 
 function configTarget(cfg: Record<string, unknown>): string {
   return String(cfg?.url || cfg?.query || cfg?.command || cfg?.target || "—");
@@ -73,7 +74,7 @@ export default function MonitorsPage() {
     setLoading(true);
     Promise.all([
       getMonitors().then(safeSetMonitors).catch(() => setMonitors([])),
-      getRecentMonitorResults().then(safeSetResults).catch(() => setResults([])),
+      getRecentMonitorResults(72).then(safeSetResults).catch(() => setResults([])),
     ]).finally(() => setLoading(false));
   };
 
@@ -258,7 +259,7 @@ export default function MonitorsPage() {
 
         {/* Page tabs */}
         <div className="mb-6 flex gap-1.5">
-          {([["monitors", "Monitors"], ["system", "System"]] as const).map(([key, label]) => (
+          {([["monitors", "Monitors"], ["digests", "Digests"], ["system", "System"]] as const).map(([key, label]) => (
             <button
               key={key}
               onClick={() => setPageTab(key)}
@@ -274,6 +275,8 @@ export default function MonitorsPage() {
         </div>
 
         {pageTab === "system" && <DaemonSection />}
+
+        {pageTab === "digests" && <DigestsSection results={results} monitors={monitors} />}
 
         {pageTab === "monitors" && <>
         {/* Create/Edit form */}

@@ -1,4 +1,9 @@
-import type { ReactNode } from "react";
+import { createContext, useContext, type ReactNode } from "react";
+
+/** True when a legacy page is mounted inside the cosmos Systems drawer, which
+ *  already renders its own panel header — PageHeader then drops the duplicate
+ *  icon + <h1> and keeps only the action buttons (e.g. "New Monitor"). */
+export const EmbeddedChromeContext = createContext(false);
 
 interface Props {
   icon?: ReactNode;
@@ -8,6 +13,10 @@ interface Props {
 }
 
 export default function PageHeader({ icon, title, subtitle, actions }: Props) {
+  const embedded = useContext(EmbeddedChromeContext);
+  if (embedded) {
+    return actions ? <div className="mb-4 flex items-center justify-end gap-2">{actions}</div> : null;
+  }
   return (
     <div className="mb-6 flex items-center justify-between">
       <div className="flex items-center gap-3">

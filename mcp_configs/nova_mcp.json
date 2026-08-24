@@ -1,12 +1,9 @@
 {
+  "//": "Nova's live DB is inside the 'nova_data' Docker volume — unreachable from any host path (the old Desktop paths here served an empty ghost DB; the runner now refuses to start on one). Run the MCP server INSIDE the container via docker exec.",
   "mcpServers": {
     "nova": {
-      "command": "python",
-      "args": ["C:/Users/sysadmin/Desktop/Helios Project/nova_/scripts/mcp_server_runner.py"],
-      "env": {
-        "DB_PATH": "C:/Users/sysadmin/Desktop/Helios Project/nova_/data/nova.db",
-        "CHROMADB_PATH": "C:/Users/sysadmin/Desktop/Helios Project/nova_/data/chromadb"
-      }
+      "command": "docker",
+      "args": ["exec", "-i", "nova-app", "python", "scripts/mcp_server_runner.py"]
     }
   }
 }

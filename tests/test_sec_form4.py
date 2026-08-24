@@ -132,4 +132,4 @@ def test_contracts_rollup_line():
     items = [_MetaIt({"contracts": {"total": 1e9, "count": 2, "branches": {"Navy": 2}}}),
              _MetaIt({"contracts": {"total": 5e8, "count": 1, "branches": {"Army": 1}}})]
     line = dsr._contracts_rollup_line(items)
-    assert "$1.5B across 3 awards" in line and "Navy 2" in line
+    assert "$1.5B ceiling across 3 awards" in line and "Navy 2" in line

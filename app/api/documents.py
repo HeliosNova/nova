@@ -138,6 +138,16 @@ async def ingest_document(request: IngestRequest):
     if not text or not text.strip():
         raise HTTPException(status_code=400, detail="No text content to ingest")
 
+    # Injection scan (2026-08-20 sweep): document ingest was the ONE external-
+    # content ingress that skipped this, so a poisoned PDF/URL was stored raw
+    # and later retrieved into the "PRIMARY SOURCE" prompt block with no
+    # warning. Every other ingress (http_fetch/browser/web_search/mcp) wraps
+    # here; documents must too — persistent injection is worse than transient.
+    from app.config import config as _cfg
+    if getattr(_cfg, "ENABLE_INJECTION_DETECTION", True):
+        from app.core.injection import sanitize_content
+        text = sanitize_content(text, context="document")
+
     doc_id, chunk_count = await svc.retriever.ingest(
         text,
         source=source,
@@ -197,6 +207,10 @@ async def upload_document(
         raise HTTPException(status_code=400, detail="No text could be extracted from this file")
 
     doc_title = (title or file.filename).strip()[:300]
+    from app.config import config as _cfg
+    if getattr(_cfg, "ENABLE_INJECTION_DETECTION", True):
+        from app.core.injection import sanitize_content
+        text = sanitize_content(text, context="document")
     doc_id, chunk_count = await svc.retriever.ingest(
         text,
         source=f"upload:{file.filename}",

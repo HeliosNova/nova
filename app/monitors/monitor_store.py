@@ -31,7 +31,7 @@ _NUMBER_RE = re.compile(r"[\$€£¥]?\s*(-?\d[\d,]*\.?\d*)\s*(%|[KMBTkmbt](?![a
 class Monitor:
     id: int
     name: str
-    check_type: str          # 'url', 'search', 'command', 'system_health', 'query', 'quiz', 'skill_test', 'curiosity', 'auto_monitor', 'maintenance', 'finetune', 'consolidation'
+    check_type: str          # 'url', 'search', 'command', 'system_health', 'query', 'quiz', 'skill_test', 'curiosity', 'auto_monitor', 'maintenance', 'finetune', 'consolidation', 'dream_consolidation'
     check_config: dict       # JSON parsed: {url, query, command, threshold_pct}
     schedule_seconds: int
     enabled: bool
@@ -91,6 +91,7 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "maintenance",
     "finetune",
     "consolidation",
+    "dream_consolidation",
     "capability_review",
     "eval",
     "prompt_analyzer",
@@ -212,7 +213,14 @@ class MonitorStore:
         return cursor.rowcount > 0
 
     def get_due(self) -> list[Monitor]:
-        """Return enabled monitors that are due for a check."""
+        """Return enabled monitors that are due for a check, MOST OVERDUE first.
+
+        Ordering fix (2026-08-14): this returned list_all() order — ORDER BY id
+        — so late-seeded monitors (Dream Consolidation) sat LAST in every deep
+        batch and the knowing cycle waited HOURS behind every digest whenever
+        the queue was deep. Overdue RATIO (elapsed/schedule), not absolute
+        lateness, so slow-cadence monitors aren't structurally punished;
+        never-run monitors sort first (they have no baseline at all)."""
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         monitors = self.list_all()
         due = []
@@ -224,6 +232,14 @@ class MonitorStore:
                 if (now - last).total_seconds() < m.schedule_seconds:
                     continue
             due.append(m)
+
+        def _overdue_ratio(m: Monitor) -> float:
+            if not m.last_check_at:
+                return float("inf")
+            last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
+            return (now - last).total_seconds() / max(m.schedule_seconds, 1)
+
+        due.sort(key=_overdue_ratio, reverse=True)
         return due
 
     # Storage cap for digests/results. Must be ≥ the posted-digest cap (12000,
@@ -683,7 +699,7 @@ class MonitorStore:
             },
             {
                 "name": "Dream Consolidation",
-                "check_type": "consolidation",
+                "check_type": "dream_consolidation",
                 "check_config": {
                     "min_hours_between": 1.0,  # minimum 1h between dream cycles
                 },
@@ -861,14 +877,19 @@ class MonitorStore:
 
         # Prompt Optimizer starts disabled -- user must set ENABLE_PROMPT_SELF_MOD=true
         # and manually enable it. The handler also guards internally at runtime.
-        prompt_opt_row = self._db.fetchone(
-            "SELECT id FROM monitors WHERE name='Prompt Optimizer'"
-        )
-        if prompt_opt_row:
-            self._db.execute(
-                "UPDATE monitors SET enabled=0 WHERE id=? AND enabled=1",
-                (prompt_opt_row["id"],),
+        # Only force-disable while the flag is OFF: seed_defaults runs on EVERY
+        # startup, so the unconditional version silently reverted the documented
+        # opt-in at the next boot (audit 2026-08-19).
+        from app.config import config as _cfg
+        if not getattr(_cfg, "ENABLE_PROMPT_SELF_MOD", False):
+            prompt_opt_row = self._db.fetchone(
+                "SELECT id FROM monitors WHERE name='Prompt Optimizer'"
             )
+            if prompt_opt_row:
+                self._db.execute(
+                    "UPDATE monitors SET enabled=0 WHERE id=? AND enabled=1",
+                    (prompt_opt_row["id"],),
+                )
 
         # Migrate existing monitors: update domain study queries + fix check_types
         self._migrate_existing_monitors()
@@ -1083,6 +1104,17 @@ def extract_numbers(text: str) -> list[float]:
     return numbers
 
 
+# A short value whose PAYLOAD is its number(s): status lines, counts, prices
+# ("42/42 sources live", "$63,410", "CPU 37%"). Anything longer is a prose
+# briefing whose leading number is incidental (a "_read N sources_" header) and
+# must NOT gate change detection via first-number comparison.
+_NUMERIC_READOUT_MAX_CHARS = 200
+
+
+def _is_numeric_readout(value: str) -> bool:
+    return len(value) <= _NUMERIC_READOUT_MAX_CHARS
+
+
 def detect_change(old_value: str, new_value: str, threshold_pct: float = 5.0) -> dict | None:
     """Compare old and new values. Returns change info or None if no significant change.
 
@@ -1094,11 +1126,17 @@ def detect_change(old_value: str, new_value: str, threshold_pct: float = 5.0) ->
     old_value = old_value.strip()
     new_value = new_value.strip()
 
-    # Numeric comparison
+    # Numeric comparison — ONLY for short numeric readouts. For a long prose
+    # briefing the leading number is a source-count header, and comparing it
+    # silently suppressed a fully-rewritten briefing when the count barely moved
+    # (2026-08-14: a fresh DRC-Ebola World Awareness lead never delivered — 27 vs
+    # 28 sources = 3.7% < 5%). Prose falls through to the text/Jaccard path below,
+    # which can only report MORE changes, never fewer (rewording is caught at
+    # similarity > 0.8).
     old_nums = extract_numbers(old_value)
     new_nums = extract_numbers(new_value)
 
-    if old_nums and new_nums:
+    if old_nums and new_nums and _is_numeric_readout(old_value) and _is_numeric_readout(new_value):
         old_n = old_nums[0]
         new_n = new_nums[0]
         if old_n == 0:

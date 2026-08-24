@@ -414,6 +414,17 @@ class HttpFetchTool(BaseTool):
                 # Follow the redirect (strip body for method changes to GET)
                 # Use pinned IP URL + Host header to prevent DNS rebinding
                 redir_headers = dict(req_headers)
+                # Credential-leak guard (2026-08-20 sweep): a caller-supplied
+                # Authorization/Cookie must NOT ride a redirect to a DIFFERENT
+                # host — an attacker page can 302 to their own domain and
+                # harvest the bearer token. Strip auth headers on cross-host
+                # hops (browsers do exactly this).
+                _cur_host = urlparse(str(resp.url)).hostname or ""
+                _next_host = urlparse(next_url).hostname or ""
+                if _cur_host.lower() != _next_host.lower():
+                    for _h in list(redir_headers):
+                        if _h.lower() in ("authorization", "cookie", "proxy-authorization"):
+                            del redir_headers[_h]
                 if redir_host:
                     redir_headers["Host"] = redir_host
                 elif "Host" in redir_headers:

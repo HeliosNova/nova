@@ -267,10 +267,14 @@ CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
 CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_lessons_topic ON lessons(topic);
+-- created_at is the filter column for the lesson/KG decay + age-prune passes
+-- run in daily maintenance; without these they full-scan (audit 2026-08-22).
+CREATE INDEX IF NOT EXISTS idx_lessons_created ON lessons(created_at);
 CREATE INDEX IF NOT EXISTS idx_skills_trigger ON skills(trigger_pattern);
 CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_facts(subject);
 CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_facts(object);
 CREATE INDEX IF NOT EXISTS idx_kg_valid_from ON kg_facts(valid_from);
+CREATE INDEX IF NOT EXISTS idx_kg_created ON kg_facts(created_at);
 CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 CREATE INDEX IF NOT EXISTS idx_monitor_results_monitor ON monitor_results(monitor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_log_type ON action_log(action_type, created_at);
@@ -315,6 +319,23 @@ class SafeDB:
         # Registry of every per-thread connection so close() can shut them all.
         self._all_conns: list[sqlite3.Connection] = []
         self._all_conns_lock = threading.Lock()
+        # Per-instance schema-ensure memo (audit 2026-08-23): stores ran their
+        # idempotent __init__ DDL (CREATE IF NOT EXISTS + ALTER-catch) on EVERY
+        # construction, and stores are constructed repeatedly in async contexts
+        # — live logs showed kg DDL 8x/2h taking the write lock on the
+        # event-loop thread (the lock-convoy class). First construction per
+        # (SafeDB, tag) runs DDL and marks; later ones skip entirely.
+        self._ensured_tags: set[str] = set()
+        self._ensured_lock = threading.Lock()
+
+    def schema_ensured(self, tag: str) -> bool:
+        """True once mark_schema_ensured(tag) ran on THIS SafeDB instance."""
+        with self._ensured_lock:
+            return tag in self._ensured_tags
+
+    def mark_schema_ensured(self, tag: str) -> None:
+        with self._ensured_lock:
+            self._ensured_tags.add(tag)
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = getattr(self._local, "conn", None)
@@ -1055,9 +1076,145 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 26 (2026-08-12): temporal host co-occurrence — the data layer
+        # for PARAPHRASE-network detection (the laundering vector text-similarity
+        # cannot see). Every digest records which source hosts appeared together;
+        # junk-tier pairs that co-occur in nearly every digest either host appears
+        # in are a syndication/farm network and collapse to ONE source in the
+        # independence clustering. Detection self-arms once the counts exist.
+        if 26 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS host_cooccurrence ("
+                    "  host_a TEXT NOT NULL,"                # canonical: host_a < host_b
+                    "  host_b TEXT NOT NULL,"
+                    "  n_cooccur INTEGER DEFAULT 1,"
+                    "  first_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  PRIMARY KEY (host_a, host_b)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS host_digest_counts ("
+                    "  host TEXT PRIMARY KEY,"
+                    "  n_digests INTEGER DEFAULT 1,"
+                    "  last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (26,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 27 (2026-08-12): durable delivery ledger. Monitor alerts that
+        # pass dedup/routing used to buffer ONLY in heartbeat memory until the
+        # digest flush — any restart in that window silently destroyed completed
+        # intelligence (2026-08-12: a finished World Awareness digest sat 29 min
+        # in a size-1 buffer, then a restart wiped it; the DB had the result row
+        # but the owner never saw it). Rows are written when an alert buffers,
+        # deleted on confirmed broadcast, and recovered into the buffer at loop
+        # start — delivery becomes at-least-once instead of best-effort.
+        if 27 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS pending_deliveries ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  targets TEXT NOT NULL,"          # CSV channel names
+                    "  monitor_name TEXT NOT NULL,"
+                    "  message TEXT NOT NULL,"
+                    "  category TEXT DEFAULT '',"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (27,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 28 (2026-08-17): fix a duplicate dispatch key that silently
+        # neutered scheduled Dream Consolidation. Both "Dream Consolidation" and
+        # "Knowledge Consolidation" were seeded with check_type='consolidation',
+        # and _CHECK_DISPATCH defined "consolidation" twice — the later (knowing/
+        # dossier) handler won, so the Dream monitor ran the dossier cycle and the
+        # real dream pipeline (reflexion prune, KG compaction, lesson-contradiction
+        # resolution, DPO mining, procedural consolidation) never ran on schedule.
+        # The dream handler now dispatches on 'dream_consolidation'; migrate the
+        # existing row so it reaches _execute_consolidation.
+        if 28 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "UPDATE monitors SET check_type='dream_consolidation' "
+                    "WHERE name='Dream Consolidation' AND check_type='consolidation'"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (28,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 29 (2026-08-18): index host_cooccurrence.n_cooccur. The
+        # anti-laundering _network_pairs() query filters `WHERE n_cooccur >= 8`
+        # on EVERY digest, but the table only had a (host_a, host_b) PK — so each
+        # call full-scanned all rows (32.5k live and growing). A range index turns
+        # it into a tiny scan of just the high-cooccurrence tail.
+        if 29 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_hco_ncooccur "
+                    "ON host_cooccurrence(n_cooccur)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (29,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 30 (2026-08-19): procedure skills — natural-language
+        # procedural knowledge matched semantically (no regex trigger, no
+        # mechanical steps). The 2026 field converged on NL/markdown skills
+        # (Agent Skills spec, SkillPyramid/SkillBrew); Nova's regex+steps
+        # formalism was the reason the auto-extractor produced 0 organic
+        # skills — the LLM can't reliably author brittle trigger regexes.
+        if 30 not in applied:
+            conn.execute("BEGIN")
+            try:
+                for stmt in (
+                    "ALTER TABLE skills ADD COLUMN kind TEXT DEFAULT 'exec'",
+                    "ALTER TABLE skills ADD COLUMN procedure_text TEXT",
+                ):
+                    try:
+                        conn.execute(stmt)
+                    except sqlite3.OperationalError:
+                        pass  # column already exists (fresh installs)
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (30,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()
+
+    # Startup grace (audit 2026-08-23): app startup runs ~18 one-shot init
+    # calls (auth lockout load, monitor seeding, skill revalidation, ...) on
+    # the lifespan's loop thread BEFORE any traffic exists — nothing can be
+    # blocked, but 18 warnings every boot trained the eye to ignore the
+    # tripwire. main.py flips this off when startup completes, so any warning
+    # in steady-state logs is a genuine event-loop-blocking offender worth
+    # fixing. Processes that never flip it (tests, scripts) simply keep the
+    # observability tripwire quiet — it exists for the live app's loop.
+    _startup_grace: bool = True
+
+    @classmethod
+    def end_startup_grace(cls) -> None:
+        cls._startup_grace = False
 
     def _warn_if_event_loop(self, sql: str) -> None:
         """Flag sync DB calls running on the event-loop thread.
@@ -1067,6 +1224,8 @@ class SafeDB:
         >60s under lock convoy → container unhealthy). Route async-context
         calls through AsyncSafeDB or asyncio.to_thread instead.
         """
+        if SafeDB._startup_grace:
+            return
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -1074,9 +1233,27 @@ class SafeDB:
         key = sql[:120]
         if key not in SafeDB._loop_thread_warned and len(SafeDB._loop_thread_warned) < 256:
             SafeDB._loop_thread_warned.add(key)
+            # Capture the first frame outside this module — the actual DB caller —
+            # so the warning is actionable ("who does sync DB on the loop") instead
+            # of just naming the SQL. Walked only when a warning first fires (once
+            # per unique statement, capped), so the cost stays off the hot path.
+            caller = "?"
+            try:
+                import os
+                import sys as _sys
+                fr = _sys._getframe(1)
+                for _ in range(25):
+                    if fr is None:
+                        break
+                    if fr.f_code.co_filename != __file__:
+                        caller = f"{os.path.basename(fr.f_code.co_filename)}:{fr.f_lineno}"
+                        break
+                    fr = fr.f_back
+            except Exception:
+                pass
             logger.warning(
-                "Sync DB call on event-loop thread (blocks asyncio; use "
-                "AsyncSafeDB or asyncio.to_thread): %s", key
+                "Sync DB call on event-loop thread from %s (blocks asyncio; use "
+                "AsyncSafeDB or asyncio.to_thread): %s", caller, key
             )
 
     @contextmanager

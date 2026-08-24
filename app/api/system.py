@@ -405,65 +405,119 @@ async def get_kg_facts(
     return facts
 
 
+def _entity_worthy(name: str) -> bool:
+    """A node must be an ENTITY, not a sentence fragment or a value.
+
+    The old graph rendered objects like '$16.62 billion in operating income',
+    'four crew members on Tih…', and bare dates as NODES — the hairball was
+    made of non-entities (rebuilt 2026-08-12)."""
+    n = (name or "").strip()
+    if not (3 <= len(n) <= 48):
+        return False
+    if len(n.split()) > 5:
+        return False
+    # Values, dates, counts are facts' OBJECTS, not graph citizens.
+    if n[0] in "$€£0123456789" or n.lower().startswith(("a ", "an ", "the ")):
+        return False
+    return True
+
+
 @router.get("/kg/graph", dependencies=[Depends(require_auth)])
 async def get_kg_graph(
     entity: str = "",
     hops: int = Query(default=2, ge=1, le=4),
     limit: int = Query(default=200, ge=1, le=5000),
+    min_conf: float = Query(default=0.6, ge=0.0, le=1.0),
+    include_related: bool = Query(default=False),
 ):
-    """Return KG data formatted as graph nodes and links for visualization."""
+    """KG data for visualization — rebuilt 2026-08-12.
+
+    Default view = the INDUCED SUBGRAPH of the highest-degree entities over the
+    quality-filtered fact set (current, confident, non-quarantined, entity-worthy
+    endpoints, `related_to` co-mention noise excluded by default). That is the
+    backbone of what Nova knows — coherent and connected — instead of the old
+    BFS-from-top-entities clumps of sentence-fragment nodes. Every node carries
+    its kg_community id + title so the client colors by MEANING."""
     from app.core.brain import get_services
+    from app.database import get_db
+    import json as _json
+
     svc = get_services()
     if not svc.kg:
-        return {"nodes": [], "links": []}
+        return {"nodes": [], "links": [], "communities": []}
+    db = get_db()
 
-    facts: list[dict] = []
+    pred_clause = "" if include_related else "AND predicate != 'related_to'"
+    rows = db.fetchall(
+        f"SELECT subject, predicate, object, confidence FROM kg_facts "
+        f"WHERE superseded_at IS NULL AND valid_to IS NULL "
+        f"AND confidence >= ? AND quarantined = 0 {pred_clause}",
+        (min_conf,),
+    )
+    facts = [dict(r) for r in rows
+             if _entity_worthy(r["subject"]) and _entity_worthy(r["object"])]
+
     if entity.strip():
-        facts = svc.kg.query(entity.strip(), hops=hops, max_results=limit)
-    else:
-        # For large limits, load all current facts directly (no BFS gaps)
-        if limit >= 1000:
-            all_facts = svc.kg.get_all_facts(limit=limit, offset=0)
-            facts = [
-                {"id": f.id, "subject": f.subject, "predicate": f.predicate,
-                 "object": f.object, "confidence": f.confidence, "source": f.source}
-                for f in all_facts if f.valid_to is None
-            ][:limit]
-        else:
-            # BFS from top entities for smaller, focused views
-            seed_count = max(10, limit // 15)
-            per_entity = max(20, limit // seed_count)
-            top = svc.kg.get_top_entities(limit=seed_count)
-            seen_ids: set[int] = set()
-            for ent in top:
-                for f in svc.kg.query(ent["subject"], hops=hops, max_results=per_entity):
-                    if f["id"] not in seen_ids:
-                        seen_ids.add(f["id"])
-                        facts.append(f)
-                        if len(facts) >= limit:
-                            break
-                if len(facts) >= limit:
-                    break
+        # Focused view: n-hop neighborhood of one entity over the filtered set.
+        want = {entity.strip().lower()}
+        for _ in range(hops):
+            grown = set(want)
+            for f in facts:
+                s, o = f["subject"].lower(), f["object"].lower()
+                if s in want or o in want:
+                    grown.add(s)
+                    grown.add(o)
+            want = grown
+        facts = [f for f in facts
+                 if f["subject"].lower() in want and f["object"].lower() in want]
 
-    node_counts: dict[str, int] = {}
-    links = []
+    # Degree over the FILTERED graph → keep the top entities and the edges
+    # among them (induced subgraph), sized to ~limit edges.
+    degree: dict[str, int] = {}
     for f in facts:
-        s, o = f["subject"], f["object"]
-        node_counts[s] = node_counts.get(s, 0) + 1
-        node_counts[o] = node_counts.get(o, 0) + 1
-        links.append({
-            "source": s,
-            "target": o,
-            "label": f["predicate"],
-            "confidence": f.get("confidence", 0.5),
-        })
+        degree[f["subject"]] = degree.get(f["subject"], 0) + 1
+        degree[f["object"]] = degree.get(f["object"], 0) + 1
+    top_n = max(20, min(150, limit // 2))
+    keep = set(sorted(degree, key=lambda k: -degree[k])[:top_n])
+    edges = [f for f in facts if f["subject"] in keep and f["object"] in keep][:limit]
+
+    # Drop isolated nodes (kept by degree but with no surviving edge).
+    connected: set[str] = set()
+    for f in edges:
+        connected.add(f["subject"])
+        connected.add(f["object"])
+
+    # Community membership → the color dimension + legend.
+    ent_comm: dict[str, int] = {}
+    legend: list[dict] = []
+    try:
+        for c in db.fetchall(
+            "SELECT id, title, entities FROM kg_communities "
+            "WHERE valid_to IS NULL ORDER BY entity_count DESC LIMIT 20"
+        ):
+            members = 0
+            for e in _json.loads(c["entities"] or "[]"):
+                el = str(e).lower()
+                for name in connected:
+                    if name.lower() == el and name not in ent_comm:
+                        ent_comm[name] = c["id"]
+                        members += 1
+            if members:
+                legend.append({"id": c["id"], "title": c["title"], "members": members})
+    except Exception:
+        pass
 
     nodes = [
-        {"id": name, "label": name, "val": count}
-        for name, count in node_counts.items()
+        {"id": name, "label": name, "val": degree.get(name, 1),
+         "community": ent_comm.get(name)}
+        for name in connected
     ]
-
-    return {"nodes": nodes, "links": links}
+    links = [
+        {"source": f["subject"], "target": f["object"],
+         "label": f["predicate"], "confidence": f.get("confidence", 0.5)}
+        for f in edges
+    ]
+    return {"nodes": nodes, "links": links, "communities": legend}
 
 
 @router.get("/kg/stats", dependencies=[Depends(require_auth)])
@@ -474,7 +528,9 @@ async def get_kg_stats():
     if not svc.kg:
         return {"total_facts": 0, "current_facts": 0, "superseded_facts": 0,
                 "unique_entities": 0, "unique_predicates": 0}
-    return svc.kg.get_stats()
+    # Four COUNT(*) scans over 15k+ rows — off the event loop (tripwire fired
+    # per request, audit 2026-08-19).
+    return await asyncio.to_thread(svc.kg.get_stats)
 
 
 @router.delete("/kg/facts/{fact_id}", dependencies=[Depends(require_auth)])
@@ -681,15 +737,31 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
                         except json.JSONDecodeError:
                             pass
 
-        # KG facts
-        kg_rows = db.fetchall("SELECT * FROM kg_facts ORDER BY id LIMIT ?", (limit,))
-        kg_facts = [
-            {
-                "subject": r["subject"], "predicate": r["predicate"], "object": r["object"],
-                "confidence": r["confidence"], "source": r["source"],
-            }
-            for r in kg_rows
-        ]
+        # KG facts — LIVE beliefs only, newest-first within the cap. The old
+        # unfiltered `ORDER BY id LIMIT n` took the OLDEST rows — dominated by
+        # superseded facts once the table outgrew the cap (15.9k rows / 5k live,
+        # audit 2026-08-19) — silently dropping most of the live KG, and a
+        # restore then resurrected superseded facts as current beliefs.
+        # Quarantined rows are excluded so an export/import cycle can't launder
+        # them past the quarantine gate.
+        try:
+            kg_rows = db.fetchall(
+                "SELECT * FROM kg_facts WHERE superseded_at IS NULL AND valid_to IS NULL "
+                "AND COALESCE(quarantined, 0) = 0 ORDER BY id DESC LIMIT ?", (limit,))
+        except Exception:
+            # Pre-migration schema (bare kg_facts table in tests/minimal installs)
+            kg_rows = db.fetchall("SELECT * FROM kg_facts ORDER BY id DESC LIMIT ?", (limit,))
+
+        def _kg_row(r):
+            d = {"subject": r["subject"], "predicate": r["predicate"], "object": r["object"],
+                 "confidence": r["confidence"], "source": r["source"]}
+            keys = r.keys()
+            for k in ("valid_from", "created_at", "trust", "provenance"):
+                if k in keys:
+                    d[k] = r[k]
+            return d
+
+        kg_facts = [_kg_row(r) for r in kg_rows]
 
         # Reflexions
         ref_rows = db.fetchall("SELECT * FROM reflexions ORDER BY id LIMIT ?", (limit,))
@@ -853,11 +925,17 @@ async def import_all(file: UploadFile = File(...)):
                     (fact["subject"], fact["predicate"], fact["object"]),
                 )
                 if not existing:
+                    # Preserve the exported temporal/trust fields so a restore
+                    # doesn't flatten fact history into "recorded just now".
                     tx.execute(
-                        "INSERT INTO kg_facts (subject, predicate, object, confidence, source) "
-                        "VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO kg_facts (subject, predicate, object, confidence, source, "
+                        "valid_from, created_at, trust, provenance) "
+                        "VALUES (?, ?, ?, ?, ?, COALESCE(?, CURRENT_TIMESTAMP), "
+                        "COALESCE(?, CURRENT_TIMESTAMP), ?, ?)",
                         (fact["subject"], fact["predicate"], fact["object"],
-                         fact.get("confidence", 0.8), fact.get("source", "imported")),
+                         fact.get("confidence", 0.8), fact.get("source", "imported"),
+                         fact.get("valid_from"), fact.get("created_at"),
+                         fact.get("trust", 0.5), fact.get("provenance", "import")),
                     )
                     stats["kg_facts"] += 1
 

@@ -44,6 +44,17 @@ _PRIMARY_SUBSTR = (
 # reliable", Admiralty A). Slightly below primary records.
 _WIRE = {"reuters.com": 1.0, "apnews.com": 0.98, "afp.com": 0.97, "ap.org": 0.98}
 
+# Curated corrections to the PC1 dataset: legitimate publications the ranking
+# underscores because of a huge SEO/syndication footprint. Without this they
+# fall under the 0.3 demotion gate and starve their beats — The Economic Times
+# ranks 0.22 yet is India's largest business daily and a primary source for the
+# finance/India monitors (demoted ~12x/6h, 2026-08-16). Keep this SMALL and
+# only for verified-legit outlets; the dataset is otherwise accurate.
+_ALLOWLIST = {
+    "economictimes.indiatimes.com": 0.55,
+    "m.economictimes.com": 0.55,
+}
+
 _NEUTRAL_DEFAULT = 0.5  # unknown / un-rated domain
 
 _cache: dict[str, float] | None = None
@@ -103,6 +114,10 @@ def authority(host: str) -> float:
     if any(h.endswith(s) or s + "/" in h for s in _PRIMARY_SUFFIXES) or any(s in h for s in _PRIMARY_SUBSTR):
         return 1.0
     reg = _registrable(h)
+    if h in _ALLOWLIST:
+        return _ALLOWLIST[h]
+    if reg in _ALLOWLIST:
+        return _ALLOWLIST[reg]
     if reg in _WIRE:
         return _WIRE[reg]
     table = _load()

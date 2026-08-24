@@ -42,6 +42,26 @@ _TOOL_SIGNALS = {
 }
 
 
+_ARITH_TIME_UNIT_RE = re.compile(
+    r"(?i)(?:\bplus\b|\bminus\b|\btimes\b|\bdivided\b|\bpercent\b|%|[+*/=]|"
+    r"\bhours?\b|\bminutes?\b|\bseconds?\b|\bam\b|\bpm\b|o'clock|"
+    r"\bkm\b|\bmiles?\b|\bkg\b|\bpounds?\b|\bfeet\b|\bmeters?\b|"
+    r"\bcelsius\b|\bfahrenheit\b|\bconvert\b)")
+
+
+def _is_trivial_single_step(q: str) -> bool:
+    """One short self-contained arithmetic/time/unit question. Planning burns
+    a full LLM round-trip (~10s+ at 24k ctx) and adds zero quality for these —
+    the 'train arrives at 6:15pm' probe spent 35s on a no-tool answer
+    (2026-08-19). Deliberately narrow: needs 2+ digits AND computable
+    vocabulary; multi-part/numbered queries never match."""
+    if len(q) > 160 or q.count("?") > 1:
+        return False
+    if _MULTI_PART_MARKERS.search(q) or _NUMBERED_LIST.search(q):
+        return False
+    return len(re.findall(r"\d", q)) >= 2 and bool(_ARITH_TIME_UNIT_RE.search(q))
+
+
 def should_plan(query: str, intent: str) -> bool:
     """Decide if a query needs planning. Pure heuristic, no LLM call."""
     if intent in ("greeting", "correction"):
@@ -49,6 +69,9 @@ def should_plan(query: str, intent: str) -> bool:
 
     q = query.strip()
     if len(q) < 15:
+        return False
+
+    if _is_trivial_single_step(q):
         return False
 
     signals = 0
@@ -136,7 +159,7 @@ async def create_plan(
                     {"role": "user", "content": query},
                 ],
                 json_mode=True,
-                json_prefix='{"',
+                json_prefix="{",
                 max_tokens=512,  # 300 truncated longer plans → "Unterminated string"
                 temperature=0.1,
             ),

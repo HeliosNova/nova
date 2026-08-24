@@ -1,0 +1,8 @@
+# Nova runs inside Linux containers: shell scripts break outright on CRLF
+# ("syntax error: unexpected ||", bad interpreter) and the freshness check
+# hashes disk-vs-container, so ANY checkout-time CRLF conversion makes the
+# tree lie. The 2026-08-24 merge checkout (Windows, core.autocrlf=true)
+# CRLF'd 364 tracked files and baked broken scripts into two images.
+# Force LF for everything text; no Windows-only files exist (.ps1 runs fine
+# with LF in PowerShell 5+).
+* text=auto eol=lf

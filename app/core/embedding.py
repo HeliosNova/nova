@@ -160,18 +160,31 @@ class OllamaEmbeddingFunction:
 
 
 _CACHED: object = False  # sentinel: not yet resolved
+# If we fell back to the default embedder because a probe FAILED (transient), the
+# monotonic deadline after which get_embedding_function re-probes — so a startup
+# hiccup on the embed instance (still pulling bge-m3, compose ordering) doesn't pin
+# the whole process on 2020-era MiniLM for its lifetime (audit 2026-08-17). A
+# DEFINITIVE default (the model IS an alias for the built-in) leaves this at 0.0.
+_FALLBACK_UNTIL: float = 0.0
+_REPROBE_COOLDOWN_S: float = 300.0
 
 
 def get_embedding_function(force: bool = False):
     """Return an OllamaEmbeddingFunction for the configured model, or None to
     fall back to ChromaDB's default. Result is cached after the first probe."""
-    global _CACHED
+    global _CACHED, _FALLBACK_UNTIL
     if _CACHED is not False and not force:
-        return _CACHED
+        import time
+        should_reprobe = (_CACHED is None and _FALLBACK_UNTIL
+                          and time.monotonic() >= _FALLBACK_UNTIL)
+        if not should_reprobe:
+            return _CACHED
+        logger.info("[embedding] re-probing embedder after prior fallback (cooldown elapsed)")
 
     model = (getattr(config, "EMBEDDING_MODEL", "") or "").strip()
     if model.lower() in _DEFAULT_ALIASES:
         _CACHED = None
+        _FALLBACK_UNTIL = 0.0  # definitive: caller wants the built-in default
         return None
 
     # Prefer the dedicated CPU embed instance (isolated request queue → never
@@ -204,10 +217,14 @@ def get_embedding_function(force: bool = False):
             raise RuntimeError("probe returned no usable vector")
         logger.info("Embedding model active: %s (dim=%d)", model, len(vec[0]))
         _CACHED = ef
+        _FALLBACK_UNTIL = 0.0
     except Exception as e:
+        import time
+        _FALLBACK_UNTIL = time.monotonic() + _REPROBE_COOLDOWN_S
         logger.warning(
             "Embedding model %r not usable via Ollama (%s) — falling back to "
-            "ChromaDB default (all-MiniLM-L6-v2)", model, e)
+            "ChromaDB default (all-MiniLM-L6-v2); will re-probe in %.0fs",
+            model, e, _REPROBE_COOLDOWN_S)
         _CACHED = None
     return _CACHED
 

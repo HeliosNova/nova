@@ -239,7 +239,7 @@ async def grade_report(report: str, label: str, *, model: str | None = None) -> 
     try:
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": _RACE_PROMPT.format(label=label, report=(report or "")[:6000])}],
-            json_mode=True, json_prefix='{"', max_tokens=120, temperature=0.0, model=model,
+            json_mode=True, json_prefix="{", max_tokens=120, temperature=0.0, model=model,
             # explicit num_ctx: a no-ctx call loads the model at the OLLAMA_NUM_CTX
             # env default (was 32768 → the 27B ballooned to 24 GB, 185 MiB free on
             # the whole GPU, 2026-07-06). The report is capped at 6000 chars.

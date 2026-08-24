@@ -37,15 +37,23 @@ _PURE_GREETING = re.compile(
 )
 
 
-async def _classify_intent(query: str) -> str:
+async def _classify_intent(query: str, has_prior_answer: bool = True) -> str:
     """Intent classification — regex first, LLM tiebreaker for ambiguous greetings.
 
     Returns: 'greeting', 'correction', or 'general'
+
+    has_prior_answer: a correction corrects a PRIOR assistant answer. On a
+    first-turn message there is nothing to correct, so correction-shaped
+    phrasing ("Actually, ...") classifies as general — this keeps the
+    auto-thinking gate and the correction machinery off queries that merely
+    contain correction-ish tokens (live 2026-08-24: "Answer yes or no and
+    explain why." classified correction → thinking disabled → wrong answer).
+    Defaults True so callers without conversation context keep legacy behavior.
     """
     stripped = query.strip()
 
     # Single source of truth for correction detection
-    if is_likely_correction(stripped):
+    if has_prior_answer and is_likely_correction(stripped):
         return "correction"
 
     if _GREETING_PATTERNS.match(stripped):

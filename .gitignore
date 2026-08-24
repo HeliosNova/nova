@@ -72,3 +72,6 @@ backups/
 
 # SearXNG local settings (contains secret_key) — use settings.yml.example as template
 searxng/settings.yml
+
+# one-off audit/verification scratch scripts (not part of the app)
+_audit/

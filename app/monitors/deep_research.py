@@ -25,6 +25,7 @@ from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, quote
 
 from app.core import llm
+from app.core.source_authority import authority as _sa_authority
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +85,47 @@ def _json_array(raw) -> list:
         except Exception:
             pass
     return out
+
+
+# Grammar-constrained array schemas (Ollama `format`) — replace the json_prefix="[{"
+# prefill that broke on Ollama 0.32.13 (both models returned a bare {object}, the
+# provider re-prepend corrupted it to "[{{…" → parse fail). See
+# brain_kg._KG_TRIPLES_SCHEMA for the full root-cause note. Two array-shaped calls
+# in this file were on the broken prefill: _learn_facts (grounded KG banking — a
+# SECOND silent-zero-facts vector) and _deep_analyze's story clustering (which
+# only degraded to "one big story" via its fallback, but still lost the per-story
+# analysis layer). Fixed 2026-08-18.
+_FACT_TRIPLES_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string"},
+            "predicate": {"type": "string"},
+            "object": {"type": "string"},
+            "confidence": {"type": "number"},
+        },
+        "required": ["subject", "predicate", "object"],
+    },
+}
+_STORY_GROUPS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": ["title", "items"],
+    },
+}
+# Flat array-of-strings (search queries / subject rewrites). The json_prefix='["'
+# callers degraded to [] on 0.32.13 (the model object-wrapped the array, the
+# re-prepend corrupted it, _json_array salvage returned dicts → the isinstance(str)
+# filter dropped them → empty). This lost the Search-o1 gap-followup loop, facet
+# expansion, and the semantic SKIP/rewrite pass (all fell back to regex/deterministic
+# backstops). A string-array `format` guarantees the shape. Fixed 2026-08-18.
+_STRING_ARRAY_SCHEMA = {"type": "array", "items": {"type": "string"}}
 
 
 # --- Source-quality tiers -------------------------------------------------
@@ -290,6 +332,16 @@ def _source_quality(url: str) -> float:
         return 0.4
     if _JUNK_HOSTS_RE.search(url):
         return 0.5
+    # Dataset-informed floor (2026-08-12): consult the 11,520-domain source-
+    # authority ratings so SELECTION and GATING see them, not just the evidence
+    # tags — before this, a dataset-rated farm (authority <0.3) enjoyed the same
+    # generic 1.0 floor as any unknown host, and a dataset-reputable outlet
+    # (>=0.8) could never anchor a lead. Hand-curated tiers above always win.
+    a = _sa_authority(h)
+    if a >= 0.8:
+        return 2.0
+    if a < 0.3:
+        return 0.4
     return 1.0
 
 
@@ -309,17 +361,22 @@ def _tier_label(url: str) -> str:
     return "single/unverified"
 
 
-def _annotated_evidence(findings: list) -> str:
+def _annotated_evidence(findings: list, host_clusters: dict | None = None) -> str:
     """Each finding tagged '(outlet · reliability · corroboration)' so the synthesizer
     weights by evidence strength instead of treating every claim as equal fact.
     Corroboration = distinct hosts among findings sharing ≥2 significant title tokens
-    (a cheap same-story proxy — no extra LLM/clustering call)."""
+    (a cheap same-story proxy — no extra LLM/clustering call).
+    `host_clusters` (independence, 2026-08-12): when the caller provides the
+    mirror map, same-cluster hosts count ONCE — a syndication network can no
+    longer inflate the corroboration tag the synthesizer picks its lead on."""
     toks = [{w for w in _key_terms(t) if w not in _HEADLINE_STOP and len(w) >= 3}
             for t, _u, _f in findings]
+    hc = host_clusters or {}
     blocks = []
     for i, (t, u, f) in enumerate(findings):
         hosts = {_host(findings[j][1]) for j in range(len(findings)) if len(toks[i] & toks[j]) >= 2}
-        corro = f"{len(hosts)} sources" if len(hosts) >= 2 else "1 source"
+        n_indep = len({hc.get(h, h) for h in hosts})
+        corro = f"{n_indep} sources" if n_indep >= 2 else "1 source"
         blocks.append(f"[{t}] ({_host(u)} · {_tier_label(u)} · {corro})\n{f}")
     return "\n\n".join(blocks)
 
@@ -370,6 +427,14 @@ def _junk_body(b: str) -> bool:
     head = b[:240].lower()
     if ("minimal readable" in head or "%pdf" in head
             or "endstream" in b[:600].lower() or b.count(" obj") > 5):
+        return True
+    # Anti-bot / error interstitials (Akamai "Access Denied" on war.gov is 432
+    # chars — passes the length gate and was treated as a valid article body).
+    if any(p in head for p in (
+        "access denied", "you don't have permission", "pardon our interruption",
+        "request unsuccessful", "attention required", "just a moment",
+        "client challenge",
+    )):
         return True
     sample = b[:3000]
     if len(_CSS_TOKENS.findall(sample)) >= 8 and sample.count(". ") < 5:
@@ -677,11 +742,13 @@ async def _focus_subjects(label: str, feed_key: str | None = None, n: int = 5) -
             f"event, a section/index/market-wrap/quote page, local trivia, a listicle or advert, or "
             f"OFF-TOPIC for {label}.\n" + listing +
             f"\n\nReturn a JSON array of exactly {len(reps)} strings (each a rewrite or \"SKIP\"), same order."}],
-            json_mode=True, json_prefix='["', max_tokens=420, temperature=0.2, model=syn)
+            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=420, temperature=0.2, model=syn)
         subs = [str(s).strip().rstrip("?") for s in _json_array(raw)
                 if isinstance(s, str) and len(str(s).strip()) > 10
                 and not str(s).strip().upper().startswith("SKIP")]
-    except Exception:
+    except Exception as e:
+        logger.warning("[DeepResearch] subject-rewrite LLM failed (%s) — falling back to "
+                       "deterministic headline cleanup: %s", label, e)
         subs = []
     if not subs:  # LLM failed entirely → clean the representative headlines deterministically
         subs = [re.sub(r"\s*[-–|:]\s*[A-Z][\w. '&]{2,30}$", "", t).strip() for t in reps]
@@ -729,7 +796,16 @@ def _reader_main_content(md: str) -> str:
     return art if len(art) >= 500 else ""
 
 
-async def _fetch_via_jina(url: str) -> str | None:
+# Article-body cap. The entailment gate (MiniCheck) needs enough of the cited
+# page to locate the claim; a 5000-char cap here made the 2026-08-21 entail
+# window widen to [:12000] INERT because every body arrived pre-truncated at
+# 5000 (live doc_len never exceeded ~5607). 12000 matches that window; the
+# synthesis path re-caps bodies to 900/28000 of its own accord, so raising this
+# only improves grounding (audit 2026-08-22).
+_BODY_MAX_CHARS = 12000
+
+
+async def _fetch_via_jina(url: str, max_len: int = _BODY_MAX_CHARS) -> str | None:
     """Bypass a paywall/verification wall on a QUALITY source via Jina Reader
     (r.jina.ai) — a reader proxy that fetches + extracts clean article text (verified
     to return full FT/Bloomberg articles the sovereign fetch gets a 403 on). External
@@ -754,14 +830,14 @@ async def _fetch_via_jina(url: str) -> str | None:
         body = _reader_main_content(raw)                          # article prose only (nav/related dropped)
         if body and not _stale_body(body):
             logger.info("[DeepResearch] paywall bypass (jina) read %s (%d chars)", _host(url), len(body))
-            return body[:5000]
+            return body[:max_len]
     except Exception as e:
         logger.debug("[DeepResearch] jina bypass failed %s: %s", _host(url), e)
     return None
 
 
 async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
-                      allow_bypass: bool = True) -> str | None:
+                      allow_bypass: bool = True, max_len: int = _BODY_MAX_CHARS) -> str | None:
     """Read an article body. Fast path: http_fetch (15s). Fallback: headless browser
     (22s) — most quality news (BBC/CNBC/Economist) is JS-rendered. Final fallback for
     QUALITY sources that hit a paywall/verification wall: the Jina reader bypass (gated
@@ -775,7 +851,7 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
         res = await asyncio.wait_for(HttpFetchTool().execute(url=url), timeout=15)
         body = (res.output or "") if getattr(res, "success", False) else ""
         if not _junk_body(body):
-            return body[:5000]
+            return body[:max_len]
     except Exception:
         pass
     from app.config import config as _cfg
@@ -785,11 +861,11 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
     # so bypass directly (no render cost). Metered/client-side hosts fall through to the
     # stealth browser below — a fresh cookieless context resets the meter.
     if _host(url) in _HARD_PAYWALL_HOSTS:
-        return await _fetch_via_jina(url) if can_bypass else None
+        return await _fetch_via_jina(url, max_len) if can_bypass else None
     # JS-rendered → render with the browser, but only within budget.
     if browser_budget is not None:
         if browser_budget[0] <= 0:
-            return await _fetch_via_jina(url) if can_bypass else None
+            return await _fetch_via_jina(url, max_len) if can_bypass else None
         browser_budget[0] -= 1
     from app.tools.browser import BrowserTool
     async with _BROWSER_SEM:
@@ -798,11 +874,11 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
                 BrowserTool().execute(action="navigate", url=url), timeout=22)
             body = (r.output or "") if getattr(r, "success", False) else ""
             if body and not _junk_body(body):
-                return body[:5000]
+                return body[:max_len]
         except Exception:
             pass
     # Browser blocked (consent/soft-paywall) → reader bypass for quality sources.
-    return await _fetch_via_jina(url) if can_bypass else None
+    return await _fetch_via_jina(url, max_len) if can_bypass else None
 
 
 _OLD_YEARS = frozenset(str(y) for y in range(2010, _NOW().year))
@@ -965,7 +1041,7 @@ async def _gather_sources(subject: str, *, read_target: int, browser_budget: int
     raw = await _invoke_bg([{"role": "user", "content":
         f"3 web-search queries digging into this {year} story from different facets "
         f"(what happened, numbers/who, reactions/analysis): '{subject}'. JSON array of 3."}],
-        json_mode=True, json_prefix='["', max_tokens=160)
+        json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=160)
     extra = [a for a in _json_array(raw) if isinstance(a, str) and len(a) > 8][:3]
     angles = [subject, f"{subject} {year}"] + extra
     search_picks, aux_picks = await asyncio.gather(
@@ -1019,7 +1095,7 @@ async def _overview_angles(subjects: list[str]) -> list[str]:
             f"OTHER story, ONE 'what happened' query.\n" +
             "\n".join(f"- {s}" for s in subjects) +
             "\nReturn one flat JSON array of all the query strings."}],
-            json_mode=True, json_prefix='["', max_tokens=360, temperature=0.2)
+            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=360, temperature=0.2)
         angles += [a for a in _json_array(raw) if isinstance(a, str) and len(a) > 8]
     except Exception:
         pass
@@ -1241,10 +1317,12 @@ async def _gap_followup(findings: list, label: str, *, model: str | None = None)
             f"gaps — missing corroboration, the 'so what' details (exact numbers, named players, "
             f"outcomes), or a consequential angle not yet covered. Return a JSON array of query "
             f"strings, most important first; NO commentary."}],
-            json_mode=True, json_prefix='["', max_tokens=220, temperature=0.3, model=model)
+            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=220, temperature=0.3, model=model)
         return [str(q).strip() for q in _json_array(raw)
                 if isinstance(q, str) and 8 < len(str(q).strip()) < 120][:5]
-    except Exception:
+    except Exception as e:
+        logger.warning("[DeepResearch] gap-followup query generation failed (%s) — "
+                       "iterative loop skips expansion this cycle: %s", label, e)
         return []
 
 
@@ -1273,7 +1351,10 @@ async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
                 f"Extract 2-3 concrete findings (facts, numbers, named events) from this article "
                 f"relevant to '{subject}'. Reply IRRELEVANT only if the article is about a COMPLETELY "
                 f"different field. Only what is stated.\n\nTITLE: {title}\n\n{body}"}],
-                max_tokens=240, temperature=0.2)
+                # 320 (was 240), 2026-08-14: the truncation tripwire caught
+                # findings cut mid-sentence several times per day — dangling
+                # fragments were entering the evidence pool.
+                max_tokens=320, temperature=0.2)
             f = (f or "").strip()
             # Drop empties, relevance-rejects, and "the page has no real content"
             # outputs (nav/boilerplate pages that slipped the body gate) — these
@@ -1426,6 +1507,43 @@ def _drop_sentences_with(text: str, bad: set[str]) -> str:
     return "\n".join(out_lines)
 
 
+# Placeholder tokens the correction model writes INSTEAD of removing a sentence
+# whose figure it can't find — bracketed ('[FIGURE NOT IN SOURCES]') or an empty
+# labeled parenthetical ('(Political Rights:; Civil Liberties:)'). These reached
+# Discord verbatim (2026-08-14 Whale Watch shipped six); the numeric backstop
+# only re-checks DIGITS so placeholder prose sailed through.
+_PLACEHOLDER_RE = re.compile(
+    r"\[[^\]]*(?:figure|number|value|data|amount|not in source|not provided|"
+    r"not stated|not specified|no figure|not available|n/?a)[^\]]*\]", re.I)
+_EMPTY_LABEL_RE = re.compile(r"\([^()]*\b\w[\w ]*:\s*(?:;|\))")
+
+
+def _strip_placeholders(text: str) -> str:
+    """Drop any sentence carrying a placeholder token (see _PLACEHOLDER_RE /
+    _EMPTY_LABEL_RE). Line-by-line so headers/bullets survive; a bare label line
+    is kept even if its content sentence dies."""
+    if not text or ("[" not in text and ":" not in text):
+        return text
+    out_lines = []
+    dropped = 0
+    for line in text.split("\n"):
+        stripped = line.lstrip("*-• ").strip()
+        if stripped.startswith("#") or not stripped:
+            out_lines.append(line)
+            continue
+        sentences = re.split(r"(?<=[.!?])\s+(?=[A-Z(\"'])", line)
+        kept = [s for s in sentences
+                if not _PLACEHOLDER_RE.search(s) and not _EMPTY_LABEL_RE.search(s)]
+        dropped += len(sentences) - len(kept)
+        if kept:
+            out_lines.append(" ".join(kept))
+        elif _is_label_line(line):
+            out_lines.append(line)
+    if dropped:
+        logger.info("[DeepResearch] dropped %d sentence(s) carrying a placeholder token", dropped)
+    return "\n".join(out_lines)
+
+
 _SCAFFOLD_RE = re.compile(
     r"(?i)(rewritten draft|provided source text|provided text block|the sources? section|"
     r"based on the (provided|sources)|corrected to match|have been (removed|adjusted)|"
@@ -1453,12 +1571,31 @@ def _strip_correction_scaffold(text: str) -> str:
     return "\n".join(kept).strip()
 
 
+# A dangling "titled '<generic>'" clause — the synthesis model writes a PLACEHOLDER
+# title ('…published in a new article titled "new article"…') when it never got the
+# real one, and it leaked to Discord (2026-08-16 Space digest). Anchored so the
+# quote's ENTIRE content is a generic document-word (optionally 'new/the/a …'), so a
+# real title ('titled "The Immune Response to X"') never matches — the closing quote
+# won't align. Strips only the clause; the surrounding finding survives.
+_PLACEHOLDER_TITLE_RE = re.compile(
+    r"\s*,?\s*(?:titled|entitled|called)\s+"
+    r"[\"'“‘]\s*(?:"
+    r"(?:new|the|this|a|an)?\s*"
+    r"(?:article|study|paper|report|preprint|analysis|manuscript|publication|piece)"
+    r"|untitled|unnamed|unknown|n/?a|tbd|none"       # bare placeholder as the whole title
+    r")\s*[\"'”’]",
+    re.I,
+)
+
+
 def _tidy_citations(text: str) -> str:
-    """Cosmetic cleanup of synthesis citation artifacts (2026-06-24 verification
-    pass): the 9B occasionally wraps a citation in stray '$' ('($quiverquant.com$)')
-    or drops a truncated source TITLE into a citation slot ('(… starts making
-    noise…)'). Deterministic + scoped to parentheticals, so real figures ('$9.2m')
-    and ordinary prose are untouched."""
+    """Cosmetic cleanup of synthesis artifacts (2026-06-24 verification pass): the
+    model occasionally wraps a citation in stray '$' ('($quiverquant.com$)'), drops a
+    truncated source TITLE into a citation slot ('(… starts making noise…)'), emits a
+    placeholder article title ('titled "new article"'), or leaves a trailing space
+    inside emphasis when a token is dropped ('*Artemis *'). Deterministic + tightly
+    scoped, so real figures ('$9.2m'), real titles, bold labels, and bullets are
+    untouched."""
     if not text:
         return text
     # 1) strip stray '$' inside any parenthetical that contains a domain (a citation).
@@ -1470,6 +1607,23 @@ def _tidy_citations(text: str) -> str:
     def _drop(m):
         return m.group(0) if re.search(r"\b[a-z0-9.\-]+\.[a-z]{2,}\b", m.group(1)) else ""
     text = re.sub(r"\s*\(([^()]*\.\.\.)\)", _drop, text)
+    # 3) drop a dangling placeholder-title clause ('titled "new article"') the model
+    #    emits when it lacks the real title (2026-08-16). Clause-level, so the real
+    #    sentence survives.
+    text = _PLACEHOLDER_TITLE_RE.sub("", text)
+    # 4) collapse single-asterisk emphasis wrapping a trailing space ('*Artemis *' ->
+    #    '*Artemis*') — the artifact left when a token is dropped inside italics
+    #    (qwen3.8 dropped 'II' from '*Artemis II*'). Single '*' only (never '**bold**'),
+    #    requires a letter in the span (skips '3 * 4 *' arithmetic), and the opening
+    #    '*' must be mid-line (skips '* ' bullets).
+    text = re.sub(r"(?<=[^\n*])\*([^*\n]*[A-Za-z][^*\n]*?) +\*(?!\*)", r"*\1*", text)
+    # 5) trim a trailing space left inside a BOLD span wrapping a FIGURE whose unit
+    #    the model dropped ('**13,931 **' -> '**13,931**'; qwen3.x sometimes drops
+    #    the unit token e.g. 'BTC' the same way it dropped 'II' from '*Artemis II*').
+    #    The unit itself is unrecoverable, but the dangling '** **' reads as broken.
+    #    Scoped to a number-ending bold span (requires a digit run before the trailing
+    #    space) so bold labels and any '**a** **b**' sequence are untouched (2026-08-18).
+    text = re.sub(r"(\*\*[^*\n]*\d[\d,.]*) +\*\*", r"\1**", text)
     return text
 
 
@@ -1713,9 +1867,10 @@ async def _ground_numbers(text: str, bodies: list[str], *, model: str | None = N
             "SOURCE TEXTS and a DRAFT briefing are below. These figures in the draft do NOT appear "
             "in the sources and were likely misread: " + "; ".join(unver[:12]) + ".\n"
             "Rewrite the draft so EVERY number matches the sources exactly: replace each listed "
-            "figure with the value actually stated in the sources, or delete that specific claim if "
-            "the sources give no figure. Change nothing else — keep all wording, structure, and "
-            "citations.\n"
+            "figure with the value actually stated in the sources, or REMOVE THE ENTIRE SENTENCE "
+            "if the sources give no figure. Never write a placeholder such as '[FIGURE NOT IN "
+            "SOURCES]' and never leave an empty '(Label:)' — omit the whole sentence instead. "
+            "Change nothing else — keep all wording, structure, and citations.\n"
             "OUTPUT RULES: return ONLY the corrected briefing itself, starting at its first heading "
             "or bold line. Do NOT add any preamble, sign-posting, or notes explaining what you "
             "changed (no 'Based on the sources…', no 'here is the rewritten draft', no '*Note:*').\n\n"
@@ -1731,6 +1886,7 @@ async def _ground_numbers(text: str, bodies: list[str], *, model: str | None = N
     still = set(_unverified_numbers(out, corpus, corpus_nc))
     if still:
         out = _drop_sentences_with(out, still)
+    out = _strip_placeholders(out)  # backstop: model wrote a placeholder, not a removal
     logger.info("[DeepResearch] numeric grounding: %d unverified figure(s) corrected/stripped",
                 len(unver))
     return out, len(unver)
@@ -1877,7 +2033,21 @@ def _reg_domain(host: str) -> str:
     return ".".join(parts[-2:]) if len(parts) >= 2 else host
 
 
-_SENT_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z(\"'])")
+# Abbreviation-safe (2026-08-14): the plain (?<=[.!?]) split broke "Staff
+# Sgt. Benjamin Pennington" at the title period — the gate then processed the
+# halves separately and a live digest led with a decapitated name fragment.
+# Common title/rank/entity abbreviations must not end a sentence.
+_SENT_SPLIT_RE = re.compile(
+    r"(?<=[.!?])"
+    r"(?<!\bSgt\.)(?<!\bGen\.)(?<!\bLt\.)(?<!\bCol\.)(?<!\bCapt\.)(?<!\bMaj\.)"
+    r"(?<!\bAdm\.)(?<!\bBrig\.)(?<!\bCmdr\.)(?<!\bSpc\.)(?<!\bCpl\.)(?<!\bPvt\.)"
+    r"(?<!\bDr\.)(?<!\bMr\.)(?<!\bMrs\.)(?<!\bMs\.)(?<!\bProf\.)(?<!\bRev\.)"
+    r"(?<!\bSen\.)(?<!\bRep\.)(?<!\bGov\.)(?<!\bPres\.)(?<!\bSec\.)(?<!\bAmb\.)"
+    r"(?<!\bSt\.)(?<!\bMt\.)(?<!\bFt\.)(?<!\bvs\.)(?<!\bInc\.)(?<!\bCorp\.)"
+    r"(?<!\bLtd\.)(?<!\bCo\.)(?<!\bJr\.)(?<!\bSr\.)(?<!\bNo\.)(?<!\bU\.S\.)"
+    r"(?<!\bU\.K\.)(?<!\bU\.N\.)(?<!\bE\.U\.)"
+    r"\s+(?=[A-Z(\"'])"
+)
 
 
 def _cited_regs(sent: str) -> set:
@@ -2047,16 +2217,182 @@ async def _check_numeric_attribution(text: str, articles: list, *, model: str | 
     return out, len(grafts)
 
 
+# ---------------------------------------------------------------------------
+# Source INDEPENDENCE (2026-08-12) — the anti-laundering layer.
+#
+# Every corroboration count in this module used to equate "distinct hosts" with
+# "independent sources". A mirror/syndication network (N domains republishing
+# the same text) therefore manufactured corroboration: it passed the ≥2-source
+# lead gate, inflated the evidence-pack corroboration tags the synthesizer
+# calibrates on, and ✓-confirmed figures so Lever A skipped fresh-verifying
+# them. This was the #1-ranked residual risk of the 2026-07-09 full-system
+# exploration ("credibility-not-provenance").
+#
+# Fix: cluster articles by near-duplicate BODY text (5-word shingles, Jaccard)
+# — union-find, deterministic, no LLM — and count CLUSTERS wherever
+# independence matters. Two outlets that both merely reprinted the same wire
+# copy are ONE source; an outlet that also wrote its own analysis is a second.
+#
+# Honest limit: text similarity cannot see PARAPHRASE laundering (an LLM-farm
+# rewriting the same claim). For figures that gap is narrowed by the authority
+# floor in _corroborate_numbers (two junk-tier clusters never confirm); full
+# paraphrase-network detection needs temporal host-pair co-occurrence history
+# (designed, not yet built — see memory knowing-tier-2026-08-12).
+# ---------------------------------------------------------------------------
+
+_SHINGLE_WORDS = 5
+_MIRROR_JACCARD = 0.55
+
+
+def _shingles(body: str) -> set[int]:
+    """Hashed 5-word shingles of a normalized body head (bounded for speed)."""
+    words = re.findall(r"[a-z0-9]+", (body or "").lower()[:4000])
+    return {hash(" ".join(words[i:i + _SHINGLE_WORDS]))
+            for i in range(max(0, len(words) - _SHINGLE_WORDS + 1))}
+
+
+def _independence_clusters(articles: list) -> tuple[list[int], dict[str, int]]:
+    """(article_cluster_ids, host→cluster_id): near-duplicate bodies share a
+    cluster. Article-level ids drive figure corroboration (an outlet's ORIGINAL
+    analysis stays independent of the wire copy it also ran); the host map is
+    the coarse view for lead-gate/evidence-tag counting — hosts joined by ANY
+    mirrored pair collapse, which is correct there: if two outlets' only overlap
+    is the same reprint, the lead is NOT independently corroborated."""
+    n = len(articles)
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    shingle_sets = [_shingles(b) for _t, _u, b in articles]
+    for i in range(n):
+        if not shingle_sets[i]:
+            continue
+        for j in range(i + 1, n):
+            if not shingle_sets[j]:
+                continue
+            inter = len(shingle_sets[i] & shingle_sets[j])
+            if not inter:
+                continue
+            union = len(shingle_sets[i] | shingle_sets[j])
+            if inter / union >= _MIRROR_JACCARD:
+                parent[find(i)] = find(j)
+
+    art_cluster = [find(i) for i in range(n)]
+    host_cluster: dict[str, int] = {}
+    # Hosts sharing any mirrored article pair merge (transitively via cluster id).
+    cluster_alias: dict[int, int] = {}
+    for i, (_t, url, _b) in enumerate(articles):
+        h = _host(url)
+        c = cluster_alias.setdefault(art_cluster[i], art_cluster[i])
+        if h in host_cluster and host_cluster[h] != c:
+            # Same host in two clusters — alias the clusters together.
+            old = host_cluster[h]
+            for k, v in list(cluster_alias.items()):
+                if v == old:
+                    cluster_alias[k] = c
+            for k, v in list(host_cluster.items()):
+                if v == old:
+                    host_cluster[k] = c
+        host_cluster[h] = c
+    n_mirrored = n - len(set(art_cluster))
+    if n_mirrored:
+        logger.info("[Independence] %d of %d articles are mirrors/syndication (%d independent clusters)",
+                    n_mirrored, n, len(set(art_cluster)))
+    return art_cluster, host_cluster
+
+
+# --- Temporal co-occurrence (paraphrase-network detection, 2026-08-12) -----
+# Text similarity catches mirrors; it cannot catch an LLM-farm REWRITING the
+# same content across its domains. Those networks have a temporal fingerprint:
+# junk-tier hosts that appear together in nearly every digest either one
+# appears in. Collection is always-on and cheap (one upsert batch per digest);
+# detection self-arms once counts accumulate and feeds the SAME host-cluster
+# map the mirror detector uses. Reputable hosts are never merged — major
+# outlets legitimately co-occur constantly.
+
+_NETWORK_MIN_COOCCUR = 8       # pair must co-appear in >= this many digests
+_NETWORK_MIN_RATIO = 0.8       # ... and in >= 80% of the rarer host's digests
+
+
+def _record_host_cooccurrence(db, hosts: list) -> None:
+    """Upsert this digest's host set into the co-occurrence counts (bounded)."""
+    hs = sorted({h for h in hosts if h and "." in h})[:30]
+    for h in hs:
+        db.execute(
+            "INSERT INTO host_digest_counts (host, n_digests) VALUES (?, 1) "
+            "ON CONFLICT(host) DO UPDATE SET n_digests = n_digests + 1, "
+            "last_seen = CURRENT_TIMESTAMP", (h,))
+    for i in range(len(hs)):
+        for j in range(i + 1, len(hs)):
+            db.execute(
+                "INSERT INTO host_cooccurrence (host_a, host_b) VALUES (?, ?) "
+                "ON CONFLICT(host_a, host_b) DO UPDATE SET n_cooccur = n_cooccur + 1, "
+                "last_seen = CURRENT_TIMESTAMP", (hs[i], hs[j]))
+
+
+def _network_pairs(db) -> set:
+    """Flagged (host_a, host_b) pairs: junk-tier hosts whose co-occurrence
+    ratio marks them as one syndication/farm network. Reputable hosts
+    (hand tier >= 2.0 or dataset authority >= 0.8) are never flagged."""
+    try:
+        rows = db.fetchall(
+            "SELECT c.host_a, c.host_b, c.n_cooccur, ha.n_digests na, hb.n_digests nb "
+            "FROM host_cooccurrence c "
+            "JOIN host_digest_counts ha ON ha.host = c.host_a "
+            "JOIN host_digest_counts hb ON hb.host = c.host_b "
+            "WHERE c.n_cooccur >= ?", (_NETWORK_MIN_COOCCUR,))
+    except Exception:
+        return set()
+    out = set()
+    for r in rows:
+        rarer = min(r["na"], r["nb"])
+        if rarer < _NETWORK_MIN_COOCCUR or r["n_cooccur"] / rarer < _NETWORK_MIN_RATIO:
+            continue
+        if any(_source_quality("http://" + h) >= 2.0 or _sa_authority(h) >= 0.8
+               for h in (r["host_a"], r["host_b"])):
+            continue
+        out.add((r["host_a"], r["host_b"]))
+    return out
+
+
+def _apply_network_pairs(db, host_clusters: dict) -> dict:
+    """Merge temporally-flagged network pairs into the mirror cluster map."""
+    try:
+        pairs = _network_pairs(db)
+    except Exception:
+        return host_clusters
+    if not pairs:
+        return host_clusters
+    merged = 0
+    for a, b in pairs:
+        ca = host_clusters.setdefault(a, hash(a))
+        cb = host_clusters.setdefault(b, hash(b))
+        if ca != cb:
+            for k, v in list(host_clusters.items()):
+                if v == cb:
+                    host_clusters[k] = ca
+            merged += 1
+    if merged:
+        logger.info("[Independence] %d temporal network pair(s) merged into clusters", merged)
+    return host_clusters
+
+
 def _figure_support(text: str, articles: list) -> dict[str, tuple[int, set]]:
     """Deterministic cross-source support: for each magnitude figure in `text`,
-    how many DISTINCT source hosts state that exact value (matched with comma/
+    how many INDEPENDENT sources state that exact value (matched with comma/
     expanded/word variants). Pure value-agreement — no semantic judgment, so unlike
-    the 9B's contradiction-guessing it can't be wrong about 'same quantity'."""
-    host_corpus: dict[str, str] = {}
-    for _t, url, body in articles:
-        h = _host(url)
-        host_corpus[h] = host_corpus.get(h, "") + " " + (body or "").lower()
-    hc = {h: (c, c.replace(",", "")) for h, c in host_corpus.items()}
+    the 9B's contradiction-guessing it can't be wrong about 'same quantity'.
+    Independence (2026-08-12): support is counted in near-duplicate CLUSTERS,
+    not hosts — N mirror domains stating a figure are ONE source."""
+    art_cluster, _ = _independence_clusters(articles)
+    corpora = []
+    for i, (_t, url, body) in enumerate(articles):
+        c = (body or "").lower()
+        corpora.append((art_cluster[i], _host(url), c, c.replace(",", "")))
     out: dict[str, tuple[int, set]] = {}
     for m in _MAGNITUDE_RE.finditer(text):
         num, unit, cur = m.group("num"), m.group("unit"), m.group("cur")
@@ -2072,10 +2408,14 @@ def _figure_support(text: str, articles: list) -> dict[str, tuple[int, set]]:
         if not distinctive:
             continue
         variants = _num_variants(num, unit, cur)
-        hosts = {h for h, (c, cnc) in hc.items() if any(v in c or v in cnc for v in variants)}
+        clusters, hosts = set(), set()
+        for cid, h, c, cnc in corpora:
+            if any(v in c or v in cnc for v in variants):
+                clusters.add(cid)
+                hosts.add(h)
         raw = m.group(0).strip()
-        prev = out.get(raw, (0, set()))[1]
-        out[raw] = (len(hosts | prev), hosts | prev)
+        prev_n, prev_hosts = out.get(raw, (0, set()))
+        out[raw] = (max(len(clusters), prev_n), hosts | prev_hosts)
     return out
 
 
@@ -2188,9 +2528,17 @@ async def _corroborate_numbers(text: str, articles: list) -> tuple[str, set]:
     if not text or len(articles) < 2:
         return text, set()
     support = _figure_support(text, articles)
-    confirmed = {f for f, (c, _h) in support.items() if c >= 2}
+    # Independence + authority floor (2026-08-12): ≥2 INDEPENDENT clusters must
+    # agree (mirrors count once), and agreement among only junk-tier hosts never
+    # confirms (a paraphrase-farm pair evades text-dedup but not this) — unless
+    # three independent clusters agree. Unconfirmed figures fail TOWARD safety:
+    # Lever A fresh-verifies exactly the figures not in this set.
+    confirmed = {
+        f for f, (c, hosts) in support.items()
+        if c >= 2 and (c >= 3 or max((_sa_authority(h) for h in hosts), default=0.0) >= 0.5)
+    }
     if confirmed:
-        logger.info("[DeepResearch] numeric corroboration: %d figure(s) confirmed by ≥2 sources", len(confirmed))
+        logger.info("[DeepResearch] numeric corroboration: %d figure(s) confirmed by ≥2 independent sources", len(confirmed))
     return text, confirmed
 
 
@@ -2330,13 +2678,20 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
     try:
         raw = await _invoke_bg(
             [{"role": "user", "content": _FACT_PROMPT.format(topic=topic, evidence=brief[:4500])}],
-            json_mode=True, json_prefix='[{', max_tokens=600, num_ctx=8192, model=model)
+            json_mode=True, json_schema=_FACT_TRIPLES_SCHEMA, max_tokens=600, num_ctx=8192, model=model)
         cands = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(cands, dict):
             cands = cands.get("facts") or cands.get("triples") or []
-    except Exception:
+    except Exception as e:
+        # Loud, not silent (2026-08-18): this is the grounded-KG banking path —
+        # the exact silent-zero class the Ollama-0.32 JSON regression caused. A
+        # swallowed 0 here is indistinguishable from a legitimately fact-free
+        # digest, so a broken extraction can hide for days. Log it.
+        logger.warning("[DeepResearch] fact extraction/parse failed (topic=%r): %s", topic, e)
         return 0
     if not isinstance(cands, list):
+        logger.warning("[DeepResearch] fact extraction returned non-list %s (topic=%r)",
+                       type(cands).__name__, topic)
         return 0
     bodies_blob = " ".join((b or "").lower() for _, _, b in (articles or []))
     combined = (bodies_blob + " " + " ".join(f.lower() for _, _, f in findings)).strip()
@@ -2468,29 +2823,182 @@ def _tok_in(tok: str, blob: str, blob_nc: str) -> bool:
     return tok in blob or tok.replace(",", "") in blob_nc
 
 
+_CLAUSE_SPLIT_RE = re.compile(
+    r"[;—–]|:\s+|,\s+(?:and|but|while|which|whereas|though|with)\s+"
+    # bare coordinators (no comma) are strong clause boundaries in the house
+    # style's dense compounds ("softened to 2.5% annually BUT rose 0.2%…");
+    # bare "and" stays out — it joins noun phrases ("food and energy").
+    r"|\s+(?:but|while|whereas|although)\s+"
+    # participial trailers carry the analytic gloss; the head is the fact
+    # ("…increase, ACCOUNTING for roughly two-thirds of…").
+    r"|,\s+(?=(?:accounting|remaining|marking|reflecting|signaling|suggesting|"
+    r"indicating|leaving|driving|bringing|pushing|raising|underscoring|highlighting)\b)"
+)
+_COPULA_TAIL_RE = re.compile(
+    r"\b(?:is|was|are|were|remains?|represents?|marks?|signals?|constitutes?|reveals?)\b\s+(?:that\s+)?(.{40,})",
+    re.IGNORECASE,
+)
+
+
+_ANALYTICAL_RE = re.compile(
+    r"(?i)\b(?:second-order implication|the implication is|this (?:consolidation|move|"
+    r"shift|strategy|finding|trend|divergence|tension|approach) (?:mirrors|suggests|"
+    r"reflects|attempts|crystallizes|positions|forces|signals|underscores|implies|"
+    r"marks|serves)|mirrors similar|crystallizes the|reflects? a broader|"
+    r"suggesting (?:a|an|sector)|is moving from|marks a (?:shift|critical)|"
+    r"represents a (?:broader|fundamental|critical)|serves as a critical|"
+    r"potentially (?:preempting|shifting|fragment))")
+
+
+def _is_analytical(claim: str) -> bool:
+    """Analysis-shaped sentence: implication/synthesis verbs and no hard
+    numbers (years excluded). These are the digest's OWN reasoning — the
+    48h [entail-drop] corpus showed ~half of all final drops were this shape.
+    A citation on them is decoration no source can entail, but the sentence
+    itself is the product: gate v4 DE-CITES them instead of deleting them.
+    Number-bearing sentences never qualify — an unsupported figure must
+    still drop."""
+    if re.search(r"\d", re.sub(r"\b(?:19|20)\d\d\b", "", claim)):
+        return False
+    return bool(_ANALYTICAL_RE.search(claim))
+
+
+def _sub_claims(claim: str) -> list[str]:
+    """Informative sub-claims of a synthesis sentence: its clauses plus the
+    copula/appraisal tail ("the most transformative element IS <fact>" → the
+    fact). Only fragments meaningfully shorter than the whole claim qualify —
+    a sentence with no such decomposition yields [] and gets no rescue pass."""
+    subs: list[str] = []
+    for p in _CLAUSE_SPLIT_RE.split(claim):
+        p = p.strip(" ,.*")
+        if 30 <= len(p) <= len(claim) - 10 and len(re.findall(r"[a-z0-9]{4,}", p.lower())) >= 4:
+            subs.append(p)
+    m = _COPULA_TAIL_RE.search(claim)
+    if m:
+        tail = m.group(1).strip(" ,.*")
+        if 40 <= len(tail) <= len(claim) - 10:
+            subs.append(tail)
+    seen: set[str] = set()
+    out: list[str] = []
+    for s in subs:
+        k = s.lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(s)
+    return out[:4]
+
+
+# Player/paywall/nav boilerplate that jina-fetched pages carry as their own
+# lines. It poisons evidence windows (live 2026-08-12: nbcnews video-player
+# blocks — "This video file cannot be played. (Error Code: 102630)" — WON the
+# window scoring for CPI claims). Substring match, short-line guard, and \xa0
+# normalization; prose lines are far longer than these fragments.
+_CHROME_SNIPPETS = (
+    "this video file cannot be played", "error code:", "create a free profile",
+    "add us on google", "subscribe now", "sign up for our", "cookie settings",
+    "cookies policy",
+)
+# generic words that are chrome only when they ARE the line ("Advertisement",
+# "3 min read") — prose mentioning them is far longer
+_CHROME_SHORT = ("advertisement", "min read")
+_CHROME_TIME_RE = re.compile(r"(?:\d{1,2}:\d{2}\s*)+|1x")
+
+
+def _scrub_chrome(body: str) -> str:
+    keep = []
+    for ln in body.split("\n"):
+        low = ln.strip().lower().replace("\xa0", " ")
+        if not low:
+            continue
+        if len(low) < 160 and any(s in low for s in _CHROME_SNIPPETS):
+            continue
+        if len(low) < 30 and any(s in low for s in _CHROME_SHORT):
+            continue
+        if _CHROME_TIME_RE.fullmatch(low):
+            continue
+        keep.append(ln)
+    return "\n".join(keep)
+
+
 async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tuple[str, int]:
     """MiniCheck entailment gate (#48, gated by ENABLE_MINICHECK, fail-open).
 
-    For each cited factual sentence, ask the CPU sidecar whether the CITED
-    source's text actually entails the claim — the check substring matching
-    cannot make. A sentence its cited source does NOT entail is re-attributed
-    to a read source that DOES entail it (deterministic re-cite), else dropped
-    (a fabricated attribution is exactly what this stack exists to catch).
-    Bounded (max_checks) and fail-open: sidecar down → text unchanged."""
+    v3 semantics (2026-08-12, from live [entail-miss] forensics): a cited
+    sentence passes when its cited source entails the WHOLE sentence, or at
+    least one informative CLAUSE of it (anchored-in-source). The house
+    synthesis style opens stories with analytic framing ("the most
+    structurally transformative element is …") that whole-sentence strict
+    entailment can never pass even when every fact inside is source-backed —
+    the v2 gate deleted 20-23 of 24 GOOD sentences per live digest while the
+    MiniCheck model itself probe-verified perfectly calibrated. A sentence
+    NONE of whose sub-claims its source entails — the actual
+    fabricated-attribution case — still re-cites or drops.
+
+    v3 evidence (same forensics): per-ARTICLE, not per-host concatenation.
+    The old per_host[:24000] cap amputated a busy host's later articles
+    entirely (claims citing them had NO evidence at all), and raw claim-token
+    window scoring kept landing on nav chrome, cookie banners, or the wrong
+    article (dates/boilerplate tokens score everywhere). Articles are ranked
+    per claim by rare-token (IDF-weighted) overlap and windows are scored the
+    same way, so boilerplate carries ~zero weight.
+
+    Bounded (max_checks primary, ≤64 clause pairs, ≤48 re-cite pairs) and
+    fail-open: sidecar down → text unchanged."""
     from app.config import config as _cfg
     if not getattr(_cfg, "ENABLE_MINICHECK", False) or not text or not arts:
         return text, 0
     url = (getattr(_cfg, "MINICHECK_URL", "") or "").rstrip("/")
     if not url:
         return text, 0
-    per_host: dict[str, str] = {}
+
+    articles: list[tuple[str, str]] = []   # (host, "title body") — one entry PER ARTICLE
     for t, u, b in arts:
         if b:
-            h = _host(u)
-            # 4000 chars ≈ CPU-tractable: the T5 chunks each doc internally, so
-            # doc size drives latency (8000-char docs × 30 pairs blew the first
-            # live run past any sane timeout — observed 2026-07-07).
-            per_host[h] = (per_host.get(h, "") + " " + (t or "") + " " + b)[:4000]
+            articles.append((_host(u), ((t or "") + " " + _scrub_chrome(b)).strip()[:24000]))
+    if not articles:
+        return text, 0
+    art_lowers = [a[1].lower() for a in articles]
+    host_set = {h for h, _ in articles}
+    host_rds = {_reg_domain(h) for h in host_set}
+
+    _df_cache: dict[str, int] = {}
+
+    def _weights(claim: str) -> dict[str, float]:
+        """IDF weight per claim token: a token found in most read articles
+        (dates, site chrome, stock phrases) is worth ~nothing; a rare content
+        token (a name, a technical term) dominates window/article selection."""
+        wts: dict[str, float] = {}
+        for tok in set(re.findall(r"[a-z0-9]{4,}", claim.lower())):
+            if tok not in _df_cache:
+                _df_cache[tok] = sum(1 for bl in art_lowers if tok in bl)
+            wts[tok] = 1.0 / (1.0 + _df_cache[tok])
+        return wts
+
+    def _windows(wts: dict[str, float], idx: int, *, w: int = 1400, k: int = 2) -> str:
+        """The k best claim-matching windows of ONE article — what the T5
+        actually judges. Overlapping windows, IDF-weighted token scoring."""
+        art, low = articles[idx][1], art_lowers[idx]
+        if not wts or len(art) <= w * k:
+            return art[:w * k]
+        step = w // 2
+        scored: list[tuple[float, int]] = []
+        for start in range(0, len(art) - step, step):
+            seg = low[start:start + w]
+            scored.append((sum(wt for t, wt in wts.items() if t in seg), start))
+        scored.sort(reverse=True)
+        picks = sorted(s for _sc, s in scored[:k])
+        return " … ".join(art[s:s + w] for s in picks)
+
+    def _doc_for(hosts: list[str], claim: str) -> str:
+        """Evidence for a claim from the cited hosts: their 2 best-matching
+        ARTICLES (ranked by IDF overlap), windowed."""
+        wts = _weights(claim)
+        rds = {_reg_domain(h) for h in hosts}
+        cand = [i for i, (h, _) in enumerate(articles)
+                if h in hosts or _reg_domain(h) in rds]
+        cand.sort(key=lambda i: -sum(wt for t, wt in wts.items() if t in art_lowers[i]))
+        return " ".join(_windows(wts, i) for i in cand[:2])[:6000]
+
     # collect (line_idx, sentence, cited_hosts) for cited factual sentences
     lines = text.split("\n")
     checks: list[tuple[int, str, list[str]]] = []
@@ -2504,43 +3012,42 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tu
             if len(st) <= 40 or len(checks) >= max_checks:
                 continue
             cited = [h for h in _DOMAIN_TOKEN_RE.findall(" ".join(_PAREN_CITE_RE.findall(st)))
-                     if h in per_host or _reg_domain(h) in {_reg_domain(k) for k in per_host}]
+                     if h in host_set or _reg_domain(h) in host_rds]
             if cited:
                 checks.append((li, st, cited))
     if not checks:
         return text, 0
 
-    def _doc_for(hosts: list[str]) -> str:
-        parts = []
-        for h in hosts:
-            if h in per_host:
-                parts.append(per_host[h])
-            else:
-                rd = _reg_domain(h)
-                parts.extend(v for k, v in per_host.items() if _reg_domain(k) == rd)
-        return " ".join(parts)[:8000]
-
     def _claim_of(st: str) -> str:
         return _PAREN_CITE_RE.sub("", st).strip()
 
     import httpx
-    # Chunked posts (8 pairs/request, generous per-chunk timeout): a partial
-    # verification beats an all-or-nothing timeout. Chunks that fail are treated
-    # as supported (fail-open per sentence).
-    pairs = [{"doc": _doc_for(hosts), "claim": _claim_of(st)} for _, st, hosts in checks]
-    results: list[dict] = []
-    try:
-        async with httpx.AsyncClient(timeout=240) as client:
-            for i in range(0, len(pairs), 8):
-                try:
-                    r = await client.post(f"{url}/check_batch", json={"pairs": pairs[i:i + 8]})
-                    r.raise_for_status()
-                    results.extend(r.json()["results"])
-                except Exception as e:
-                    logger.warning("[DeepResearch] entailment chunk %d failed (%r) — fail-open", i // 8, e)
-                    results.extend({"supported": True, "prob": -1.0} for _ in pairs[i:i + 8])
-    except Exception as e:
-        logger.warning("[DeepResearch] entailment gate unavailable (%r) — skipping", e)
+
+    async def _check_pairs(check_pairs: list[dict], *, fail_open: bool) -> list[dict] | None:
+        """Chunked posts (8 pairs/request): a partial verification beats an
+        all-or-nothing timeout. fail_open=True marks failed chunks supported;
+        fail_open=False returns None on failure (caller skips that rescue)."""
+        results: list[dict] = []
+        try:
+            async with httpx.AsyncClient(timeout=240) as client:
+                for i in range(0, len(check_pairs), 8):
+                    try:
+                        r = await client.post(f"{url}/check_batch", json={"pairs": check_pairs[i:i + 8]})
+                        r.raise_for_status()
+                        results.extend(r.json()["results"])
+                    except Exception as e:
+                        if not fail_open:
+                            raise
+                        logger.warning("[DeepResearch] entailment chunk %d failed (%r) — fail-open", i // 8, e)
+                        results.extend({"supported": True, "prob": -1.0} for _ in check_pairs[i:i + 8])
+        except Exception as e:
+            logger.warning("[DeepResearch] entailment pass unavailable (%r)", e)
+            return None
+        return results
+
+    pairs = [{"doc": _doc_for(hosts, _claim_of(st)), "claim": _claim_of(st)} for _, st, hosts in checks]
+    results = await _check_pairs(pairs, fail_open=True)
+    if results is None:
         return text, 0
     if all(r.get("prob") == -1.0 for r in results):
         logger.warning("[DeepResearch] entailment gate: every chunk failed — skipping")
@@ -2548,37 +3055,86 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tu
 
     unsupported = [(li, st, hosts) for (li, st, hosts), res in zip(checks, results)
                    if not res.get("supported")]
+    # Show-your-work forensics (2026-08-12): the gate DELETES content — when it
+    # fails a claim, the exact (claim, evidence-head, prob) must be inspectable.
+    # These lines are what exposed the v2 root causes (chrome windows, amputated
+    # articles, unentailable analytic lead-ins) after two blind fix attempts.
+    for (li, st, hosts), res in list(zip(checks, results))[:24]:
+        if not res.get("supported"):
+            _d = _doc_for(hosts, _claim_of(st))
+            logger.info("[entail-miss] p=%.3f hosts=%s claim=%r doc_head=%r doc_len=%d",
+                        res.get("prob", -1), hosts[:3], _claim_of(st)[:110], _d[:90], len(_d))
     if not unsupported:
         logger.info("[DeepResearch] entailment gate: %d/%d cited sentences entailed by their source",
                     len(checks), len(checks))
         return text, 0
 
-    # second chance: does ANY other read source entail the claim? (re-cite, don't drop)
-    recite: dict[int, tuple[str, str]] = {}   # check-index → (sentence, new_host)
-    drop: list[tuple[int, str]] = []
-    alt_pairs, alt_meta = [], []
+    # Anchored-in-source rescue: before re-citing/dropping, check the failed
+    # sentence's informative sub-claims against the SAME cited evidence. Any
+    # entailed sub-claim keeps the sentence and its citation — the source
+    # demonstrably backs the sentence's factual core; the remainder is the
+    # digest's own synthesis, which is the product, not a fabrication.
+    _CLAUSE_TOTAL = 64
+    clause_pairs: list[dict] = []
+    clause_meta: list[tuple[int, str]] = []
     for li, st, hosts in unsupported:
-        others = [h for h in per_host if h not in hosts]
-        for h in others:
-            alt_pairs.append({"doc": per_host[h], "claim": _claim_of(st)})
+        if len(clause_pairs) >= _CLAUSE_TOTAL:
+            break
+        claim = _claim_of(st)
+        for sub in _sub_claims(claim):
+            if len(clause_pairs) >= _CLAUSE_TOTAL:
+                break
+            clause_pairs.append({"doc": _doc_for(hosts, sub), "claim": sub})
+            clause_meta.append((li, st))
+    anchored: set[tuple[int, str]] = set()
+    if clause_pairs:
+        c_res = await _check_pairs(clause_pairs, fail_open=False) or []
+        for key, res in zip(clause_meta, c_res):
+            if res.get("supported"):
+                anchored.add(key)
+
+    still = [(li, st, hosts) for li, st, hosts in unsupported if (li, st) not in anchored]
+
+    # second chance: does ANY other read source entail the claim? (re-cite, don't drop)
+    # Bounded fan-out (2026-08-12): the v1 re-cite tried EVERY other read host
+    # per failed claim — a 24-source overview with 12 failures queued ~276 CPU
+    # entailment pairs (~30 min), stalling the whole digest chain. An IDF-ranked
+    # prescreen keeps only the 4 most plausible alternates per claim, ≤48 total.
+    _ALT_PER_CLAIM, _ALT_TOTAL = 4, 48
+    alt_pairs: list[dict] = []
+    alt_meta: list[tuple[int, str, str]] = []
+    for li, st, hosts in still:
+        if len(alt_pairs) >= _ALT_TOTAL:
+            break
+        claim = _claim_of(st)
+        wts = _weights(claim)
+        rds = {_reg_domain(h) for h in hosts}
+        host_best: dict[str, tuple[int, float]] = {}   # host → (raw hits, idf score)
+        for i, (h, _) in enumerate(articles):
+            if h in hosts or _reg_domain(h) in rds:
+                continue
+            hits = sum(1 for t in wts if t in art_lowers[i])
+            sc = sum(wt for t, wt in wts.items() if t in art_lowers[i])
+            cur = host_best.get(h)
+            if cur is None or sc > cur[1]:
+                host_best[h] = (hits, sc)
+        scored = sorted(((v[1], h) for h, v in host_best.items() if v[0] >= 2), reverse=True)
+        for _sc, h in scored[:_ALT_PER_CLAIM]:
+            if len(alt_pairs) >= _ALT_TOTAL:
+                break
+            alt_pairs.append({"doc": _doc_for([h], claim), "claim": claim})
             alt_meta.append((li, st, h))
-    alt_results = []
+    alt_results: list[dict] = []
     if alt_pairs:
-        try:
-            async with httpx.AsyncClient(timeout=240) as client:
-                for i in range(0, len(alt_pairs), 8):
-                    r = await client.post(f"{url}/check_batch", json={"pairs": alt_pairs[i:i + 8]})
-                    r.raise_for_status()
-                    alt_results.extend(r.json()["results"])
-        except Exception as e:
-            logger.warning("[DeepResearch] entailment re-cite pass unavailable (%r)", e)
-            alt_results = []
+        alt_results = await _check_pairs(alt_pairs, fail_open=False) or []
     entailed_by: dict[tuple[int, str], str] = {}
     for (li, st, h), res in zip(alt_meta, alt_results):
         if res.get("supported") and (li, st) not in entailed_by:
             entailed_by[(li, st)] = h
     n_changed = 0
-    for li, st, hosts in unsupported:
+    decited = 0
+    drop: list[tuple[int, str]] = []
+    for li, st, hosts in still:
         if (li, st) in entailed_by:
             new_host = entailed_by[(li, st)]
             new_st = _PAREN_CITE_RE.sub("", st).rstrip()
@@ -2588,13 +3144,54 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tu
                 new_st = f"{new_st} ({new_host})"
             lines[li] = lines[li].replace(st, new_st)
             n_changed += 1
+        elif _is_analytical(_claim_of(st)):
+            # gate v4 (2026-08-14): the digest's own reasoning keeps its
+            # sentence but loses the citation no source could entail.
+            new_st = re.sub(r"\s+([.!?])$", r"\1", _PAREN_CITE_RE.sub("", st).rstrip())
+            lines[li] = lines[li].replace(st, new_st)
+            decited += 1
+            n_changed += 1
         else:
             drop.append((li, st))
+    # v4.1 (2026-08-14): a bold-headline LEAD ("* **Headline:** …") is a SUMMARY
+    # of its section — per-sentence entailment fails it for the same structural
+    # reason as analysis sentences (it aggregates many sources). When the rest of
+    # its line SURVIVED the gate, decapitating it leaves an incoherent body: keep
+    # the lead, strip its citation. A lead whose whole section died still dies
+    # with it. (regex, not lstrip: a charwise strip of "*-• " eats the bold
+    # marker's own asterisks and never matches.)
+    # TWO PHASES so a lead is judged against what ACTUALLY survives its section,
+    # not its soon-to-die siblings: an earlier one-pass version evaluated the
+    # lead against the pre-drop line, so a lead whose whole section was doomed
+    # still saw ≥40 surviving chars (the doomed siblings) and wrongly survived.
+    leads = [(li, st) for li, st in drop if re.match(r"\s*[*\-•]?\s*\*\*", st)]
+    lead_set = {(li, st) for li, st in leads}
+    # Phase 1: remove every NON-lead dropped sentence.
     for li, st in drop:
+        if (li, st) in lead_set:
+            continue
         lines[li] = lines[li].replace(st, "").rstrip()
         n_changed += 1
-    logger.info("[DeepResearch] entailment gate: %d checked, %d unsupported → %d re-cited, %d dropped",
-                len(checks), len(unsupported), len(entailed_by), len(drop))
+        # Post-rescue forensics: [entail-miss] shows what the PRIMARY check
+        # rejected (rescue input); these lines show what actually DIED after
+        # every rescue — the set the next gate iteration must be judged on.
+        logger.info("[entail-drop] claim=%r", _claim_of(st)[:140])
+    # Phase 2: keep a lead DE-CITED only if ≥40 chars of its own line survived.
+    for li, st in leads:
+        remaining = _PAREN_CITE_RE.sub("", lines[li].replace(st, "")).strip("*-• \t")
+        if len(remaining) >= 40:
+            new_st = re.sub(r"\s+([.!?])$", r"\1", _PAREN_CITE_RE.sub("", st).rstrip())
+            lines[li] = lines[li].replace(st, new_st)
+            decited += 1
+            n_changed += 1
+        else:
+            lines[li] = lines[li].replace(st, "").rstrip()
+            n_changed += 1
+            logger.info("[entail-drop] claim=%r", _claim_of(st)[:140])
+    logger.info(
+        "[DeepResearch] entailment gate: %d checked, %d unsupported → %d anchored (clause), "
+        "%d re-cited, %d de-cited (analysis), %d dropped",
+        len(checks), len(unsupported), len(anchored), len(entailed_by), decited, len(drop))
     out = "\n".join(l for l in lines)
     return out, n_changed
 
@@ -2751,7 +3348,7 @@ async def _verify_lead_claims(text: str, label: str, *, corroborated=frozenset()
                 "{\"verdict\": \"supported\"|\"contradicted\"|\"unaddressed\", "
                 "\"note\": \"<one short sentence giving the value the evidence states, ONLY if "
                 "contradicted>\"}."}],
-                json_mode=True, json_prefix='{"', max_tokens=160, temperature=0.0)
+                json_mode=True, json_prefix="{", max_tokens=160, temperature=0.0)
             data = llm.extract_json_object(raw) if raw else {}
         except Exception as e:
             logger.debug("[DeepResearch] fresh-check judge failed: %s", e)
@@ -2789,7 +3386,7 @@ async def _verify_lead_claims(text: str, label: str, *, corroborated=frozenset()
 _LEAD_CITE_RE = re.compile(r"\(([a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\)")
 
 
-def _gate_lead_credibility(text: str) -> tuple[str, bool]:
+def _gate_lead_credibility(text: str, host_clusters: dict | None = None) -> tuple[str, bool]:
     """CORROBORATION-GATED LEAD: a headline that rests on a SINGLE lower-credibility
     source with no independent corroboration gets an inline sourcing caveat.
 
@@ -2808,8 +3405,13 @@ def _gate_lead_credibility(text: str) -> tuple[str, bool]:
     hosts = {h for h in hosts if "." in h}
     if not hosts:
         return text, False                      # uncited lead — _ensure_citations' job
-    if max(_source_quality("http://" + h) for h in hosts) >= 2.0 or len(hosts) >= 2:
-        return text, False                      # credible anchor OR ≥2 independent sources
+    # Independence (2026-08-12): mirror-network hosts collapse to one source
+    # before the ≥2 check — N farm domains reprinting the same text can no
+    # longer manufacture the corroboration that waves a lead through.
+    hc = host_clusters or {}
+    n_indep = len({hc.get(h, h) for h in hosts})
+    if max(_source_quality("http://" + h) for h in hosts) >= 2.0 or n_indep >= 2:
+        return text, False                      # credible anchor OR ≥2 INDEPENDENT sources
     caveat = ("\n⚠️ _Sourcing note: this lead rests on a single lower-credibility source "
               "and is not independently corroborated — treat as unconfirmed._")
     cut = m.end(1)
@@ -2909,7 +3511,19 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
                 f"nothing reported rather than speculation.")
 
     hosts = sorted({_host(u) for _, u, _ in findings})
-    evidence = _annotated_evidence(findings)
+    # Independence map (2026-08-12): near-duplicate bodies collapse for every
+    # corroboration count in this chain — mirrors/syndication count once.
+    _host_clusters = _independence_clusters(articles)[1] if articles else {}
+    # Temporal layer: record this digest's host set (always-on, cheap) and merge
+    # any flagged paraphrase-network pairs into the cluster map. Fail-open.
+    try:
+        from app.database import get_db as _gdb
+        _db_co = _gdb()
+        await asyncio.to_thread(_record_host_cooccurrence, _db_co, hosts)
+        _host_clusters = await asyncio.to_thread(_apply_network_pairs, _db_co, _host_clusters)
+    except Exception as e:
+        logger.debug("[Independence] co-occurrence layer skipped: %s", e)
+    evidence = _annotated_evidence(findings, host_clusters=_host_clusters)
     from app.config import config as _cfg
     syn_model = (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None  # Lever C
 
@@ -2966,14 +3580,14 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     # Lever A: fresh independent verification of the lead's top claims (gated, bounded).
     try:
         from app.config import config as _cfg
-        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", False):
+        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", True):
             final, _ = await _verify_lead_claims(final, label, corroborated=_corr)
     except Exception as e:
         logger.warning("[DeepResearch] claim verification failed: %s", e)
 
     # Corroboration-gated lead: caveat a headline resting on a single low-credibility
     # source (robust to unknown farms the blocklist misses). Deterministic, always on.
-    final, _gated = _gate_lead_credibility(final)
+    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters)
     if _gated:
         logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
 
@@ -3012,11 +3626,13 @@ async def _deep_analyze(findings: list, label: str, today: str, *,
             f"Group these {label} findings into the distinct ongoing STORIES they cover. Merge findings "
             "about the SAME event into one story; aim for 5-9 stories. Return JSON only: "
             '[{"title": "...", "items": [0, 3, 7]}].\n\n' + numbered}],
-            json_mode=True, json_prefix="[{", max_tokens=600, temperature=0.1, model=model, num_ctx=8192)
+            json_mode=True, json_schema=_STORY_GROUPS_SCHEMA, max_tokens=600, temperature=0.1, model=model, num_ctx=8192)
         groups = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(groups, dict):
             groups = groups.get("stories") or groups.get("items") or []
-    except Exception:
+    except Exception as e:
+        logger.warning("[DeepResearch] deep-analyze story clustering failed (%s) — "
+                       "degrading to single-story analysis for %r", e, label)
         groups = []
     stories = []
     for g in (groups or [])[:10]:
@@ -3027,6 +3643,8 @@ async def _deep_analyze(findings: list, label: str, today: str, *,
         if title and idxs:
             stories.append((title, idxs))
     if not stories:   # clustering failed — analyze the whole pool as one story
+        logger.info("[DeepResearch] deep-analyze fell back to single-story pool for %r "
+                    "(%d findings, no clusters)", label, len(findings))
         stories = [(label, list(range(len(findings))))]
 
     # 2) analyze EACH story in depth, concurrently — the "enough calls" layer.
@@ -3059,7 +3677,8 @@ async def _deep_analyze(findings: list, label: str, today: str, *,
                 # is now a backstop with headroom, not the editor.
                 max_tokens=2200, temperature=0.3, model=model, num_ctx=16384)
             return (title, (a or "").strip())
-        except Exception:
+        except Exception as e:
+            logger.warning("[DeepResearch] per-story analysis failed (story=%r): %s", title, e)
             return (title, "")
     analyses = await asyncio.gather(*[_an(t, ix) for t, ix in stories])
     blocks = [f"### {t}\n{a}" for t, a in analyses if a]
@@ -3175,7 +3794,19 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     production synthesis on captured evidence with any (model, config). syn_model=None
     -> config.MONITOR_SYNTHESIS_MODEL."""
     hosts = sorted({_host(u) for _, u, _ in findings})
-    evidence = _annotated_evidence(findings)
+    # Independence map (2026-08-12): near-duplicate bodies collapse for every
+    # corroboration count in this chain — mirrors/syndication count once.
+    _host_clusters = _independence_clusters(articles)[1] if articles else {}
+    # Temporal layer: record this digest's host set (always-on, cheap) and merge
+    # any flagged paraphrase-network pairs into the cluster map. Fail-open.
+    try:
+        from app.database import get_db as _gdb
+        _db_co = _gdb()
+        await asyncio.to_thread(_record_host_cooccurrence, _db_co, hosts)
+        _host_clusters = await asyncio.to_thread(_apply_network_pairs, _db_co, _host_clusters)
+    except Exception as e:
+        logger.debug("[Independence] co-occurrence layer skipped: %s", e)
+    evidence = _annotated_evidence(findings, host_clusters=_host_clusters)
 
     # REAL deep research: analyze each story in depth FIRST (many calls), then let the
     # final synthesis (this call) reason over those analyses + the full findings.
@@ -3204,7 +3835,9 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         try:
             from app.core.dossiers import get_domain_dossier
             from app.database import get_db
-            _d = get_domain_dossier(get_db(), label)
+            # Off the event loop — a sync DB read here was the one steady-state
+            # [Sync DB call on event-loop] violation (audit 2026-08-23).
+            _d = await asyncio.to_thread(get_domain_dossier, get_db(), label)
             if _d and _d["body"]:
                 prior_block = (
                     "PRIOR UNDERSTANDING — what Nova already knew about this domain "
@@ -3275,14 +3908,14 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "above — never invent a company, number, person, or event.")
     if prior_block:
         # Knowing tier: novelty + contradiction discipline against the dossier.
+        # (The KNOWN-VS-NEW count is measured OUT-OF-BAND after the chain — an
+        # in-band marker was dropped by the aggregation merge; probe 2026-08-12.)
         _syn_prompt += (
             "\nA PRIOR UNDERSTANDING block is present above. LEAD with what is genuinely "
             "NEW or CHANGED relative to it — do not re-report known context except where "
             "needed for sense. Where today's findings CONTRADICT the prior understanding, "
             "write 'CONTRADICTS PRIOR UNDERSTANDING:' inline and state the correction "
-            "plainly. After the final section, append exactly one line "
-            "'KNOWN-VS-NEW: <n> new | <n> updates | <n> contradictions' counting today's "
-            "developments against the prior understanding.")
+            "plainly.")
     try:
         # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
         # (owner directive: maximize the best output; extra generations are fine.)
@@ -3345,6 +3978,29 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     final = _drop_orphan_headers(final)   # remove any section header left empty by the strip passes
     final = _repair_dangling_fragments(final)  # recover sentences broken by an excised entity (prep/possessive)
     final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
+    # Knowing instrumentation v2 (2026-08-12): measured OUT-OF-BAND — one tiny
+    # gated call counting the finished digest against the prior dossier. The
+    # v1 in-band marker asked the synthesis to append a count line, but the
+    # aggregation merge rewrites candidates and dropped it (probe-verified).
+    if prior_block:
+        try:
+            _kvn_raw = await _invoke_bg([{"role": "user", "content":
+                prior_block +
+                "TODAY'S BRIEFING:\n" + final[:9000] +
+                "\n\nCount today's developments in the briefing against the PRIOR "
+                "UNDERSTANDING above: how many are genuinely NEW (absent from prior), "
+                "how many UPDATE something already known, and how many CONTRADICT it. "
+                'Return JSON only: {"new": <int>, "updates": <int>, "contradictions": <int>}'}],
+                json_mode=True, json_prefix="{", max_tokens=80, temperature=0.0,
+                model=syn_model, num_ctx=8192)
+            # Balanced-brace salvage (not bare json.loads) so a stray prose prefix
+            # from the 27B doesn't drop the KNOWN-VS-NEW instrumentation line (2026-08-18).
+            _kvn = llm.extract_json_object(_kvn_raw) if isinstance(_kvn_raw, str) else (_kvn_raw or {})
+            logger.info("[Knowing] %s KNOWN-VS-NEW: %s new | %s updates | %s contradictions",
+                        label, _kvn.get("new"), _kvn.get("updates"), _kvn.get("contradictions"))
+        except Exception as e:
+            logger.debug("[Knowing] KNOWN-VS-NEW measurement failed: %s", e)
+
     learned = await _learn_facts(label, final, findings, kg, articles=articles, model=syn_model)
     logger.info("[DeepResearch] %s overview: read %d sources (%s), learned %d facts",
                 label, len(findings), ", ".join(hosts[:6]), learned)
@@ -3365,14 +4021,14 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     # Lever A: fresh independent verification of the lead's top claims (gated, bounded).
     try:
         from app.config import config as _cfg
-        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", False):
+        if getattr(_cfg, "ENABLE_CLAIM_VERIFICATION", True):
             final, _ = await _verify_lead_claims(final, label, corroborated=_corr)
     except Exception as e:
         logger.warning("[DeepResearch] claim verification failed: %s", e)
 
     # Corroboration-gated lead: caveat a headline resting on a single low-credibility
     # source (robust to unknown farms the blocklist misses). Deterministic, always on.
-    final, _gated = _gate_lead_credibility(final)
+    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters)
     if _gated:
         logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
 

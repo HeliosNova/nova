@@ -126,8 +126,10 @@ async def critique_answer(
                 {"role": "user", "content": user_content},
             ],
             json_mode=True,
-            json_prefix='{"',
-            max_tokens=400,
+            json_prefix="{",
+            # 700, was 400: a verbose issues-list overran 400 and the cut JSON
+            # failed json.loads → critique silently skipped (tripwire 2026-08-19).
+            max_tokens=700,
             temperature=0.1,
         )
         if not raw:
@@ -208,7 +210,7 @@ async def adversarial_critique(
                 {"role": "user", "content": user_content},
             ],
             json_mode=True,
-            json_prefix='{"',
+            json_prefix="{",
             max_tokens=500,
             temperature=0.1,
         )
@@ -322,7 +324,7 @@ async def critique_unified(
                 {"role": "user", "content": user_content},
             ],
             json_mode=True,
-            json_prefix='{"',
+            json_prefix="{",
             max_tokens=700,
             temperature=0.1,
         )

@@ -10,8 +10,12 @@ import app.monitors.deep_research as dr
 
 
 def test_common_context_byte_identical_and_capped():
-    a = dr._common_context("July 06, 2026", "finance", "A" * 20000, "E" * 12000)
-    b = dr._common_context("July 06, 2026", "finance", "A" * 20000, "E" * 12000)
+    # Inputs sized RELATIVE to the caps so this test survives cap retunes
+    # (the 2026-08-12 18000→30000 ANALYSIS_CAP raise broke the old fixed sizes).
+    big_a = "A" * (dr._COMMON_ANALYSIS_CAP + 5000)
+    big_e = "E" * (dr._COMMON_EVIDENCE_CAP + 3000)
+    a = dr._common_context("July 06, 2026", "finance", big_a, big_e)
+    b = dr._common_context("July 06, 2026", "finance", big_a, big_e)
     assert a == b, "same inputs must produce identical bytes — that's the cache contract"
     assert "A" * dr._COMMON_ANALYSIS_CAP in a and "A" * (dr._COMMON_ANALYSIS_CAP + 1) not in a
     assert "E" * dr._COMMON_EVIDENCE_CAP in a and "E" * (dr._COMMON_EVIDENCE_CAP + 1) not in a
@@ -43,9 +47,9 @@ async def test_enrich_prompt_starts_with_common(monkeypatch):
     assert out == "THE-DRAFT"           # empty generation → draft kept (accept-guard)
     assert captured["content"].startswith(common)
     assert captured["content"].rstrip().endswith("DRAFT:\nTHE-DRAFT")
-    # num_ctx raised 12288→16384 (2026-07-09) so the enrich pass can rewrite a
-    # full digest without clipping its prompt (part of the truncation fix).
-    assert captured["num_ctx"] == 16384
+    # num_ctx 16384→20480 (2026-08-12): the shared pack grew to ~10k tokens with
+    # the ANALYSIS_CAP raise; enrich carries pack + draft + 5000 gen.
+    assert captured["num_ctx"] == 20480
 
 
 async def test_best_synthesis_merge_shares_context_prefix(monkeypatch):
@@ -68,8 +72,11 @@ async def test_best_synthesis_merge_shares_context_prefix(monkeypatch):
     content, kw = merges[0]
     assert content.startswith(ctx)
     assert "EVIDENCE" not in content    # context_block replaces the legacy evidence slice
-    # merge must run on the SAME model + ctx size as the gens or the cache is useless
-    assert kw.get("num_ctx") == 12288 and kw.get("model") == "m27"
+    # merge must run on the SAME model + ctx size as the gens or the cache is
+    # useless — asserted as the CONTRACT (equal to the gen calls' num_ctx), not
+    # a hardcoded constant, so ctx-lattice retunes can't silently break it.
+    gen_ctxs = {c[1].get("num_ctx") for c in calls if "=== DRAFT 1 ===" not in c[0]}
+    assert kw.get("num_ctx") in gen_ctxs and kw.get("model") == "m27"
     assert out.startswith("MERGED")
 
 

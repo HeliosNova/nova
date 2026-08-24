@@ -48,10 +48,10 @@ export default function ResponsiveTable<T>({
   return (
     <>
       {/* Desktop: standard table (hidden below md) */}
-      <div className="hidden md:block overflow-x-auto rounded-lg border border-nova-border">
+      <div className="hidden overflow-x-auto rounded-lg border border-nova-border bg-nova-surface/55 backdrop-blur-md md:block">
         <table className="w-full text-sm">
           <thead>
-            <tr className="border-b border-nova-border bg-nova-surface text-left text-xs text-nova-text-dim">
+            <tr className="border-b border-nova-border bg-nova-surface/70 text-left text-xs text-nova-text-dim">
               {headerPrefix && <th className="px-3 py-2 w-8">{headerPrefix}</th>}
               {columns.map((col, i) => (
                 <th key={i} className={`px-3 py-2 ${col.className || ""}`}>

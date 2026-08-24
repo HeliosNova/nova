@@ -298,7 +298,8 @@ async def maybe_trigger_tool_creation(
 
             # Create via CustomToolStore (same path as _handle_tool_create)
             params_json = json.dumps(parameters) if isinstance(parameters, list) else parameters
-            tool_id = svc.custom_tools.create_tool(name, description, params_json, code)
+            tool_id = svc.custom_tools.create_tool(
+                name, description, params_json, code, screen_network=True)
             if tool_id == -1:
                 logger.debug("Auto-tool '%s' rejected by CustomToolStore", name)
                 return

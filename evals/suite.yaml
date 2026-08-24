@@ -115,6 +115,19 @@ tasks:
       - type: answer_contains
         value: "126"
 
+  - id: tool_math_implicit_routing
+    # Forced math tool-routing (model program item 2, 2026-08-24): NO explicit
+    # tool request, no "calculate" verb — the [MATH TOOL ROUTING] block alone
+    # must push this through the calculator instead of mental arithmetic.
+    category: tool-use
+    query: "What is 847 * 293 - 1200?"
+    timeout: 120
+    assertions:
+      - type: tool_invoked
+        value: calculator
+      - type: answer_contains
+        value: "246971"
+
   - id: tool_calculator_sqrt
     category: tool-use
     query: "What is the square root of 256?"
@@ -374,22 +387,25 @@ tasks:
 
   - id: semantic_domain_shift_negation
     category: semantic-match
-    # Negation: skill should NOT trigger when the user explicitly asks for
-    # the opposite. Pinned as a known limitation — current semantic match
-    # is bag-of-words and will likely fire. Lift when negation handling lands.
+    # Negation handling LANDED 2026-08-18 (scoped rejection cues in
+    # _query_skill_topically_related: tokens in a rejection cue's window cannot
+    # anchor, and a skill whose domain appears ONLY under negation is rejected).
+    # Upgraded from the pinned response_not_empty to the real assertion.
     query: "I do NOT want today's Bitcoin price — just the historical low"
     timeout: 120
     paraphrase_of: skill_match_stock_price
     assertions:
-      - type: response_not_empty
+      - type: skill_not_matched
 
   - id: semantic_domain_shift_unrelated
     category: semantic-match
     # Domain-shift adversarial: superficial word overlap ("price",
     # "stock") with the Stock Price Probe skill but the actual ask is
-    # totally unrelated (advice on a hobby, not a quote). Skill should
-    # NOT match. Pinned as response_not_empty — full skill_not_matched
-    # assertion would be tighter but harness doesn't support that flag yet.
+    # totally unrelated (advice on a hobby, not a quote). STILL PINNED as
+    # response_not_empty (2026-08-18): this distractor measures 0.730 vs the
+    # stock skill — ABOVE the news true-paraphrase at 0.723 — so similarity
+    # alone cannot separate them; that's the bag-of-words floor. skill_not_matched
+    # now exists as an assertion type; lift when intent-aware matching lands.
     query: "I have a stockpile of old vinyl records — any tips on pricing them for resale?"
     timeout: 120
     paraphrase_of: skill_match_stock_price
@@ -960,3 +976,51 @@ tasks:
       - type: answer_contains
         value: "TCP"
       - type: response_not_empty
+
+  # =========================================================================
+  # knowing — standing dossiers CAUSE correct answers (knowing tier 2026-08-12)
+  # Causal pair: BEFORE (no dossier) the fictional entity is unanswerable;
+  # AFTER seeding, chat must answer from the dossier's understanding.
+  # =========================================================================
+
+  - id: knowing_dossier_direct
+    category: knowing
+    query: "What do you know about the Aurora-7 fusion pilot plant in Iceland?"
+    timeout: 120
+    seed_dossier:
+      title: "Fusion Energy Pilots"
+      body: |
+        ## Current understanding
+        The Aurora-7 fusion pilot plant in Iceland is the field's furthest-along compact tokamak: in July 2026 it sustained a fusion gain of Q=2.1 for 43 seconds (fusionreview.com), the first pilot-scale device to hold net gain beyond half a minute. The result moved private fusion timelines forward by an estimated two years.
+        ## How we got here
+        - (2026-03) Aurora-7 achieved first plasma (fusionreview.com)
+        - (2026-07) Sustained Q=2.1 for 43 seconds (fusionreview.com)
+        ## Key facts & figures
+        - Fusion gain: Q=2.1 sustained for 43 seconds (fusionreview.com)
+        ## Open questions
+        - Whether Q>3 is reachable without a divertor redesign
+    assertions:
+      - type: answer_contains
+        value: "2.1"
+
+  - id: knowing_dossier_paraphrase
+    category: knowing
+    # Avoids 'Aurora' entirely — retrieval must match on iceland/fusion tokens.
+    query: "Where do things stand with Iceland's experimental fusion project?"
+    timeout: 120
+    paraphrase_of: knowing_dossier_direct
+    seed_dossier:
+      title: "Fusion Energy Pilots"
+      body: |
+        ## Current understanding
+        The Aurora-7 fusion pilot plant in Iceland is the field's furthest-along compact tokamak: in July 2026 it sustained a fusion gain of Q=2.1 for 43 seconds (fusionreview.com), the first pilot-scale device to hold net gain beyond half a minute. The result moved private fusion timelines forward by an estimated two years.
+        ## How we got here
+        - (2026-03) Aurora-7 achieved first plasma (fusionreview.com)
+        - (2026-07) Sustained Q=2.1 for 43 seconds (fusionreview.com)
+        ## Key facts & figures
+        - Fusion gain: Q=2.1 sustained for 43 seconds (fusionreview.com)
+        ## Open questions
+        - Whether Q>3 is reachable without a divertor redesign
+    assertions:
+      - type: answer_contains
+        value: "2.1"

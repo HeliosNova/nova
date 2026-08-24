@@ -1,6 +1,6 @@
 """Smoke tests for modules that lacked direct test coverage.
 
-Targets: chat API, channels/base, core/quality, core/kg, main.py imports.
+Targets: chat API, core/quality, core/kg, main.py imports.
 Goal: imports work, key functions don't crash on valid input, error cases
 return sensible errors.
 """
@@ -10,121 +10,6 @@ from __future__ import annotations
 from unittest.mock import MagicMock, AsyncMock, patch
 
 import pytest
-
-
-# ===========================================================================
-# channels/base.py — BaseChannel
-# ===========================================================================
-
-class TestBaseChannelSplitMessage:
-    """Test BaseChannel._split_message() directly."""
-
-    def test_short_message_no_split(self):
-        from app.channels.base import BaseChannel
-        result = BaseChannel._split_message("Hello world", max_length=2000)
-        assert result == ["Hello world"]
-
-    def test_empty_message(self):
-        from app.channels.base import BaseChannel
-        result = BaseChannel._split_message("")
-        assert result == [""]
-
-    def test_long_message_splits_at_newline(self):
-        from app.channels.base import BaseChannel
-        text = "Line one\n" * 300  # ~3000 chars
-        result = BaseChannel._split_message(text, max_length=2000)
-        assert len(result) >= 2
-        for chunk in result:
-            assert len(chunk) <= 2000
-
-    def test_long_message_splits_at_space(self):
-        from app.channels.base import BaseChannel
-        text = "word " * 500  # 2500 chars, no newlines
-        result = BaseChannel._split_message(text, max_length=2000)
-        assert len(result) >= 2
-        for chunk in result:
-            assert len(chunk) <= 2000
-
-    def test_no_split_points_hard_cut(self):
-        from app.channels.base import BaseChannel
-        text = "x" * 3000  # No spaces or newlines
-        result = BaseChannel._split_message(text, max_length=2000)
-        assert len(result) >= 2
-        assert result[0] == "x" * 2000
-
-    def test_exact_max_length(self):
-        from app.channels.base import BaseChannel
-        text = "x" * 2000
-        result = BaseChannel._split_message(text, max_length=2000)
-        assert result == [text]
-
-
-class TestBaseChannelHandleQuery:
-    """Test BaseChannel._handle_query() with mocked think()."""
-
-    @pytest.mark.asyncio
-    async def test_handle_query_returns_response(self):
-        from app.channels.base import BaseChannel
-        from app.schema import StreamEvent, EventType
-
-        channel = BaseChannel()
-
-        events = [
-            StreamEvent(type=EventType.TOKEN, data={"text": "Hello "}),
-            StreamEvent(type=EventType.TOKEN, data={"text": "there!"}),
-            StreamEvent(type=EventType.DONE, data={}),
-        ]
-
-        async def mock_think(**kwargs):
-            for e in events:
-                yield e
-
-        with patch("app.core.brain.think", mock_think):
-            result = await channel._handle_query("Hi", "user-1")
-            assert result == "Hello there!"
-
-    @pytest.mark.asyncio
-    async def test_handle_query_error_event(self):
-        from app.channels.base import BaseChannel
-        from app.schema import StreamEvent, EventType
-
-        channel = BaseChannel()
-
-        async def mock_think(**kwargs):
-            yield StreamEvent(type=EventType.ERROR, data={"message": "LLM down"})
-
-        with patch("app.core.brain.think", mock_think):
-            result = await channel._handle_query("Hi", "user-1")
-            assert "Error" in result
-            assert "LLM down" in result
-
-    @pytest.mark.asyncio
-    async def test_handle_query_exception(self):
-        from app.channels.base import BaseChannel
-
-        channel = BaseChannel()
-
-        async def mock_think(**kwargs):
-            raise RuntimeError("Connection lost")
-            yield  # make it a generator
-
-        with patch("app.core.brain.think", mock_think):
-            result = await channel._handle_query("Hi", "user-1")
-            assert "sorry" in result.lower() or "wrong" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_handle_query_empty_response(self):
-        from app.channels.base import BaseChannel
-        from app.schema import StreamEvent, EventType
-
-        channel = BaseChannel()
-
-        async def mock_think(**kwargs):
-            yield StreamEvent(type=EventType.DONE, data={})
-
-        with patch("app.core.brain.think", mock_think):
-            result = await channel._handle_query("Hi", "user-1")
-            assert "no response" in result.lower()
 
 
 # ===========================================================================
@@ -405,10 +290,6 @@ class TestChatAPIEndpoints:
 
 class TestModuleImports:
     """Verify all production modules import without crashing."""
-
-    def test_import_channels_base(self):
-        from app.channels.base import BaseChannel
-        assert BaseChannel is not None
 
     def test_import_core_quality(self):
         from app.core.quality import all_tools_clean

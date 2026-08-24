@@ -145,11 +145,15 @@ class WhatsAppBot:
             text = text[split_at:].lstrip()
         return chunks
 
-    async def _send_message(self, to: str, text: str) -> None:
-        """Send a text message via the WhatsApp Business API."""
+    async def _send_message(self, to: str, text: str) -> bool:
+        """Send a text message via the WhatsApp Business API. Returns True ONLY on
+        a confirmed 2xx. send_alert() relies on this bool for at-least-once
+        delivery — returning None/True on failure would mark a lost digest as
+        delivered and purge it from the pending_deliveries journal (audit
+        2026-08-17)."""
         if not self.api_url or not self.api_token:
             logger.warning("[WhatsApp] API URL or token not configured, cannot send")
-            return
+            return False
 
         payload = {
             "messaging_product": "whatsapp",
@@ -169,8 +173,11 @@ class WhatsAppBot:
                     "[WhatsApp] Send failed (status=%d): %s",
                     resp.status_code, resp.text[:500],
                 )
+                return False
+            return True
         except Exception as e:
             logger.error("[WhatsApp] Send failed: %s", e)
+            return False
 
     async def send_alert(self, message: str) -> bool:
         """Send a message to the default chat. Converts Discord markdown to
@@ -181,12 +188,14 @@ class WhatsAppBot:
             from app.channels.format_for_channel import to_whatsapp
             wa_message = to_whatsapp(message)
             _chunks = self._split_message(wa_message)
+            ok = True
             async with self._send_lock:
                 for _ci, chunk in enumerate(_chunks):
                     if _ci:
                         await asyncio.sleep(0.3)
-                    await self._send_message(self.default_chat_id, chunk)
-            return True
+                    if not await self._send_message(self.default_chat_id, chunk):
+                        ok = False
+            return ok
         except Exception as e:
             logger.error("[WhatsApp] Alert send failed: %s", e)
             return False
@@ -237,62 +246,55 @@ class WhatsAppBot:
             except Exception:
                 return JSONResponse({"status": "invalid body"}, status_code=400)
 
-            # Parse the nested WhatsApp webhook structure
+            # Parse the nested WhatsApp webhook structure — a batched webhook
+            # can carry SEVERAL messages across entries/changes; the old
+            # messages[0]-only handling silently dropped the rest (audit
+            # 2026-08-19).
             try:
-                entry = body.get("entry", [])
-                if not entry:
-                    return JSONResponse({"status": "ok"})
-
-                changes = entry[0].get("changes", [])
-                if not changes:
-                    return JSONResponse({"status": "ok"})
-
-                value = changes[0].get("value", {})
-                messages = value.get("messages", [])
-                if not messages:
-                    return JSONResponse({"status": "ok"})
-
-                msg = messages[0]
-                msg_id = msg.get("id", "")
-                msg_type = msg.get("type", "")
-                sender_phone = msg.get("from", "")
-
-                # Dedup — WhatsApp may send the same webhook multiple times (persistent
-                # via SQLite). to_thread: writer-lock DB calls stay off the event loop
-                # (54h-freeze bug class, 2026-07-03).
-                if await asyncio.to_thread(self._check_dedup, msg_id):
-                    return JSONResponse({"status": "ok"})
-                await asyncio.to_thread(self._record_dedup, msg_id)
-
-                # Only handle text messages
-                if msg_type != "text":
-                    return JSONResponse({"status": "ok"})
-
-                text_body = msg.get("text", {}).get("body", "").strip()
-                if not text_body:
-                    return JSONResponse({"status": "ok"})
-
-                # Allowlist check
-                if not self._is_allowed(sender_phone):
-                    await self._send_message(
-                        sender_phone,
-                        "Sorry, you're not authorized to use this bot.",
-                    )
-                    return JSONResponse({"status": "ok"})
-
-                # Process the message
-                answer = await self._handle_query(text_body, sender_phone)
-
-                async with self._send_lock:
-                    for chunk in self._split_message(answer):
-                        await self._send_message(sender_phone, chunk)
-
+                for entry in body.get("entry", []):
+                    for change in entry.get("changes", []):
+                        for msg in (change.get("value", {}) or {}).get("messages", []):
+                            await self._handle_webhook_message(msg)
             except Exception as e:
                 logger.error("[WhatsApp] Webhook handler error: %s", e, exc_info=True)
 
             return JSONResponse({"status": "ok"})
 
         return router
+
+    async def _handle_webhook_message(self, msg: dict) -> None:
+        """Process ONE webhook message.
+
+        Dedup ordering matters: recording BEFORE handling meant a crash
+        mid-handling permanently lost the message (Meta's retry got deduped).
+        Now recorded after handling — a send failure reprocesses on retry,
+        which is acceptable; a silently lost owner message is not. to_thread:
+        writer-lock DB calls stay off the event loop (54h-freeze bug class).
+        """
+        msg_id = msg.get("id", "")
+        msg_type = msg.get("type", "")
+        sender_phone = msg.get("from", "")
+        if await asyncio.to_thread(self._check_dedup, msg_id):
+            return
+        if msg_type != "text":
+            await asyncio.to_thread(self._record_dedup, msg_id)
+            return
+        text_body = msg.get("text", {}).get("body", "").strip()
+        if not text_body:
+            await asyncio.to_thread(self._record_dedup, msg_id)
+            return
+        if not self._is_allowed(sender_phone):
+            await asyncio.to_thread(self._record_dedup, msg_id)
+            await self._send_message(
+                sender_phone,
+                "Sorry, you're not authorized to use this bot.",
+            )
+            return
+        answer = await self._handle_query(text_body, sender_phone)
+        async with self._send_lock:
+            for chunk in self._split_message(answer):
+                await self._send_message(sender_phone, chunk)
+        await asyncio.to_thread(self._record_dedup, msg_id)
 
     async def start(self) -> None:
         """No-op — webhook-based adapter, no polling needed."""

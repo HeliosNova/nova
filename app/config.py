@@ -68,7 +68,7 @@ _MUTABLE_FIELDS = {
     "TEMPERATURE_DEFAULT",
     "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "LESSON_VECTOR_STRONG_DISTANCE",
     "KG_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
-    "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT", "REFLEXION_DISTANCE_THRESHOLD",
+    "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT",
     "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
     "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS", "SKILL_SUCCESS_QUALITY",
     "INJECTION_SUSPICIOUS_THRESHOLD",
@@ -97,7 +97,7 @@ _MUTABLE_FIELDS = {
     "PROMPT_MOD_MAX_PROPOSALS_PER_DAY", "PROMPT_MOD_MAX_PENDING",
     "PROMPT_MOD_MAX_PROMOTIONS_PER_DAY", "PROMPT_MOD_MAX_DRIFT",
     "PROMPT_MOD_MIN_IMPROVEMENT_PP", "PROMPT_MOD_REGRESSION_TOLERANCE_PP",
-    "PROMPT_MOD_STABILITY_RUNS", "PROMPT_MOD_LATENCY_OVERHEAD_MAX",
+    "PROMPT_MOD_LATENCY_OVERHEAD_MAX",
 }
 
 
@@ -112,15 +112,6 @@ class Config:
     # chat context-gather timed out; manual audit 2026-07-09). Falls back to
     # OLLAMA_URL if the embed instance is unreachable (embedding.py probes both).
     EMBED_OLLAMA_URL: str = field(default_factory=lambda: _env("EMBED_OLLAMA_URL", "http://embed:11434"))
-
-    # Learning / reflexion toggles — these were referenced in code but missing
-    # from config, leading to `AttributeError: ??? ` at inspection time.
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
-    ENABLE_REFLEXION: bool = field(default_factory=lambda: _env("ENABLE_REFLEXION", "true").lower() == "true")
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
-    ENABLE_BACKGROUND_TASKS: bool = field(default_factory=lambda: _env("ENABLE_BACKGROUND_TASKS", "true").lower() == "true")
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
-    ENABLE_AUTO_FINETUNE: bool = field(default_factory=lambda: _env("ENABLE_AUTO_FINETUNE", "false").lower() == "true")
 
     # MCP (Model Context Protocol) — client (consume external MCP tools)
     ENABLE_MCP: bool = field(default_factory=lambda: _env("ENABLE_MCP", "true").lower() == "true")
@@ -358,9 +349,14 @@ class Config:
     # Concurrent sub-agent ceiling. Was hard-coded to 3; lifted now that
     # AGENT_TASK_TIMEOUT is 300s (RTX 3090 + 9B Q8 can sustain 5+ in parallel).
     MAX_PARALLEL_AGENTS: int = field(default_factory=lambda: _env_int("MAX_PARALLEL_AGENTS", 6))
-    # Recursive sub-agents: depth 2 = top-level can spawn level-1 sub-agents who can spawn level-2.
-    # Threshold gate prevents trivial sub-tasks from cascading; only complex sub-tasks recurse.
-    MAX_STRUCTURAL_DEPTH: int = field(default_factory=lambda: _env_int("MAX_STRUCTURAL_DEPTH", 2))
+    # Recursive sub-agents. Default 1 (2026-08-20 sweep): at 2, a depth-1
+    # sub-agent could decompose AGAIN (the gate is `depth >= MAX_STRUCTURAL_DEPTH`,
+    # so 1 >= 2 is False), letting one crafted message fan out to ~10 + 10x10 =
+    # 110 think() calls with no tree-wide concurrency cap — a single-GPU DoS.
+    # Depth 1 restores the documented "max depth = 1" invariant: the top-level
+    # query decomposes once into ≤MAX_AGENT_COUNT sub-agents; those cannot
+    # re-decompose. The threshold gate still keeps trivial sub-tasks from firing.
+    MAX_STRUCTURAL_DEPTH: int = field(default_factory=lambda: _env_int("MAX_STRUCTURAL_DEPTH", 1))
     # Tree-of-thought: when enabled, AgentLoop samples multiple action chains for hard steps
     # and picks the most consistent one. Adds latency proportional to sample count.
     ENABLE_TREE_OF_THOUGHT: bool = field(default_factory=lambda: _env("ENABLE_TREE_OF_THOUGHT", "true").lower() == "true")
@@ -394,6 +390,12 @@ class Config:
 
     # Skill import/export signing
     REQUIRE_SIGNED_SKILLS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_SKILLS", "true").lower() == "true")
+    # Lesson/KG import signing (2026-08-19, owner-approved): data_export.py has
+    # read these via getattr since the signing feature shipped, but the fields
+    # never existed — setting the env vars silently did nothing. Default false
+    # (unchanged behavior); flip to true to refuse unsigned knowledge imports.
+    REQUIRE_SIGNED_LESSONS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_LESSONS", "false").lower() == "true")
+    REQUIRE_SIGNED_KG_FACTS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_KG_FACTS", "false").lower() == "true")
 
     # Curiosity / autonomy
     ENABLE_CURIOSITY: bool = field(default_factory=lambda: _env("ENABLE_CURIOSITY", "true").lower() == "true")
@@ -485,8 +487,6 @@ class Config:
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
     REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
     REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
-    REFLEXION_DISTANCE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_DISTANCE_THRESHOLD", 0.7))
     ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
     SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
     # Minimum answer quality (reflexion score) for a skill execution to count as
@@ -518,9 +518,6 @@ class Config:
     PROMPT_MOD_MIN_IMPROVEMENT_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_MIN_IMPROVEMENT_PP", 2.0))
     # Max regression allowed (pp) in any non-target category before blocking
     PROMPT_MOD_REGRESSION_TOLERANCE_PP: float = field(default_factory=lambda: _env_float("PROMPT_MOD_REGRESSION_TOLERANCE_PP", 1.0))
-    # Number of consecutive shadow runs required (candidate must pass K out of this many)
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
-    PROMPT_MOD_STABILITY_RUNS: int = field(default_factory=lambda: _env_int("PROMPT_MOD_STABILITY_RUNS", 3))
     # Max latency overhead before blocking (1.15 = 15% overhead allowed)
     PROMPT_MOD_LATENCY_OVERHEAD_MAX: float = field(default_factory=lambda: _env_float("PROMPT_MOD_LATENCY_OVERHEAD_MAX", 1.15))
 

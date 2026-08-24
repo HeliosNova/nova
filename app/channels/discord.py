@@ -24,6 +24,7 @@ class DiscordBot:
         intents = discord.Intents.default()
         intents.message_content = True
         self._client = discord.Client(intents=intents)
+        self._shutdown = False  # set by close(); distinguishes app shutdown from a dead client
         self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # discord user_id → conv_id
         self._conv_store = None  # lazy-init DB store
         self._conv_lock = asyncio.Lock()
@@ -272,10 +273,28 @@ class DiscordBot:
         backoff = _INITIAL_BACKOFF
 
         while True:
+            # discord.py cannot restart a closed Client — a second .start() on
+            # it returns immediately, which used to hit the silent `return`
+            # below and leave the primary delivery channel dead until app
+            # restart (audit 2026-08-19). Rebuild client + handlers per retry,
+            # the way the telegram adapter does.
+            if self._client.is_closed():
+                intents = discord.Intents.default()
+                intents.message_content = True
+                self._client = discord.Client(intents=intents)
+                self._setup_events()
             connect_started = time.monotonic()
             try:
                 await self._client.start(self.token)
-                return  # Clean exit
+                if self._shutdown:
+                    return  # Clean exit — close() during app shutdown
+                logger.warning(
+                    "[Discord] gateway loop exited without exception (client "
+                    "closed) — reconnecting in %.0fs", backoff,
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, _MAX_BACKOFF)
+                continue
             except discord.LoginFailure as e:
                 logger.error("[Discord] Authentication failed (check DISCORD_TOKEN): %s", e)
                 return  # Don't retry auth failures
@@ -305,5 +324,6 @@ class DiscordBot:
 
     async def close(self):
         """Gracefully close the Discord connection."""
+        self._shutdown = True
         if self._client and not self._client.is_closed():
             await self._client.close()

@@ -131,8 +131,9 @@ def should_decompose(
     if not config.ENABLE_MULTI_AGENT:
         return False
 
-    # Gate 2: Recursion depth cap — sub-agents can spawn sub-sub-agents up to MAX_STRUCTURAL_DEPTH.
-    # Default depth=2 allows compare-of-compares and multi-step research to recurse.
+    # Gate 2: Recursion depth cap. At the default MAX_STRUCTURAL_DEPTH=1 a sub-agent
+    # cannot itself decompose (top level only); raising it would let compare-of-
+    # compares and multi-step research recurse.
     if _structural_depth.get() >= config.MAX_STRUCTURAL_DEPTH:
         return False
 

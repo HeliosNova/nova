@@ -282,8 +282,10 @@ def _detect_stale_dates(body: str) -> list[str]:
     """Return list of date strings in the body that are older than _STALE_DAYS."""
     if not body:
         return []
-    from datetime import datetime as _dt, timedelta as _td
-    cutoff = _dt.utcnow() - _td(days=_STALE_DAYS)
+    from datetime import datetime as _dt, timedelta as _td, timezone as _tz
+    # naive UTC (matches the naive datetimes _try_parse_date returns) without the
+    # deprecated utcnow() (audit 2026-08-22).
+    cutoff = _dt.now(_tz.utc).replace(tzinfo=None) - _td(days=_STALE_DAYS)
     stale: list[str] = []
     for m in _DATE_RE.finditer(body):
         raw = m.group(1)
@@ -301,7 +303,7 @@ def _detect_stale_dates(body: str) -> list[str]:
 
 
 def _try_parse_date(raw: str):
-    from datetime import datetime as _dt
+    from datetime import datetime as _dt, timezone as _tz
     formats = (
         "%B %d, %Y", "%B %d %Y", "%b %d, %Y", "%b %d %Y",
         "%B %d", "%b %d",   # year-less, assume current year
@@ -311,7 +313,7 @@ def _try_parse_date(raw: str):
         try:
             d = _dt.strptime(raw.strip().rstrip("."), fmt)
             if "%Y" not in fmt and "%y" not in fmt:
-                d = d.replace(year=_dt.utcnow().year)
+                d = d.replace(year=_dt.now(_tz.utc).year)
             return d
         except ValueError:
             continue

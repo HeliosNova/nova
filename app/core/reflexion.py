@@ -610,6 +610,11 @@ class ReflexionStore:
     def __init__(self, db):
         self._db = db
         self._collection = None
+        # Schema-ensure memo (audit 2026-08-23): skip re-running idempotent DDL
+        # on repeated construction — it was landing write-lock DDL on the
+        # event-loop thread every time a store was built in an async context.
+        if getattr(db, "schema_ensured", lambda _t: False)("reflexions"):
+            return
         for stmt in self._SCHEMA.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -625,6 +630,7 @@ class ReflexionStore:
                 self._db.execute(f"ALTER TABLE reflexions ADD COLUMN {col} {typedef}")
             except Exception:
                 pass
+        getattr(db, "mark_schema_ensured", lambda _t: None)("reflexions")
 
     # --- ChromaDB vector collection ---
 
@@ -1031,8 +1037,13 @@ class ReflexionStore:
         if len(new_words) < 2:
             return []
 
+        # is_eval excluded: eval-harness failures are synthetic probes —
+        # clustering them would mint lessons about the eval suite itself
+        # (audit 2026-08-23).
         failures = self._db.fetchall(
-            "SELECT * FROM reflexions WHERE outcome = 'failure' ORDER BY created_at DESC LIMIT 100"
+            "SELECT * FROM reflexions WHERE outcome = 'failure' "
+            "AND (is_eval IS NULL OR is_eval = 0) "
+            "ORDER BY created_at DESC LIMIT 100"
         )
 
         similar = []
@@ -1083,21 +1094,26 @@ class ReflexionStore:
 # Recurring failure promotion — auto-create lessons from repeated failures
 # ---------------------------------------------------------------------------
 
-async def check_recurring_failures(task_summary: str, learning_engine) -> None:
+async def check_recurring_failures(task_summary: str, learning_engine, store=None) -> bool:
     """Check if similar failures have recurred 3+ times and auto-promote to a lesson.
 
-    Uses the ReflexionStore from the active services to find patterns.
+    `store` defaults to the active services' ReflexionStore (the chat path);
+    the scheduled sweep passes one explicitly. Returns True when a promotion
+    was attempted (a cluster was found), False otherwise.
     """
-    from app.core.brain import get_services
     from app.core import llm as llm_mod
 
-    svc = get_services()
-    if not svc.reflexions:
-        return
+    if store is None:
+        from app.core.brain import get_services
 
-    similar = svc.reflexions.find_recurring_failures(task_summary)
+        svc = get_services()
+        store = svc.reflexions
+    if not store:
+        return False
+
+    similar = store.find_recurring_failures(task_summary)
     if not similar:
-        return
+        return False
 
     # Collect the failure reflections for LLM synthesis
     reflections = [r.reflection for r in similar[:5]]
@@ -1123,7 +1139,7 @@ async def check_recurring_failures(task_summary: str, learning_engine) -> None:
         )
         obj = llm_mod.extract_json_object(raw)
         if not obj or "lesson" not in obj:
-            return
+            return True
 
         lesson_id = learning_engine.add_knowledge_lesson(
             topic=obj.get("topic", task_summary[:100]),
@@ -1137,3 +1153,54 @@ async def check_recurring_failures(task_summary: str, learning_engine) -> None:
         )
     except Exception as e:
         logger.debug("Recurring failure promotion failed: %s", e)
+    return True
+
+
+async def sweep_recurring_failures(store, learning_engine, *, max_promotions: int = 2) -> int:
+    """Scheduled sweep: promote recurring-failure clusters to lessons.
+
+    check_recurring_failures only runs when a NEW failure arrives in live chat
+    (brain.py post-response) — the same chat-starvation that kept auto-skills
+    at zero organic skills. With monitor-driven usage, recurring failure
+    clusters sat unpromoted forever (live probe 2026-08-23: an n=9 quiz-failure
+    cluster, 0 auto-lessons ever minted). This walks recent non-eval failures
+    from daily maintenance and pushes each corroborated cluster through the
+    SAME promotion path. Lesson dedup in the learning engine folds re-promoted
+    clusters into the existing lesson instead of duplicating.
+
+    Returns the number of clusters promoted (LLM calls are capped by
+    max_promotions). Failures are logged, never raised.
+    """
+    try:
+        rows = store._db.fetchall(
+            "SELECT id, task_summary FROM reflexions WHERE outcome = 'failure' "
+            "AND (is_eval IS NULL OR is_eval = 0) "
+            "ORDER BY created_at DESC LIMIT 100"
+        )
+    except Exception as e:
+        logger.info("Failure-sweep: reflexions unavailable: %s", e)
+        return 0
+
+    promoted = 0
+    consumed: set[int] = set()
+    for row in rows:
+        if promoted >= max_promotions:
+            break
+        if row["id"] in consumed:
+            continue
+        similar = store.find_recurring_failures(row["task_summary"] or "")
+        if not similar:
+            continue
+        member_ids = {r.id for r in similar}
+        if member_ids & consumed:
+            consumed |= member_ids  # cluster overlaps one already promoted this pass
+            continue
+        attempted = await check_recurring_failures(
+            row["task_summary"] or "", learning_engine, store=store
+        )
+        consumed |= member_ids | {row["id"]}
+        if attempted:
+            promoted += 1
+    if promoted:
+        logger.info("Failure-sweep: promoted %d recurring-failure cluster(s)", promoted)
+    return promoted

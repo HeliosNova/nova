@@ -48,6 +48,45 @@ def test_rank_keeps_small_digest_intact(db):
     assert salience.rank_digest_items(db, items) == items  # never thin a tiny digest
 
 
+# --- Knowing signal (dossier-primed salience, 2026-08-12) -------------------
+
+def _seed_dossier(db, title, open_questions):
+    db.execute(
+        "INSERT INTO dossiers (kind, dkey, title, body) VALUES ('domain', ?, ?, ?)",
+        (title.lower().replace(" ", "-"), title,
+         f"## Current understanding\nstuff\n\n## Open questions\n{open_questions}\n"),
+    )
+
+
+def test_knowing_signal_lifts_open_question_matches(db):
+    # An item that speaks to a dossier's Open question outranks generic news —
+    # even with zero owner-query signal (Nova's OWN curiosity is a signal).
+    _seed_topics(db)
+    db.execute("INSERT INTO topic_frequency (topic, query_count) VALUES ('markets', 3)")
+    _seed_dossier(db, "Perovskite Solar", "- Will perovskite tandem modules reach commercial durability certification?")
+    hot = salience.score_text(db, "Perovskite tandem modules pass durability certification milestone.")
+    cold = salience.score_text(db, "Regional festival attendance grows modestly this summer season.")
+    assert hot > cold
+
+
+def test_contradiction_flag_boosts_score(db):
+    _seed_topics(db)
+    db.execute("INSERT INTO topic_frequency (topic, query_count) VALUES ('markets', 3)")
+    base = salience.score_text(db, "Chip production output rose in the second quarter.")
+    flagged = salience.score_text(
+        db, "Chip production output rose in the second quarter. CONTRADICTS PRIOR UNDERSTANDING.")
+    assert flagged > base
+
+
+def test_cold_start_uses_knowing_only(db):
+    # No owner queries, no learned weights — but dossiers exist: standing
+    # knowledge still ranks, corroboration still counts, nothing crashes.
+    _seed_dossier(db, "Quantum Computing", "- When will logical qubit counts cross 100?")
+    know = salience.score_text(db, "Logical qubit counts cross 100 in new quantum computing record.")
+    generic = salience.score_text(db, "Generic item mentioning nothing from standing knowledge here.")
+    assert know > generic
+
+
 def test_irrelevant_item_can_be_dropped(db):
     # Regression (2026-06-21 review): the drop-floor was inert (base==floor).
     # With owner signal present, a truly-irrelevant item must score BELOW floor.
@@ -108,6 +147,43 @@ def test_parse_forecast_line(db):
 
 def test_no_forecast_line_returns_none(db):
     assert forecasts.parse_and_store_forecast(db, "No forecast here. CHANGED: stuff.") is None
+
+
+def test_parse_forecast_with_confidence_word(db):
+    # The dossier prompt's template reads '<0.x confidence>' and the 27B writes
+    # the word — probe-confirmed 2026-08-13. The v1 regex demanded end-of-line
+    # after the number, so the prompt's OWN format never parsed (one of two
+    # stacked bugs behind zero minted forecasts across 60+ consolidations).
+    text = ("CHANGED: initial dossier\n"
+            "FORECAST: The Fed announces a 25 basis point cut at the September 17 "
+            "FOMC meeting | 36 days | 0.78 confidence")
+    fid = forecasts.parse_and_store_forecast(db, text, source_monitor="Knowledge Consolidation")
+    assert fid
+    row = db.fetchone("SELECT claim, confidence FROM forecasts WHERE id=?", (fid,))
+    assert "September 17" in row["claim"] and abs(row["confidence"] - 0.78) < 1e-6
+    assert "confidence" not in row["claim"]
+
+
+def test_forecast_none_optout_not_stored(db):
+    # The v2 mandatory line contract: 'FORECAST: none' is the explicit opt-out
+    # and must never create a forecast row.
+    assert forecasts.parse_and_store_forecast(db, "CHANGED: quiet cycle.\nFORECAST: none") is None
+
+
+def test_calibration_gap_and_scoping(db):
+    # Judgment rung (2026-08-14): stated confidence must be WORTH its number.
+    for conf, status, key in ((0.9, "hit", "dossier:finance"), (0.9, "miss", "dossier:finance"),
+                              (0.8, "miss", "dossier:finance"), (0.6, "hit", "dossier:ai-and-ml")):
+        fid = forecasts.create_forecast(db, f"claim {conf}/{status}", days=1,
+                                        confidence=conf, storyline_key=key)
+        db.execute("UPDATE forecasts SET status=? WHERE id=?", (status, fid))
+    cal = forecasts.calibration(db, key_prefix="dossier:finance")
+    assert cal["n"] == 3
+    assert abs(cal["mean_conf"] - 0.867) < 0.01
+    assert abs(cal["hit_rate"] - 0.333) < 0.01
+    assert cal["gap"] > 0.5                      # ran badly overconfident
+    # min_n gate: no lessons from tiny samples
+    assert forecasts.calibration(db, key_prefix="dossier:ai-and-ml", min_n=5) is None
 
 
 @pytest.mark.asyncio

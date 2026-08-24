@@ -98,11 +98,11 @@ Your job: design ONE Python function that would have answered these queries. Out
 CONSTRAINTS:
 - The function MUST be named `run`.
 - Code MUST be valid Python — it will be parsed with ast.parse.
-- Keep code under 80 lines. Use the standard library freely (math, json, re, datetime, statistics, urllib, http, socket, os if needed).
+- Keep code under 80 lines. Use the safe standard library (math, json, re, datetime, statistics, collections, itertools, functools).
+- DO NOT import networking, subprocess, FFI, OS, or import-machinery modules (socket, urllib, http, httpx, requests, subprocess, ctypes, os, sys, importlib, ...), and DO NOT use eval / exec / getattr / __import__ / open. Generated tools run sandboxed without the network — any such tool is REJECTED. Nova reaches the web through its own web_search tool, not generated code.
 - DO NOT use placeholders like "# implement here" or hardcoded fake data — write the real logic.
 - DO NOT call other custom tools or undefined functions; the function must run standalone.
-- If the gap is about web fetching, use `urllib.request.urlopen` or `httpx`.
-- If the gap is about computation, do the math directly.
+- Generate tools for COMPUTATION / transformation only (parsing, formatting, math, aggregation). Do the work directly.
 - The function must return a STRING (the answer the assistant would give).
 
 Output ONLY the JSON object — no preamble, no explanations, no code fences."""
@@ -365,7 +365,11 @@ async def synthesize_tools_from_gaps(db, *, max_per_run: int = 3) -> dict:
         return {"clusters_seen": 0, "tools_created": 0, "rejected": [], "created_names": []}
 
     store = CustomToolStore(db)
-    existing_names = {t.name for t in store.list_tools()} if hasattr(store, "list_tools") else set()
+    # get_all_tools() is the real method — the old `list_tools` never existed, so
+    # `hasattr(...)` was always False and this dedup gate was dead: every cycle
+    # re-proposed (and smoke-executed) tools for already-covered keywords until
+    # create_tool's uniqueness check finally rejected them (audit 2026-08-22).
+    existing_names = {t.name for t in store.get_all_tools()}
 
     created: list[str] = []
     rejected: list[dict] = []
@@ -417,6 +421,7 @@ async def synthesize_tools_from_gaps(db, *, max_per_run: int = 3) -> dict:
             description=proposal["description"],
             parameters=params_json,
             code=proposal["code"],
+            screen_network=True,  # generated from capability gaps → no network/exec
         )
         if tid > 0:
             created.append(proposal["name"])

@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, Field
 
 from app.auth import require_auth
@@ -15,6 +15,18 @@ from app.config import config
 logger = logging.getLogger(__name__)
 
 router = APIRouter(tags=["daemon"], dependencies=[Depends(require_auth)])
+
+
+def _safe_json(raw) -> dict:
+    """Parse a JSON column, returning {} on malformed data so one corrupt
+    event_queue row can't 500 the whole listing endpoint (audit 2026-08-22)."""
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else {"value": parsed}
+    except (json.JSONDecodeError, TypeError, ValueError):
+        return {}
 
 
 # ---------------------------------------------------------------------------
@@ -57,7 +69,7 @@ async def ingest_event(event: EventIn):
 
 
 @router.get("/daemon/events")
-async def list_events(status: str = "pending", limit: int = 50):
+async def list_events(status: str = "pending", limit: int = Query(50, ge=1, le=500)):
     """List events in the queue."""
     from app.core.brain import get_services
 
@@ -75,7 +87,7 @@ async def list_events(status: str = "pending", limit: int = 50):
         {
             "id": r["id"],
             "event_type": r["event_type"],
-            "payload": json.loads(r["payload"]) if r["payload"] else {},
+            "payload": _safe_json(r["payload"]),
             "priority": r["priority"],
             "status": r["status"],
             "created_at": r["created_at"],
@@ -89,7 +101,7 @@ async def list_events(status: str = "pending", limit: int = 50):
 # ---------------------------------------------------------------------------
 
 @router.get("/daemon/log")
-async def get_daemon_log(hours: int = 24, category: str | None = None, limit: int = 100):
+async def get_daemon_log(hours: int = Query(24, ge=1, le=720), category: str | None = None, limit: int = Query(100, ge=1, le=1000)):
     """Get recent daemon log entries."""
     from app.core.brain import get_services
 
@@ -98,7 +110,7 @@ async def get_daemon_log(hours: int = 24, category: str | None = None, limit: in
         raise HTTPException(503, "Monitor store not initialized")
 
     db = svc.monitor_store.db
-    cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+    cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
 
     if category:
         rows = db.fetchall(

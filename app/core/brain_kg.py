@@ -28,6 +28,29 @@ _SOURCE_CONFIDENCE: dict[str, float] = {
 _DEFAULT_SOURCE_CONFIDENCE = 0.65
 
 
+# Grammar-constrained array output (Ollama `format`) — replaces the fragile
+# json_prefix="[{" prefill. On the 0.32.13 engine both qwen3.8:27b and nova-ft
+# stopped returning array ELEMENTS for a multi-char "[{" prefill (each returned a
+# bare {object}); the provider's re-prepend guard then produced "[{{…}" and
+# json.loads died at char 2 — KG extraction silently added ZERO facts from
+# 2026-08-15 (last extracted fact 20:58). A schema passed as `format` forces a
+# well-formed top-level array and is the Ollama-recommended method for structured
+# output (proven: 4/4 valid triples on both models, _audit/repro4.py).
+_KG_TRIPLES_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "subject": {"type": "string"},
+            "predicate": {"type": "string"},
+            "object": {"type": "string"},
+            "confidence": {"type": "number"},
+        },
+        "required": ["subject", "predicate", "object"],
+    },
+}
+
+
 async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = "",
                               *, max_answer_chars: int = 1000, max_triples: int = 5,
                               model: str | None = None,
@@ -98,7 +121,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": prompt}],
             json_mode=True,
-            json_prefix="[{",
+            json_schema=_KG_TRIPLES_SCHEMA,
             model=model,
         )
         if raw is None or not raw:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import hmac
+import ipaddress
 import json
 import logging
 import time
@@ -148,6 +149,26 @@ def _get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+_DOCKER_BRIDGE = ipaddress.ip_network("172.16.0.0/12")
+
+
+def _is_nat_collapsed_ip(ip: str) -> bool:
+    """True for the loopback + Docker-bridge addresses that host->published-port
+    traffic collapses to under Docker's NAT — EVERY client looks like one gateway/
+    container IP there (the live auth_lockouts row was 172.18.0.8). Locking such an
+    address out is pure self-DoS with no security value (it can't tell clients
+    apart), so these are exempt from the failure-lockout. Genuine LAN (10/8,
+    192.168/16) and public IPs are NOT exempt: when a trusted proxy supplies real
+    per-client IPs via X-Forwarded-For the lockout still protects them. The 401 on
+    a wrong key is unaffected — only the accumulate-and-lock path is skipped.
+    (audit 2026-08-22)"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return addr.is_loopback or addr in _DOCKER_BRIDGE
+
+
 def _evict_oldest(d: dict, max_size: int) -> None:
     """Evict oldest entries from a dict when it exceeds max_size."""
     if len(d) <= max_size:
@@ -177,6 +198,10 @@ def _cleanup_expired_entries() -> None:
 
 def _check_rate_limit(ip: str) -> None:
     """Raise 429 if IP has exceeded auth failure limit."""
+    # NAT-collapsed addresses can't be meaningfully rate-limited (all clients
+    # share them) and locking them out only DoSes the owner — skip.
+    if _is_nat_collapsed_ip(ip):
+        return
     now = time.time()
 
     # Periodic cleanup of expired entries (removes stale IPs)
@@ -213,6 +238,10 @@ def _check_rate_limit(ip: str) -> None:
 
 def _record_failure(ip: str) -> None:
     """Record an auth failure and lock out if threshold exceeded."""
+    # Don't accumulate failures for NAT-collapsed addresses — locking the shared
+    # gateway/loopback out is self-DoS, not protection (see _is_nat_collapsed_ip).
+    if _is_nat_collapsed_ip(ip):
+        return
     now = time.time()
 
     # Explicit entry creation (no defaultdict auto-creation)

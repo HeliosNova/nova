@@ -780,21 +780,53 @@ class DreamConsolidator:
                 continue
 
             new_confidence = max(m["confidence"] for m in cluster)
+            # Converge on ONE canonical per family. Canonicals are excluded from
+            # clustering (correctly), but the source lessons keep regenerating —
+            # so every fresh trio minted ANOTHER canonical (7 "art history"
+            # canonicals by 2026-08-19). If a prior canonical matches this
+            # cluster's topic, refresh it in place instead of inserting.
+            existing_canonical = None
             try:
-                # Insert the canonical lesson
-                cursor = await self._db.execute(
-                    "INSERT INTO lessons "
-                    "(topic, correct_answer, lesson_text, context, confidence) "
-                    "VALUES (?, ?, ?, ?, ?)",
-                    (
-                        new_topic[:200],
-                        new_answer[:1000],
-                        f"Procedural-consolidation: merged {len(cluster)} lessons",
-                        "procedural_consolidation",
-                        min(0.95, new_confidence),
-                    ),
+                canon_rows = await self._db.fetchall(
+                    "SELECT id, topic FROM lessons "
+                    "WHERE lesson_text LIKE 'Procedural-consolidation:%' "
+                    "ORDER BY created_at DESC LIMIT 100"
                 )
-                new_lesson_id = cursor.lastrowid
+                new_topic_tokens = _tokens(new_topic)
+                for cr in canon_rows:
+                    if _jaccard(new_topic_tokens, _tokens(cr["topic"] or "")) >= 0.5:
+                        existing_canonical = cr
+                        break
+            except Exception:
+                pass
+            try:
+                if existing_canonical:
+                    new_lesson_id = existing_canonical["id"]
+                    await self._db.execute(
+                        "UPDATE lessons SET correct_answer = ?, "
+                        "confidence = MAX(confidence, ?), lesson_text = ? "
+                        "WHERE id = ?",
+                        (
+                            new_answer[:1000],
+                            min(0.95, new_confidence),
+                            f"Procedural-consolidation: merged {len(cluster)} lessons (refreshed)",
+                            new_lesson_id,
+                        ),
+                    )
+                else:
+                    cursor = await self._db.execute(
+                        "INSERT INTO lessons "
+                        "(topic, correct_answer, lesson_text, context, confidence) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            new_topic[:200],
+                            new_answer[:1000],
+                            f"Procedural-consolidation: merged {len(cluster)} lessons",
+                            "procedural_consolidation",
+                            min(0.95, new_confidence),
+                        ),
+                    )
+                    new_lesson_id = cursor.lastrowid
                 # Demote members so retrieval prefers the canonical lesson
                 placeholders = ",".join("?" for _ in cluster_ids)
                 await self._db.execute(
@@ -890,10 +922,12 @@ class DreamConsolidator:
             ("dream", digest, "dream_consolidator"),
         )
 
-        # Prune old daemon log entries (keep 7 days)
-        cutoff = (datetime.utcnow() - timedelta(days=7)).isoformat()
+        # Prune old daemon log entries (keep 7 days). Use SQL datetime() so the
+        # cutoff matches the stored 'YYYY-MM-DD HH:MM:SS' format — a Python
+        # isoformat() cutoff has a 'T' separator + microseconds, so the TEXT
+        # comparison was format-inconsistent (audit 2026-08-17).
         await self._db.execute(
-            "DELETE FROM daemon_log WHERE created_at < ?", (cutoff,)
+            "DELETE FROM daemon_log WHERE created_at < datetime('now', '-7 days')"
         )
 
         # Trust decay — trust must be maintained through use (Sovereign-OS pattern)

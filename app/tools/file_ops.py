@@ -96,6 +96,17 @@ class FileOpsTool(BaseTool):
                 error_category=ErrorCategory.VALIDATION,
             )
 
+    def _is_protected_secret(self, safe) -> bool:
+        """A file whose NAME or EXTENSION marks it a secret/credential/DB.
+
+        Read/list must honor this, not just write/delete (2026-08-20 sweep):
+        the guard was asymmetric, so file_ops(read, /data/training_data.jsonl)
+        exfiltrated every DPO pair (user queries + corrections), and at full
+        tier any .env/.pem/.key text was readable — a clean exfil primitive for
+        a second-order injection to pair with an outbound http_fetch."""
+        return (safe.suffix.lower() in self._PROTECTED_EXTENSIONS
+                or safe.name.lower() in self._PROTECTED_FILES)
+
     async def _read(self, path_str: str) -> ToolResult:
         safe = _safe_path(path_str, write=False)
         if safe is None:
@@ -103,6 +114,8 @@ class FileOpsTool(BaseTool):
         for part in safe.parts:
             if part.lower() in self._PROTECTED_DIRS:
                 return ToolResult(output="", success=False, error=f"Cannot access '{part}/' directory (protected)", error_category=ErrorCategory.PERMISSION)
+        if self._is_protected_secret(safe):
+            return ToolResult(output="", success=False, error=f"Cannot read '{safe.name}' (protected secret/DB file)", error_category=ErrorCategory.PERMISSION)
         if not safe.exists():
             return ToolResult(output="", success=False, error=f"File not found: {safe.name}", error_category=ErrorCategory.NOT_FOUND)
         if not safe.is_file():
@@ -162,6 +175,8 @@ class FileOpsTool(BaseTool):
             entries = sorted(safe.iterdir())
             lines = []
             for entry in entries[:100]:  # Limit listing
+                if entry.is_file() and self._is_protected_secret(entry):
+                    continue  # don't disclose secret/DB filenames in listings
                 prefix = "d " if entry.is_dir() else "f "
                 size = entry.stat().st_size if entry.is_file() else 0
                 lines.append(f"{prefix}{entry.name} ({size} bytes)")

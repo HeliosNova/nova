@@ -46,6 +46,10 @@ class Skill:
     consecutive_failures: int = 0
     source: str = "correction"   # "correction" | "auto" | "manual"
     composed_of: list[int] = field(default_factory=list)  # ordered sub-skill IDs
+    # Procedure skills (migration 30): natural-language procedural knowledge,
+    # semantic-match only (trigger_pattern is empty), guidance not execution.
+    kind: str = "exec"           # "exec" | "procedure"
+    procedure_text: str | None = None
 
 
 def _pattern_specificity(pattern: str) -> tuple[int, int, int]:
@@ -71,52 +75,152 @@ _SKILL_MATCH_STOPWORDS = frozenset({
     "while", "such", "some", "many", "much", "every", "each",
     "really", "actually", "currently",
 })
-# Generic verbs + quantitative/financial TOPIC nouns. These are too broad to
-# anchor a match. The nouns were added 2026-06-13: a math word problem ("the
-# shop doubles every price") matched `real_time_price_lookup` at sim=0.751 via
-# the shared word "price" — a false positive that injected a price-lookup
-# procedure into an arithmetic answer. With these non-anchoring, such a skill
-# must fire via its specific regex ("current price of X"), while entity queries
-# ("price of gold") still match the right skill via the entity token ("gold").
+# Generic verbs + meta nouns. Too broad to anchor a match on their own.
+#
+# REDESIGNED 2026-08-18. The 2026-06-13 version also genericized the
+# quantitative/financial TOPIC nouns (price/cost/rate/market/latest/today/
+# current/convert/…) to block ONE false positive — a math word problem ("the
+# shop doubles every price") matching `real_time_price_lookup` at sim=0.751.
+# That overshot catastrophically: the nightly eval's semantic-match recall sat
+# at 25% for months because true paraphrases share EXACTLY those domain nouns
+# ("BTC cost"↔"crypto price", "NVDA share price"↔"stock price") — the gate
+# vetoed every one (live-traced 2026-08-18: all 5 failing eval paraphrases died
+# here, none at the embedder, which scores them 0.65–0.77). The math-FP's real
+# signature is COMPUTATIONAL INTENT, not shared topic nouns — now handled by
+# _COMPUTATIONAL_QUERY_RE below, so the domain nouns anchor matches again.
 _SKILL_MATCH_GENERIC = frozenset({
     "compare", "comparison", "contrast", "find", "search",
     "lookup", "look", "get", "fetch", "retrieve", "store",
     "save", "remember", "set", "create", "make", "build",
-    "give", "show", "list", "calculate", "compute", "convert",
+    "give", "show", "list", "calculate", "compute",
     "test", "check", "validate", "verify", "explain", "describe",
     "preference", "user", "info", "data", "result", "value",
     "difference", "differences", "different", "versus",
     "method", "methods", "approach", "approaches",
     "type", "types", "kind", "kinds", "sort", "sorts",
     "case", "cases", "example", "examples",
-    "price", "prices", "cost", "costs", "rate", "rates",
-    "amount", "amounts", "total", "totals", "market", "markets",
-    "number", "numbers", "count", "level", "levels", "point",
-    "points", "current", "latest", "today", "real", "time",
 })
 
+# Arithmetic / word-problem intent: these queries need the model (or calculator)
+# to COMPUTE, and must never semantic-match a lookup skill no matter how
+# topically similar (the bat-and-ball FP class). Regex skills still apply.
+_COMPUTATIONAL_QUERY_RE = re.compile(
+    r"(?i)(?:"
+    r"\d[\d,.]*\s*(?:%|percent\b)"                      # percentages of numbers
+    r"|\d[\d,.]*\s*[+*/^]\s*\d"                         # explicit operators
+    r"|\b(?:calculate|compute|solve)\b"                 # imperative math
+    r"|\d[\d,.]*\s+(?:more|less|fewer)\s+than\b"        # word-problem comparisons
+    r"|\b(?:doubles?|doubled|triples?|tripled|halved|twice)\b"  # scaling verbs
+    r"|\bwhat\s+is\s+the\s+(?:new|total|sum|difference)\b"      # solve-for phrasing
+    r"|\bhow\s+many\b.{0,40}\d"                         # counting problems
+    r")")
 
-def _query_skill_topically_related(query: str, skill_name: str, trigger_pattern: str) -> bool:
-    """Reject a semantic skill match that shares no SUBSTANTIVE token with the
-    query. Embedding similarity alone conflates *topic* with *intent* — a math
-    problem about prices is ~0.75 similar to a price-lookup skill. A match is
-    kept only if query and skill share a concrete (non-stopword, non-generic)
-    token; returns False to reject.
+# Above this cosine similarity a semantic match is trusted WITHOUT lexical
+# overlap (bge-m3 places true paraphrases at 0.65–0.77; the strong tier mirrors
+# the lessons/KG "strong vector stands alone" pattern). Computational queries
+# are vetoed before this bypass, so the 0.751 math-FP cannot ride it.
+# 0.72 (was 0.70): a cross-domain FP was measured at 0.703 (a news query vs the
+# crypto skill — shared doc scaffolding inflates cross-skill sims) while the
+# true zero-overlap paraphrases measure 0.730/0.740/0.763. 0.72 splits them.
+# HONEST LIMIT: a topic-ADJACENT distractor can land inside the TP band (vinyl
+# "stockpile…pricing…resale" scored 0.730 vs the stock skill, above the news TP
+# at 0.723) — similarity alone cannot separate that pair; it's the bag-of-words
+# floor, pinned in the eval suite as a known limitation.
+_SEMANTIC_STRONG_SIM = 0.72
+
+# Negation handling (2026-08-18, lifts the suite's pinned limitation): a
+# REJECTION cue negates the tokens in the window after it, so "I do NOT want
+# today's Bitcoin price" cannot anchor on {bitcoin, price}. Deliberately
+# excludes inability phrasing ("can't find the price" is a frustrated REQUEST,
+# not a rejection).
+_REJECTION_CUES = frozenset({
+    "not", "no", "dont", "don't", "never", "without", "except",
+    "instead", "rather", "avoid", "stop",
+})
+_NEGATION_WINDOW = 4
+
+
+def _negated_query_tokens(query: str) -> frozenset[str]:
+    """Tokens governed by a rejection cue (the cue's following window)."""
+    toks = re.findall(r"[a-z0-9']+", (query or "").lower())
+    neg: set[str] = set()
+    for i, t in enumerate(toks):
+        if t in _REJECTION_CUES:
+            neg.update(toks[i + 1: i + 1 + _NEGATION_WINDOW])
+    return frozenset(neg)
+
+# Skill-vs-skill DUPLICATE bar for create_skill. Deliberately much higher than
+# the query-matching threshold: "duplicate" means near-identical trigger intent,
+# not mere topical kinship. At the old 0.55 (reusing SKILL_SEMANTIC_THRESHOLD)
+# any two skills sharing boilerplate collapsed into one (live: 6 seeded eval
+# skills → 1 survivor, holding semantic-match recall at 25% for months).
+# 0.94 is MEASURED (2026-08-18, bge-m3, worst-case shared-scaffold docs):
+# distinct sibling skills score 0.836–0.914 doc-vs-doc (max = two different
+# "price of X" skills at 0.914) while a true reworded duplicate scores 0.968.
+_SKILL_DUP_SIM = 0.94
+
+
+def _query_skill_topically_related(query: str, skill_name: str, trigger_pattern: str,
+                                   similarity: float = 0.0) -> bool:
+    """Admissibility check for a semantic skill match (redesigned 2026-08-18).
+
+    Three-stage decision:
+      1. COMPUTATIONAL VETO — arithmetic/word-problem queries never semantic-
+         match a skill (the bat-and-ball FP class: a math problem about prices
+         is ~0.75 similar to a price-lookup skill but needs COMPUTATION, not a
+         lookup). Regex-triggered skills still apply to such queries.
+      2. LEXICAL ANCHOR — a shared substantive (non-stopword, non-generic,
+         ≥3-char) token between query and skill admits the match. Floor was 4;
+         3 admits the short entities real queries pivot on (btc, eth, km, nvda).
+      3. STRONG-SIM BYPASS — no lexical anchor, but cosine similarity ≥ 0.70:
+         trust the embedding. True paraphrases routinely share ZERO surface
+         tokens with the skill ("will it rain today" ↔ "Weather Probe" at 0.74;
+         "10km in miles" ↔ "Unit Convert" at 0.76 — both live-measured) — the
+         old always-on lexical veto held semantic-match eval recall at 25%.
     """
+    if _COMPUTATIONAL_QUERY_RE.search(query or ""):
+        return False
     q_all = {
-        t for t in re.findall(r"[a-z][a-z0-9]{3,}", (query or "").lower())
+        t for t in re.findall(r"[a-z][a-z0-9]{2,}", (query or "").lower())
         if t not in _SKILL_MATCH_STOPWORDS
     }
     if not q_all:
         return False
     q_sub = q_all - _SKILL_MATCH_GENERIC
-    raw = set(re.findall(r"[a-z][a-z0-9_]{3,}", (skill_name + " " + (trigger_pattern or "")).lower()))
-    skill_all = {t for piece in raw for t in re.split(r"[_\\]", piece) if len(t) >= 4}
+    raw = set(re.findall(r"[a-z][a-z0-9_]{2,}", (skill_name + " " + (trigger_pattern or "")).lower()))
+    skill_all = {t for piece in raw for t in re.split(r"[_\\]", piece) if len(t) >= 3}
     skill_sub = skill_all - _SKILL_MATCH_GENERIC
-    # If both sides have tokens but no substantive overlap, reject.
-    if skill_all and not (q_sub & skill_sub):
-        return False
-    return True
+    if not skill_all:
+        return True
+    # NEGATION SCOPE (2026-08-18): tokens under a rejection cue cannot anchor,
+    # and a skill whose domain appears ONLY under negation is rejected outright
+    # ("I do NOT want today's Bitcoin price" must not fire the crypto skill —
+    # while "I don't need the weather, what's the bitcoin price" still fires it
+    # via the un-negated {bitcoin, price} anchor).
+    neg = _negated_query_tokens(query)
+    exact = q_sub & skill_sub
+    if exact - neg:
+        return True                    # live (non-negated) anchor
+    # Fuzzy anchor: a typo'd domain token ("wether" for "weather", ratio 0.92)
+    # is a REAL user behavior that exact overlap misses and whose embedding sim
+    # lands just below the strong tier. Near-identical (SequenceMatcher ratio
+    # ≥ 0.85, both sides ≥ 5 chars so short tokens can't false-anchor) counts —
+    # unless the query token is itself negated.
+    from difflib import SequenceMatcher
+    fuzzy_negated = False
+    for qt in q_sub:
+        if len(qt) < 5:
+            continue
+        for st in skill_sub:
+            if len(st) >= 5 and SequenceMatcher(None, qt, st).ratio() >= 0.85:
+                if qt in neg:
+                    fuzzy_negated = True
+                else:
+                    return True
+    if exact or fuzzy_negated:
+        return False                   # skill domain present ONLY under negation
+    # No lexical anchor — admit only on a strong embedding signal.
+    return similarity >= _SEMANTIC_STRONG_SIM
 
 
 class SkillStore:
@@ -225,7 +329,15 @@ class SkillStore:
             distance = results["distances"][0][0]
             # ChromaDB cosine distance: 0 = identical, 2 = opposite.
             similarity = 1.0 - (distance / 2.0)
-            if similarity < config.SKILL_SEMANTIC_THRESHOLD:
+            # DUP threshold is its own constant (2026-08-18). This check used to
+            # reuse SKILL_SEMANTIC_THRESHOLD (0.55) — a QUERY-matching bar, far
+            # too loose for "these two skills are the same": any two skills
+            # sharing boilerplate scaffolding cleared 0.55, so create_skill
+            # silently swallowed distinct skills as "duplicates". Live proof:
+            # the eval harness seeded 6 "Eval: X Probe" skills and only ONE
+            # survived — the true root cause of semantic-match recall sitting
+            # at 25% for months (the skills to match simply weren't there).
+            if similarity < _SKILL_DUP_SIM:
                 return None
             metadata = results["metadatas"][0][0]
             existing_id = int(metadata["skill_id"])
@@ -235,13 +347,25 @@ class SkillStore:
             existing_row = self._db.fetchone(
                 "SELECT name FROM skills WHERE id = ?", (existing_id,)
             )
-            if existing_row and existing_row["name"].lower() == name.lower():
+            if existing_row is None:
+                # GHOST vector: the SQLite row is gone (raw delete / partial
+                # cleanup) but its embedding survived. Treating a ghost as a
+                # live duplicate BLOCKS legitimate new skills forever (seen
+                # live 2026-08-18). Drop the stale vector and allow creation —
+                # mirrors _semantic_match's stale-id sweep.
+                try:
+                    collection.delete(ids=[results["ids"][0][0]])
+                    logger.info("Semantic dedup: dropped ghost vector for deleted skill #%d", existing_id)
+                except Exception:
+                    pass
+                return None
+            if existing_row["name"].lower() == name.lower():
                 return None
             logger.info(
                 "Semantic dedup: '%s' is %.3f similar to existing #%d '%s' "
                 "(threshold %.2f)",
                 name, similarity, existing_id, existing_name,
-                config.SKILL_SEMANTIC_THRESHOLD,
+                _SKILL_DUP_SIM,
             )
             return existing_id
         except Exception as e:
@@ -354,6 +478,11 @@ class SkillStore:
         for row in rows:
             try:
                 pattern = row["trigger_pattern"]
+                if not pattern:
+                    # Procedure skills (kind='procedure') have no regex trigger —
+                    # they match semantically only. re.search("") matches EVERY
+                    # query, so an empty pattern must never reach the search.
+                    continue
                 # Check for ReDoS-prone patterns before running
                 if _is_redos_risk(pattern):
                     logger.warning("Skill trigger pattern rejected (ReDoS risk): %s", pattern)
@@ -372,9 +501,12 @@ class SkillStore:
             )
             return self._row_to_skill(matches[0])
 
-        # Semantic fallback — finds skills whose natural-language descriptions
-        # are close to the query even when regex doesn't match exactly.
-        return self._semantic_match(query)
+        # No semantic fallback here: get_matching_skill orchestrates the
+        # two-stage flow (regex → gated semantic). A tail call here ran the
+        # semantic pass TWICE per query (double embed round-trip on the chat
+        # critical path) and bypassed ENABLE_SEMANTIC_SKILL_MATCHING entirely
+        # (merge artifact, audit 2026-08-19).
+        return None
 
     # ------------------------------------------------------------------
     # CRUD
@@ -419,11 +551,10 @@ class SkillStore:
                     continue
                 if not skill.enabled:
                     continue
-                # Sanity gate: a semantic match must share a SUBSTANTIVE token
-                # with the query — embedding similarity alone conflates topic
-                # with intent (a price-themed math problem matched a price-lookup
-                # skill at sim=0.751). See _query_skill_topically_related.
-                if not _query_skill_topically_related(query, skill.name, skill.trigger_pattern):
+                # Admissibility gate: computational-intent veto + lexical anchor
+                # OR strong-sim bypass (see _query_skill_topically_related).
+                if not _query_skill_topically_related(query, skill.name, skill.trigger_pattern,
+                                                      similarity=similarity):
                     logger.info(
                         "Semantic skill match REJECTED (insufficient overlap): '%s' for query=%r",
                         skill.name, query[:60],
@@ -433,6 +564,11 @@ class SkillStore:
                     "Semantic skill match: '%s' (id=%d, sim=%.3f, walked %d)",
                     skill.name, skill_id, similarity, idx,
                 )
+                # Margin observability (2026-08-19): the threshold sits 0.003
+                # under the weakest true paraphrase — the eval harness reads
+                # this to report min margin so embedder drift shows up as
+                # margin EROSION, not a surprise recall crash.
+                self.last_semantic_sim = similarity
                 # Best-effort cleanup of any stale embeddings we passed over
                 if stale_ids:
                     try:
@@ -453,6 +589,60 @@ class SkillStore:
         except Exception as e:
             logger.warning("Semantic skill lookup failed: %s", e)
         return None
+
+    def create_procedure_skill(
+        self,
+        name: str,
+        description: str,
+        procedure_text: str,
+        source: str = "auto",
+        initial_success_rate: float = 0.7,
+    ) -> int | None:
+        """Create a natural-language PROCEDURE skill (migration 30).
+
+        No trigger regex, no mechanical steps: matched semantically, rendered
+        into the prompt as guidance. This is the field-aligned representation
+        (NL/markdown skills — Agent Skills spec, SkillPyramid/SkillBrew line);
+        the regex+steps formalism is why auto-extraction produced 0 organic
+        skills in Nova's lifetime.
+        """
+        name = (name or "").strip()[:120]
+        description = (description or "").strip()
+        procedure_text = (procedure_text or "").strip()
+        if not name or len(procedure_text) < 60 or len(procedure_text) > 2400:
+            logger.info("Procedure skill rejected (name/length): %r", name[:60])
+            return None
+        # Same 0.94 semantic dup bar as exec skills; the embed doc for
+        # procedures is name+description, comparable to name+pattern-hint docs.
+        dup_id = self._find_semantic_duplicate(name, description[:200])
+        if dup_id is not None:
+            logger.info("Procedure skill '%s' rejected: dup of #%d", name, dup_id)
+            return None
+        existing = self._db.fetchone(
+            "SELECT id FROM skills WHERE LOWER(name) = LOWER(?)", (name,))
+        import sqlite3 as _sqlite3
+        try:
+            if existing:
+                self._db.execute(
+                    "UPDATE skills SET procedure_text = ?, kind = 'procedure', "
+                    "enabled = 1 WHERE id = ?",
+                    (procedure_text, existing["id"]))
+                self._embed_skill(existing["id"], name, description[:200])
+                logger.info("Procedure skill updated: #%d '%s'", existing["id"], name)
+                return existing["id"]
+            cursor = self._db.execute(
+                "INSERT INTO skills (name, trigger_pattern, steps, answer_template, "
+                "success_rate, source, composed_of, kind, procedure_text) "
+                "VALUES (?, '', '[]', NULL, ?, ?, '[]', 'procedure', ?)",
+                (name, initial_success_rate, source, procedure_text))
+        except _sqlite3.OperationalError as e:
+            logger.warning("Procedure skill write failed (pre-migration-30 schema?): %s", e)
+            return None
+        skill_id = cursor.lastrowid
+        self._embed_skill(skill_id, name, description[:200])
+        logger.info("Procedure skill created: #%d '%s' (%d chars)",
+                    skill_id, name, len(procedure_text))
+        return skill_id
 
     def create_skill(
         self,
@@ -506,7 +696,7 @@ class SkillStore:
             logger.warning(
                 "Skill '%s' rejected: semantically too similar to existing skill #%d "
                 "(similarity ≥ %.2f). Narrow the trigger or merge with the existing skill.",
-                name, dup_id, config.SKILL_SEMANTIC_THRESHOLD,
+                name, dup_id, _SKILL_DUP_SIM,
             )
             return None
 
@@ -973,135 +1163,6 @@ class SkillStore:
     # Skill composition
     # ------------------------------------------------------------------
 
-    def get_composed_steps(self, skill: Skill) -> list[dict]:
-        """Expand a composed skill into its full ordered step list.
-
-        Fetches each sub-skill by ID in order, concatenates their steps,
-        then appends the composing skill's own steps last. Cycles and
-        missing/disabled sub-skills are skipped silently.
-
-        Returns skill.steps unchanged if composed_of is empty.
-        """
-        if not skill.composed_of:
-            return skill.steps
-
-        seen: set[int] = {skill.id}
-        all_steps: list[dict] = []
-
-        for sub_id in skill.composed_of[:10]:  # cap at 10 to prevent runaway chains
-            if sub_id in seen:
-                logger.debug("Skill composition cycle detected at #%d, skipping", sub_id)
-                continue
-            seen.add(sub_id)
-            sub = self.get_skill(sub_id)
-            if sub and sub.enabled:
-                all_steps.extend(sub.steps)
-            else:
-                logger.debug("Composed sub-skill #%d unavailable, skipping", sub_id)
-
-        # Append the composing skill's own steps last (may be empty for pure compositions)
-        all_steps.extend(skill.steps)
-        return all_steps or skill.steps
-
-    # ------------------------------------------------------------------
-    # Metrics & maintenance
-    # ------------------------------------------------------------------
-
-    def get_skill_stats(self) -> dict:
-        """Return aggregate skill system metrics."""
-        rows = self._db.fetchall("SELECT * FROM skills")
-        if not rows:
-            return {
-                "total": 0, "enabled": 0, "disabled": 0,
-                "total_uses": 0, "avg_success_rate": 0.0,
-                "stale_count": 0, "top_skills": [],
-                "by_source": {},
-            }
-
-        total = len(rows)
-        enabled = sum(1 for r in rows if r["enabled"])
-        total_uses = sum(r["times_used"] for r in rows)
-        avg_rate = sum(r["success_rate"] for r in rows) / total
-
-        # Source breakdown
-        by_source: dict[str, int] = {}
-        for r in rows:
-            src = _safe_col(r, "source", "correction")
-            by_source[src] = by_source.get(src, 0) + 1
-
-        # Stale: not used in SKILL_STALE_DAYS days (NULL last_used_at = never used = stale)
-        stale_row = self._db.fetchone(
-            "SELECT COUNT(*) FROM skills WHERE "
-            "last_used_at IS NULL OR last_used_at < datetime('now', ?)",
-            (f"-{config.SKILL_STALE_DAYS} days",),
-        )
-        stale_count = stale_row[0] if stale_row else 0
-
-        top = self._db.fetchall(
-            "SELECT id, name, times_used, success_rate FROM skills WHERE enabled = 1 "
-            "ORDER BY times_used DESC LIMIT 5"
-        )
-
-        return {
-            "total": total,
-            "enabled": enabled,
-            "disabled": total - enabled,
-            "total_uses": total_uses,
-            "avg_success_rate": round(avg_rate, 3),
-            "stale_count": stale_count,
-            "by_source": by_source,
-            "top_skills": [
-                {
-                    "id": r["id"],
-                    "name": r["name"],
-                    "uses": r["times_used"],
-                    "success_rate": round(r["success_rate"], 3),
-                }
-                for r in top
-            ],
-        }
-
-    def decay_stale_skills(self) -> int:
-        """Reduce success_rate on skills unused for SKILL_STALE_DAYS days.
-
-        Each decay pass reduces success_rate by 5% (multiplicative).
-        Skills that cross below 0.3 after decay are auto-disabled.
-        Returns number of skills decayed.
-        """
-        rows = self._db.fetchall(
-            "SELECT id, name, success_rate FROM skills WHERE enabled = 1 AND "
-            "(last_used_at IS NULL OR last_used_at < datetime('now', ?))",
-            (f"-{config.SKILL_STALE_DAYS} days",),
-        )
-        if not rows:
-            return 0
-
-        decayed = 0
-        for row in rows:
-            new_rate = row["success_rate"] * 0.95
-            if new_rate < 0.3:
-                self._db.execute(
-                    "UPDATE skills SET success_rate = ?, enabled = 0 WHERE id = ?",
-                    (new_rate, row["id"]),
-                )
-                logger.info(
-                    "Disabled stale skill #%d '%s': success_rate decayed to %.2f",
-                    row["id"], row["name"], new_rate,
-                )
-            else:
-                self._db.execute(
-                    "UPDATE skills SET success_rate = ? WHERE id = ?",
-                    (new_rate, row["id"]),
-                )
-            decayed += 1
-
-        logger.info("Skill staleness decay: %d skills decayed", decayed)
-        return decayed
-
-    # ------------------------------------------------------------------
-    # Internal helpers
-    # ------------------------------------------------------------------
-
     def _row_to_skill(self, row) -> Skill:
         """Convert a DB row to a Skill dataclass."""
         steps = json.loads(row["steps"]) if isinstance(row["steps"], str) else row["steps"]
@@ -1126,6 +1187,8 @@ class SkillStore:
             consecutive_failures=row["consecutive_failures"] if "consecutive_failures" in row_keys else 0,
             source=row["source"] if "source" in row_keys else "correction",
             composed_of=composed_of,
+            kind=(row["kind"] if "kind" in row_keys and row["kind"] else "exec"),
+            procedure_text=row["procedure_text"] if "procedure_text" in row_keys else None,
         )
 
 

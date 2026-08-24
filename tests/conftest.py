@@ -83,7 +83,6 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("DEDUP_JACCARD_THRESHOLD", "0.85")
     monkeypatch.setenv("REFLEXION_DECAY_DAYS", "90")
     monkeypatch.setenv("REFLEXION_DECAY_AMOUNT", "0.05")
-    monkeypatch.setenv("REFLEXION_DISTANCE_THRESHOLD", "0.7")
     monkeypatch.setenv("SKILL_EMA_ALPHA", "0.15")
     monkeypatch.setenv("INJECTION_SUSPICIOUS_THRESHOLD", "0.3")
     monkeypatch.setenv("REFLEXION_FAILURE_THRESHOLD", "0.6")

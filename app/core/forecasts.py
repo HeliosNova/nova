@@ -11,6 +11,7 @@ monitor that grades due forecasts with one grounded LLM call.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from urllib.parse import urlparse
@@ -43,10 +44,14 @@ def create_forecast(db, claim: str, *, days: int, confidence: float,
         return None
 
 
-# Parses an optional "FORECAST: <claim> | <N> days | <0.x>" line the LLM may emit.
+# Parses a "FORECAST: <claim> | <N> days | <0.x confidence>" line the LLM emits.
+# The trailing 'confidence' word is tolerated: the dossier prompt's own template
+# reads '<0.x confidence>', and the 27B dutifully writes the word — the v1 regex
+# demanded end-of-line right after the number, so the exact format the prompt
+# requested could never parse (found via live probe 2026-08-13).
 _FORECAST_LINE = re.compile(
     r"(?im)^\s*FORECAST:\s*(?P<claim>.+?)\s*\|\s*(?P<days>\d+)\s*(?:days?)?\s*"
-    r"(?:\|\s*(?P<conf>0?\.\d+|1(?:\.0)?))?\s*$"
+    r"(?:\|\s*(?P<conf>0?\.\d+|1(?:\.0)?)\s*(?:confidence)?)?\s*$"
 )
 
 
@@ -162,7 +167,7 @@ async def resolve_one(db, fc: dict) -> str:
     try:
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": prompt}],
-            json_mode=True, json_prefix='{"', max_tokens=160, temperature=0.1,
+            json_mode=True, json_prefix="{", max_tokens=160, temperature=0.1,
         )
         data = llm.extract_json_object(raw) if raw else {}
     except Exception as e:
@@ -193,11 +198,41 @@ def accuracy(db) -> dict:
     return {"resolved": n, "hits": hits, "rate": round(hits / n, 2) if n else None}
 
 
+def calibration(db, *, key_prefix: str | None = None, min_n: int = 1) -> dict | None:
+    """Calibration over resolved forecasts: is stated confidence WORTH its
+    number? (judgment rung, 2026-08-14). gap > 0 = overconfident (claimed more
+    than delivered); Brier score penalizes both miscalibration and hedging.
+    `key_prefix` scopes to one storyline/dossier family ('dossier:finance');
+    returns None below `min_n` resolved — no lessons from tiny samples."""
+    where = "status IN ('hit','miss')"
+    args: tuple = ()
+    if key_prefix:
+        where += " AND storyline_key LIKE ?"
+        args = (key_prefix + "%",)
+    try:
+        rows = db.fetchall(
+            f"SELECT confidence, status FROM forecasts WHERE {where}", args)
+    except Exception:
+        return None
+    if len(rows) < max(1, min_n):
+        return None
+    outcomes = [(float(r["confidence"] or 0.55), 1.0 if r["status"] == "hit" else 0.0)
+                for r in rows]
+    n = len(outcomes)
+    hit_rate = sum(o for _, o in outcomes) / n
+    mean_conf = sum(c for c, _ in outcomes) / n
+    brier = sum((c - o) ** 2 for c, o in outcomes) / n
+    return {"n": n, "hit_rate": round(hit_rate, 3), "mean_conf": round(mean_conf, 3),
+            "gap": round(mean_conf - hit_rate, 3), "brier": round(brier, 3)}
+
+
 async def resolve_due(db) -> str:
     """Resolve all due forecasts; return a digest-ready summary."""
-    due = list_due(db)
+    # These read/aggregate the DB synchronously; off-load so resolve_due (awaited
+    # directly by the heartbeat) never blocks the event loop (2026-08-14 audit).
+    due = await asyncio.to_thread(list_due, db)
     if not due:
-        acc = accuracy(db)
+        acc = await asyncio.to_thread(accuracy, db)
         if acc["resolved"]:
             return f"FORECASTS | none due. Track record: {acc['hits']}/{acc['resolved']} hits ({acc['rate']})"
         return "FORECASTS | none due"
@@ -207,8 +242,14 @@ async def resolve_due(db) -> str:
         icon = {"hit": "✅", "miss": "❌", "unresolvable": "❓"}.get(v, "•")
         if v in ("hit", "miss", "unresolvable"):
             lines.append(f"{icon} {fc['claim'][:120]}")
-    acc = accuracy(db)
+    acc = await asyncio.to_thread(accuracy, db)
     if not lines:
         return "FORECASTS | due forecasts not yet judgeable"
     header = f"## 🔮 FORECAST RESOLUTIONS ({acc['hits']}/{acc['resolved']} hits, {acc['rate']})"
+    cal = await asyncio.to_thread(calibration, db, min_n=5)
+    if cal:
+        direction = "overconfident" if cal["gap"] > 0.05 else (
+            "underconfident" if cal["gap"] < -0.05 else "well calibrated")
+        header += (f"\ncalibration: stated {cal['mean_conf']:.0%} vs delivered "
+                   f"{cal['hit_rate']:.0%} — {direction} (Brier {cal['brier']:.2f}, n={cal['n']})")
     return header + "\n" + "\n".join(lines)

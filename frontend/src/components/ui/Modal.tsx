@@ -1,4 +1,5 @@
 import { useEffect, useRef, type ReactNode } from "react";
+import { createPortal } from "react-dom";
 import { cn } from "@/lib/utils";
 import { X } from "lucide-react";
 
@@ -65,12 +66,15 @@ export default function Modal({ open, onClose, title, size = "md", footer, child
 
   if (!open) return null;
 
-  return (
+  // Portal to <body> so the overlay escapes any ancestor with backdrop-filter /
+  // transform (e.g. the cosmos region panels), which would otherwise trap this
+  // fixed overlay inside that element's clipped stacking context.
+  return createPortal(
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm animate-fade-in">
       <div
         ref={dialogRef}
         className={cn(
-          "w-full rounded-lg border border-nova-border bg-nova-surface shadow-xl animate-scale-in",
+          "w-full rounded-lg border border-nova-border bg-nova-surface/90 shadow-xl backdrop-blur-xl animate-scale-in",
           sizeMap[size],
         )}
         role="dialog"
@@ -96,6 +100,7 @@ export default function Modal({ open, onClose, title, size = "md", footer, child
           </div>
         )}
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

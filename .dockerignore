@@ -1,6 +1,12 @@
 # Keep the build context tiny — the Dockerfile only COPYs app/, tests/,
 # evals/, and two scripts. Without this file the context shipped multiple
 # virtualenvs and model artifacts (gigabytes) to the daemon per build.
+# Secrets: never let .env into the build context (2026-08-20 sweep) — the
+# Dockerfile uses explicit COPYs today so nothing bakes it in, but a future
+# `COPY . .` would silently layer NOVA_API_KEY / channel tokens into the image.
+.env
+.env.*
+searxng/settings.yml
 .git
 .venv
 venv

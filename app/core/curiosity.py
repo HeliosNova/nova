@@ -196,10 +196,27 @@ class CuriosityQueue:
 
     def __init__(self, db):
         self._db = db
-        for stmt in self._SCHEMA.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                self._db.execute(stmt)
+        # Schema-ensure memo (audit 2026-08-23): don't re-run DDL per
+        # construction — it was taking the write lock on the event-loop thread.
+        if not getattr(db, "schema_ensured", lambda _t: False)("curiosity_queue"):
+            for stmt in self._SCHEMA.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    self._db.execute(stmt)
+            getattr(db, "mark_schema_ensured", lambda _t: None)("curiosity_queue")
+
+    @staticmethod
+    def _bumped_urgency(current: float) -> float:
+        """Dedup re-mint bump (+0.1) that never PROMOTES an item into the
+        daemon's critical band (urgency >= 0.7 → researched every idle ~5-min
+        tick). Background self-generated topics (dossier open questions at 0.6,
+        tensions at 0.5) were climbing 0.6→0.7 via repeated consolidation
+        re-mints and pinning the daemon on GPU-burning loops (2026-08-18 audit).
+        Items BORN critical (admission=0.8 etc.) still escalate normally.
+        """
+        if current >= 0.7:
+            return min(1.0, current + 0.1)
+        return min(0.69, current + 0.1)
 
     @staticmethod
     def _jaccard_similarity(a: str, b: str) -> float:
@@ -285,12 +302,32 @@ class CuriosityQueue:
             (topic,),
         )
         if existing:
-            new_urgency = min(1.0, existing["urgency"] + 0.1)
+            # Born-critical incoming (owner-facing admission at 0.8) must not be
+            # absorbed into a sub-critical background row at the 0.69 cap —
+            # merge keeps the max of the bump and a critical-band incoming
+            # (audit 2026-08-19). Background re-mints still can't climb past 0.69.
+            new_urgency = max(self._bumped_urgency(existing["urgency"]),
+                              urgency if urgency >= 0.7 else 0.0)
             self._db.execute(
                 "UPDATE curiosity_queue SET urgency = ? WHERE id = ?",
                 (new_urgency, existing["id"]),
             )
             return existing["id"]
+
+        # Cooldown: a topic that recently FAILED or was DISMISSED must not be
+        # re-minted. Consolidation re-added an unresolvable "Resolve
+        # contradiction: …" every cycle and the daemon retried it forever
+        # (48 wasted 27B research rounds/48h, 2026-08-14). Suppress verbatim
+        # re-mints for 7 days; a genuinely still-relevant topic can return after.
+        recent_dead = self._db.fetchone(
+            "SELECT id FROM curiosity_queue "
+            "WHERE status IN ('failed', 'dismissed') AND topic = ? "
+            "AND COALESCE(resolved_at, created_at) > datetime('now', '-7 days')",
+            (topic,),
+        )
+        if recent_dead:
+            logger.debug("Curiosity topic skipped (recently failed/dismissed): '%s'", topic[:80])
+            return -1
 
         # Dedup: Jaccard fuzzy match against pending topics. Tracks the max
         # observed score for instrumentation — even when nothing matches we
@@ -307,7 +344,9 @@ class CuriosityQueue:
             if score > max_jaccard:
                 max_jaccard = score
             if score > 0.6:
-                new_urgency = min(1.0, row["urgency"] + 0.1)
+                # Same born-critical preservation as the exact-match merge above.
+                new_urgency = max(self._bumped_urgency(row["urgency"]),
+                                  urgency if urgency >= 0.7 else 0.0)
                 self._db.execute(
                     "UPDATE curiosity_queue SET urgency = ? WHERE id = ?",
                     (new_urgency, row["id"]),
@@ -324,13 +363,18 @@ class CuriosityQueue:
             "SELECT COUNT(*) AS c FROM curiosity_queue WHERE status = 'pending'"
         )["c"]
         if pending_count >= MAX_QUEUE_SIZE:
-            # FIFO eviction: remove the oldest pending item (insertion order)
+            # FIFO eviction: remove the oldest pending item (insertion order).
+            # Logged (audit 2026-08-17): every other branch logs; a silent evict
+            # meant self-directed learning topics were dropped invisibly under a
+            # sustained gap-detection backlog.
             self._db.execute(
                 "DELETE FROM curiosity_queue WHERE id = ("
                 "  SELECT id FROM curiosity_queue WHERE status = 'pending' "
                 "  ORDER BY created_at ASC LIMIT 1"
                 ")"
             )
+            logger.info("Curiosity queue full (%d >= %d) — evicted oldest pending topic (FIFO)",
+                        pending_count, MAX_QUEUE_SIZE)
 
         cursor = self._db.execute(
             "INSERT INTO curiosity_queue (topic, source, urgency) VALUES (?, ?, ?)",
@@ -471,10 +515,13 @@ class TopicTracker:
 
     def __init__(self, db):
         self._db = db
-        for stmt in self._SCHEMA.strip().split(";"):
-            stmt = stmt.strip()
-            if stmt:
-                self._db.execute(stmt)
+        # Schema-ensure memo (audit 2026-08-23): see CuriosityQueue.__init__.
+        if not getattr(db, "schema_ensured", lambda _t: False)("topic_frequency"):
+            for stmt in self._SCHEMA.strip().split(";"):
+                stmt = stmt.strip()
+                if stmt:
+                    self._db.execute(stmt)
+            getattr(db, "mark_schema_ensured", lambda _t: None)("topic_frequency")
 
     def record_topic(self, query: str) -> None:
         """Record a query topic with fuzzy matching.

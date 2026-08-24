@@ -6,7 +6,7 @@ import {
   getLearningMetrics, getLessons, getSkills, deleteLesson, deleteSkill, toggleSkill,
   getReflexions, getTrainingData, getFinetuneStatus, getFinetuneHistory,
   getTrainingDataStatsDetailed, exportTrainingData, getConfigSummary, triggerFinetune,
-  getKGFacts, getCuriosityQueue, bulkDeleteLessons,
+  getKGFacts, getCuriosityQueue, bulkDeleteLessons, getKGStats, getDossiers,
 } from "../lib/api";
 import { formatDate } from "../lib/utils";
 import type { ReflexionInfo, TrainingDataEntry, FinetuneStatus, FinetuneHistoryRun, TrainingDataStatsDetailed, KGFact, CuriosityItem } from "../lib/types";
@@ -36,6 +36,14 @@ export default function LearningPage() {
   const [sortField, setSortField] = useState<SortField>("confidence");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [metricsRefreshing, setMetricsRefreshing] = useState(false);
+  // Living headline metrics (2026-08-12): the old "Corrections/Training
+  // Examples" cards headlined zeros from the retired fine-tune era.
+  const [kgCurrent, setKgCurrent] = useState<number | null>(null);
+  const [dossierCount, setDossierCount] = useState<number | null>(null);
+  useEffect(() => {
+    getKGStats().then((s) => setKgCurrent(s.current_facts)).catch(() => {});
+    getDossiers().then((d) => setDossierCount(d.length)).catch(() => {});
+  }, []);
   const [selectedLessons, setSelectedLessons] = useState<Set<number>>(new Set());
   const [finetuneHistory, setFinetuneHistory] = useState<FinetuneHistoryRun[]>([]);
   const [trainingStats, setTrainingStats] = useState<TrainingDataStatsDetailed | null>(null);
@@ -184,8 +192,8 @@ export default function LearningPage() {
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <StatCard label="Lessons" value={store.metrics.total_lessons} />
               <StatCard label="Skills" value={store.metrics.total_skills} />
-              <StatCard label="Corrections" value={store.metrics.total_corrections} />
-              <StatCard label="Training Examples" value={store.metrics.training_examples} sub={store.metrics.last_correction_date ? `Last: ${formatDate(store.metrics.last_correction_date)}` : undefined} />
+              <StatCard label="KG Facts (live)" value={kgCurrent ?? "—"} />
+              <StatCard label="Dossiers" value={dossierCount ?? "—"} sub="standing understanding" />
             </div>
           </div>
         )}

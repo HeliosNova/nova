@@ -52,8 +52,11 @@ def _content_hash(value: str) -> str:
         return ""
     phrases = _NOUN_PHRASE_RE.findall(value)
     if not phrases:
-        # Fall back to a hash of the first 200 chars normalized
-        norm = re.sub(r"\s+", " ", value.lower()).strip()[:200]
+        # Fall back to a hash of the FULL normalized text. Hashing only the
+        # first 200 chars false-deduped distinct stories that shared an opening
+        # ("The Federal Reserve announced ...") — dropping the genuine follow-up
+        # (audit 2026-08-22).
+        norm = re.sub(r"\s+", " ", value.lower()).strip()
         return hashlib.sha256(norm.encode("utf-8")).hexdigest()[:32]
     # Normalize + dedupe + sort + take top 5
     seen: set[str] = set()

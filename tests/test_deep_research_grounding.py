@@ -745,7 +745,7 @@ async def test_hard_paywall_routes_to_bypass_not_browser(monkeypatch):
     monkeypatch.setattr(br, "BrowserTool", _Browser)
     jina = {"called": False}
 
-    async def _fake_jina(url):
+    async def _fake_jina(url, max_len=12000):
         jina["called"] = True
         return "BYPASS ARTICLE BODY"
 
@@ -754,6 +754,30 @@ async def test_hard_paywall_routes_to_bypass_not_browser(monkeypatch):
     assert out == "BYPASS ARTICLE BODY"
     assert jina["called"] is True
     assert _Browser.launched is False       # hard paywall must not burn a render
+
+
+@pytest.mark.asyncio
+async def test_fetch_body_lifts_5000_cap_to_12000(monkeypatch):
+    # Regression (audit 2026-08-22): _fetch_body capped every article body at
+    # 5000, which made the native-enrich entail window (domain_study_runner
+    # `body[:12000]`) INERT — the body arrived pre-truncated at 5000. The cap is
+    # now _BODY_MAX_CHARS (12000); a longer article must flow through at 12000.
+    import app.tools.http_fetch as hf
+
+    para = ("The committee reviewed the proposal in detail. Analysts noted several risks. "
+            "Revenue grew across most regions. The board approved the budget. "
+            "Executives outlined a plan for the next quarter. Investors responded positively. ")
+    long_body = para * 60
+    assert len(long_body) > 12000
+
+    class _Http:
+        async def execute(self, **kw):
+            return _FR(output=long_body, success=True)
+
+    monkeypatch.setattr(hf, "HttpFetchTool", _Http)
+    out = await dr._fetch_body("https://example.com/article", browser_budget=[0], allow_bypass=False)
+    assert out is not None
+    assert len(out) == 12000, f"expected the 12000-char cap, got {len(out)}"
 
 
 @pytest.mark.asyncio
@@ -786,7 +810,7 @@ async def test_metered_paywall_escalates_to_stealth_browser(monkeypatch):
     monkeypatch.setattr(br, "BrowserTool", _Browser)
     jina = {"called": False}
 
-    async def _fake_jina(url):
+    async def _fake_jina(url, max_len=12000):
         jina["called"] = True
         return None
 

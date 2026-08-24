@@ -210,8 +210,12 @@ class SignalBot:
             text = text[split_at:].lstrip()
         return chunks
 
-    async def _send_message(self, recipient: str, text: str) -> None:
-        """Send a message via signal-cli REST API."""
+    async def _send_message(self, recipient: str, text: str) -> bool:
+        """Send a message via signal-cli REST API. Returns True ONLY on a
+        confirmed 2xx. send_alert() relies on this bool for at-least-once
+        delivery — returning None/True on failure would mark a lost digest as
+        delivered and purge it from the pending_deliveries journal (audit
+        2026-08-17)."""
         try:
             resp = await self._client.post(
                 f"{self.api_url}/v2/send",
@@ -224,8 +228,11 @@ class SignalBot:
             )
             if resp.status_code not in (200, 201):
                 logger.warning("[Signal] Send returned status %d: %s", resp.status_code, resp.text)
+                return False
+            return True
         except Exception as e:
             logger.error("[Signal] Send failed to %s: %s", recipient, e)
+            return False
 
     async def send_alert(self, message: str) -> bool:
         """Send a message to the default recipient. Strips Discord markdown
@@ -236,12 +243,14 @@ class SignalBot:
             from app.channels.format_for_channel import to_signal
             sig_message = to_signal(message)
             _chunks = self._split_message(sig_message)
+            ok = True
             async with self._send_lock:
                 for _ci, chunk in enumerate(_chunks):
                     if _ci:
                         await asyncio.sleep(0.3)
-                    await self._send_message(self.default_recipient, chunk)
-            return True
+                    if not await self._send_message(self.default_recipient, chunk):
+                        ok = False
+            return ok
         except Exception as e:
             logger.error("[Signal] Alert send failed: %s", e)
             return False

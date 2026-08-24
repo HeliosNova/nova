@@ -91,7 +91,10 @@ class OllamaProvider:
         messages: list[dict],
         *,
         json_mode: bool = False,
-        json_prefix: str = "[{",
+        # "{" (was "[{"): object is the only shape default-prefix callers expect;
+        # array callers pass json_schema. See core/llm.py invoke_nothink for the
+        # full rationale (2026-08-18).
+        json_prefix: str = "{",
         json_schema: dict | None = None,
         max_tokens: int = 1000,
         temperature: float = 0.1,
@@ -113,7 +116,16 @@ class OllamaProvider:
         # digest incident). Probe: `think:false` alone returns clean output;
         # `think:false` + the prefix echoes/leaks. So only prefill the json_prefix
         # for JSON-continuation models, nothing else.
-        if json_mode and json_prefix:
+        #
+        # NOT when a json_schema is set (2026-08-18): grammar-constrained `format`
+        # already forces well-formed output, so the prefill is redundant AND
+        # harmful — on Ollama 0.32.13 a multi-char "[{" prefill made both qwen3.8
+        # and nova-ft return a bare {object} instead of array elements, which the
+        # re-prepend guard below then corrupted to "[{{…" → json.loads died at
+        # char 2 → KG extraction + storylines silently produced ZERO output from
+        # 2026-08-15. json_prefix is still consulted purely for array-vs-object
+        # detection in _find_balanced_json. See brain_kg._KG_TRIPLES_SCHEMA.
+        if json_mode and json_prefix and not json_schema:
             ollama_messages.append({"role": "assistant", "content": json_prefix})
 
         payload = {
@@ -149,14 +161,23 @@ class OllamaProvider:
             data = resp.json()
             content = data.get("message", {}).get("content", "")
 
-            if json_mode and json_prefix:
-                # Prefill-continuation models (qwen35) return content WITHOUT
-                # the prefix — re-prepend it. Models whose chat template closes
-                # the assistant turn instead (gemma3) ignore the prefill and
-                # return the complete object — prepending again would corrupt
-                # it to "{{...". Verified against both families 2026-06-11.
-                if not content.lstrip().startswith(json_prefix.lstrip()):
-                    content = json_prefix + content
+            if json_mode and json_prefix and not json_schema:
+                # Re-prepend ONLY the open bracket, and only if the model omitted
+                # it. History: 0.30 CONTINUED from the prefill (returned content
+                # WITHOUT the prefix, so we re-prepended the whole thing); 0.32.13
+                # returns COMPLETE JSON and ignores the prefill. Prepending the
+                # full multi-char prefix onto complete-but-differently-spaced JSON
+                # CORRUPTED it — a live probe (2026-08-18) showed nova-ft returns
+                # `{ "title"` (space after brace) for a `{"` prefill → the old
+                # guard made `{"{ "title"` → json.loads died. The open char alone
+                # (`[` or `{`) is the safe minimal repair: a no-op whenever the
+                # model already emitted valid JSON (the 0.32 norm), and the correct
+                # single-char fix for a genuine continuation. Multi-char ARRAY
+                # prefills ([{ / ["), where the model wraps the array in an object,
+                # are handled at the source via json_schema instead.
+                open_char = json_prefix.lstrip()[:1]
+                if open_char and not content.lstrip().startswith(open_char):
+                    content = open_char + content
 
             # Silent-truncation tripwire: invoke_nothink (the deep_research
             # grounding/synthesis path) never checked done_reason, so a digest
@@ -186,7 +207,17 @@ class OllamaProvider:
             content = _strip_think_tags(content)
 
             if json_mode:
-                content = _find_balanced_json(content, json_prefix)
+                # Shape for the balanced-extract: when a json_schema is present
+                # it is AUTHORITATIVE — derive array-vs-object from the schema,
+                # never from json_prefix. (2026-08-18: flipping the prefix
+                # default to "{" silently collapsed every schema-ARRAY caller's
+                # output to its FIRST ELEMENT — _find_balanced_json extracted
+                # the first {…} out of the array — zeroing KG extraction again.
+                # Caught within minutes by the new eval extraction canary.)
+                shape = json_prefix
+                if json_schema is not None:
+                    shape = "[" if json_schema.get("type") == "array" else "{"
+                content = _find_balanced_json(content, shape)
 
             return content.strip()
 

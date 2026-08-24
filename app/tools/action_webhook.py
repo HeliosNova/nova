@@ -46,6 +46,12 @@ def _is_url_allowed(url: str) -> bool:
     if not allowlist:
         return False
     parsed = urlparse(url)
+    # Reject path traversal: a '..' segment can pass the prefix check (its first
+    # char is '/') and then escape the allowed path once the receiving server
+    # normalizes it (e.g. /webhooks/../admin -> /admin). No legitimate webhook
+    # target contains '..' (audit 2026-08-22).
+    if ".." in parsed.path.split("/"):
+        return False
     for raw_prefix in allowlist.split(","):
         raw_prefix = raw_prefix.strip()
         if not raw_prefix:
@@ -54,9 +60,13 @@ def _is_url_allowed(url: str) -> bool:
         if (parsed.scheme == prefix.scheme and parsed.netloc == prefix.netloc
                 and parsed.path.startswith(prefix.path)):
             # Ensure the path match ends at a boundary to prevent
-            # /api matching /api-internal
+            # /api matching /api-internal. If the configured prefix already ends
+            # with '/', that slash IS the boundary and any sub-path is in-scope
+            # (a trailing-slash prefix previously rejected every sub-path — the
+            # boundary check only applies to a slash-less prefix; audit 2026-08-22).
             rest = parsed.path[len(prefix.path):]
-            if rest and rest[0] not in ('/', '?', '#'):
+            if (not prefix.path.endswith("/")
+                    and rest and rest[0] not in ('/', '?', '#')):
                 continue
             return True
     return False
@@ -211,6 +221,11 @@ class WebhookTool(BaseTool):
                 next_url = str(resp.url.join(location))
                 if not _is_safe_url(next_url):
                     raise ValueError(f"Redirect #{redirects} blocked (internal/private address)")
+                # Allowlist must hold on EVERY hop (2026-08-20 sweep): checking
+                # only _is_safe_url let an allowlisted endpoint 302 to any
+                # PUBLIC url, escaping WEBHOOK_ALLOWED_URLS entirely.
+                if not _is_url_allowed(next_url):
+                    raise ValueError(f"Redirect #{redirects} target not in webhook allowlist")
                 # 307/308 preserve original method; 301/302/303 switch to GET
                 status_code = resp.status_code
                 if status_code in (301, 302, 303):

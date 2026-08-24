@@ -17,7 +17,7 @@ import { toast } from "sonner";
 // Helper to get store actions without causing re-renders
 const actions = () => useChatStore.getState();
 
-export default function ChatPage() {
+export default function ChatPage({ embedded = false }: { embedded?: boolean }) {
   // Select individual fields to avoid re-rendering on unrelated state changes
   const messages = useChatStore((s) => s.messages);
   const streaming = useChatStore((s) => s.streaming);
@@ -232,7 +232,7 @@ export default function ChatPage() {
 
   return (
     <div className="flex h-full">
-      <ChatSidebar onSelect={loadConversation} />
+      {!embedded && <ChatSidebar onSelect={loadConversation} />}
 
       <div className="flex flex-1 flex-col min-w-0 min-h-0">
         {/* Messages area */}
@@ -243,18 +243,18 @@ export default function ChatPage() {
                 {/* Nova logo */}
                 <div className="relative mx-auto mb-6 h-16 w-16">
                   <div className="absolute inset-0 rounded-2xl bg-gradient-to-br from-nova-accent/20 to-nova-glow/10 blur-xl" />
-                  <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-nova-border bg-nova-surface shadow-[var(--shadow-nova-glow)]">
+                  <div className="relative flex h-16 w-16 items-center justify-center rounded-2xl border border-nova-border bg-nova-surface/70 backdrop-blur-md shadow-[var(--shadow-nova-glow)]">
                     <MessageSquare size={28} strokeWidth={1.5} className="text-nova-accent" />
                   </div>
                 </div>
-                <p className="text-2xl font-bold bg-gradient-to-r from-nova-text to-nova-glow bg-clip-text text-transparent">Nova</p>
-                <p className="mt-1.5 text-sm text-nova-text-dim">Start a conversation</p>
+                <p className="font-display text-3xl font-semibold tracking-[-0.02em] text-nova-text">Nova</p>
+                <p className="mt-1.5 font-mono text-[11px] uppercase tracking-[0.2em] text-nova-text-dim">Ask the intelligence anything</p>
                 <div className="mt-6 flex flex-wrap justify-center gap-2 max-w-md">
                   {["What's happening in the markets?", "Search for the latest AI news", "What do you know about me?", "What's the weather in LA?"].map((prompt) => (
                     <button
                       key={prompt}
                       onClick={() => handleSend(prompt)}
-                      className="rounded-lg border border-nova-border px-3 py-1.5 text-xs text-nova-text-dim hover:text-nova-text hover:border-nova-accent/30 hover:bg-nova-accent/5 transition-all"
+                      className="rounded-lg border border-nova-border bg-nova-surface/60 px-3 py-1.5 text-xs text-nova-text-dim backdrop-blur-md transition-all hover:border-nova-accent/40 hover:bg-nova-accent/10 hover:text-nova-text"
                     >
                       {prompt}
                     </button>

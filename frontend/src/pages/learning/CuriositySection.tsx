@@ -9,8 +9,10 @@ interface Props {
   loading: boolean;
 }
 
+const RESOLVED = new Set(["resolved", "researched", "completed"]);
+
 export default function CuriositySection({ items, loading }: Props) {
-  const [filter, setFilter] = useState<"all" | "pending" | "researched" | "completed">("all");
+  const [filter, setFilter] = useState<"all" | "pending" | "resolved">("all");
 
   if (loading) {
     return <Skeleton lines={4} />;
@@ -21,19 +23,27 @@ export default function CuriositySection({ items, loading }: Props) {
       <EmptyState
         icon={<Search size={40} strokeWidth={1.5} />}
         title="No curiosity items queued."
-        description="Nova generates curiosity items when it detects knowledge gaps during conversation."
+        description="Nova generates curiosity items when it detects knowledge gaps — from conversations, dossier open-questions, and unresolved tensions."
       />
     );
   }
 
-  const filtered = filter === "all" ? items : items.filter(i => i.status === filter);
+  const filtered =
+    filter === "all" ? items
+    : filter === "pending" ? items.filter(i => i.status === "pending")
+    : items.filter(i => RESOLVED.has(i.status));
   const pendingCount = items.filter(i => i.status === "pending").length;
-  const researchedCount = items.filter(i => i.status === "researched" || i.status === "completed").length;
+  const resolvedCount = items.filter(i => RESOLVED.has(i.status)).length;
+
+  // urgency is 0–1: >=0.7 High, >=0.5 Med, else Low.
+  const urg = (u: number) => u >= 0.7 ? { label: "High", cls: "bg-nova-error/20 text-nova-error" }
+    : u >= 0.5 ? { label: "Med", cls: "bg-nova-warning/20 text-nova-warning" }
+    : { label: "Low", cls: "bg-nova-border text-nova-text-dim" };
 
   return (
     <section className="space-y-2">
       <div className="mb-3 flex gap-1.5">
-        {([["all", `All (${items.length})`], ["pending", `Pending (${pendingCount})`], ["researched", `Done (${researchedCount})`]] as const).map(([key, label]) => (
+        {([["all", `All (${items.length})`], ["pending", `Pending (${pendingCount})`], ["resolved", `Done (${resolvedCount})`]] as const).map(([key, label]) => (
           <button
             key={key}
             onClick={() => setFilter(key)}
@@ -47,39 +57,40 @@ export default function CuriositySection({ items, loading }: Props) {
           </button>
         ))}
       </div>
-      {filtered.map((item) => (
-        <Card key={item.id}>
-          <div className="flex items-start justify-between gap-3">
-            <div className="min-w-0 flex-1">
-              <p className="text-sm font-medium">{item.question}</p>
-              <div className="mt-1 flex flex-wrap items-center gap-2">
-                <span className="rounded bg-nova-border/40 px-1.5 py-0.5 text-[10px] text-nova-text-dim">
-                  {item.source}
-                </span>
-                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  item.status === "completed" || item.status === "researched"
-                    ? "bg-nova-success/20 text-nova-success"
-                    : item.status === "pending"
-                    ? "bg-nova-border text-nova-text-dim"
+      {filtered.map((item) => {
+        const u = urg(item.urgency ?? 0);
+        const resolved = RESOLVED.has(item.status);
+        return (
+          <Card key={item.id}>
+            <div className="flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-medium text-nova-text leading-snug">{item.topic || "(untitled curiosity)"}</p>
+                <div className="mt-1.5 flex flex-wrap items-center gap-2">
+                  <span className="rounded bg-nova-border/40 px-1.5 py-0.5 text-[10px] text-nova-text-dim">
+                    {item.source?.replace(/_/g, " ")}
+                  </span>
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                    resolved ? "bg-nova-success/20 text-nova-success"
+                    : item.status === "pending" ? "bg-nova-border text-nova-text-dim"
                     : "bg-nova-warning/20 text-nova-warning"
-                }`}>
-                  {item.status}
-                </span>
-                <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  item.priority >= 3 ? "bg-nova-error/20 text-nova-error"
-                    : item.priority >= 2 ? "bg-nova-warning/20 text-nova-warning"
-                    : "bg-nova-border text-nova-text-dim"
-                }`}>
-                  {item.priority >= 3 ? "High" : item.priority >= 2 ? "Med" : "Low"} priority
-                </span>
+                  }`}>
+                    {item.status}
+                  </span>
+                  <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${u.cls}`}>{u.label} urgency</span>
+                </div>
+                {resolved && item.resolution && (
+                  <p className="mt-2 border-l-2 border-nova-success/40 pl-2.5 text-[12px] leading-relaxed text-nova-text-dim/85">
+                    {item.resolution.length > 320 ? item.resolution.slice(0, 320) + "…" : item.resolution}
+                  </p>
+                )}
               </div>
+              <span className="shrink-0 text-xs text-nova-text-dim">
+                {formatDate(item.created_at)}
+              </span>
             </div>
-            <span className="shrink-0 text-xs text-nova-text-dim">
-              {formatDate(item.created_at)}
-            </span>
-          </div>
-        </Card>
-      ))}
+          </Card>
+        );
+      })}
     </section>
   );
 }

@@ -4,7 +4,7 @@ import { toast } from "sonner";
 import { Button, EmptyState, Skeleton, FormInput, FormSelect, ResponsiveTable, StatCard, ConfirmDialog } from "../../components/ui";
 import type { Column } from "../../components/ui/ResponsiveTable";
 import { formatDate, pct } from "../../lib/utils";
-import { getKGGraph, getKGStats, deleteKGFact, searchMonitorResults, searchMessages } from "../../lib/api";
+import { getKGGraph, getKGStats, deleteKGFact, searchMonitorResults, searchMessages, getDossiers, getDossier } from "../../lib/api";
 import type { KGFact, KGGraphData, KGStats, KGGraphNode } from "../../lib/types";
 import KGGraph from "../../components/KGGraph";
 import type { EntityInfo } from "../../components/KGGraph";
@@ -74,6 +74,11 @@ interface Props {
   onSearch: () => void;
   onLoadMore: () => void;
   onFactDeleted?: () => void;
+  initialView?: ViewMode;
+  /** When "fill", the section flexes to its parent's height and the graph fills
+   *  the remaining space (used in the full-height cosmos Knowledge region).
+   *  A number keeps the legacy fixed-height layout (the Learning page). */
+  graphHeight?: number | "fill";
 }
 
 export default function KnowledgeGraphSection({
@@ -85,8 +90,11 @@ export default function KnowledgeGraphSection({
   onSearch,
   onLoadMore,
   onFactDeleted,
+  initialView = "list",
+  graphHeight = 640,
 }: Props) {
-  const [viewMode, setViewMode] = useState<ViewMode>("list");
+  const fill = graphHeight === "fill";
+  const [viewMode, setViewMode] = useState<ViewMode>(initialView);
   const [graphData, setGraphData] = useState<KGGraphData>({ nodes: [], links: [] });
   const [graphLoading, setGraphLoading] = useState(false);
   const [graphEntity, setGraphEntity] = useState("");
@@ -101,17 +109,41 @@ export default function KnowledgeGraphSection({
     getKGStats().then(setStats).catch(() => {});
   }, [facts.length]);
 
-  // Fetch entity content (monitor results + conversations)
+  // slug mirrors backend dossiers._slug (lowercase, non-alnum → dash).
+  const slug = (s: string) => s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 80);
+
+  // Pull the "Current understanding" prose out of a dossier body (the section
+  // most useful in a compact panel), falling back to the body head.
+  const understandingOf = (body: string): string => {
+    const m = body.match(/##\s*Current understanding\s*\n([\s\S]*?)(?=\n##\s|\n#\s|$)/i);
+    const txt = (m ? m[1] : body).trim();
+    return txt.length > 900 ? txt.slice(0, 900).replace(/\s+\S*$/, "") + "…" : txt;
+  };
+
+  // Fetch entity content (dossier + monitor results + conversations)
   const fetchEntityInfo = useCallback(async (entity: string) => {
-    setEntityInfo({ monitors: [], msgs: [], loading: true });
-    const [monitorHits, msgs] = await Promise.all([
+    setEntityInfo({ monitors: [], msgs: [], loading: true, dossier: null });
+    const key = slug(entity);
+    const [monitorHits, msgs, dossierList] = await Promise.all([
       searchMonitorResults(entity, 8).catch(() => []),
       searchMessages(entity).catch(() => []),
+      getDossiers("entity").catch(() => []),
     ]);
+    // Match an entity dossier by slug (dkey) or title, then load its body.
+    let dossier: EntityInfo["dossier"] = null;
+    const hit = (Array.isArray(dossierList) ? dossierList : []).find(
+      (d) => d.dkey === key || d.title.toLowerCase() === entity.toLowerCase());
+    if (hit) {
+      try {
+        const full = await getDossier(hit.id);
+        dossier = { id: hit.id, title: hit.title, understanding: understandingOf(full.body || ""), updated_at: hit.updated_at };
+      } catch { /* dossier is a bonus; ignore fetch failure */ }
+    }
     setEntityInfo({
       monitors: Array.isArray(monitorHits) ? monitorHits.slice(0, 8) : [],
       msgs: Array.isArray(msgs) ? msgs.slice(0, 8) : [],
       loading: false,
+      dossier,
     });
   }, []);
 
@@ -145,10 +177,13 @@ export default function KnowledgeGraphSection({
     fetchEntityInfo(node.label);
   };
 
-  // When switching to graph from list, carry search term over
+  // Carry the search term across view switches (both directions) so the two
+  // views can't silently show results for different queries.
   const handleViewChange = (mode: ViewMode) => {
     if (mode === "graph" && viewMode === "list" && search) {
       setGraphEntity(search);
+    } else if (mode === "list" && viewMode === "graph" && graphEntity !== search) {
+      onSearchChange(graphEntity);
     }
     setViewMode(mode);
   };
@@ -167,10 +202,10 @@ export default function KnowledgeGraphSection({
   };
 
   return (
-    <section className="animate-fade-in">
+    <section className={fill ? "flex min-h-0 flex-1 flex-col animate-fade-in" : "animate-fade-in"}>
       {/* Stats bar */}
       {stats && (
-        <div className="mb-4 grid grid-cols-2 md:grid-cols-4 gap-3">
+        <div className={`mb-4 grid grid-cols-2 md:grid-cols-4 gap-3 ${fill ? "shrink-0" : ""}`}>
           <StatCard label="Total Facts" value={stats.total_facts} />
           <StatCard label="Current" value={stats.current_facts} />
           <StatCard label="Entities" value={stats.unique_entities} />
@@ -179,7 +214,7 @@ export default function KnowledgeGraphSection({
       )}
 
       {/* View mode toggle + search */}
-      <div className="mb-4 flex flex-col md:flex-row gap-2">
+      <div className={`mb-4 flex flex-col md:flex-row gap-2 ${fill ? "shrink-0" : ""}`}>
         <div className="flex gap-1 shrink-0">
           <button
             onClick={() => handleViewChange("list")}
@@ -269,19 +304,21 @@ export default function KnowledgeGraphSection({
 
       {/* Graph view */}
       {viewMode === "graph" && (
-        <KGGraph
-          graphData={graphData}
-          onNodeClick={handleNodeClick}
-          selectedEntity={graphEntity}
-          entityInfo={entityInfo}
-          loading={graphLoading}
-          height={520}
-        />
+        <div className={fill ? "min-h-0 flex-1" : ""}>
+          <KGGraph
+            graphData={graphData}
+            onNodeClick={handleNodeClick}
+            selectedEntity={graphEntity}
+            entityInfo={entityInfo}
+            loading={graphLoading}
+            height={graphHeight}
+          />
+        </div>
       )}
 
       {/* List view */}
       {viewMode === "list" && (
-        <>
+        <div className={fill ? "min-h-0 flex-1 overflow-y-auto" : "contents"}>
           {loading && facts.length === 0 ? (
             <Skeleton lines={6} />
           ) : facts.length === 0 ? (
@@ -327,7 +364,7 @@ export default function KnowledgeGraphSection({
               )}
             </>
           )}
-        </>
+        </div>
       )}
 
       {/* Delete confirmation */}

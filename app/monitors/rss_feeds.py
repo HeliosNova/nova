@@ -205,6 +205,11 @@ _FEEDS: dict[str, list[str]] = {
         "https://www.biopharmadive.com/feeds/news/",
     ],
     "open source and github": [
+        # The actual daily trending repos (GitHub killed its official
+        # trending.atom; this community feed is what the stargazer monitor uses).
+        # Was missing here, so the monitor leaned on web_search and shipped soft,
+        # secondary "about GitHub" blogs (~10 sources, 2026-08-16).
+        "https://mshibanami.github.io/GitHubTrendingRSS/daily/all.xml",
         "https://news.ycombinator.com/rss",
         "https://github.blog/feed/",
         "https://opensource.com/feed",

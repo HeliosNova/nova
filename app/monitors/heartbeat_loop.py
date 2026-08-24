@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -29,13 +30,105 @@ from app.monitors.monitor_store import (
 logger = logging.getLogger(__name__)
 
 _MAX_CONCURRENT_LLM_MONITORS = 1  # one monitor's GPU work at a time — leaves the 3090 free for a side process (owner 2026-06-30)
+# Digest-class (27B deep-research) monitors may overlap each other at width 2:
+# a digest spends minutes in network gather and the CPU MiniCheck gate while
+# the GPU idles — a second digest fills that idle time, and Ollama queues
+# same-model calls so the 27B is never contended. Cross-CLASS overlap stays
+# forbidden (see _ClassGate): brain-query monitors drive the 9B, and
+# 27B+9B co-residency exceeds the 24GB card — the documented thrash ceiling.
+_MAX_CONCURRENT_DIGEST_MONITORS = 2
 # Post digests progressively as monitors finish, so a large due-batch (or a restart
 # mid-batch) can't strand every update behind the slowest monitor. Small groups keep
 # most of the digest-bundling benefit while making the feed timely + restart-resilient.
 _DIGEST_FLUSH_EVERY = 3
+# A sub-threshold buffer (1-2 items) used to wait for the END-OF-TICK flush, which
+# sits behind every remaining slow monitor — a single 27B digest kept a completed
+# briefing hostage for 30+ min, and a restart in that window destroyed it
+# (2026-08-12). The age flusher posts any buffer older than this regardless of size.
+_DIGEST_MAX_BUFFER_AGE = 300  # seconds
+# Buffered alerts older than this at recovery are stale intelligence — drop them
+# rather than posting yesterday's briefing after a long outage.
+_DELIVERY_RECOVERY_MAX_AGE_H = 24
 
 # Monitors whose output is non-factual — skip KG extraction for these
 _NO_KG_MONITORS = frozenset({"Morning Check-in", "Self-Reflection"})
+
+# Analytical/forecast curiosity topics ("<Domain>: Can X absorb Y?" — the
+# dossier open-question style). Their best-possible research answer is a hedged
+# synthesis, which the FACTUAL closure judge structurally rejects — these
+# resolve as [provisional] instead of burning MAX_ATTEMPTS and discarding the
+# work (2026-08-18). Factual topics ("What is X?", "Resolve contradiction: …")
+# deliberately do NOT match.
+_ANALYTICAL_TOPIC_RE = re.compile(
+    r"(?i)^(?:[^:]{0,80}:\s*)?"                       # optional "Domain: " prefix
+    r"(?:can|will|could|might|would|should|do(?:es)?\s+\w+\s+(?:have|stand|survive)"
+    r"|how\s+(?:might|will|could|would|likely)"
+    r"|what\s+(?:happens|if|would|will)"
+    r"|is\s+it\s+likely|are\s+\w+\s+likely)\b")
+
+
+_PERSON_TITLE_RE = re.compile(r"(?i)^(?:dr|mr|mrs|ms|prof|gen|sen|rep|gov|amb)\.?\s")
+_ORG_WORDS = frozenset({
+    "inc", "corp", "llc", "ltd", "fund", "forum", "commission", "institute",
+    "university", "bank", "group", "chase", "capital", "partners", "company",
+    "committee", "council", "agency", "administration", "ministry",
+    "department", "association", "foundation", "laboratory", "labs",
+})
+
+
+def _person_shaped(name: str) -> bool:
+    """Conservative person detector for direction curation: title prefix, or
+    2-3 title-case tokens with no org marker words."""
+    name = (name or "").strip()
+    if _PERSON_TITLE_RE.match(name):
+        return True
+    toks = name.split()
+    if any(t.lower().strip(".,") in _ORG_WORDS for t in toks):
+        return False
+    return 2 <= len(toks) <= 3 and all(t[:1].isupper() for t in toks if t)
+
+
+def _curate_inverted_leads(db) -> int:
+    """Supersede the org-as-subject side of mutual A-leads-B / B-leads-A pairs.
+
+    Extraction sometimes emits both directions ("Citadel leads Ken Griffin"
+    alongside the correct one). Only acts when EXACTLY one side is
+    person-shaped — ambiguous pairs are left alone. Supersession, not
+    deletion: the losing row keeps its audit trail (found live 2026-08-14,
+    4 pairs)."""
+    pairs = db.fetchall(
+        "SELECT a.id aid, a.subject asub, b.id bid, b.subject bsub "
+        "FROM kg_facts a JOIN kg_facts b "
+        "ON LOWER(a.subject)=LOWER(b.object) AND LOWER(a.object)=LOWER(b.subject) "
+        "AND a.predicate=b.predicate AND a.id < b.id "
+        "WHERE a.predicate='leads' AND a.superseded_at IS NULL "
+        "AND b.superseded_at IS NULL LIMIT 20"
+    )
+    n = 0
+    for p in pairs:
+        a_person, b_person = _person_shaped(p["asub"]), _person_shaped(p["bsub"])
+        if a_person == b_person:
+            continue                      # ambiguous — leave both
+        wrong_id = p["bid"] if a_person else p["aid"]
+        n += db.execute(
+            "UPDATE kg_facts SET superseded_at = datetime('now'), "
+            "provenance = COALESCE(provenance,'') || "
+            "' | superseded:inverted-direction-curation' "
+            "WHERE id = ? AND superseded_at IS NULL", (wrong_id,)).rowcount
+    return n
+
+
+def _skeletal_digest(text: str, cap: int = 1200) -> str:
+    """Deterministic skeleton of a digest for demoted retention: headings and
+    bolded lead lines only — the structure and headline claims survive, the
+    prose body (already consolidated into dossiers by now) is released."""
+    keep = []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if s.startswith("#") or s.startswith(("* **", "- **", "**")):
+            keep.append(s)
+    out = "\n".join(keep) or (text or "")[:cap]
+    return out[:cap]
 
 # ---------------------------------------------------------------------------
 # Deliberation scrubber — strip untagged model deliberation from monitor output
@@ -142,6 +235,83 @@ def _domain_study_passes_citation_gate(result: str) -> bool:
     return True
 
 
+def _class_floor_order(slow: list, classify, now: datetime) -> list:
+    """Promote starved non-digest monitors to the FRONT of the batch.
+
+    Tick tails die on every restart, and 'other'-class monitors always LIVE in
+    the tail: digest cadences (4-8h) produce overdue ratios that outrank a
+    daily monitor's for most of its life, so eval/forecast-resolution ran 31h+
+    late whenever restarts kept truncating batches (2026-08-14). Any
+    other-class monitor ≥25% past schedule jumps the queue — digests wait
+    behind at most a few starved dailies instead of the reverse, forever."""
+    def _ratio(m) -> float:
+        if not m.last_check_at:
+            return float("inf")
+        try:
+            last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
+        except Exception:
+            return float("inf")
+        return (now - last).total_seconds() / max(m.schedule_seconds, 1)
+
+    starved = [m for m in slow if classify(m) == "other" and _ratio(m) >= 1.25]
+    if not starved:
+        return slow
+    starved_ids = {id(m) for m in starved}
+    return starved + [m for m in slow if id(m) not in starved_ids]
+
+
+# ---------------------------------------------------------------------------
+# _ClassGate — model-aware monitor concurrency
+# ---------------------------------------------------------------------------
+
+class _ClassGate:
+    """Concurrency gate: monitors of the SAME class may overlap up to that
+    class's width; different classes NEVER overlap.
+
+    Classes map to the GPU model a monitor drives (27B digest chain vs 9B
+    brain queries). The 24GB card cannot hold both resident, so cross-class
+    concurrency churns model load/unload on every call — the documented
+    thrash ceiling. Same-class width 2 lets one digest's network gather and
+    CPU MiniCheck phases overlap another digest's GPU synthesis; Ollama
+    queues same-model requests, so the GPU itself is never contended.
+
+    Fairness is drain-and-switch: entrants are FIFO, and a waiter of a
+    different class blocks LATER same-class entrants from jumping the queue —
+    so an hourly 9B monitor can't starve behind a day-long digest backlog,
+    and one 9B run can't be starved out by a stream of digests."""
+
+    def __init__(self, widths: dict[str, int], default: int = 1):
+        self._widths = widths
+        self._default = default
+        self._cond = asyncio.Condition()
+        self._cls: str | None = None
+        self._n = 0
+        self._queue: list[tuple[str, object]] = []   # FIFO of (class, token)
+
+    async def acquire(self, cls: str) -> None:
+        token = object()
+        async with self._cond:
+            self._queue.append((cls, token))
+            while True:
+                pos = next(i for i, (_, t) in enumerate(self._queue) if t is token)
+                width = self._widths.get(cls, self._default)
+                same_prefix = all(c == cls for c, _ in self._queue[:pos])
+                if ((self._n == 0 and pos == 0)
+                        or (self._cls == cls and self._n < width and same_prefix)):
+                    self._queue.pop(pos)
+                    self._cls = cls
+                    self._n += 1
+                    return
+                await self._cond.wait()
+
+    async def release(self) -> None:
+        async with self._cond:
+            self._n -= 1
+            if self._n == 0:
+                self._cls = None
+            self._cond.notify_all()
+
+
 # ---------------------------------------------------------------------------
 # HeartbeatLoop — the background engine
 # ---------------------------------------------------------------------------
@@ -174,7 +344,13 @@ class HeartbeatLoop:
         # per channel-group at the end of the tick — so 80 due monitors post a
         # single briefing instead of 80 interleaving messages.
         self._digest_enabled = bool(getattr(config, "ENABLE_MONITOR_DIGEST", True))
-        self._digest_buffer: list[tuple[frozenset, str, str, str]] = []
+        # Entries: (targets, monitor_name, message, category, ledger_row_id, buffered_at).
+        # ledger_row_id points at the pending_deliveries row (migration 27) that makes
+        # the buffered alert survive a restart; buffered_at (monotonic) drives the
+        # age flusher. row_id None = ledger write failed, in-memory-only fallback.
+        self._digest_buffer: list[tuple[frozenset, str, str, str, int | None, float]] = []
+        self._flush_lock = asyncio.Lock()
+        self._flusher_task: asyncio.Task | None = None
         # Per-monitor delivery-failure retry counts: a digest whose broadcast
         # failed on EVERY channel is re-buffered for the next flush instead of
         # being silently dropped (audit 2026-07-08); capped so a permanently
@@ -185,6 +361,8 @@ class HeartbeatLoop:
         """Start the heartbeat loop as a background task."""
         self._running = True
         self._task = asyncio.create_task(self._loop())
+        if self._digest_enabled:
+            self._flusher_task = asyncio.create_task(self._age_flusher())
         logger.info("[Heartbeat] Started (interval=%ds)", config.HEARTBEAT_INTERVAL)
         return self._task
 
@@ -194,12 +372,21 @@ class HeartbeatLoop:
         if self._task:
             self._task.cancel()
             logger.info("[Heartbeat] Stopped")
+        if self._flusher_task:
+            self._flusher_task.cancel()
 
     async def _loop(self) -> None:
         """Main loop — check due monitors every HEARTBEAT_INTERVAL seconds."""
         try:
             # Small delay on startup to let services initialize
             await asyncio.sleep(10)
+
+            # Recover alerts that buffered but never broadcast before the last
+            # shutdown (the 2026-08-12 lost-World-digest failure mode). They
+            # re-enter the normal buffer; the age flusher posts them within
+            # minutes, once the channel bots have connected.
+            if self._digest_enabled:
+                await self._recover_pending_deliveries()
 
             while self._running:
                 try:
@@ -263,12 +450,20 @@ class HeartbeatLoop:
                                 )
                             slow = overdue
 
-                        # LLM monitors with bounded concurrency
+                        # LLM monitors with bounded, model-aware concurrency:
+                        # digest-class monitors overlap each other (width 2);
+                        # everything else is exclusive, and classes never mix.
+                        # Starved non-digest monitors jump the queue first.
+                        slow = _class_floor_order(
+                            slow, self._monitor_class,
+                            datetime.now(timezone.utc).replace(tzinfo=None))
                         if slow:
-                            sem = asyncio.Semaphore(_MAX_CONCURRENT_LLM_MONITORS)
+                            gate = _ClassGate({"digest": _MAX_CONCURRENT_DIGEST_MONITORS},
+                                              default=_MAX_CONCURRENT_LLM_MONITORS)
 
                             async def _limited_check(monitor):
-                                async with sem:
+                                await gate.acquire(self._monitor_class(monitor))
+                                try:
                                     try:
                                         await self._check_monitor(monitor)
                                     except Exception as e:
@@ -307,7 +502,9 @@ class HeartbeatLoop:
                                             monitor.id, "error",
                                             message=f"Exception — retry in ~{_retry_delay // 60} min: {e}",
                                         )
-                                # Progressive flush (OUTSIDE the semaphore — Discord I/O must
+                                finally:
+                                    await gate.release()
+                                # Progressive flush (OUTSIDE the gate — Discord I/O must
                                 # not hold a monitor concurrency slot): post as soon as a few
                                 # updates buffer, so nothing waits behind the slowest run and a
                                 # restart mid-batch keeps what already completed.
@@ -335,6 +532,22 @@ class HeartbeatLoop:
             logger.info("[Heartbeat] Loop cancelled")
         except Exception as e:
             logger.error("[Heartbeat] Loop terminated unexpectedly: %s", e)
+
+    def _monitor_class(self, monitor: Monitor) -> str:
+        """Concurrency class for _ClassGate — keyed to the GPU model the
+        monitor drives. Mirrors the _execute_query_monitor routing predicate:
+        Domain Study:*/Auto:*/feed-backed query monitors run the 27B
+        deep-research chain ("digest"); every other slow monitor (brain.think
+        9B queries, quiz, consolidation, eval) stays exclusive ("other")."""
+        if monitor.check_type != "query":
+            return "other"
+        try:
+            from app.monitors.rss_feeds import feeds_for
+            if monitor.name.startswith(("Domain Study:", "Auto:")) or feeds_for(monitor.name):
+                return "digest"
+        except Exception:
+            pass
+        return "other"
 
     async def _check_monitor(self, monitor: Monitor) -> None:
         """Execute a single monitor check."""
@@ -566,7 +779,7 @@ class HeartbeatLoop:
             return
 
         # Send alert
-        await self._send_alert(monitor, analysis)
+        delivered = await self._send_alert(monitor, analysis)
 
         # Auto-disable one-shot reminders after first alert (supports both
         # legacy "[Reminder]" and current "reminder:" prefixes). Recurring
@@ -589,15 +802,25 @@ class HeartbeatLoop:
                 await asyncio.to_thread(self.store.update, monitor.id, enabled=False)
                 logger.info("[Heartbeat] Reminder '%s' auto-disabled after alert", monitor.name)
 
-        # Record
-        status = "changed" if change_info else "ok"
-        if change_info and change_info.get("type") == "numeric":
-            status = "alert"
-        await asyncio.to_thread(self.store.record_alert, monitor.id)
+        # Record. A result that reached this point WAS delivered (or buffered
+        # for delivery) — it is an alert. The old `"changed" if change_info
+        # else "ok"` stored every always-notify digest (the bulk of the feed)
+        # as 'ok': indistinguishable from a suppressed run in every metric,
+        # AND on the hard-delete path of the demote-don't-delete retention,
+        # which protects status='alert' only (deep pass 2026-08-14).
+        status = "alert" if delivered else "ok"
+        if delivered and change_info and change_info.get("type") != "numeric":
+            status = "changed"
+        if delivered:
+            # Only advance cooldown / last_alert_at when something actually went
+            # out (or was journaled for delivery). Recording a suppressed run
+            # previously advanced the cooldown for an alert that never fired.
+            await asyncio.to_thread(self.store.record_alert, monitor.id)
         await asyncio.to_thread(
             self.store.add_result,
             monitor.id, status, value=new_value[:12000] if new_value else "",
-            message=analysis[:500] if analysis else "")
+            message=((analysis[:500] if analysis else "") if delivered
+                     else "not delivered (suppressed or channel failure)"))
 
     # Registry: check_type -> handler. Adding a new check type is one method
     # plus one entry here — _execute_check never changes. Lambdas adapt the
@@ -615,7 +838,7 @@ class HeartbeatLoop:
         "auto_monitor": lambda self, m, cfg: self._execute_auto_monitor_detection(cfg),
         "maintenance": lambda self, m, cfg: self._execute_maintenance(cfg),
         "finetune": lambda self, m, cfg: self._execute_finetune_check(cfg),
-        "consolidation": lambda self, m, cfg: self._execute_consolidation(cfg),
+        "dream_consolidation": lambda self, m, cfg: self._execute_consolidation(cfg),
         "capability_review": lambda self, m, cfg: self._execute_capability_review(cfg),
         "eval": lambda self, m, cfg: self._execute_eval_harness(cfg),
         "prompt_analyzer": lambda self, m, cfg: self._execute_prompt_analyzer(cfg),
@@ -1178,14 +1401,26 @@ class HeartbeatLoop:
             f"Topic context: {lesson.topic}. "
             f"Key information: {(lesson.lesson_text or lesson.correct_answer or '')[:300]}\n\n"
             f"Question: {question}\n\n"
-            "Answer based on the context provided."
+            # Concise: an unbounded ramble overran the 600-token cap and got cut
+            # mid-answer, which the grader then scored as a knowledge FAILURE
+            # (false-failure reflexion, 2026-08-15 watch). 2-3 sentences is ample
+            # for a quiz answer and keeps grading clean.
+            "Answer concisely in 2-3 sentences based on the context provided."
         )
         try:
             answer = await llm.invoke_nothink(
                 [{"role": "user", "content": answer_prompt}],
-                max_tokens=600, temperature=0.3,
+                # 900, was 600: the concise instruction alone doesn't stop the
+                # 9B from rambling past the cap (re-fired 2026-08-19), and a
+                # mid-answer cut grades as a false knowledge FAILURE.
+                max_tokens=900, temperature=0.3,
             )
             answer = answer.strip()
+            # Belt-and-suspenders: grade only complete sentences — drop any
+            # trailing fragment so a cut never reads as a wrong answer.
+            m = re.search(r"^(.*[.!?])(?:[^.!?]*)$", answer, re.DOTALL)
+            if m and len(m.group(1)) >= 60:
+                answer = m.group(1)
         except Exception as e:
             return f"[Quiz answer generation failed: {e}]"
 
@@ -1489,6 +1724,32 @@ class HeartbeatLoop:
                 # the rest. Failed closure → requeue (fail() bumps attempts).
                 _resolved_ok = await self._curiosity_closure_check(item.topic, result)
                 if not _resolved_ok:
+                    # ANALYTICAL/forecast questions ("Can India's markets absorb
+                    # $50B?" — the dossier open-question style) structurally
+                    # fail a FACTUAL closure judge: their best-possible answer
+                    # is a hedged synthesis, which the judge rejects as not
+                    # "concrete". Pre-2026-08-18 that meant 3 research passes
+                    # per item, all DISCARDED (~16h of GPU across the backlog,
+                    # zero knowledge stored). If the question is analytical and
+                    # the research is substantive (stage-1 deflection heuristics
+                    # already passed to reach the judge), keep the knowledge:
+                    # resolve as PROVISIONAL and bank grounded facts below.
+                    # Factual topics keep the strict requeue-on-fail path.
+                    if _ANALYTICAL_TOPIC_RE.search(item.topic or ""):
+                        if svc.kg and len(result) > 50:
+                            from app.core.brain import _extract_kg_triples
+                            try:
+                                await _extract_kg_triples(svc.kg, item.topic, result, trust=0.5,
+                                                          source_name="Curiosity Research")
+                            except Exception:
+                                pass
+                        await asyncio.to_thread(
+                            svc.curiosity.resolve, item.id,
+                            "[provisional] " + result[:1985])
+                        logger.info("[Curiosity] analytical question resolved as provisional: %s",
+                                    item.topic[:80])
+                        return (f"CURIOSITY PROVISIONAL | topic={item.topic[:80]} | "
+                                f"analytical question — hedged synthesis stored")
                     await asyncio.to_thread(svc.curiosity.fail, item.id)
                     logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
                     return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
@@ -1577,7 +1838,16 @@ class HeartbeatLoop:
         # Stage 2: LLM judge — does this answer the question?
         try:
             from app.core import llm as llm_mod
+            # Date-anchored: without this the FAST_MODEL's training-cutoff prior
+            # rejects real post-cutoff events as "fictional future scenarios"
+            # (seen live 2026-08-19: a researched answer about the sitting Fed
+            # chair was requeued forever). Judge concreteness, not plausibility.
+            _today = datetime.now(timezone.utc).strftime("%A, %B %d, %Y")
             judge_prompt = (
+                f"TODAY IS {_today}. The proposed answer was produced from LIVE web research and "
+                f"may describe events after your training cutoff — those events are real. Judge "
+                f"ONLY whether the answer concretely addresses the question, NOT whether its "
+                f"events match your training knowledge.\n\n"
                 f"QUESTION: {topic[:300]}\n\n"
                 f"PROPOSED ANSWER:\n{result[:1200]}\n\n"
                 f"Did the proposed answer actually answer the question with concrete information? "
@@ -1809,6 +2079,40 @@ class HeartbeatLoop:
             except Exception as e:
                 parts.append(f"cross_synthesis decay failed: {e}")
                 logger.warning("[Heartbeat] cross_synthesis decay failed: %s", e)
+        if svc.skills:
+            # Disuse-based skill retirement (audit 2026-08-17): decay_stale_skills
+            # was defined but NEVER called — a skill created and rarely/never
+            # triggered never aged out (dream only disables skills that RAN and
+            # failed). Wired in next to the lesson/KG/reflexion decays.
+            try:
+                decayed = await asyncio.to_thread(svc.skills.decay_stale_skills)
+                if decayed:
+                    parts.append(f"stale skills decayed: {decayed}")
+            except Exception as e:
+                parts.append(f"skill decay failed: {e}")
+                logger.warning("[Heartbeat] Skill staleness decay failed: %s", e)
+        # Knowing-tier retention (audit 2026-08-17): dossier_revisions and
+        # storyline_events are append-only; keep a generous window so they don't
+        # grow unbounded (volumes are small — keep-last-N / age prune).
+        try:
+            from app.database import get_db
+            _db = get_db()
+
+            def _knowing_retention():
+                a = _db.execute(
+                    "DELETE FROM dossier_revisions WHERE id NOT IN ("
+                    "  SELECT id FROM dossier_revisions dr WHERE ("
+                    "    SELECT COUNT(*) FROM dossier_revisions d2 "
+                    "    WHERE d2.dossier_id = dr.dossier_id AND d2.id >= dr.id) <= 30)").rowcount
+                b = _db.execute(
+                    "DELETE FROM storyline_events "
+                    "WHERE created_at < datetime('now', '-180 days')").rowcount
+                return a, b
+            drev, sev = await asyncio.to_thread(_knowing_retention)
+            if drev or sev:
+                parts.append(f"knowing-tier retention: {drev} revisions + {sev} events pruned")
+        except Exception as e:
+            logger.warning("[Heartbeat] knowing-tier retention failed: %s", e)
         if svc.reflexions:
             try:
                 decayed = await asyncio.to_thread(svc.reflexions.decay_stale, days=90)
@@ -1883,12 +2187,154 @@ class HeartbeatLoop:
             )).rowcount
             if trust_deleted:
                 parts.append(f"trust_audit pruned: {trust_deleted}")
-            results_deleted = (await asyncio.to_thread(
+            # Demote-don't-delete (CrystalMem pattern, adopted 2026-08-13):
+            # digests are the knowing tier's evidence base, and capability lost
+            # to hard deletion never fully recovers ("memory hysteresis",
+            # arXiv:2608.00303). Content rows demote full → skeletal (30d) →
+            # trace (90d) and are never deleted; non-content rows (ok/skip/
+            # error — no knowledge value) still purge at 30 days.
+            nonalert_deleted = (await asyncio.to_thread(
                 db.execute,
-                "DELETE FROM monitor_results WHERE created_at < datetime('now', '-30 days')",
+                "DELETE FROM monitor_results WHERE created_at < datetime('now', '-30 days') "
+                "AND status NOT IN ('alert', 'changed')",
             )).rowcount
-            if results_deleted:
-                parts.append(f"monitor_results pruned: {results_deleted}")
+            if nonalert_deleted:
+                parts.append(f"monitor_results non-content pruned: {nonalert_deleted}")
+
+            def _demote_pass():
+                rows = db.fetchall(
+                    "SELECT id, value FROM monitor_results WHERE "
+                    "created_at < datetime('now', '-30 days') AND status IN ('alert', 'changed') "
+                    "AND COALESCE(message,'') NOT LIKE 'demoted:%' AND LENGTH(value) > 1200 "
+                    "LIMIT 200"
+                )
+                for r in rows:
+                    db.execute(
+                        "UPDATE monitor_results SET value = ?, message = 'demoted:skeletal' WHERE id = ?",
+                        (_skeletal_digest(r["value"]), r["id"]),
+                    )
+                n_skel = len(rows)
+                n_trace = db.execute(
+                    "UPDATE monitor_results SET value = substr(value, 1, 200), "
+                    "message = 'demoted:trace' WHERE "
+                    "created_at < datetime('now', '-90 days') AND message = 'demoted:skeletal'",
+                ).rowcount
+                return n_skel, n_trace
+
+            n_skel, n_trace = await asyncio.to_thread(_demote_pass)
+            if n_skel or n_trace:
+                parts.append(f"digests demoted: {n_skel} skeletal, {n_trace} trace")
+
+            # Quarantine disposition (2026-08-14): jailed facts had NO exit
+            # path — 811 rows accumulated since Jul 8, no release and no
+            # expiry. Quarantine is a 30-day audit window for suspected
+            # poisoning, not a life sentence: rows still jailed after 30 days
+            # expire. (Unlike digests these are UNTRUSTED accusations, already
+            # excluded from all retrieval — deletion is the safe direction.)
+            q_expired = (await asyncio.to_thread(
+                db.execute,
+                "DELETE FROM kg_facts WHERE quarantined=1 "
+                "AND created_at < datetime('now','-30 days')",
+            )).rowcount
+            if q_expired:
+                parts.append(f"quarantine expired: {q_expired}")
+            # Vector-index lifecycle hygiene (2026-08-14): supersessions,
+            # expiries, and the quarantine purge above never touched their
+            # VECTORS — the kg_facts collection grew to 3× the live set and
+            # diluted every semantic top-k with dead rows.
+            try:
+                from app.core.brain import get_services
+                _svc = get_services()
+                if _svc.kg:
+                    n_vec = await _svc.kg.prune_stale_vectors()
+                    if n_vec:
+                        parts.append(f"stale KG vectors pruned: {n_vec}")
+                # Same hygiene for the lessons index (2026-08-20 sweep): it had
+                # NO vector lifecycle, so churn left ghosts + unindexed lessons.
+                if _svc.learning:
+                    l_del, l_idx = await asyncio.to_thread(
+                        _svc.learning.prune_and_backfill_lesson_vectors)
+                    if l_del:
+                        parts.append(f"stale lesson vectors pruned: {l_del}")
+            except Exception as e:
+                logger.warning("[Heartbeat] vector hygiene failed: %s", e)
+            try:
+                n_inv = await asyncio.to_thread(_curate_inverted_leads, db)
+                if n_inv:
+                    parts.append(f"inverted-direction facts superseded: {n_inv}")
+            except Exception as e:
+                logger.warning("[Heartbeat] inverted-leads curation failed: %s", e)
+            # Lifecycle rot on the DELETE side (2026-08-14 audit): several stores
+            # were insert-only and grew unbounded. Each prune is failure-isolated.
+            try:
+                from app.core.storylines import close_stale
+                n_sl = await asyncio.to_thread(close_stale, db, 21)
+                if n_sl:
+                    parts.append(f"storylines auto-closed: {n_sl}")
+            except Exception as e:
+                logger.warning("[Heartbeat] storyline auto-close failed: %s", e)
+            try:
+                from app.core.brain import get_services as _get_svc
+                _svc2 = _get_svc()
+                if _svc2.kg:
+                    n_al = await _svc2.kg.prune_dead_aliases()
+                    if n_al:
+                        parts.append(f"dead KG aliases pruned: {n_al}")
+            except Exception as e:
+                logger.warning("[Heartbeat] alias prune failed: %s", e)
+            try:
+                n_hp = (await asyncio.to_thread(
+                    db.execute,
+                    "DELETE FROM host_cooccurrence WHERE COALESCE(n_cooccur,0) <= 1 "
+                    "AND last_seen < datetime('now', '-60 days')",
+                )).rowcount
+                # Also drop ANY pair (recurring included) not seen in 90 days: a
+                # co-occurrence network gone quiet for 3 months is dead and rebuilds
+                # if the hosts reappear. The singleton prune alone left recurring
+                # pairs (n_cooccur>=2) unbounded; this bounds the table to a rolling
+                # active window without harming live-network detection (audit
+                # 2026-08-22).
+                n_hp += (await asyncio.to_thread(
+                    db.execute,
+                    "DELETE FROM host_cooccurrence WHERE last_seen < datetime('now', '-90 days')",
+                )).rowcount
+                if n_hp:
+                    parts.append(f"host pairs pruned: {n_hp}")
+            except Exception as e:
+                logger.warning("[Heartbeat] host_cooccurrence prune failed: %s", e)
+            try:
+                n_dd = (await asyncio.to_thread(
+                    db.execute,
+                    "DELETE FROM dedup_decisions WHERE created_at < datetime('now', '-90 days')",
+                )).rowcount
+                n_ql = (await asyncio.to_thread(
+                    db.execute,
+                    "DELETE FROM output_quality_log WHERE created_at < datetime('now', '-90 days')",
+                )).rowcount
+                if n_dd or n_ql:
+                    parts.append(f"decision logs pruned: {n_dd + n_ql}")
+            except Exception as e:
+                logger.warning("[Heartbeat] decision-log prune failed: %s", e)
+            # eval_reports: keep the newest 40 JSON+MD reports; never touch the
+            # append-only history log or the regression baseline.
+            try:
+                from pathlib import Path as _Path
+                _erd = _Path("/data/eval_reports")
+                removed = 0
+                if _erd.is_dir():
+                    for _pat in ("eval_*.json", "eval_*.md"):
+                        for _old in sorted(_erd.glob(_pat))[:-40]:
+                            if _old.name in ("eval_baseline.json", "eval_history.jsonl"):
+                                continue
+                            try:
+                                _old.unlink()
+                                removed += 1
+                            except OSError:
+                                pass
+                if removed:
+                    parts.append(f"eval reports pruned: {removed}")
+            except Exception as e:
+                logger.warning("[Heartbeat] eval_reports retention failed: %s", e)
         except Exception as e:
             logger.warning("[Heartbeat] Audit prune failed: %s", e)
         # Periodic SQLite backup — daily snapshot, VERIFIED, kept in two
@@ -1974,6 +2420,31 @@ class HeartbeatLoop:
                             str(off_dir),
                         )
                         parts.append("off-volume backup SKIPPED (dir not mounted)")
+                    # True OFFSITE leg (2026-08-14): E:\nova-offsite was fed by
+                    # a MANUAL robocopy that was never scheduled — the daily leg
+                    # silently didn't exist (found one snapshot behind). The
+                    # drive bind-mounts at /offsite; same copy+verify+retention.
+                    offsite_dir = Path("/offsite")
+                    if offsite_dir.is_dir():
+                        try:
+                            os_target = offsite_dir / target.name
+                            await asyncio.to_thread(shutil.copyfile, target, os_target)
+                            os_ok, os_detail = await asyncio.to_thread(verify_snapshot, os_target)
+                            if os_ok:
+                                parts.append(f"offsite backup verified: {os_target.name}")
+                                for old in sorted(offsite_dir.glob("nova-*.db"))[:-7]:
+                                    try:
+                                        old.unlink()
+                                    except OSError:
+                                        pass
+                            else:
+                                logger.error("[Heartbeat] OFFSITE backup verify FAILED: %s", os_detail)
+                                parts.append(f"OFFSITE BACKUP VERIFY FAILED: {os_detail}")
+                        except Exception as e:
+                            logger.error("[Heartbeat] offsite backup copy failed: %s", e)
+                            parts.append(f"offsite backup copy failed: {e}")
+                    else:
+                        parts.append("offsite backup SKIPPED (E: not mounted)")
                 # Retain last 7 in-volume backups
                 snapshots = sorted(backup_dir.glob("nova-*.db"))
                 for old in snapshots[:-7]:
@@ -2002,6 +2473,31 @@ class HeartbeatLoop:
                     parts.append(f"principles distilled: {distilled}")
         except Exception as e:
             logger.warning("[Heartbeat] Principle distillation failed: %s", e)
+        # Procedure-skill induction — distill NL procedure skills from proven
+        # memory (success reflexions + repeatedly-helpful lessons). Scheduled
+        # here, NOT in the chat path: chat-gated extraction produced 0 organic
+        # skills in Nova's lifetime because tool-using chat barely exists
+        # (audit 2026-08-23). Same decoupling that makes auto_tools work.
+        try:
+            from app.core.auto_skills import induce_procedure_skills
+            if svc.skills:
+                induced = await induce_procedure_skills(get_db(), svc.skills)
+                if induced:
+                    parts.append(f"procedure skills induced: {induced}")
+        except Exception as e:
+            logger.warning("[Heartbeat] Skill induction failed: %s", e)
+        # Recurring-failure promotion sweep — the chat-path trigger
+        # (check_recurring_failures) requires a NEW live-chat failure and so
+        # never fired under monitor-driven usage; clusters sat unpromoted
+        # (audit 2026-08-23: an n=9 quiz-failure cluster, 0 auto-lessons ever).
+        try:
+            from app.core.reflexion import sweep_recurring_failures
+            if svc.reflexions and svc.learning:
+                swept = await sweep_recurring_failures(svc.reflexions, svc.learning)
+                if swept:
+                    parts.append(f"failure clusters promoted: {swept}")
+        except Exception as e:
+            logger.warning("[Heartbeat] Failure sweep failed: %s", e)
         # Cross-monitor feedback loops
         try:
             loop_parts = await self._check_feedback_loops(svc)
@@ -2307,7 +2803,8 @@ class HeartbeatLoop:
         # 2026-05-08 — "...issues reg." dangling). Treat as raw to preserve
         # the full text.
         "capability_review",
-        "consolidation",  # dream digests are already concise
+        "consolidation",         # knowledge/dossier digests are already structured
+        "dream_consolidation",   # dream digests are already concise
         "eval",           # eval reports are already structured
     })
 
@@ -2389,8 +2886,12 @@ class HeartbeatLoop:
                 )
             return f"Monitor '{monitor.name}' update: {new_value[:200]}"
 
-    async def _send_alert(self, monitor: Monitor, message: str) -> None:
-        """Send an alert via available channel bots.
+    async def _send_alert(self, monitor: Monitor, message: str) -> bool:
+        """Send an alert via available channel bots. Returns True when the
+        alert was delivered or buffered/journaled for delivery, False when it
+        was SUPPRESSED (dedup, no channels) — the caller records status from
+        this, so a suppressed result can never masquerade as a delivered one
+        (deep pass 2026-08-14).
 
         Routing precedence (per owner directive 2026-04-25):
           1. Per-monitor `channels` column — if set (CSV like "discord,signal"),
@@ -2414,7 +2915,7 @@ class HeartbeatLoop:
                         "[Heartbeat] '%s' suppressed by cross-monitor dedup",
                         monitor.name,
                     )
-                    return
+                    return False
             except Exception as e:
                 logger.warning("[Heartbeat] dedup check failed: %s", e)
 
@@ -2427,13 +2928,32 @@ class HeartbeatLoop:
                 )
             elif not (self._discord or self._telegram or self._whatsapp or self._signal):
                 logger.warning("[Heartbeat] No channels configured for alert '%s'", monitor.name)
-            return
+            return False
 
         # Batch this cycle's alerts into one digest per channel-group (the loop
-        # flushes after the tick), unless digest mode is disabled.
+        # flushes after the tick), unless digest mode is disabled. The alert is
+        # simultaneously journaled to pending_deliveries so a restart between
+        # buffering and broadcast can't destroy it (at-least-once delivery).
         if self._digest_enabled:
-            self._digest_buffer.append((frozenset(targets), monitor.name, message, monitor.category or ""))
-            return
+            row_id: int | None = None
+            try:
+                from app.database import get_db
+
+                def _journal() -> int:
+                    cur = get_db().execute(
+                        "INSERT INTO pending_deliveries (targets, monitor_name, message, category) "
+                        "VALUES (?, ?, ?, ?)",
+                        (",".join(sorted(targets)), monitor.name, message, monitor.category or ""),
+                    )
+                    return cur.lastrowid
+
+                row_id = await asyncio.to_thread(_journal)
+            except Exception as e:
+                logger.warning("[Heartbeat] delivery journal write failed for '%s': %s", monitor.name, e)
+            self._digest_buffer.append(
+                (frozenset(targets), monitor.name, message, monitor.category or "", row_id, time.monotonic())
+            )
+            return True
 
         full_message = f"[{monitor.name}]\n" + message.lstrip("\n")
         sent = await self._broadcast(full_message, targets)
@@ -2446,6 +2966,7 @@ class HeartbeatLoop:
                 pass
         else:
             logger.error("[Heartbeat] ALL notification channels failed for '%s'", monitor.name)
+        return bool(sent)
 
     def _alert_targets(self, monitor: Monitor) -> set[str]:
         """Channels that should receive this alert: a per-monitor `channels`
@@ -2512,56 +3033,181 @@ class HeartbeatLoop:
         return "\n".join(parts).strip()
 
     async def _flush_digest(self) -> None:
-        """Send the buffered cycle alerts as one digest per channel-group."""
-        buf = self._digest_buffer
-        self._digest_buffer = []
-        if not buf:
-            return
-        groups: dict[frozenset, list[tuple[str, str]]] = {}
-        cats: dict[str, str] = {}
-        for tgt, name, msg, cat in buf:
-            groups.setdefault(tgt, []).append((name, msg))
-            cats[name] = cat
-        for tgt, items in groups.items():
-            try:
-                # Salience: lead with what matters to the owner, drop sub-floor
-                # noise (only kicks in on larger digests; never thins a tiny one).
-                if getattr(config, "ENABLE_SALIENCE_FILTER", True) and len(items) > 2:
-                    try:
-                        from app.core.salience import rank_digest_items
-                        from app.database import get_db
-                        items = rank_digest_items(get_db(), items)
-                    except Exception as e:
-                        logger.warning("[Heartbeat] salience ranking skipped: %s", e)
-                digest = self._format_digest(items, cats)
-                if await self._broadcast(digest, set(tgt)):
-                    logger.info("[Heartbeat] digest sent: %d update(s) → %s",
-                                len(items), ",".join(sorted(tgt)))
-                    for name, _ in items:
-                        self._alert_retry_counts.pop(name, None)
-                else:
-                    # Every channel failed — re-buffer for the next flush so
-                    # the intelligence isn't silently lost (record_check has
-                    # already advanced, so the monitor won't refire on its own).
-                    kept = 0
-                    for name, msg in items:
-                        n = self._alert_retry_counts.get(name, 0) + 1
-                        self._alert_retry_counts[name] = n
-                        if n <= 3:
-                            self._digest_buffer.append((tgt, name, msg, cats.get(name, "")))
-                            kept += 1
-                        else:
-                            logger.error(
-                                "[Heartbeat] digest for '%s' undelivered after %d attempts — dropped",
-                                name, n,
+        """Send the buffered cycle alerts as one digest per channel-group.
+
+        Confirmed sends delete their pending_deliveries journal rows; failures
+        keep the row and re-buffer (so neither a channel outage nor a restart
+        loses the alert). The lock keeps the progressive, end-of-tick, and
+        age-flusher call sites from interleaving digests.
+        """
+        async with self._flush_lock:
+            buf = self._digest_buffer
+            self._digest_buffer = []
+            if not buf:
+                return
+            # Group by channel-set, carrying each entry's journal row_id WITH the
+            # entry. The old (tgt, name)-keyed dict collided when the same monitor
+            # produced two alerts in one flush (a re-buffered/recovered entry plus
+            # a fresh one): the second overwrote the first's row_id, so on success
+            # one journal row leaked (→ duplicate repost after restart) and on
+            # salience suppression the wrong row could be deleted.
+            groups: dict[frozenset, list[tuple[str, str, int | None]]] = {}
+            cats: dict[str, str] = {}
+            for tgt, name, msg, cat, row_id, _ts in buf:
+                groups.setdefault(tgt, []).append((name, msg, row_id))
+                cats[name] = cat
+            for tgt, entries in groups.items():
+                try:
+                    kept = entries
+                    # Salience: lead with what matters to the owner, drop sub-floor
+                    # noise (only kicks in on larger digests; never thins a tiny one).
+                    if getattr(config, "ENABLE_SALIENCE_FILTER", True) and len(entries) > 2:
+                        try:
+                            from app.core.salience import rank_digest_items
+                            from app.database import get_db
+                            items = [(n, m) for n, m, _ in entries]
+                            # to_thread: rank_digest_items reads dossier bodies —
+                            # a heavy sync DB read that must not block the loop.
+                            ranked = await asyncio.to_thread(rank_digest_items, get_db(), items)
+                            # Reconstruct concrete entries (with row_ids) in ranked
+                            # order — duplicates consumed positionally, leftovers
+                            # are the suppressed set.
+                            pool: dict[tuple[str, str], list] = {}
+                            for e in entries:
+                                pool.setdefault((e[0], e[1]), []).append(e)
+                            kept = []
+                            for n, m in ranked:
+                                lst = pool.get((n, m))
+                                if lst:
+                                    kept.append(lst.pop(0))
+                            # A salience drop is a final suppression — clear its
+                            # journal row or recovery would repost it forever.
+                            suppressed_rows = [e[2] for lst in pool.values() for e in lst]
+                            if suppressed_rows:
+                                await self._delete_journal_rows(suppressed_rows)
+                        except Exception as e:
+                            logger.warning("[Heartbeat] salience ranking skipped: %s", e)
+                            kept = entries
+                    items = [(n, m) for n, m, _ in kept]
+                    digest = self._format_digest(items, cats)
+                    if await self._broadcast(digest, set(tgt)):
+                        logger.info("[Heartbeat] digest sent: %d update(s) → %s",
+                                    len(items), ",".join(sorted(tgt)))
+                        for n, _m, _r in kept:
+                            self._alert_retry_counts.pop(n, None)
+                        await self._delete_journal_rows([e[2] for e in kept])
+                    else:
+                        # Every channel failed — re-buffer for the next flush so
+                        # the intelligence isn't silently lost (record_check has
+                        # already advanced, so the monitor won't refire on its own).
+                        kept_count = 0
+                        dropped_rows: list[int | None] = []
+                        for n, m, row_id in kept:
+                            cnt = self._alert_retry_counts.get(n, 0) + 1
+                            self._alert_retry_counts[n] = cnt
+                            if cnt <= 3:
+                                self._digest_buffer.append(
+                                    (tgt, n, m, cats.get(n, ""), row_id, time.monotonic())
+                                )
+                                kept_count += 1
+                            else:
+                                logger.error(
+                                    "[Heartbeat] digest for '%s' undelivered after %d attempts — dropped",
+                                    n, cnt,
+                                )
+                                dropped_rows.append(row_id)
+                        await self._delete_journal_rows(dropped_rows)
+                        if kept_count:
+                            logger.warning(
+                                "[Heartbeat] delivery failed on all channels — re-buffered %d item(s)",
+                                kept_count,
                             )
-                    if kept:
-                        logger.warning(
-                            "[Heartbeat] delivery failed on all channels — re-buffered %d item(s)",
-                            kept,
-                        )
+                except Exception as e:
+                    logger.error("[Heartbeat] digest flush failed: %s", e)
+
+    async def _delete_journal_rows(self, row_ids: list[int | None]) -> None:
+        """Remove delivered (or terminally dropped) alerts from the journal."""
+        ids = [r for r in row_ids if r is not None]
+        if not ids:
+            return
+        try:
+            from app.database import get_db
+            await asyncio.to_thread(
+                get_db().executemany,
+                "DELETE FROM pending_deliveries WHERE id = ?",
+                [(i,) for i in ids],
+            )
+        except Exception as e:
+            logger.warning("[Heartbeat] delivery journal cleanup failed: %s", e)
+
+    async def _recover_pending_deliveries(self) -> None:
+        """Reload journaled-but-never-broadcast alerts into the digest buffer.
+
+        A crash after broadcast but before the journal delete re-posts that
+        digest once (at-least-once semantics) — acceptable; the failure mode
+        this kills is silent loss. Stale rows (> _DELIVERY_RECOVERY_MAX_AGE_H)
+        are purged instead of posting day-old briefings after a long outage.
+        """
+        try:
+            from app.database import get_db
+            db = get_db()
+
+            def _load():
+                db.execute(
+                    "DELETE FROM pending_deliveries WHERE created_at < "
+                    f"datetime('now', '-{_DELIVERY_RECOVERY_MAX_AGE_H} hours')"
+                )
+                return db.fetchall(
+                    "SELECT id, targets, monitor_name, message, category "
+                    "FROM pending_deliveries ORDER BY id"
+                )
+
+            rows = await asyncio.to_thread(_load)
+            for row in rows:
+                targets = frozenset(t for t in (row["targets"] or "").split(",") if t)
+                if not targets:
+                    await self._delete_journal_rows([row["id"]])
+                    continue
+                self._digest_buffer.append(
+                    (targets, row["monitor_name"], row["message"],
+                     row["category"] or "", row["id"], time.monotonic())
+                )
+            if rows:
+                logger.info(
+                    "[Heartbeat] recovered %d undelivered alert(s) from the journal — "
+                    "flushing within ~%ds", len(rows), _DIGEST_MAX_BUFFER_AGE,
+                )
+        except Exception as e:
+            logger.warning("[Heartbeat] delivery journal recovery failed: %s", e)
+
+    async def _age_flusher(self) -> None:
+        """Post any buffer that has been waiting past _DIGEST_MAX_BUFFER_AGE.
+
+        The progressive flush needs _DIGEST_FLUSH_EVERY items and the end-of-tick
+        flush sits behind every remaining slow monitor, so without this a 1-2
+        item buffer (a completed digest) could wait 30+ minutes — and a restart
+        in that window used to destroy it. Runs as its own task because the main
+        loop blocks inside asyncio.gather for the whole slow-monitor batch.
+        """
+        while self._running:
+            try:
+                await asyncio.sleep(60)
+                if not self._digest_buffer:
+                    continue
+                oldest = min(entry[5] for entry in self._digest_buffer)
+                if time.monotonic() - oldest >= _DIGEST_MAX_BUFFER_AGE:
+                    logger.info(
+                        "[Heartbeat] age flush: %d buffered alert(s) waited %ds",
+                        len(self._digest_buffer), int(time.monotonic() - oldest),
+                    )
+                    await self._flush_digest()
+            except asyncio.CancelledError:
+                break
             except Exception as e:
-                logger.error("[Heartbeat] digest flush failed: %s", e)
+                # One bad iteration must NOT kill the guard against silent digest
+                # loss — log and keep looping (the old outer except exited the
+                # task forever, so the guard could vanish until restart).
+                logger.error("[Heartbeat] age flush iteration failed (continuing): %s", e)
 
     async def _execute_eval_harness(self, cfg: dict) -> str:
         """Run the automated eval suite and return a summary string for the monitor result."""
@@ -2577,6 +3223,13 @@ class HeartbeatLoop:
         report_dir = cfg.get("report_dir") or config.EVAL_REPORT_PATH
 
         harness = EvalHarness(suite_path=suite_path, report_dir=report_dir)
+        # Multi-agent tasks assert decomposition behavior; with structural
+        # decomposition disabled at runtime they fail structurally and pollute
+        # pass_rate + flag false regressions (2026-08-14 audit: pass 0.29,
+        # decomposition_rate 0.00 under ENABLE_MULTI_AGENT=false). Skip them so
+        # real drift in other categories isn't masked.
+        if not config.ENABLE_MULTI_AGENT:
+            harness._skip_categories = {"multi-agent"}
 
         # Verify suite file exists before attempting to run
         import pathlib
@@ -2663,6 +3316,22 @@ class HeartbeatLoop:
                     pass
 
         await asyncio.to_thread(_count_tables)
+
+        # Dead-man's floor (2026-08-18): size-only thresholding had no LOWER bound,
+        # so a wiped/wrong DB reported "healthy". `monitors`==0 is unambiguous (the
+        # app seeds ~50 monitors on first start and can't run without them);
+        # `kg_facts`==0 alongside a populated monitors table means the memory-loop
+        # store — "the product" — was wiped. Escalate, never downgrade. Only when
+        # the DB file actually exists ("size" was recorded) — a missing/inaccessible
+        # DB is already reported above and must not be masked by table counts.
+        if "size" in fields:
+            if fields.get("monitors") == 0:
+                status = "error"
+                summary = "monitors table EMPTY — DB not seeded / wrong DB path"
+            elif fields.get("kg_facts") == 0 and (fields.get("monitors") or 0) > 0:
+                if status != "error":
+                    status = "warning"
+                summary = "kg_facts EMPTY on an established install — memory-loop store wiped?"
 
         return format_monitor_result("DB Size Monitor", status, summary, fields)
 
@@ -2820,6 +3489,14 @@ class HeartbeatLoop:
                 doc_count = collection.count()
                 fields["docs"] = doc_count
                 summary = f"{doc_count} docs indexed"
+                if doc_count == 0:
+                    # Not "healthy" (2026-08-18): a zero count is either a genuinely
+                    # empty store OR the known stale-handle-after-reindex failure
+                    # (CLAUDE.md) where the app holds a dropped collection and every
+                    # retrieval silently returns nothing. Surface it as a warning so a
+                    # wiped index is visible instead of reading as normal.
+                    status = "warning"
+                    summary = "0 docs indexed — empty store or stale collection handle"
             except Exception as e:
                 status = "error"
                 summary = f"chromadb error: {e}"
@@ -2871,7 +3548,18 @@ class HeartbeatLoop:
                 fields["orphans"] = orphans_row["c"]
             active = fields.get("active", 0)
             orphans = fields.get("orphans", 0)
-            status = "warning" if isinstance(active, int) and active and isinstance(orphans, int) and orphans / max(active, 1) > 0.6 else "info"
+            if isinstance(active, int) and active == 0:
+                # Dead-man's switch (2026-08-18): an established KG reporting ZERO
+                # active facts is broken (wiped store / stale handle / get_stats
+                # returning zeros), not "healthy" — the old code fell through to
+                # status="info" ("0 active facts" read as normal, same blind spot
+                # that hid the extraction flatline).
+                status = "error"
+            elif (isinstance(active, int) and active and isinstance(orphans, int)
+                    and orphans / max(active, 1) > 0.6):
+                status = "warning"
+            else:
+                status = "info"
             summary = f"{active} active facts"
             return format_monitor_result("KG Health Monitor", status, summary, fields)
         except Exception as e:
@@ -2978,6 +3666,49 @@ class HeartbeatLoop:
             "prev_6h": prev_count,
             "delta_pct": f"{pct:+.1f}%",
         }
+
+        # Dead-man's switch on the EXTRACTION pipe specifically (2026-08-18). The
+        # spike/drop logic above counts ALL kg_facts, so it reported "normal" while
+        # source='extracted' SILENTLY FLATLINED FOR 3 DAYS: an Ollama-0.32.13 JSON
+        # array-parse regression killed digest KG extraction, and steady non-
+        # extraction sources (curiosity, storylines has_status, principles) masked
+        # the total. Worse, a true zero-vs-zero window fell into `prev_count==0 →
+        # pct=0.0 → "normal"`. A digest pipeline that RUNS but banks ZERO extracted
+        # facts is broken — alarm on it directly (this would have caught R1 in hours).
+        try:
+            ex_row = await asyncio.to_thread(
+                db.fetchone,
+                "SELECT count(*) as c FROM kg_facts "
+                "WHERE source='extracted' AND created_at > datetime('now', '-24 hours')")
+            dg_row = await asyncio.to_thread(
+                db.fetchone,
+                "SELECT count(*) as c FROM monitor_results mr JOIN monitors m ON m.id=mr.monitor_id "
+                "WHERE m.check_type='query' AND mr.created_at > datetime('now', '-24 hours')")
+            ex_24h = ex_row["c"] if ex_row else 0
+            dg_24h = dg_row["c"] if dg_row else 0
+            fields["extracted_24h"] = ex_24h
+            fields["digests_24h"] = dg_24h
+            if dg_24h >= 3 and ex_24h == 0:
+                return format_monitor_result(
+                    "KG Growth Rate", "warning",
+                    f"KG extraction FLATLINE — {dg_24h} digests ran in 24h but 0 facts "
+                    f"extracted (likely a JSON parse/extraction regression)", fields)
+            # Second dead-man's switch: the digest pipeline ITSELF stalled. If
+            # enabled query monitors exist but produced ZERO digests in 24h, the
+            # heartbeat/monitor loop is wedged — the old zero-vs-zero window still
+            # reported "+0.0% normal" one level up (2026-08-18).
+            if dg_24h == 0:
+                enq_row = await asyncio.to_thread(
+                    db.fetchone,
+                    "SELECT count(*) as c FROM monitors WHERE check_type='query' AND enabled=1")
+                if enq_row and enq_row["c"] > 0:
+                    return format_monitor_result(
+                        "KG Growth Rate", "warning",
+                        f"DIGEST PIPELINE STALL — {enq_row['c']} query monitors enabled but "
+                        f"0 digests produced in 24h (monitor loop wedged?)", fields)
+        except Exception:
+            pass
+
         if abs(pct) >= threshold and prev_count >= 10:
             direction = "spike" if pct > 0 else "drop"
             return format_monitor_result(

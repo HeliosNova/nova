@@ -49,9 +49,32 @@ async def main() -> None:
     from app.mcp_server import create_mcp_server
 
     # --- Initialize database ---
+    # Ghost-DB guard (audit 2026-08-19): on a host where /data/nova.db doesn't
+    # exist, get_db()+init_schema() silently MINTS an empty DB (F:\data\nova.db,
+    # 4KB, was found — proof this already happened) and every MCP tool then
+    # returns valid-JSON-zero-results while the real DB lives in the nova_data
+    # Docker volume. Refuse to serve an empty store instead of lying.
+    _db_file = Path(config.DB_PATH)
+    if not _db_file.exists() or _db_file.stat().st_size < 65536:
+        logger.error(
+            "Refusing to start: %s is missing or empty (%d bytes). Nova's live DB "
+            "lives in the 'nova_data' Docker volume — run this server inside the "
+            "container (docker exec) or set DB_PATH to a real copy of nova.db.",
+            config.DB_PATH,
+            _db_file.stat().st_size if _db_file.exists() else 0,
+        )
+        sys.exit(2)
     logger.info("Initializing database at %s", config.DB_PATH)
     db = get_db()
     db.init_schema()
+    _live = db.fetchone("SELECT (SELECT COUNT(*) FROM kg_facts) AS kg, (SELECT COUNT(*) FROM lessons) AS l")
+    if _live and _live["kg"] == 0 and _live["l"] == 0:
+        logger.error(
+            "Refusing to serve an EMPTY knowledge store (0 kg_facts, 0 lessons) "
+            "at %s — this is almost certainly the wrong DB_PATH.", config.DB_PATH,
+        )
+        sys.exit(2)
+    logger.info("DB live: %d kg_facts, %d lessons", _live["kg"], _live["l"])
 
     # --- Create service instances ---
     user_facts = UserFactStore(db)

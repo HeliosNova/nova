@@ -90,7 +90,7 @@ class LLMProvider(Protocol):
         messages: list[dict],
         *,
         json_mode: bool = False,
-        json_prefix: str = "[{",
+        json_prefix: str = "{",  # object default — see module-level invoke_nothink
         json_schema: dict | None = None,
         max_tokens: int = 8000,
         temperature: float = 0.1,
@@ -177,7 +177,11 @@ def get_provider() -> LLMProvider:
 
 import time as _time
 
-INTERACTIVE_PRIORITY_WINDOW_S = 45.0  # background LLM monitors defer if a chat happened within this long
+INTERACTIVE_PRIORITY_WINDOW_S = 90.0  # background LLM monitors defer if a chat happened within this long
+# (90 not 45, 2026-08-14: under 27B<->9B swap contention a single chat tool
+# round can take 30-60s; a 45s window expired between rounds and let digests
+# resume mid-chat, thrashing the swap. 90s spans a slow round with margin; the
+# only cost is digests waiting 90s (not 45s) after the last chat activity.)
 _last_interactive_monotonic: float = -1e9
 
 
@@ -228,7 +232,15 @@ async def invoke_nothink(
     messages: list[dict],
     *,
     json_mode: bool = False,
-    json_prefix: str = "[{",
+    # Default "{" (was "[{", 2026-08-18): every remaining caller that omits
+    # json_prefix expects an OBJECT (agent_loop plan/act/critique, dream REM,
+    # workspace facts, quiz grade, kg_consistency) — array-shaped callers all
+    # pass an explicit json_schema now. The array default was a landmine on the
+    # 0.32 engine: the model ignores the prefill and returns {obj}, the
+    # open-char guard prepends "[" → "[{obj}" — corruption that only survived
+    # because every caller happened to salvage via extract_json_object.
+    # Single-char "{" is the proven-robust prefill on both models.
+    json_prefix: str = "{",
     json_schema: dict | None = None,
     max_tokens: int = 8000,
     temperature: float = 0.1,

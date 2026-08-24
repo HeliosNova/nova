@@ -7,7 +7,7 @@ import json
 import logging
 import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel
 
 from app.auth import require_auth
@@ -58,25 +58,25 @@ async def trigger_event(req: TriggerEventRequest):
 
 
 @router.get("/pending")
-async def list_pending_events(limit: int = 20):
+async def list_pending_events(limit: int = Query(20, ge=1, le=100)):
     """List pending events in the queue."""
     db = get_db()
     rows = db.fetchall(
         "SELECT id, event_type, payload, priority, status, created_at "
         "FROM event_queue WHERE status = 'pending' "
         "ORDER BY priority DESC, created_at ASC LIMIT ?",
-        (min(limit, 100),),
+        (limit,),
     )
     return {"count": len(rows), "events": [dict(r) for r in (rows or [])]}
 
 
 @router.get("/recent")
-async def list_recent_events(limit: int = 50):
+async def list_recent_events(limit: int = Query(50, ge=1, le=200)):
     """List recently processed events."""
     db = get_db()
     rows = db.fetchall(
         "SELECT id, event_type, payload, priority, status, processed_at, created_at "
         "FROM event_queue ORDER BY created_at DESC LIMIT ?",
-        (min(limit, 200),),
+        (limit,),
     )
     return {"count": len(rows), "events": [dict(r) for r in (rows or [])]}

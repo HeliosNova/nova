@@ -7,6 +7,13 @@ httpx==0.28.1
 
 # Database
 chromadb==0.6.3
+# posthog >=6 broke capture()'s signature, spamming "Failed to send telemetry"
+# from any fresh chroma client (chroma's own fix, PR #4970, is this pin; the
+# 0.6.x line never got it). App telemetry is also off via ANONYMIZED_TELEMETRY.
+# NOTE (audit 2026-08-24): do NOT bump chromadb to 1.x casually — 1.0.0-1.5.8
+# carries CVE-2026-45829 (CVSS 10 pre-auth RCE in the server path); embedded
+# 0.6.3 predates the vulnerable code entirely.
+posthog<6
 
 # Math
 sympy==1.13.3
@@ -33,9 +40,13 @@ Pillow>=10.0.0
 
 # Voice (optional — only used when ENABLE_VOICE=true)
 openai-whisper==20250625
+piper-tts==1.7.0
 
-# MCP (Model Context Protocol)
-mcp>=1.23.0
+# MCP (Model Context Protocol) — pinned <2: mcp 2.0.0 (pulled by an unpinned
+# rebuild 2026-08-12) removed the 1.x Server decorator API (`Server.list_tools`)
+# that app/mcp_server.py targets, silently breaking the MCP feature + its tests.
+# Lift the pin only together with a port of mcp_server.py to the 2.x API.
+mcp>=1.23.0,<2
 
 # Testing
 pytest==8.3.5

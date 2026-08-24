@@ -28,7 +28,21 @@ import re
 from collections import Counter
 from datetime import datetime, timezone
 
+from app.core.text_utils import STOP_WORDS
+
 logger = logging.getLogger(__name__)
+
+# Query verbs / non-topical words that are NOT in the general stopword list but
+# are still useless as a capability-gap "keyword" (they cluster across unrelated
+# failures — e.g. "does", "higher", "clock" produced 3 dead goals; audit
+# 2026-08-23). Combined with STOP_WORDS below.
+_GOAL_KEYWORD_JUNK = frozenset({
+    "what", "where", "when", "which", "show", "tell", "find", "search",
+    "calculate", "compute", "does", "did", "done", "will", "would", "could",
+    "should", "have", "has", "had", "there", "their", "about", "into", "over",
+    "than", "then", "this", "that", "these", "those", "some", "much", "many",
+    "more", "most", "less", "higher", "lower", "value", "thing", "stuff",
+})
 
 
 _GOAL_TEMPLATES = {
@@ -117,11 +131,21 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
         if src and key:
             active_signatures.add(f"{src}:{key}".lower()[:200])
 
+    # Signature consult (2026-08-19): active_signatures was built and never
+    # read — the documented count-proof dedupe didn't exist, so a theme
+    # re-minted with changed counts a day after completion.
+    def _sig_active(sig_src: str, sig_key: str) -> bool:
+        return bool(sig_src and sig_key) and f"{sig_src}:{sig_key}".lower()[:200] in active_signatures
+
     # --- Source 1: capability_gap clustering ---
-    gap_rows = db.fetchall(
-        "SELECT id, query, reason FROM capability_gaps "
-        "WHERE reviewed = 0 AND created_at > datetime('now', '-30 days')"
-    )
+    try:
+        gap_rows = db.fetchall(
+            "SELECT id, query, reason FROM capability_gaps "
+            "WHERE reviewed = 0 AND created_at > datetime('now', '-30 days')"
+        )
+    except Exception as e:
+        logger.debug("[Goals] capability-gap source skipped: %s", e)
+        gap_rows = []
     if gap_rows:
         # Cluster by simple keyword extraction — pull the longest noun-phrase-ish token
         clusters: Counter[str] = Counter()
@@ -130,12 +154,12 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
             # Pull the top 1-2 substantive words
             words = re.findall(r"\b[a-z][a-z0-9_-]{3,}\b", q)
             for w in words[:3]:
-                if w not in {"what", "where", "when", "which", "show", "tell", "find", "search", "calculate", "compute"}:
+                if w not in STOP_WORDS and w not in _GOAL_KEYWORD_JUNK:
                     clusters[w] += 1
         for keyword, count in clusters.most_common(3):
             if count < 3:
                 continue
-            if _theme_active(keyword):
+            if _theme_active(keyword) or _sig_active("capability_gap_cluster", keyword):
                 continue
             goal_text = _GOAL_TEMPLATES["capability_gap_cluster"].format(
                 pattern=keyword, count=count
@@ -148,14 +172,21 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
                     return derived
 
     # --- Source 2: curiosity queue duplicates ---
-    curiosity_rows = db.fetchall(
-        "SELECT topic, COUNT(*) as n FROM curiosity_queue "
-        "WHERE status='pending' AND created_at > datetime('now', '-14 days') "
-        "GROUP BY topic HAVING n >= 2 ORDER BY n DESC LIMIT 3"
-    )
+    # Each source is isolated: a missing/failing table (e.g. curiosity_queue is
+    # lazy-created and absent on a brand-new install) must skip only that source,
+    # not abort the whole derivation and mint zero goals (audit 2026-08-23).
+    try:
+        curiosity_rows = db.fetchall(
+            "SELECT topic, COUNT(*) as n FROM curiosity_queue "
+            "WHERE status='pending' AND created_at > datetime('now', '-14 days') "
+            "GROUP BY topic HAVING n >= 2 ORDER BY n DESC LIMIT 3"
+        )
+    except Exception as e:
+        logger.debug("[Goals] curiosity source skipped: %s", e)
+        curiosity_rows = []
     for r in curiosity_rows:
         topic = r["topic"]
-        if _theme_active(topic[:30]):
+        if _theme_active(topic[:30]) or _sig_active("recurring_curiosity", topic):
             continue
         goal_text = _GOAL_TEMPLATES["recurring_curiosity"].format(topic=topic[:120], count=r["n"])
         ctx = {"source": "recurring_curiosity", "topic": topic, "count": r["n"]}
@@ -166,13 +197,17 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
                 return derived
 
     # --- Source 3: failing skills ---
-    skill_rows = db.fetchall(
-        "SELECT name, consecutive_failures FROM skills "
-        "WHERE enabled=1 AND consecutive_failures >= 3 "
-        "ORDER BY consecutive_failures DESC LIMIT 3"
-    )
+    try:
+        skill_rows = db.fetchall(
+            "SELECT name, consecutive_failures FROM skills "
+            "WHERE enabled=1 AND consecutive_failures >= 3 "
+            "ORDER BY consecutive_failures DESC LIMIT 3"
+        )
+    except Exception as e:
+        logger.debug("[Goals] skill source skipped: %s", e)
+        skill_rows = []
     for r in skill_rows:
-        if _theme_active(r["name"]):
+        if _theme_active(r["name"]) or _sig_active("skill_repair", r["name"]):
             continue
         goal_text = _GOAL_TEMPLATES["skill_repair"].format(
             skill_name=r["name"], count=r["consecutive_failures"]
@@ -200,7 +235,7 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
     pass  # tool_trust_regression source intentionally retired — see above
 
     # --- Source 5: stale lessons (only one goal per cycle for this) ---
-    if not _theme_active("stale lesson"):
+    if not _theme_active("stale lesson") and not _sig_active("stale_lesson_review", "stale_lessons"):
         try:
             stale_count = db.fetchone(
                 "SELECT COUNT(*) as n FROM lessons "
@@ -209,7 +244,8 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
             )["n"]
             if stale_count >= 10:
                 goal_text = _GOAL_TEMPLATES["stale_lesson_review"].format(count=stale_count)
-                ctx = {"source": "stale_lesson_review", "count": stale_count}
+                ctx = {"source": "stale_lesson_review", "count": stale_count,
+                       "topic": "stale_lessons"}
                 row_id = _insert_goal(db, goal_text, priority=0.3, source="derived", context=ctx)
                 if row_id:
                     derived.append({"id": row_id, "goal": goal_text, "source_kind": "stale_lesson_review"})

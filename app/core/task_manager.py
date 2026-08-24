@@ -51,11 +51,16 @@ def _persist_init(db) -> None:
     """Create the persistence table on first init."""
     if db is None:
         return
+    # Schema-ensure memo (audit 2026-08-23): skip re-running DDL per call —
+    # it was taking the write lock on the event-loop thread.
+    if getattr(db, "schema_ensured", lambda _t: False)("background_tasks"):
+        return
     try:
         for stmt in _PERSIST_SCHEMA.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
                 db.execute(stmt)
+        getattr(db, "mark_schema_ensured", lambda _t: None)("background_tasks")
     except Exception as e:
         logger.warning("[TaskManager] persist table init failed: %s", e)
 

@@ -31,6 +31,17 @@ export function formatDate(iso: string): string {
 }
 
 /**
+ * Parse a SQLite "YYYY-MM-DD HH:MM:SS" (UTC, no T/Z) or ISO timestamp to epoch
+ * ms for sorting/comparison. Returns 0 for missing/unparseable so sorts stay
+ * stable (string `a > b` compares only work while the format is uniform).
+ */
+export function parseTs(iso?: string | null): number {
+  if (!iso) return 0;
+  const t = Date.parse(iso.includes("T") ? iso : iso.replace(" ", "T") + "Z");
+  return Number.isNaN(t) ? 0 : t;
+}
+
+/**
  * Truncate a string to a max length, appending "..." if truncated.
  */
 export function truncate(str: string, max: number): string {

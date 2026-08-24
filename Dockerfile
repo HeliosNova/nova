@@ -1,6 +1,44 @@
+# --- SQLite 3.53.4 builder (audit 2026-08-24) ---
+# Debian trixie ships libsqlite3 3.46.1, which carries the 16-year-latent
+# WAL-reset corruption bug (fixed upstream in 3.51.3; found via Tailscale's
+# 2025 outages). Trigger: two connections on the same WAL DB writing /
+# checkpointing at the same instant -> pages silently never migrate from WAL
+# to the main file -> permanent corruption. Nova's entire brain is ONE WAL
+# SQLite file and docker-exec write scripts DO run alongside the app, so the
+# risk window is real even though in-process writes serialize on SafeDB's
+# write lock. Debian's +deb13u1 backports only the FTS5 CVE, NOT this fix
+# (verified via the package changelog), so we compile a fixed SQLite and let
+# the stdlib pick it up via /usr/local/lib (ld.so precedence + stable C ABI).
+FROM python:3.12-slim AS sqlite-builder
+# libc6-dev is EXPLICIT: it is only a Recommends of gcc, so
+# --no-install-recommends leaves gcc unable to link a test program and
+# sqlite's configure reports the misleading "No working C compiler found".
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libc6-dev make curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && echo 'int main(void){return 0;}' > /tmp/cc-probe.c \
+    && gcc /tmp/cc-probe.c -o /tmp/cc-probe && /tmp/cc-probe
+# Note: no custom CFLAGS — 3.53's autosetup configure rejects them and already
+# enables math functions, DBSTAT and JSON by default (verified in a probe build;
+# python picked up 3.53.4 with FTS5 working).
+RUN curl -fsSL https://sqlite.org/2026/sqlite-autoconf-3530400.tar.gz -o /tmp/sqlite.tar.gz \
+    && tar -xzf /tmp/sqlite.tar.gz -C /tmp \
+    && cd /tmp/sqlite-autoconf-3530400 \
+    && ./configure --prefix=/usr/local --enable-fts5 --enable-fts4 --enable-fts3 --enable-rtree \
+    && make -j"$(nproc)" && make install
+
 FROM python:3.12-slim
 
 WORKDIR /app
+
+# Fixed SQLite (see sqlite-builder stage): /usr/local/lib outranks /usr/lib in
+# ld.so search order, so python's stdlib _sqlite3 binds 3.53.4 at import.
+# COPY dereferences symlinks, so copy the real .so once and recreate the
+# SONAME links (_sqlite3 links libsqlite3.so.0).
+COPY --from=sqlite-builder /usr/local/lib/libsqlite3.so.3.53.4 /usr/local/lib/
+RUN ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so.0 \
+    && ln -sf libsqlite3.so.3.53.4 /usr/local/lib/libsqlite3.so \
+    && ldconfig
 
 # System deps + Playwright Chromium dependencies
 RUN apt-get update && apt-get install -y --no-install-recommends \

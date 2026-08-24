@@ -104,19 +104,14 @@ class TestWhisperTranscriber:
 
     @pytest.mark.asyncio
     async def test_transcribe_max_duration_exceeded(self):
-        """Transcribe audio exceeding VOICE_MAX_DURATION (300s) still returns result.
+        """Audio over VOICE_MAX_DURATION is REJECTED before transcription.
 
-        Note: VOICE_MAX_DURATION is defined in config but not currently
-        enforced in the transcription pipeline. This test documents that
-        long audio is processed without error at the transcriber level.
+        Enforcement added 2026-08-19 — previously the config knob existed but
+        was checked nowhere and this test documented the gap.
         """
         from app.core.voice import WhisperTranscriber
 
         mock_model = MagicMock()
-        mock_model.transcribe.return_value = {
-            "text": "very long audio",
-            "language": "en",
-        }
 
         mock_whisper = MagicMock()
         # 301 seconds of audio at 16000 Hz sample rate
@@ -129,12 +124,11 @@ class TestWhisperTranscriber:
         transcriber._model = mock_model
 
         # _run() does `import whisper` — patch sys.modules so it resolves
-        with patch("app.core.voice._HAS_WHISPER", True), \
-             patch.dict(sys.modules, {"whisper": mock_whisper}):
-            result = await transcriber.transcribe(Path("/tmp/long.wav"))
+        with patch("app.core.voice._HAS_WHISPER", True),              patch.dict(sys.modules, {"whisper": mock_whisper}):
+            with pytest.raises(ValueError, match="VOICE_MAX_DURATION"):
+                await transcriber.transcribe(Path("/tmp/long.wav"))
 
-        assert result.duration == 301.0
-        assert result.text == "very long audio"
+        mock_model.transcribe.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_transcribe_exception_handling(self):
@@ -144,10 +138,16 @@ class TestWhisperTranscriber:
         mock_model = MagicMock()
         mock_model.transcribe.side_effect = RuntimeError("CUDA out of memory")
 
+        mock_whisper = MagicMock()
+        mock_audio = MagicMock()
+        mock_audio.__len__ = lambda self: 5 * 16000  # 5s — under the limit
+        mock_whisper.load_audio.return_value = mock_audio
+        mock_whisper.audio.SAMPLE_RATE = 16000
+
         transcriber = WhisperTranscriber(model_size="base")
         transcriber._model = mock_model
 
-        with patch("app.core.voice._HAS_WHISPER", True):
+        with patch("app.core.voice._HAS_WHISPER", True),              patch.dict(sys.modules, {"whisper": mock_whisper}):
             with pytest.raises(RuntimeError, match="CUDA out of memory"):
                 await transcriber.transcribe(Path("/tmp/test.wav"))
 

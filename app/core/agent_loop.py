@@ -308,8 +308,14 @@ class Scratchpad:
             text = text[: self.max_chars] + "\n[truncated]"
         return text
 
-    def render_full(self, plan: Plan) -> str:
-        """Render everything for final synthesis."""
+    def render_full(self, plan: Plan, max_chars: int = 24000) -> str:
+        """Render everything for final synthesis. Bounded overall (not just per
+        field): findings accumulate one row per extracted fact across up to
+        max_iterations steps plus hydrated prior findings, so an uncapped join
+        could exceed the synthesis num_ctx and silently truncate the HEAD — the
+        QUERY and anti-fabrication rules — before the model ever sees them
+        (audit 2026-08-22). The head (QUERY + plan) is always kept; the findings
+        tail is what drops."""
         lines = [f"QUERY: {self.query}", f"\nPLAN ({len(plan.steps)} steps):"]
         for s in plan.steps:
             lines.append(f"  [{s.status}] {s.id}. {s.description[:120]}")
@@ -319,7 +325,10 @@ class Scratchpad:
             lines.append("\nFINDINGS:")
             for k, v in self.findings.items():
                 lines.append(f"  - {k}: {str(v)[:200]}")
-        return "\n".join(lines)
+        text = "\n".join(lines)
+        if len(text) > max_chars:
+            text = text[:max_chars] + "\n[truncated]"
+        return text
 
 
 # ---------------------------------------------------------------------------
@@ -948,7 +957,14 @@ class AgentLoop:
         prompt = PLAN_PROMPT.format(query=query, tools=tools_text) + failure_block
         resp = await llm.invoke_nothink([{"role": "user", "content": prompt}], max_tokens=600, json_mode=True)
         try:
-            obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
+            # extract_json_object (balanced-brace salvage), not a bare json.loads:
+            # the old `json.loads(resp) if resp.startswith("{") else extract...`
+            # ternary skipped salvage exactly when the model returned "{valid}<trailing
+            # prose>" — json.loads threw and the deliberation step degraded instead of
+            # recovering. Salvage handles the clean-{ case identically and never raises.
+            # Downstream sites that RETURN obj / append it guard on `and obj` so an
+            # empty {} still falls through to the fallback (2026-08-18, matches planning.py).
+            obj = extract_json_object(resp)
             steps_data = obj.get("steps", []) if isinstance(obj, dict) else []
         except Exception:
             steps_data = []
@@ -980,8 +996,8 @@ class AgentLoop:
             for _ in range(sample_n):
                 resp = await llm.invoke_nothink([{"role": "user", "content": prompt}], max_tokens=400, json_mode=True, temperature=0.7)
                 try:
-                    obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
-                    if isinstance(obj, dict):
+                    obj = extract_json_object(resp)
+                    if isinstance(obj, dict) and obj:
                         actions.append(obj)
                 except Exception:
                     continue
@@ -991,8 +1007,8 @@ class AgentLoop:
 
         resp = await llm.invoke_nothink([{"role": "user", "content": prompt}], max_tokens=400, json_mode=True, temperature=0.2)
         try:
-            obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
-            if isinstance(obj, dict):
+            obj = extract_json_object(resp)
+            if isinstance(obj, dict) and obj:
                 return obj
         except Exception:
             pass
@@ -1087,7 +1103,7 @@ class AgentLoop:
                     json_mode=True,
                     temperature=temp,
                 )
-                obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
+                obj = extract_json_object(resp)
                 if isinstance(obj, dict):
                     facts = obj.get("facts") or {}
                     if isinstance(facts, dict):
@@ -1119,8 +1135,8 @@ class AgentLoop:
         )
         try:
             resp = await llm.invoke_nothink([{"role": "user", "content": prompt}], max_tokens=200, json_mode=True, temperature=0.1)
-            obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
-            if isinstance(obj, dict):
+            obj = extract_json_object(resp)
+            if isinstance(obj, dict) and obj:
                 return Critique(
                     satisfied=bool(obj.get("satisfied", False)),
                     fatal=bool(obj.get("fatal", False)),
@@ -1169,6 +1185,11 @@ class AgentLoop:
                 [{"role": "user", "content": prompt}],
                 max_tokens=1200,
                 temperature=0.1,
+                # The scratchpad (render_full, capped 24k chars) + SYNTHESIZE_PROMPT
+                # exceed the 4096 model default; without an explicit num_ctx Ollama
+                # would silently truncate the HEAD (the query + rules) on a
+                # findings-heavy run (audit 2026-08-22).
+                num_ctx=16384,
             )
         except Exception as e:
             return f"[synthesis failed: {e}]\n\n" + scratchpad.render_full(plan)
@@ -1302,7 +1323,7 @@ JSON:"""
                 json_mode=True,
                 temperature=0.2,
             )
-            obj = json.loads(resp) if resp.strip().startswith("{") else extract_json_object(resp)
+            obj = extract_json_object(resp)
             if not isinstance(obj, dict):
                 return False
             if obj.get("refuse"):
@@ -1323,6 +1344,7 @@ JSON:"""
                 description=description,
                 parameters=parameters,
                 code=code,
+                screen_network=True,  # LLM-generated mid-deliberation → no network/exec
             )
             if tool_id == -1:
                 # CustomToolStore logged the rejection reason already

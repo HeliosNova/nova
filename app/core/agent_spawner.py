@@ -421,6 +421,14 @@ async def merge_agent_results(
                 ],
                 max_tokens=merge_tokens,
                 temperature=config.TEMPERATURE_DEFAULT,
+                # Explicit num_ctx (2026-08-20 sweep): merge_body is up to 10
+                # agent blocks × 1500 chars + prompts + the merge instruction
+                # appended LAST (~4k+ tokens). At the 4096 model default Ollama
+                # silently truncates from the HEAD — dropping the earliest
+                # agents AND the trailing instruction. The output-budget half of
+                # this bug was fixed before; this is the input half (same
+                # num_ctx discipline that killed storylines).
+                num_ctx=16384,
             ),
             timeout=merge_timeout,
         )

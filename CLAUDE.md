@@ -18,9 +18,10 @@ files in `app/`. Learning is the product.
   baseline; misses are paraphrase-retrieval + generation-behavior gaps, tracked as work items).
 - **Weight fine-tuning is experimental and unproven.** Across every `run_history.json`: 0 successful
   train→A/B→deploy. The one honest A/B (independent cross-family judge `llama3.1:8b`, position-swapped,
-  4-dimension) shows `nova-ft` **ties** its base `qwen3.5:9b` (≈8/10 ties, +0.03 pref). Keep
-  `ENABLE_AUTO_FINETUNE=false`. Treat FT as a *style/behavior* experiment only — never claim it makes
-  the model "smarter."
+  4-dimension) shows `nova-ft` **ties** its base `qwen3.5:9b` (≈8/10 ties, +0.03 pref). Auto-finetune
+  has no runtime pathway (the trainer lives in `archive/training/`; the old `ENABLE_AUTO_FINETUNE`
+  flag was inert and removed 2026-08-23 — reviving auto-FT means restoring the archive, not a flag).
+  Treat FT as a *style/behavior* experiment only — never claim it makes the model "smarter."
 - **FT deploy gate:** a candidate promotes only if it wins `scripts/eval_harness.py` with
   `EVAL_JUDGE_MODEL` set to a *different-family* local model (no self-judging; swap + multi-dimension on).
 - **Config override gotcha:** `/data/config_overrides.json` overrides `.env`. A stale
@@ -79,7 +80,7 @@ User query -> brain.think()
   -> retrieve documents if needed (ChromaDB + FTS5 + RRF)
   -> build system prompt (8 prioritized blocks)
   -> generate response (Ollama — local inference)
-  -> tool loop if tool call detected (max 5 rounds)
+  -> tool loop if tool call detected (max 6 rounds)
   -> stream tokens via SSE
   -> post-response: corrections, fact extraction, skill creation
 ```
@@ -546,6 +547,38 @@ Query API:
 
 Use case for bitemporal: reflexion auditing ("what did Nova believe about X
 last Tuesday when it made decision Y?") and time-travel debugging.
+
+## Knowing Tier — Living Dossiers (2026-08-12)
+
+Owner thesis: Nova exists to LEARN AND BECOME KNOWING — its own epistemic
+growth. Digests (its richest thinking) expire on the 30-day monitor_results
+retention with only KG triples surviving, and every digest was written from an
+amnesiac 48h window. The knowing tier closes that gap: **durable, revisable
+understanding** distilled from already-verified digests BEFORE expiry.
+
+| Piece | Where |
+|-------|-------|
+| Module | `app/core/dossiers.py` |
+| Tables | `dossiers` (current body) + `dossier_revisions` (bitemporal history — "what did Nova understand about X on date D") — migration 25 |
+| Cycle | "Knowledge Consolidation" monitor (`check_type="consolidation"`, daily): staleness-first, ≤8 updates/cycle, sequential 27B calls |
+| Digest priming | `deep_research._synthesize_from_evidence` injects the domain dossier as PRIOR UNDERSTANDING into the prefix-cache block; synthesis leads with what's NEW, flags "CONTRADICTS PRIOR UNDERSTANDING" inline, emits a `KNOWN-VS-NEW: n new \| n updates \| n contradictions` line (logged as `[Knowing]`, stripped before posting) |
+| Chat | `get_relevant_dossiers` retrieves the matched dossier's 'Current understanding' PROSE into context (prose is native where raw KG triples were denied by the 9B) |
+| Eval | `knowing` category — causal before/seed/after pairs (`_run_knowing_task`): the dossier must CAUSE the correct answer (`memory_caused_fix`), not merely exist |
+| Rungs 2-4 | Each consolidated dossier's top Open Question feeds the curiosity queue (`dossier_open_question`); consolidations mint optional FORECAST lines into the self-grading loop; ≥2 domain updates/cycle re-consolidate the **State of the World** meta-dossier (refuses <3 domains) |
+| Entity dossiers | kind='entity': subjects with ≥8 live KG facts in 14d (generic actors stop-listed) earn a dossier from their facts + digest mentions; ≤2/cycle, new entities yield to the domain backlog |
+| Independence | `_independence_clusters` (shingle-Jaccard mirrors) + `host_cooccurrence` temporal layer (junk-tier pairs co-occurring ≥8 times at ≥0.8 ratio = one network; reputable hosts never merged) collapse laundering in figure corroboration, the lead gate, and evidence tags; `_source_quality` consults the 11,520-domain authority dataset |
+| Kill switch | `ENABLE_DOSSIERS` (default true) |
+
+Structure per dossier: `## Current understanding / ## How we got here /
+## Key facts & figures / ## Open questions` + a CHANGED note per revision.
+Domain dossiers are keyed `slug(label)` (monitor name minus "Domain Study: ");
+storyline dossiers require ≥3 thread moves. Update calls pass explicit
+`num_ctx=12288`, `max_tokens=2600` (the 1600 v1 cap cut 5/8 first-cycle
+dossiers — caught by the same-day truncation tripwire). Citations are
+normalized to bare outlet text (the model invented URLs when embellishing
+into md links). Retrieval tokenizes at ≥2 chars with a stopword list
+(the ≥4 floor made the 'AI and ML' title unmatchable); single title-token
+hits qualify, body-only matches need ≥2.
 
 ## Multi-Agent Structural Decomposition
 

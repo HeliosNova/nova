@@ -1,13 +1,15 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-2%2C392-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-2%2C931-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
 **The personal AI that actually remembers what you teach it.**
 
 Correct Nova once and it remembers — by turning the correction into a lesson and a knowledge-graph fact that it retrieves on every future answer. Durable, inspectable, in-context learning: no retraining, no weight surgery. All on your hardware. Your data never leaves.
+
+And it doesn't just wait for you: **70+ autonomous monitors research the world around the clock and consolidate what they learn into living dossiers, forecasts, and a rolling "State of the World"** — Nova's goal is its own epistemic growth. Chat is the surface where you interrogate what it has come to know.
 
 ```
 You: "What's the capital of Australia?"
@@ -43,7 +45,8 @@ Nova is a sovereign personal AI that runs entirely on your hardware with zero cl
 | Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No | No |
 | Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
-| Proactive monitors | **69 across 35+ domains** | Automations | No |
+| Proactive monitors | **72 across 35+ domains** | Automations | No |
+| Builds its own understanding | **Living dossiers + forecasts** | No | No |
 | MCP (client + server) | **Both** | No | Client only |
 | Self fine-tune (DPO) | Experimental¹ | No | No |
 
@@ -61,8 +64,9 @@ cp .env.example .env
 docker compose up -d
 
 # Pull models (one-time)
-docker exec nova-ollama ollama pull qwen3.5:27b            # Main model
-docker exec nova-ollama ollama pull bge-m3                 # Embeddings (won a paraphrase-retrieval bake-off)
+docker exec nova-ollama ollama pull qwen3.8:27b           # Deep-research synthesis + heavy reasoning
+docker exec nova-ollama ollama pull qwen3.5:9b            # Fast chat + tool model
+docker exec nova-ollama ollama pull bge-m3               # Embeddings (won a paraphrase-retrieval bake-off)
 ```
 
 Open `http://localhost:5173` — that's it.
@@ -89,14 +93,15 @@ User query -> brain.think()
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
-Meanwhile, 69 monitors run autonomously:
-  -> web search across 35+ domains every 1-24h
+Meanwhile, 72 monitors run autonomously:
+  -> deep-research each domain: multi-source gather -> synthesize a cited briefing
+     (entailment-gated so every claim traces to a source) -> deliver via Discord/Telegram
   -> extract knowledge graph triples from every result
-  -> send alerts via Discord/Telegram when something changes
-  -> quiz itself on learned lessons, validate skills, research gaps
+  -> consolidate briefings into living dossiers + mint self-grading forecasts
+  -> quiz itself on lessons, validate skills, research its own knowledge gaps
 ```
 
-No LangChain. No LangGraph. No agent frameworks. ~79 files of async Python + httpx + FastAPI.
+No LangChain. No LangGraph. No agent frameworks. ~129 files of async Python + httpx + FastAPI.
 
 ## The Learning Loop
 
@@ -118,6 +123,19 @@ The `memory-learning` eval category (`evals/suite.yaml`) proves it: for each tes
 ### Self fine-tuning (archived)
 
 Nova used to export `{query, chosen, rejected}` pairs from corrections and run a local DPO fine-tune behind an A/B gate. In honest, independently-judged A/B evals (a *different-family* local judge, position-swapped, multi-dimension) those small-data fine-tunes **tied or lost to the base model** — consistent with the research consensus that retrieval/memory beats fine-tuning for injecting facts, and that small models degrade under small-data tuning. Because it never beat the base across any run, the whole weight-training stack was **archived on 2026-06-12** to `archive/training/`; the memory loop above is how Nova learns. Restore that directory if you want to revisit weight tuning for *style/behavior* (not facts).
+
+## The Knowing Tier
+
+The memory loop above is how Nova learns *from you*. The **knowing tier** is how it learns *about the world* — its own epistemic growth, not just answering on demand.
+
+Each monitor produces a deep-research briefing — Nova's richest thinking. Those used to expire on the 30-day retention with only KG triples surviving, and every one was written from an amnesiac 48-hour window. The knowing tier distills already-verified briefings into **durable, revisable understanding** before they expire:
+
+- **Living dossiers** — per-domain and per-entity documents (`Current understanding / How we got here / Key facts & figures / Open questions`) that a daily consolidation cycle revises from new briefings, flagging `CONTRADICTS PRIOR UNDERSTANDING` inline and keeping a bitemporal revision trail ("what did Nova understand about X on date D").
+- **Forecasts** — consolidations mint falsifiable predictions (statement + probability + horizon) into a self-grading loop; a resolver later scores them against live web search, building a calibration record.
+- **State of the World** — a rolling meta-dossier re-synthesized from the domain dossiers whenever enough of them move.
+- **Curiosity** — each dossier's top open question feeds a research queue; cross-dossier numeric contradictions surface as new questions to investigate.
+
+Chat is the surface where you interrogate all of this: relevant dossier prose is pulled into context, so "where does the Iran situation stand?" answers from maintained understanding, not a cold search.
 
 ## Tools (20 built-in)
 
@@ -161,7 +179,7 @@ All channels support phone-number allowlisting, message splitting, and graceful 
 
 ## Heartbeat Monitors
 
-69 monitors are seeded by default (the count is pinned by a test) and run on schedule across 35+ domains — Nova works even when you're not talking to it:
+72 monitors are seeded by default and run on schedule across 35+ domains — Nova works even when you're not talking to it. Each domain monitor doesn't just search; it runs a **deep-research pass** (multi-source gather → cited synthesis → entailment gate that drops or de-cites any claim it can't trace to a source) and delivers a briefing:
 
 | Category | Monitors | Schedule | What they do |
 |----------|----------|----------|-------------|
@@ -237,7 +255,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-2,387 tests across ~95 files: brain pipeline, memory loop, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
+2,931 tests across ~130 files: brain pipeline, memory loop, knowing tier, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
 
 ## Hardware Requirements
 
@@ -254,8 +272,8 @@ Nova's LLM layer is provider-agnostic — you don't need a 3090.
 
 | Setup | VRAM | How |
 |-------|------|-----|
-| **Full local (default)** | 20GB+ | `qwen3.5:27b` via Ollama |
-| **Quantized local** | 16GB | `qwen3.5:27b-q4_K_M` — set `LLM_MODEL=qwen3.5:27b-q4_K_M` in `.env` |
+| **Full local (default)** | 20GB+ | `qwen3.8:27b` via Ollama |
+| **Quantized local** | 16GB | `qwen3.8:27b-q4_K_M` — set `LLM_MODEL=qwen3.8:27b-q4_K_M` in `.env` |
 | **Smaller model** | 8GB | `qwen3.5:9b` — set `LLM_MODEL=qwen3.5:9b` in `.env` |
 | **Tiny model** | 4GB | `qwen3.5:4b` — set `LLM_MODEL=qwen3.5:4b` in `.env` |
 | **No GPU (CPU only)** | — | `qwen3.5:4b` on CPU — slow but fully functional |

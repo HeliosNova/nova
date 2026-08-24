@@ -8,6 +8,12 @@ Signal sources (all cheap, no LLM, off the GPU):
                      the TopicTracker substrate) — what they keep asking about.
   - corroboration  : how many outlets confirmed the story (digest "N outlets").
   - learned weight : salience_weights, nudged by 👍/👎 ratings over time.
+  - knowing        : overlap with Nova's standing knowledge (dossier titles, and
+                     their Open-questions doubled — an item that speaks to what
+                     Nova is explicitly trying to find out is high-signal), plus
+                     a boost for inline CONTRADICTS PRIOR UNDERSTANDING flags
+                     (reality moving against the model of the world is the
+                     epistemically hottest event a digest can carry).
 
 Learning closes the loop the rating button already opens: a 👍 raises that topic's
 weight, 👎 lowers it. Bounded; degrades to a neutral score on any error.
@@ -58,15 +64,40 @@ def _learned_weights(db) -> dict[str, float]:
     return {r["topic"]: float(r["weight"] or 0.0) for r in rows}
 
 
+_OPEN_Q_RE = re.compile(r"##\s*Open questions(.*?)(?:\n##|\Z)", re.S | re.I)
+
+
+def _knowing_topics(db) -> dict[str, float]:
+    """Tokens from Nova's standing knowledge: dossier titles weigh 1.0, their
+    Open-questions sections 2.0 (what Nova explicitly wants to find out)."""
+    try:
+        rows = db.fetchall(
+            "SELECT title, body FROM dossiers "
+            "WHERE kind IN ('domain', 'storyline', 'entity') "
+            "ORDER BY updated_at DESC LIMIT 60"
+        )
+    except Exception:
+        return {}
+    out: dict[str, float] = {}
+    for r in rows:
+        for tok in _tokens(r["title"] or ""):
+            out[tok] = max(out.get(tok, 0.0), 1.0)
+        m = _OPEN_Q_RE.search(r["body"] or "")
+        if m:
+            for tok in _tokens(m.group(1)):
+                out[tok] = max(out.get(tok, 0.0), 2.0)
+    return out
+
+
 def score_text(db, text: str, *, owner: dict | None = None,
-               learned: dict | None = None) -> float:
+               learned: dict | None = None, knowing: dict | None = None) -> float:
     """Return a 0..1 salience score. Higher = more likely to matter to the owner.
 
-    `owner`/`learned` may be precomputed (see rank_digest_items) to avoid a SQL
-    read per item; if None they're fetched. A genuinely irrelevant item (no owner
-    interest, no corroboration) scores LOW so it can fall below the drop floor —
-    the previous version floored everything at 0.4 == the drop threshold, making
-    the noise-drop inert.
+    `owner`/`learned`/`knowing` may be precomputed (see rank_digest_items) to
+    avoid SQL reads per item; if None they're fetched. A genuinely irrelevant
+    item (no owner interest, no corroboration, outside standing knowledge)
+    scores LOW so it can fall below the drop floor — the previous version
+    floored everything at 0.4 == the drop threshold, making the noise-drop inert.
     """
     toks = _tokens(text)
     if not toks:
@@ -76,6 +107,8 @@ def score_text(db, text: str, *, owner: dict | None = None,
         owner = _owner_topics(db)
     if learned is None:
         learned = _learned_weights(db)
+    if knowing is None:
+        knowing = _knowing_topics(db)
 
     # 1) Owner-interest: fraction of this item's tokens the owner queries about.
     if owner:
@@ -95,13 +128,20 @@ def score_text(db, text: str, *, owner: dict | None = None,
         best = max((learned.get(t, 0.0) for t in toks), default=0.0)
         lw = max(0.0, min(1.0, 0.5 + best / 4.0))
 
-    # COLD START (no owner queries AND no learned weights): we know nothing about
-    # what matters, so don't drop anything — score mid/high, corroboration only.
+    # 4) Knowing: overlap with dossier titles/Open-questions (~3 weighted hits
+    #    saturate — an open-question hit counts double), plus the contradiction
+    #    flag the dossier priming writes inline when reality moved against
+    #    Nova's standing understanding.
+    know = min(1.0, sum(knowing[t] for t in toks if t in knowing) / 6.0) if knowing else 0.0
+    contra = 0.15 if "CONTRADICTS PRIOR UNDERSTANDING" in (text or "") else 0.0
+
+    # COLD START (no owner queries AND no learned weights): don't gut the
+    # digest — corroboration and standing knowledge only, floored mid-range.
     if not owner and not learned:
-        return round(0.5 + 0.3 * corrob, 3)
+        return round(min(1.0, 0.4 + 0.3 * corrob + 0.3 * know + contra), 3)
 
     # Informed: convex blend in [0,1]; low items CAN fall below the drop floor.
-    score = 0.5 * interest + 0.3 * corrob + 0.2 * lw
+    score = 0.4 * interest + 0.25 * corrob + 0.15 * lw + 0.2 * know + contra
     return round(min(1.0, score), 3)
 
 
@@ -138,13 +178,17 @@ def rank_digest_items(db, items: list[tuple[str, str]], *, floor: float = 0.15) 
     """
     if len(items) <= 2:
         return items  # never thin out a tiny digest
-    # Hoist the owner/learned reads ONCE (was 2 SQL reads per item before).
-    owner, learned = _owner_topics(db), _learned_weights(db)
-    scored = [(name, msg, score_text(db, msg, owner=owner, learned=learned)) for name, msg in items]
+    # Hoist the owner/learned/knowing reads ONCE (was 2 SQL reads per item before).
+    owner, learned, knowing = _owner_topics(db), _learned_weights(db), _knowing_topics(db)
+    scored = [(name, msg, score_text(db, msg, owner=owner, learned=learned, knowing=knowing))
+              for name, msg in items]
     scored.sort(key=lambda x: x[2], reverse=True)
     scores = [s for _, _, s in scored]
     mean, std = statistics.fmean(scores), statistics.pstdev(scores)
-    cut = max(floor, mean - 0.75 * std)
+    # epsilon guard: fmean of identical scores can land one ulp ABOVE them
+    # (e.g. fmean([0.4]*3) > 0.4 in binary), which silently thinned an
+    # all-equal digest to the keep_min fallback.
+    cut = max(floor, mean - 0.75 * std) - 1e-9
     kept = [(n, m) for n, m, s in scored if s >= cut]
     # Always keep at least the top half so a harsh cut can't gut the briefing.
     keep_min = max(2, len(items) // 2)

@@ -57,6 +57,9 @@ class EvalTask:
     # the fix. Auto-cleaned after the task (context-marker scoped).
     seed_lesson: dict | None = None
     seed_fact: dict | None = None  # {subject, predicate, object} — KG analogue (wired in WS2C)
+    # {title, body} — a standing dossier seeded BETWEEN the before/after runs of
+    # a knowing task to prove the dossier CAUSES the correct answer (2026-08-12).
+    seed_dossier: dict | None = None
     paraphrase_of: str | None = None
     tags: list[str] = field(default_factory=list)
     # Multi-turn: prior turns run sequentially in a shared ephemeral
@@ -207,6 +210,10 @@ def check_assertion(
     if atype == "skill_matched":
         return skill_used is not None
 
+    if atype == "skill_not_matched":
+        # Adversarial probes (negation / domain-shift): the skill must NOT fire.
+        return skill_used is None
+
     if atype == "skill_name_matches":
         return skill_used is not None and bool(
             re.search(assertion["value"], skill_used, re.IGNORECASE)
@@ -273,6 +280,8 @@ def format_assertion_failure(
         return f"tool_invoked({assertion['value']!r}) — tools used: {tools_invoked}"
     if atype == "skill_matched":
         return f"skill_matched — no skill matched (skill_used={skill_used!r})"
+    if atype == "skill_not_matched":
+        return f"skill_not_matched — a skill DID fire (skill_used={skill_used!r})"
     if atype == "skill_name_matches":
         return f"skill_name_matches({assertion['value']!r}) — skill_used={skill_used!r}"
     if atype == "reflexion_in_range":
@@ -610,6 +619,9 @@ class EvalHarness:
     ) -> None:
         self.suite_path = Path(suite_path or config.EVAL_SUITE_PATH)
         self.report_dir = Path(report_dir or config.EVAL_REPORT_PATH)
+        # Similarities of semantic skill matches observed this run (margin
+        # observability, 2026-08-19).
+        self._semantic_sims: list[float] = []
         _default_tol = (
             regression_tolerance
             if regression_tolerance is not None
@@ -634,6 +646,12 @@ class EvalHarness:
         # Shadow-eval module overrides (set via set_module_overrides())
         self._module_overrides: dict[str, str] = {}
         self._scoring_module_overrides: dict[str, str] = {}
+        # Categories to skip at load (opt-in; empty by default so load_suite()
+        # stays pure for tests). The nightly monitor sets this when a category's
+        # capability is disabled at runtime — e.g. multi-agent under
+        # ENABLE_MULTI_AGENT=false, whose structural failures otherwise pollute
+        # pass_rate + flag false regressions (2026-08-14 audit).
+        self._skip_categories: set[str] = set()
 
     def set_module_overrides(
         self,
@@ -693,10 +711,23 @@ class EvalHarness:
                 seed_document=raw.get("seed_document"),
                 seed_lesson=raw.get("seed_lesson"),
                 seed_fact=raw.get("seed_fact"),
+                seed_dossier=raw.get("seed_dossier"),
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
                 turns=raw.get("turns", []),
             ))
+        # Opt-in category skip (empty by default → load_suite() stays pure for
+        # tests that exercise every category directly). The nightly monitor sets
+        # _skip_categories when a category's capability is disabled at runtime,
+        # so its structural failures don't pollute pass_rate/regression.
+        if self._skip_categories:
+            before = len(tasks)
+            tasks = [t for t in tasks if t.category not in self._skip_categories]
+            if before != len(tasks):
+                logger.info(
+                    "[EvalHarness] skipping %d task(s) in disabled categories: %s",
+                    before - len(tasks), ", ".join(sorted(self._skip_categories)),
+                )
         return tasks
 
     def suite_version(self) -> str:
@@ -790,10 +821,19 @@ class EvalHarness:
                 continue
             seen_titles.add(doc.get("title", ""))
             try:
+                # Stable doc_id (2026-08-12): without it, ingest() minted a new
+                # id per nightly run and the "idempotent" seed accumulated —
+                # 46 duplicate eval-seed documents were polluting the live
+                # Documents store (audit screenshot). Deterministic id → the
+                # re-ingest genuinely replaces.
+                import re as _re
+                _stable = "eval-seed-" + _re.sub(
+                    r"[^a-z0-9]+", "-", doc.get("title", "eval-seed").lower()).strip("-")[:60]
                 doc_id, n_chunks = await retriever.ingest(
                     text=doc["text"],
                     title=doc.get("title", "eval-seed"),
                     source=doc.get("source", "eval"),
+                    doc_id=_stable,
                 )
                 logger.debug(
                     "[EvalHarness] Seeded document %r → %d chunk(s) (doc_id=%s)",
@@ -861,6 +901,21 @@ class EvalHarness:
 
         latency = time.monotonic() - start
         response_text = "".join(tokens).strip()
+
+        # Margin observability (2026-08-19): when a semantic skill match fired,
+        # collect its similarity so the run can report the minimum margin over
+        # SKILL_SEMANTIC_THRESHOLD — embedder/quantization drift then shows as
+        # margin erosion instead of a surprise recall crash (the threshold sits
+        # 0.003 under the weakest true paraphrase).
+        if skill_used:
+            try:
+                from app.core.brain import get_services
+                _sim = getattr(get_services().skills, "last_semantic_sim", None)
+                if isinstance(_sim, float):
+                    self._semantic_sims.append(_sim)
+                    get_services().skills.last_semantic_sim = None
+            except Exception:
+                pass
 
         # Compute heuristic reflexion score (consistent, no LLM call)
         reflexion_score: float | None = None
@@ -939,13 +994,126 @@ class EvalHarness:
                 )
         return failed
 
+    async def _run_knowing_task(self, task: EvalTask) -> TaskResult:
+        """Knowing tier (2026-08-12): prove a standing dossier CAUSES the correct
+        answer. BEFORE (dossier absent) the query must not be answerable; a
+        dossier is seeded; AFTER, chat must answer FROM its understanding.
+        Same causal shape as kg-retrieval — contributes the memory_caused_fix
+        fields so the category reports a causal_fix_rate, not mere recall."""
+        from app.database import get_db
+        from app.core.dossiers import _slug
+
+        seed = task.seed_dossier or {}
+        title, body = seed.get("title"), seed.get("body")
+        db = get_db()
+        start = time.monotonic()
+
+        if not (title and body):
+            return TaskResult(
+                task_id=task.id, category=task.category, query=task.query,
+                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                reflexion_score=None, latency_seconds=0.0,
+                failed_assertions=["knowing: seed_dossier (title/body) missing"],
+                error="setup_error",
+            )
+
+        dkey = _slug(title)
+
+        def _clean():
+            # In finally so a cancelled run can't leave the fictional dossier
+            # live, where chat would retrieve it into real prompts.
+            try:
+                db.execute("DELETE FROM dossiers WHERE kind = 'domain' AND dkey = ?", (dkey,))
+            except Exception as e:
+                logger.warning("[EvalHarness] dossier cleanup failed for %s: %s", task.id, e)
+
+        _clean()  # defensive pre-clean
+
+        try:
+            # 1. BEFORE — dossier absent
+            before = await self._invoke_brain(task.query, task.timeout)
+            before_failed = self._evaluate_assertions(task.assertions, before)
+            before_correct = bool(before.response_text) and not before_failed
+
+            # 2. SEED the dossier
+            try:
+                db.execute(
+                    "INSERT INTO dossiers (kind, dkey, title, body, changed_note, update_count) "
+                    "VALUES ('domain', ?, ?, ?, 'eval seed', 1)",
+                    (dkey, title, body),
+                )
+            except Exception as e:
+                logger.warning("[EvalHarness] dossier seed failed for %s: %s", task.id, e)
+
+            # 3. AFTER — dossier present
+            after = await self._invoke_brain(task.query, task.timeout)
+            after_failed = self._evaluate_assertions(task.assertions, after)
+            after_correct = bool(after.response_text) and not after_failed
+        finally:
+            _clean()
+
+        latency = time.monotonic() - start
+
+        # Same rule as kg-retrieval: only an AFTER-leg timeout makes the pair
+        # untestable; a timed-out BEFORE leg IS the not-answerable evidence.
+        if after.timed_out and not after_correct:
+            return TaskResult(
+                task_id=task.id,
+                category=task.category,
+                query=task.query,
+                passed=False,
+                response_text=after.response_text[:2000],
+                tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+                skill_used=after.skill_used,
+                reflexion_score=after.reflexion_score,
+                latency_seconds=round(latency, 2),
+                failed_assertions=["knowing: after run timed out — pair untestable"],
+                error=after.error or before.error,
+                decomposed=after.decomposed,
+                timed_out=True,
+                memory_before_correct=None,
+                memory_after_correct=None,
+                memory_caused_fix=None,
+            )
+
+        caused_fix = bool(after_correct and not before_correct)
+        notes = [
+            f"before_correct={before_correct} after_correct={after_correct} "
+            f"caused_fix={caused_fix}"
+        ]
+        if before.timed_out:
+            notes.append("before leg timed out — counted as before_correct=False")
+        report_failures = ([] if after_correct else after_failed) + notes
+
+        return TaskResult(
+            task_id=task.id,
+            category=task.category,
+            query=task.query,
+            passed=after_correct,
+            response_text=after.response_text[:2000],
+            tools_invoked=list(dict.fromkeys(after.tools_invoked)),
+            skill_used=after.skill_used,
+            reflexion_score=after.reflexion_score,
+            latency_seconds=round(latency, 2),
+            failed_assertions=report_failures,
+            error=after.error,
+            decomposed=after.decomposed,
+            timed_out=False,
+            memory_before_correct=before_correct,
+            memory_after_correct=after_correct,
+            memory_caused_fix=caused_fix,
+        )
+
     async def run_task(self, task: EvalTask) -> TaskResult:
         """Run one eval task through the real brain pipeline."""
-        # memory-learning / kg-retrieval tasks use dedicated before/seed/after paths
+        # memory-learning / kg-retrieval / knowing tasks use dedicated
+        # before/seed/after paths
         if task.category == "kg-retrieval" and task.seed_fact:
             return await self._run_kg_task(task)
         if task.category == "memory-learning" and task.seed_lesson:
             return await self._run_memory_task(task)
+        if task.category == "knowing" and task.seed_dossier:
+            return await self._run_knowing_task(task)
 
         if task.turns:
             inv = await self._run_multi_turn(task)
@@ -1257,6 +1425,59 @@ class EvalHarness:
 
     # --- Full suite run ---
 
+    async def _run_extraction_canary(self) -> int:
+        """Live-model canary for the digest→KG extraction chain (2026-08-18).
+
+        Returns the number of triples the REAL _extract_kg_triples banks from a
+        fixed, unambiguous mini-digest (routed to the synthesis model exactly
+        like the production heartbeat call). The text yields 4-5 clean canonical
+        triples on a healthy pipeline; 0 means the chain is broken (LLM shape
+        drift, parse regression, schema failure) regardless of what the chat
+        categories say. -1 = canary itself errored (reported, not flagged, so an
+        infra hiccup doesn't masquerade as a pipeline regression).
+        """
+        try:
+            from app.core.brain import _extract_kg_triples
+            added: list = []
+
+            class _CanaryKG:
+                async def check_and_resolve_contradictions(self, *a, **k):
+                    return True
+
+                async def add_fact(self, s, p, o, **k):
+                    added.append((s, p, o))
+                    return True
+
+            text = ("Nvidia leads the GPU market with record data-center revenue. "
+                    "Google acquired Wiz for $32 billion. SoftBank invested in "
+                    "OpenAI. TSMC is located in Taiwan. Jensen Huang leads NVIDIA.")
+            syn = (getattr(config, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
+            await _extract_kg_triples(
+                _CanaryKG(), "Extraction Canary", text,
+                source_name="Extraction Canary",
+                max_answer_chars=2000, max_triples=8, model=syn)
+            if not added:
+                # _extract_kg_triples swallows its own exceptions and returns
+                # None, so an Ollama outage surfaces here as 0 triples — which
+                # would flag a REGRESSION. Distinguish: if the LLM is
+                # unreachable, that's the -1 infra case, not a pipeline break
+                # (audit 2026-08-19; the -1 branch was otherwise unreachable
+                # for LLM failures).
+                from app.core import llm as _llm
+                try:
+                    healthy = await _llm.check_health()
+                except Exception:
+                    healthy = False
+                if not healthy:
+                    logger.warning("[EvalHarness] extraction canary: 0 triples but LLM "
+                                   "unreachable — reporting infra error, not regression")
+                    return -1
+            logger.info("[EvalHarness] extraction canary: %d triple(s)", len(added))
+            return len(added)
+        except Exception as e:
+            logger.warning("[EvalHarness] extraction canary errored: %s", e)
+            return -1
+
     async def run_all(self, tasks: list[EvalTask] | None = None) -> EvalReport:
         """Run the full suite and return a complete EvalReport."""
         if tasks is None:
@@ -1265,6 +1486,7 @@ class EvalHarness:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         suite_ver = self.suite_version()
         start_ts = time.monotonic()
+        self._semantic_sims = []
 
         logger.info("[EvalHarness] Starting eval run %s — %d tasks", run_id, len(tasks))
 
@@ -1314,6 +1536,34 @@ class EvalHarness:
         baseline_data, baseline_run_id = self._load_baseline()
         regressions = detect_regressions(categories, baseline_data, self.tolerance)
 
+        # Digest-pipeline extraction canary (2026-08-18): the Ollama 0.32
+        # upgrade silently zeroed KG extraction for 3 DAYS while this harness
+        # stayed green — every task here exercises brain.think() chat; the
+        # digest→KG chain had no coverage. Push a FIXED mini-digest through the
+        # REAL _extract_kg_triples (live model, schema format) against a
+        # counting stub; zero triples on this known-good text = the pipeline is
+        # broken, flagged as a first-class regression so the report goes
+        # [REGRESSION] and the monitor alerts.
+        canary_triples = await self._run_extraction_canary()
+        if canary_triples == 0:
+            regressions.append(RegressionFlag(
+                metric="extraction.canary_triples", baseline=1.0, current=0.0,
+                delta=-1.0, tolerance=0.0, flagged=True))
+
+        # Semantic-match margin tripwire: min observed sim vs threshold. A
+        # margin under 0.02 means one embedder/quantization shift away from a
+        # recall crash — flag it while recall still looks perfect.
+        if self._semantic_sims:
+            _thr = float(getattr(config, "SKILL_SEMANTIC_THRESHOLD", 0.65))
+            _min_margin = round(min(self._semantic_sims) - _thr, 4)
+            logger.info("[EvalHarness] semantic margin: min=%.4f over threshold %.2f "
+                        "(%d matches)", _min_margin, _thr, len(self._semantic_sims))
+            if 0 <= _min_margin < 0.02:
+                regressions.append(RegressionFlag(
+                    metric="semantic-match.min_margin", baseline=0.02,
+                    current=_min_margin, delta=_min_margin - 0.02,
+                    tolerance=0.0, flagged=True))
+
         flagged = [r for r in regressions if r.flagged]
         if flagged:
             logger.warning(
@@ -1336,6 +1586,7 @@ class EvalHarness:
             "LLM_MODEL": config.LLM_MODEL,
             "LLM_PROVIDER": config.LLM_PROVIDER,
             "prompt_module_versions": _active_versions,
+            "extraction_canary_triples": canary_triples,
         }
 
         report = EvalReport(

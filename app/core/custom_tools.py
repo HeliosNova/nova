@@ -1,9 +1,17 @@
 """Dynamic Tool Creation — create, store, and execute user-defined tools.
 
-Tools are Python scripts persisted in SQLite. They execute in a hardened
-subprocess sandbox with forced sandboxed-level safety checks (regardless of
-the system access tier) and a runtime preamble that blocks network access
-and filesystem writes outside the sandbox directory.
+Tools are Python scripts persisted in SQLite. Per owner directive (2026-04-25),
+Nova is sovereign on its own hardware: custom tools run behind a SYNTAX check
+only (`_check_dynamic_tool_safety`). There is NO policy sandbox — the
+`_DYNAMIC_TOOL_BLOCKED_*` sets below and the permissive runtime preamble are
+retained for reference/revival, not enforced. Execution is still tier-gated
+(`@requires_tier`) and runs in an isolated `python -I` subprocess with a
+minimal environment (`get_safe_env`), but do NOT mistake this for a hardened
+sandbox: for the autonomous LLM-authored code paths that feed this module
+(auto_tools, tool_triggers, agent_loop) it means generated code reaches exec
+with nothing between it and the interpreter but a parse check. (Docstring
+corrected 2026-08-22 — it previously claimed forced sandboxed-level checks and
+a network/filesystem-blocking preamble that this module does not apply.)
 """
 
 from __future__ import annotations
@@ -70,6 +78,53 @@ def _check_dynamic_tool_safety(code: str) -> str | None:
         _ast.parse(code)
     except SyntaxError as e:
         return f"Syntax error: {e}"
+    return None
+
+
+def _generated_tool_network_violation(code: str) -> str | None:
+    """Forced-sandbox AST screen for AUTO-GENERATED tool code. The owner's own
+    tools keep the syntax-only directive, but auto_tools/tool_triggers/agent_loop
+    generate tool code from capability gaps that can be steered by INJECTED web
+    content, and it runs in-process at full tier (socket isn't blocked there) —
+    an exfil path the sovereign directive never intended. This re-applies the
+    comprehensive `_DYNAMIC_TOOL_BLOCKED_*` sets (disabled for owner tools) so the
+    reachable bypasses are closed: network/subprocess/FFI AND the import machinery
+    (`importlib`), `os`, the exec/introspection builtins (`getattr`/`eval`/`exec`/
+    `__import__`/`open`), and the dunder-attribute escape (`__subclasses__`/
+    `__mro__`/...). Returns the offending token, or None. An in-process AST screen
+    is defense-in-depth, not a hard boundary, but it stops LLM-generated exfil
+    code — existing generated tools are pure computation, so it breaks nothing
+    (audit 2026-08-23)."""
+    import ast as _ast
+    try:
+        tree = _ast.parse(code)
+    except SyntaxError:
+        return None  # syntax is rejected separately
+    blocked_builtins = {b.rstrip("(") for b in _DYNAMIC_TOOL_BLOCKED_BUILTINS}
+    for node in _ast.walk(tree):
+        if isinstance(node, _ast.Import):
+            for alias in node.names:
+                top = alias.name.split(".")[0]
+                if top in _DYNAMIC_TOOL_BLOCKED_IMPORTS:
+                    return top
+        elif isinstance(node, _ast.ImportFrom):
+            if node.module and node.module.split(".")[0] in _DYNAMIC_TOOL_BLOCKED_IMPORTS:
+                return node.module.split(".")[0]
+        elif isinstance(node, _ast.Call):
+            f = node.func
+            if isinstance(f, _ast.Name) and f.id in blocked_builtins:
+                # __import__("socket") / getattr(...) / eval / exec / compile / open
+                if f.id == "__import__" and node.args:
+                    a0 = node.args[0]
+                    if isinstance(a0, _ast.Constant) and isinstance(a0.value, str):
+                        return a0.value.split(".")[0]
+                return f.id
+        elif isinstance(node, _ast.Attribute):
+            if node.attr in _DYNAMIC_TOOL_BLOCKED_DUNDERS:
+                return node.attr
+        elif isinstance(node, _ast.Name):
+            if node.id in blocked_builtins and node.id.startswith("__"):
+                return node.id
     return None
 
 
@@ -259,8 +314,14 @@ class CustomToolStore:
         description: str,
         parameters: str,
         code: str,
+        screen_network: bool = False,
     ) -> int:
-        """Create a new custom tool. Returns tool ID, or -1 on failure."""
+        """Create a new custom tool. Returns tool ID, or -1 on failure.
+
+        `screen_network=True` (set by the auto-generated callers) additionally
+        rejects code that imports network/subprocess/FFI modules — the exfil
+        path for injection-steered generated tools. Owner-driven creation leaves
+        it False (the sovereign syntax-only directive)."""
         name = name.strip().lower().replace(" ", "_")
         if not name or len(name) > 50:
             logger.warning("Invalid tool name: %r", name)
@@ -279,6 +340,17 @@ class CustomToolStore:
         if safety_error:
             logger.warning("Tool '%s' code blocked: %s", name, safety_error)
             return -1
+
+        # Auto-generated tools may not reach the network or spawn processes.
+        if screen_network:
+            _net = _generated_tool_network_violation(code)
+            if _net is not None:
+                logger.warning(
+                    "Auto-generated tool '%s' rejected: forbidden import %r "
+                    "(generated tools may not open the network / spawn processes)",
+                    name, _net,
+                )
+                return -1
 
         # Size limits
         if len(code) > self.MAX_CODE_LENGTH:
@@ -416,6 +488,26 @@ class DynamicTool(BaseTool):
     @requires_tier("standard", "full")
     async def execute(self, **kwargs) -> ToolResult:
         """Build and execute the tool's Python script in a hardened sandbox."""
+        # Re-read the record each invocation: the registry has no unregister, so
+        # this is the ONLY seam where a mid-session disable (auto-disable, prune,
+        # API toggle) or code update can take effect. The cached-code version kept
+        # disabled tools callable with stale code until restart (audit 2026-08-19).
+        fresh_code = fresh_enabled = None
+        try:
+            row = self._store._db.fetchone(
+                "SELECT code, enabled FROM custom_tools WHERE name = ?", (self.name,))
+            if row is not None:
+                fresh_code, fresh_enabled = row["code"], row["enabled"]
+        except Exception:
+            pass
+        # Only trust a well-formed row (mocked stores in tests return MagicMocks;
+        # ad-hoc DynamicTools may have no DB row — keep constructor code then).
+        if isinstance(fresh_code, str) and fresh_code:
+            if not fresh_enabled:
+                return ToolResult(output="", success=False,
+                                  error=f"Custom tool '{self.name}' is disabled.",
+                                  error_category=ErrorCategory.PERMISSION)
+            self._code = fresh_code
         # FORCED sandbox-level safety check — ignores system tier.
         # Dynamic tools are user-created code and must always be maximally restricted.
         safety_error = _check_dynamic_tool_safety(self._code)

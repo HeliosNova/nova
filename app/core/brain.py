@@ -221,6 +221,97 @@ _EXPLICIT_TOOL_REQUEST_RE = re.compile(
     re.IGNORECASE,
 )
 
+# IMPLICIT math — model program item 2 (2026-08-24). Tool-executed arithmetic
+# beats mental arithmetic (2026 field data: tool routing lifts competition-math
+# scores double digits), so math-classified queries get a [MATH TOOL ROUTING]
+# system block in _build_messages forcing calculator/code_exec. The patterns
+# stay PRECISE — dates (2026-08-24), version strings (0.32.15), year ranges
+# (2020-2026) and prose with digits must not fire:
+#   - operator expressions require SPACED operators or explicit x/× between
+#     numbers (unspaced hyphen = date/range; dotted pairs = versions)
+#   - phrase forms ("% of", "square root", "divided by") are strong anywhere
+_ARITHMETIC_EXPR_RE = re.compile(
+    r"\d\s+[-+*/^]\s+\d"                      # 847 * 293, 100 - 35 (spaced)
+    r"|\d\s*[+*/^]\s*\d"                      # 3+4, 12*7 (unspaced, but never '-')
+    r"|\d\s*[×÷]\s*\d",                       # unicode operators
+)
+_MATH_PHRASE_RE = re.compile(
+    r"%\s+of\s+\d|percent\s+of|square\s+root|\bsqrt\b|\bcube\s+root\b"
+    r"|divided\s+by|multiplied\s+by|\bmodulo\b|to\s+the\s+power\s+of"
+    r"|compound\s+interest|annual\s+interest"
+    r"|\d\s+(?:plus|minus|times)\s+\d",
+    re.IGNORECASE,
+)
+# Guard: a dotted number pair ("0.32.15") is a version string, and '\d+%' alone
+# ("40% of developers") is prose — both need a phrase/expr signal to count.
+_VERSION_STRING_RE = re.compile(r"\d+\.\d+\.\d+")
+
+
+def _is_computational_query(query: str) -> bool:
+    """Math-classified: an arithmetic expression, a math phrase, or a
+    constraint word problem. Used to force calculator/code_exec routing."""
+    if not query or len(query) < 8:
+        return False
+    if _MATH_PHRASE_RE.search(query):
+        return True
+    stripped_versions = _VERSION_STRING_RE.sub(" ", query)
+    if _ARITHMETIC_EXPR_RE.search(stripped_versions):
+        return True
+    from app.core.agent_loop import _is_math_logic_word_problem
+    return _is_math_logic_word_problem(query)
+
+
+# Calculator-transcription guard (item 2b, 2026-08-24). Live failure: the
+# routing block correctly forced the calculator ("847 * 293 - 1200 = 246971")
+# and the 9B then wrote DIFFERENT DIGITS in the answer ("= **235,671**").
+# When the answer restates the SAME expression with a different number, that
+# is a transcription error by construction — substitute the tool's number.
+# Numbers not tied to a calculator expression are never touched.
+_CALC_OUTPUT_RE = re.compile(r"(.+?)\s*=\s*(-?[\d,]+(?:\.\d+)?)\s*$")
+_ANSWER_EQ_CLAIM_RE = re.compile(
+    r"([\d(][\d\s+\-*/^×÷().,%]*?)\s*=\s*(\**)(-?[\d,]+(?:\.\d+)?)(\**)"
+)
+
+
+def _norm_expr(e: str) -> str:
+    return re.sub(r"\s+", "", e).replace(",", "").replace("×", "*").replace("÷", "/")
+
+
+def _nums_equal(a: str, b: str) -> bool:
+    a, b = a.replace(",", ""), b.replace(",", "")
+    if a == b:
+        return True
+    try:
+        return float(a) == float(b)
+    except ValueError:
+        return False
+
+
+def _fix_calculator_transcriptions(answer: str, tool_results: list[dict]) -> str:
+    if not answer or not tool_results:
+        return answer
+    correct: dict[str, str] = {}
+    for tr in tool_results:
+        if tr.get("tool") != "calculator":
+            continue
+        m = _CALC_OUTPUT_RE.match(str(tr.get("output", tr.get("result", ""))).strip())
+        if m:
+            correct[_norm_expr(m.group(1))] = m.group(2).replace(",", "")
+    if not correct:
+        return answer
+
+    def _sub(m: re.Match) -> str:
+        expr, bold_open, num, bold_close = m.group(1), m.group(2), m.group(3), m.group(4)
+        want = correct.get(_norm_expr(expr))
+        if want is None or _nums_equal(num, want):
+            return m.group(0)
+        logger.warning(
+            "[calc-transcription] answer wrote %r for %r but calculator returned %s — fixed",
+            num, expr.strip(), want)
+        return f"{expr.rstrip()} = {bold_open}{want}{bold_close}"
+
+    return _ANSWER_EQ_CLAIM_RE.sub(_sub, answer)
+
 # Time-sensitive queries (current price, latest news, today's weather) must
 # never serve from workspace cache or stale lessons — the "fact" they cached
 # yesterday is wrong today. Used to:
@@ -466,6 +557,79 @@ _VALIDATION_BLANKED_MSG = (
 )
 
 
+async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str:
+    """MiniCheck gate for tool-backed chat answers (2026-08-19).
+
+    The heuristic claim validator keys on digits/entities, so qualitative
+    fabrications sail through — live BoJ probe: "rates remain accommodative
+    (still negative)" survived validation while the tool evidence said 1.00%.
+    When tools ran, every factual-shaped sentence must be entailed by the tool
+    evidence or it is dropped. Same sidecar, thresholds, and show-your-work
+    logging as the digest gate. Fail-open on any service failure; over-strip
+    guarded (>50% of chars would go → keep original).
+    """
+    from app.config import config as _cfg
+    if not final_content or not tool_results:
+        return final_content
+    if not getattr(_cfg, "ENABLE_MINICHECK", False):
+        return final_content
+    url = (getattr(_cfg, "MINICHECK_URL", "") or "").rstrip("/")
+    if not url:
+        return final_content
+
+    doc = "\n\n".join((tr.get("output") or "")[:4000] for tr in tool_results[:6])[:12000]
+    if len(doc) < 200:
+        return final_content
+
+    # Factual-shaped sentences: statements long enough to carry a claim.
+    # Deliberately NOT digit-gated — that's the hole this closes.
+    sents = [s.strip() for s in re.split(r"(?<=[.!?])\s+", final_content)]
+    cands = []
+    for s in sents:
+        plain = re.sub(r"[*_#>`\[\]]", "", s).strip()
+        if len(plain) < 40 or plain.endswith("?"):
+            continue
+        cands.append((s, plain))
+    if not cands:
+        return final_content
+    # Digit-bearing claims first (most checkable), then the rest, cap 12.
+    cands.sort(key=lambda t: (not any(c.isdigit() for c in t[1])))
+    cands = cands[:12]
+
+    import httpx
+    pairs = [{"doc": doc, "claim": plain} for _s, plain in cands]
+    try:
+        async with httpx.AsyncClient(timeout=60) as client:
+            r = await client.post(f"{url}/check_batch", json={"pairs": pairs})
+            r.raise_for_status()
+            results = r.json()["results"]
+    except Exception as e:
+        logger.warning("[chat-entail] MiniCheck unavailable (%r) — fail-open", e)
+        return final_content
+
+    out = final_content
+    dropped = 0
+    for (orig, plain), res in zip(cands, results):
+        if res.get("supported"):
+            continue
+        if orig in out:
+            out = out.replace(orig, "", 1)
+            dropped += 1
+            logger.warning("[chat-entail-drop] p=%.3f claim=%r",
+                           float(res.get("prob", 0.0)), plain[:140])
+    if not dropped:
+        return final_content
+    # Tidy: collapse whitespace artifacts left by removals.
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    out = re.sub(r"\n{3,}", "\n\n", out).strip()
+    if len(out) < 0.5 * len(final_content) or len(out) < 60:
+        logger.warning("[chat-entail] over-strip guard: %d/%d chars would remain — keeping original",
+                       len(out), len(final_content))
+        return final_content
+    logger.info("[chat-entail] dropped %d unsupported sentence(s)", dropped)
+    return out
+
+
 def _guard_validated_content(pre_validate: str, validated: str) -> str:
     """If claim-validation reduced a non-empty answer to empty/whitespace, return an
     explicit can't-verify message instead of nothing. A blank `validated` otherwise
@@ -608,18 +772,29 @@ async def _gather_context(
         ctx.matched_skill = await _t_skill_match
         if ctx.matched_skill:
             logger.info("Skill matched: '%s' (id=%d)", ctx.matched_skill.name, ctx.matched_skill.id)
-            steps_desc = "\n".join(
-                f"  {i+1}. Use {s.get('tool', '?')} with {json.dumps(s.get('args_template', {}))}"
-                for i, s in enumerate(ctx.matched_skill.steps)
-            )
-            ctx.skills_text = (
-                f"## Matched Skill: {ctx.matched_skill.name}\n\n"
-                f"You have a learned procedure for this type of query. Follow these steps:\n"
-                f"{steps_desc}\n"
-            )
-            if ctx.matched_skill.answer_template:
-                ctx.skills_text += f"\nAnswer format: {ctx.matched_skill.answer_template}\n"
-            ctx.skills_text += "\nFollow this procedure. If the skill seems wrong for this query, deviate and explain why.\n"
+            if (getattr(ctx.matched_skill, "kind", "exec") == "procedure"
+                    and getattr(ctx.matched_skill, "procedure_text", None)):
+                # Procedure skill (migration 30): NL guidance, not mechanical steps.
+                ctx.skills_text = (
+                    f"## Matched Skill: {ctx.matched_skill.name}\n\n"
+                    f"You have a learned procedure for this type of query:\n"
+                    f"{ctx.matched_skill.procedure_text}\n"
+                    f"\nFollow this procedure. If it seems wrong for this query, "
+                    f"deviate and explain why.\n"
+                )
+            else:
+                steps_desc = "\n".join(
+                    f"  {i+1}. Use {s.get('tool', '?')} with {json.dumps(s.get('args_template', {}))}"
+                    for i, s in enumerate(ctx.matched_skill.steps)
+                )
+                ctx.skills_text = (
+                    f"## Matched Skill: {ctx.matched_skill.name}\n\n"
+                    f"You have a learned procedure for this type of query. Follow these steps:\n"
+                    f"{steps_desc}\n"
+                )
+                if ctx.matched_skill.answer_template:
+                    ctx.skills_text += f"\nAnswer format: {ctx.matched_skill.answer_template}\n"
+                ctx.skills_text += "\nFollow this procedure. If the skill seems wrong for this query, deviate and explain why.\n"
         else:
             active_skills = await _run_context_io(
                 "skills.active",
@@ -796,6 +971,32 @@ async def _gather_context(
                 logger.info("[dossiers] injected %d dossier(s) into context", len(_dossiers))
         except Exception as e:
             logger.debug("[dossiers] chat retrieval failed: %s", e)
+
+    # --- Self-state snapshot (2026-08-19) ---
+    # Chat denied having active forecasts while 210 sat open with a 15-2
+    # graded record (probe): the model can only know what's in its prompt.
+    # Self-referential questions get a live snapshot of Nova's own apparatus.
+    # Match a BOUNDED PREFIX and skip monitor/system queries (2026-08-20): the
+    # regex was matching trigger words buried deep in the giant "=== System
+    # Context ===" blob that monitor think() calls carry, injecting self-state
+    # into 49 monitor prompts/day. An owner's self-referential question has the
+    # trigger in its first ~160 chars; a monitor's prefix is the sentinel.
+    _q_head = (query or "")[:160]
+    if not _q_head.lstrip().startswith("===") and _SELF_STATE_RE.search(_q_head):
+        try:
+            from app.database import get_db
+            _sstext = await _run_context_io(
+                "self_state",
+                asyncio.to_thread(_self_state_text, get_db()),
+                default="",
+            )
+            if _sstext:
+                ctx.kg_facts_text = (
+                    (_sstext + "\n\n" + ctx.kg_facts_text) if ctx.kg_facts_text else _sstext
+                )
+                logger.info("[self-state] injected system snapshot into context")
+        except Exception as e:
+            logger.debug("[self-state] snapshot failed: %s", e)
 
     # --- Reflexions (past failure warnings) ---
     if svc.reflexions:
@@ -1101,6 +1302,15 @@ async def _build_messages(
             "(run code and/or use the calculator). You MUST invoke the appropriate "
             "tool (code_exec or calculator) and base your answer on its actual "
             "output — do not compute or recall the result from memory instead.")})
+    elif intent == "general" and _is_computational_query(query):
+        # Forced math tool-routing (model program item 2, 2026-08-24): implicit
+        # arithmetic goes through the calculator too. Tool-executed arithmetic
+        # is deterministic; mental arithmetic on a 9B silently slips.
+        messages.append({"role": "system", "content": (
+            "[MATH TOOL ROUTING] This query involves arithmetic. Compute every "
+            "numeric result with the calculator tool (single expressions) or "
+            "code_exec (multi-step computations) — never do arithmetic in your "
+            "head. Base the final answer on the tool output.")})
 
     # Query Planning
     was_planned = False
@@ -1181,6 +1391,99 @@ _TOOL_ACTION_RE = re.compile(
     r"current(?:ly)?|today|news|run|execute|calculate|compute|price now)\b",
     re.IGNORECASE,
 )
+
+# --- Self-state snapshot (2026-08-19) --------------------------------------
+# Questions about Nova's OWN apparatus ("what are your active forecasts?")
+# must answer from live system state, not the model's guess about itself.
+_SELF_STATE_RE = re.compile(
+    r"(?:\byour\b|\byou\b)[^.?!]{0,40}\b(?:forecasts?|predictions?|monitors?|monitoring|"
+    r"storylines?|dossiers?|tracking|watching|working on)\b"
+    r"|\bwhat\s+(?:are|do)\s+you\s+(?:currently\s+)?(?:track|monitor|watch|forecast|predict|cover)\b",
+    re.IGNORECASE,
+)
+
+
+def _self_state_text(db) -> str:
+    """Live snapshot of Nova's own apparatus for self-referential questions."""
+    try:
+        parts: list[str] = []
+        row = db.fetchone("SELECT COUNT(*) c FROM monitors WHERE enabled=1")
+        n_mon = row["c"] if row else 0
+        fc = {r["status"]: r["c"] for r in db.fetchall(
+            "SELECT status, COUNT(*) c FROM forecasts GROUP BY status")}
+        st = db.fetchone("SELECT COUNT(*) c FROM storylines WHERE status='active'")
+        do = db.fetchone("SELECT COUNT(*) c, MAX(updated_at) m FROM dossiers")
+        kg = db.fetchone("SELECT COUNT(*) c FROM kg_facts WHERE superseded_at IS NULL")
+        le = db.fetchone("SELECT COUNT(*) c FROM lessons")
+        parts.append(
+            "Nova system self-state (LIVE, authoritative — answer questions about "
+            "what Nova tracks/forecasts/monitors from THIS, never claim these "
+            "don't exist):\n"
+            f"- Monitors: {n_mon} enabled (domain studies, feeds, self-improvement cycles)\n"
+            f"- Forecasts: {fc.get('open', 0)} OPEN self-grading forecasts; graded record "
+            f"{fc.get('hit', 0)} hits / {fc.get('miss', 0)} misses\n"
+            f"- Active storylines tracked: {st['c'] if st else 0}\n"
+            f"- Knowledge dossiers maintained: {do['c'] if do else 0} "
+            f"(last consolidated {do['m'] if do and do['m'] else 'n/a'})\n"
+            f"- Knowledge graph: {kg['c'] if kg else 0} current facts; "
+            f"{le['c'] if le else 0} lessons")
+        recents = db.fetchall(
+            "SELECT claim, confidence, resolves_at FROM forecasts WHERE status='open' "
+            "ORDER BY created_at DESC LIMIT 5")
+        if recents:
+            parts.append("Most recent open forecasts:\n" + "\n".join(
+                f"- ({r['confidence']:.0%}, resolves {str(r['resolves_at'])[:10]}) {r['claim'][:160]}"
+                for r in recents))
+        low = db.fetchall(
+            "SELECT claim, confidence FROM forecasts WHERE status='open' "
+            "ORDER BY confidence ASC, created_at DESC LIMIT 3")
+        if low:
+            parts.append("Least-confident open forecasts:\n" + "\n".join(
+                f"- ({r['confidence']:.0%}) {r['claim'][:160]}" for r in low))
+        return "\n\n".join(parts)
+    except Exception as e:
+        logger.debug("[self-state] snapshot build failed: %s", e)
+        return ""
+
+
+# --- Unfinished-draft detection (2026-08-19) -------------------------------
+# A chat probe shipped 'Let me fetch the actual news articles directly:' plus
+# the provider token-limit marker AS the final answer. Process narration that
+# announces a next step is not an answer.
+_TRUNCATION_MARKER = "[Warning: Response was truncated due to token limit]"
+_PLAN_TAIL_RE = re.compile(
+    r"(?is)\b(?:let me|i(?:'ll| will)(?: now)?|now i(?:'ll| will)|next,? i(?:'ll| will))\s+"
+    r"(?:fetch|search|check|retrieve|pull|look|dig|browse|synthesi[sz]e|provide|compile|gather)"
+    r"[^\n]{0,100}[:…]?\s*$"
+)
+
+
+def _draft_is_unfinished(text: str) -> bool:
+    """True when a draft is cut off or ends announcing its next step."""
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _TRUNCATION_MARKER in t:
+        return True
+    return bool(_PLAN_TAIL_RE.search(t[-200:]))
+
+
+# --- Deflection detection (2026-08-19) -------------------------------------
+# "I couldn't produce a useful answer — can you rephrase?" with ZERO tool
+# calls on a searchable question (BoJ probe). Honest, but lazy: the model has
+# web_search and chose not to use it.
+_DEFLECTION_RE = re.compile(
+    r"(?i)\b(?:couldn'?t produce a useful answer|"
+    r"i don'?t have (?:any |specific |current |that )?(?:information|data|details)|"
+    r"i'?m (?:unable|not able) to (?:find|answer|provide)|"
+    r"no (?:information|data) (?:available|on that)|"
+    r"can you rephrase)\b"
+)
+
+
+def _is_deflection(text: str) -> bool:
+    t = (text or "").strip()
+    return bool(t) and len(t) < 600 and bool(_DEFLECTION_RE.search(t))
 
 
 def _kg_answers_query(query: str, kg_facts_text: str) -> bool:
@@ -1266,6 +1569,11 @@ async def _run_generation_loop(
         and not image
         and selected_model != config.FAST_MODEL
     )
+    logger.info(
+        "[thinking-gate] hard=%s use_thinking=%s model=%s intent=%s qhead=%r",
+        _hard_query_auto_thinking, use_thinking,
+        selected_model or config.LLM_MODEL, intent, query[:60],
+    )
     if _hard_query_auto_thinking:
         # System-2 nudge for reasoning / constraint word problems. The 9B
         # pattern-matches the intuitive (often wrong) answer otherwise — it
@@ -1274,11 +1582,13 @@ async def _run_generation_loop(
         messages = messages + [{
             "role": "system",
             "content": (
-                "This is a reasoning problem. Before answering: name the unknowns "
-                "as variables, write the equation implied by EACH stated condition, "
-                "solve, then check your solution satisfies every condition. Do not "
-                "assume the first intuitive answer is correct. State the final "
-                "answer concisely after reasoning."
+                "This is a reasoning problem. In your private thinking: name the "
+                "unknowns as variables, write the equation implied by EACH stated "
+                "condition, solve, then check your solution satisfies every "
+                "condition. Do not assume the first intuitive answer is correct. "
+                "Your visible answer must be ONLY the conclusion in 1-3 plain "
+                "sentences — no step headings, no variable definitions, no "
+                "restating the working."
             ),
         }]
     _GENERATION_TIMEOUT = float(config.GENERATION_TIMEOUT)
@@ -1330,6 +1640,19 @@ async def _run_generation_loop(
 
     try:
         for tool_round in range(_effective_max_rounds):
+            # Refresh the GPU-yield latch EACH tool round (2026-08-14): the
+            # priority window is set at think() entry, but a tool-heavy chat
+            # runs many LLM rounds over minutes — the window expired mid-loop,
+            # background digests resumed, and the owner's own chat then thrashed
+            # the 27B<->9B swap round after round (measured: a tool-using chat
+            # hit >250s under digest load). Re-noting per round keeps digests
+            # yielded for the whole conversation, so chat gets one swap and
+            # exclusive 9B, not a swap per round. `ephemeral` (False = real
+            # owner chat) is the owner-facing signal in this scope; eval/monitor
+            # loops run ephemeral=True and never self-latch.
+            if not ephemeral:
+                from app.core import llm as _latch_llm_round
+                _latch_llm_round.note_interactive_activity()
             # Inject prior-round thinking as a system anchor so the model can
             # see "what I was reasoning before" — avoids re-deriving and
             # catches contradiction with prior rounds. Only fires after round 0
@@ -1567,7 +1890,11 @@ async def _run_generation_loop(
                             ),
                         }]
                         synthesis = await asyncio.wait_for(
-                            llm.invoke_nothink(synth_messages, max_tokens=800, temperature=_temperature),
+                            # num_ctx=24576 (chat's _CHAT_NUM_CTX): synth_messages carries
+                            # the full tool-loop prompt; the 4096 model default would
+                            # silently head-truncate the system prompt + query (audit 2026-08-17).
+                            llm.invoke_nothink(synth_messages, max_tokens=800,
+                                               temperature=_temperature, num_ctx=24576),
                             timeout=_GENERATION_TIMEOUT,
                         )
                         if synthesis and synthesis.strip():
@@ -2589,7 +2916,9 @@ async def _refine_response(
                 polish_msg,
             ]
             polished = await llm.invoke_nothink(
-                messages_for_polish, max_tokens=2000, temperature=0.2,
+                # num_ctx=24576 (chat's _CHAT_NUM_CTX): messages_for_polish carries the
+                # full tool output; 4096 default would head-truncate it (audit 2026-08-17).
+                messages_for_polish, max_tokens=2000, temperature=0.2, num_ctx=24576,
             )
             polished = (polished or "").strip()
             if polished and len(polished) >= 50 and not _has_tool_leakage(polished):
@@ -2702,7 +3031,9 @@ async def _refine_response(
                 ]
                 try:
                     cov_response = await llm.invoke_nothink(
-                        cov_messages, max_tokens=800, temperature=0.2,
+                        # num_ctx=24576 (chat's _CHAT_NUM_CTX): cov_messages mirrors the
+                        # full prompt; 4096 default would head-truncate it (audit 2026-08-17).
+                        cov_messages, max_tokens=800, temperature=0.2, num_ctx=24576,
                     )
                     cov_response = (cov_response or "").strip()
                     if cov_response and len(cov_response) >= 30:
@@ -2761,7 +3092,9 @@ async def _refine_response(
                 async def _sample_one(temp: float) -> str:
                     try:
                         resp = await llm.invoke_nothink(
-                            alt_messages, max_tokens=2000, temperature=temp,
+                            # num_ctx=24576 (chat's _CHAT_NUM_CTX): alt_messages mirrors the
+                            # full prompt; 4096 default would head-truncate it (audit 2026-08-17).
+                            alt_messages, max_tokens=2000, temperature=temp, num_ctx=24576,
                         )
                         return (resp or "").strip()
                     except Exception as e:
@@ -3711,7 +4044,10 @@ async def think(
             )
 
         # --- Step 3: Intent ---
-        intent = await _classify_intent(query)
+        # A correction needs a prior assistant answer in THIS conversation —
+        # first-turn messages can't be corrections (see _classify_intent).
+        _has_prior_answer = any(m.get("role") == "assistant" for m in history)
+        intent = await _classify_intent(query, has_prior_answer=_has_prior_answer)
 
         # --- Step 3b: Vision pre-pass (if image attached) ---
         # When an image is present, run a structured visual analysis FIRST so the
@@ -3862,7 +4198,93 @@ async def think(
             was_planned, ephemeral, gen, query=query,
         ):
             yield event
+        # Facts-first misfire guard (2026-08-19): the gate can match a NEWS
+        # fact subject ("Stack Overflow…") to a CONCEPTUAL question ("stack vs
+        # queue"), and the tool-less model then emits only a (stripped)
+        # tool-call attempt → the user gets an EMPTY answer (reproduced live;
+        # also the reasoning_definition eval failure). If tool-less generation
+        # produced nothing, regenerate once WITH tools instead of shipping "".
+        if _gen_tools is not tools:
+            # Judge the SANITIZED draft: the misfire draft is a raw text
+            # tool-call ('{"tool": ...}' — non-empty), which the sanitizer
+            # later strips to "".
+            _ff_draft = _sanitize_answer(gen.final_content or "")
+            if not _ff_draft.strip():
+                logger.warning(
+                    "[facts-first] tool-less generation empty after sanitize "
+                    "(raw head: %r) — retrying with tools",
+                    (gen.final_content or "")[:120])
+                gen = _GenerationResult()
+                async for event in _run_generation_loop(
+                    messages, tools, svc, conversation_id, image, intent,
+                    was_planned, ephemeral, gen, query=query,
+                ):
+                    yield event
+
+        # Unfinished-draft repair (2026-08-19): the draft ends announcing its
+        # next step or carries the token-limit marker — process narration, not
+        # an answer. One tool-free rewrite pass over the already-gathered
+        # context; keep the repair only if it is itself finished.
+        if gen.final_content and _draft_is_unfinished(gen.final_content):
+            logger.warning("[unfinished-draft] repairing (tail: %r)",
+                           gen.final_content[-120:])
+            messages.append({"role": "assistant", "content": gen.final_content})
+            messages.append({"role": "user", "content": (
+                "STOP. Do not narrate any further steps or plans. Using ONLY the "
+                "information already gathered above, write the complete final "
+                "answer now. If some detail could not be retrieved, say so in one "
+                "sentence and answer with what you have. Output the answer "
+                "directly — no preamble.")})
+            _repair = _GenerationResult()
+            async for event in _run_generation_loop(
+                messages, [], svc, conversation_id, image, intent,
+                was_planned, ephemeral, _repair, query=query,
+            ):
+                yield event
+            if (_repair.final_content or "").strip() and not _draft_is_unfinished(_repair.final_content):
+                _repair.tool_results = gen.tool_results + _repair.tool_results
+                gen = _repair
+
+        # Deflection rescue (2026-08-19): a short "I can't answer that" with
+        # ZERO tool calls on a general question — force ONE web_search and
+        # regenerate from its results instead of shipping the shrug.
+        if (intent == "general" and not gen.tool_results
+                and _is_deflection(gen.final_content)
+                and svc.tool_registry and svc.tool_registry.get("web_search")):
+            logger.warning("[deflection-rescue] zero-tool deflection — forcing web_search")
+            _ws_out = ""
+            try:
+                _ws_res = await asyncio.wait_for(
+                    svc.tool_registry.get("web_search").execute(query=query), timeout=60)
+                if getattr(_ws_res, "success", False):
+                    _ws_out = (_ws_res.output or "")[:4000]
+            except Exception as e:
+                logger.warning("[deflection-rescue] web_search failed: %s", e)
+            if _ws_out:
+                gen.tool_results.append({"tool": "web_search", "args": {"query": query},
+                                         "output": _ws_out})
+                messages.append({"role": "assistant", "content": gen.final_content})
+                messages.append({"role": "user", "content": (
+                    f"Fresh web search results for the question:\n\n{_ws_out}\n\n"
+                    "Answer the original question directly from these results. If "
+                    "they don't fully answer it, state what IS known from them — "
+                    "do not just say you cannot answer.")})
+                _rescue = _GenerationResult()
+                async for event in _run_generation_loop(
+                    messages, [], svc, conversation_id, image, intent,
+                    was_planned, ephemeral, _rescue, query=query,
+                ):
+                    yield event
+                if (_rescue.final_content or "").strip():
+                    _rescue.tool_results = gen.tool_results + _rescue.tool_results
+                    gen = _rescue
         _timer.mark(f"generation({len(gen.tool_results)}tools)")
+
+        # Deterministic digit guard: if the answer restates a calculator
+        # expression with different digits, trust the tool (item 2b).
+        if gen.final_content and gen.tool_results:
+            gen.final_content = _fix_calculator_transcriptions(
+                gen.final_content, gen.tool_results)
 
         # --- Step 8: Ephemeral early return ---
         if ephemeral:
@@ -3882,6 +4304,7 @@ async def think(
                 )
                 final_content = _guard_validated_content(
                     _pre_validate_content_ephemeral, final_content)
+                final_content = await _entail_gate_chat(final_content, gen.tool_results)
                 if stripped_reasons:
                     for r in stripped_reasons:
                         logger.warning("[claim-validator-ephemeral] %s", r)
@@ -3993,6 +4416,7 @@ async def think(
                 final_content, evidence, current_model_tag=config.LLM_MODEL,
             )
             final_content = _guard_validated_content(_pre_validate_content_main, final_content)
+            final_content = await _entail_gate_chat(final_content, gen.tool_results)
             if stripped_reasons:
                 for r in stripped_reasons:
                     logger.warning("[claim-validator] %s", r)

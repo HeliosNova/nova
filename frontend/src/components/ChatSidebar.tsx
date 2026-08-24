@@ -159,7 +159,7 @@ export default function ChatSidebar({ onSelect }: Props) {
         />
       )}
 
-      <aside className={`${panelClasses} flex h-full flex-col border-r border-nova-border bg-nova-surface`}>
+      <aside className={`${panelClasses} flex h-full flex-col border-r border-nova-border bg-nova-surface/70 backdrop-blur-md`}>
         <div className="space-y-2 border-b border-nova-border p-3">
           <button
             onClick={() => newChat()}

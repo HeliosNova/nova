@@ -58,7 +58,7 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
             continue
         # Skip if already a principle for this topic
         existing = db.fetchone(
-            "SELECT id FROM kg_facts WHERE provenance='principle' AND subject=? LIMIT 1",
+            "SELECT id FROM kg_facts WHERE source='principle' AND subject=? LIMIT 1",
             (topic[:200],),
         )
         if existing:
@@ -104,7 +104,7 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
             continue
         # Dedupe
         existing = db.fetchone(
-            "SELECT id FROM kg_facts WHERE provenance='principle' AND subject=? LIMIT 1",
+            "SELECT id FROM kg_facts WHERE source='principle' AND subject=? LIMIT 1",
             (topic_label[:200],),
         )
         if existing:

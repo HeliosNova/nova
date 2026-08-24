@@ -1139,7 +1139,11 @@ class TestAutoSkillCreation:
                     mock_skills,
                 )
 
-        assert len(mock_skills.get_all_skills()) == 0
+        # Migration-30 contract: a strict-guard reject on a multi-tool
+        # interaction may memorialize a PROCEDURE skill; no EXEC skill exists.
+        created = mock_skills.get_all_skills()
+        assert all(getattr(s, "kind", "exec") == "procedure" for s in created)
+        assert not any(s.trigger_pattern for s in created)
 
     @pytest.mark.asyncio
     async def test_auto_skill_handles_llm_skip(self, mock_skills):
@@ -1157,7 +1161,11 @@ class TestAutoSkillCreation:
                     mock_skills,
                 )
 
-        assert len(mock_skills.get_all_skills()) == 0
+        # Migration-30 contract: a strict-guard reject on a multi-tool
+        # interaction may memorialize a PROCEDURE skill; no EXEC skill exists.
+        created = mock_skills.get_all_skills()
+        assert all(getattr(s, "kind", "exec") == "procedure" for s in created)
+        assert not any(s.trigger_pattern for s in created)
 
 
 class TestParaphraseRetrieval:

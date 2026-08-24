@@ -37,6 +37,10 @@ import type {
   CustomToolInfo,
   CuriosityItem,
   FinetuneTriggerResponse,
+  DossierSummary,
+  DossierDetail,
+  DossierRevision,
+  DossierRevisionDetail,
 } from "./types";
 
 export function getBaseUrl(): string {
@@ -277,6 +281,18 @@ export async function getRecentMonitorResults(hours = 24): Promise<MonitorResult
 
 export async function getMonitorDetail(id: number): Promise<MonitorDetail> {
   return request(`/api/monitors/${id}`);
+}
+
+export async function getForecasts(limit = 40): Promise<import("./types").ForecastData> {
+  return request(`/api/forecasts?limit=${limit}`);
+}
+
+export async function getStorylines(status = "active", limit = 40): Promise<import("./types").StorylineData> {
+  return request(`/api/storylines?status=${status}&limit=${limit}`);
+}
+
+export async function getStoryline(id: number): Promise<import("./types").StorylineDetail> {
+  return request(`/api/storylines/${id}`);
 }
 
 export async function searchMonitorResults(query: string, limit = 8): Promise<import("./types").MonitorResultHit[]> {
@@ -545,4 +561,24 @@ export async function voiceChat(blob: Blob, filename = "recording.webm"): Promis
   });
   if (!res.ok) throw new Error(`Voice chat failed: ${res.status}`);
   return res;
+}
+
+// ── Knowing tier: dossiers (2026-08-12) ──
+
+export async function getDossiers(kind?: string): Promise<DossierSummary[]> {
+  const data = await request<unknown>(`/api/dossiers${kind ? `?kind=${encodeURIComponent(kind)}` : ""}`);
+  return ensureArray<DossierSummary>(data, "dossiers");
+}
+
+export async function getDossier(id: number): Promise<DossierDetail> {
+  return request<DossierDetail>(`/api/dossiers/${id}`);
+}
+
+export async function getDossierRevisions(id: number): Promise<DossierRevision[]> {
+  const data = await request<unknown>(`/api/dossiers/${id}/revisions`);
+  return ensureArray<DossierRevision>(data, "revisions");
+}
+
+export async function getDossierRevision(id: number, revisionId: number): Promise<DossierRevisionDetail> {
+  return request<DossierRevisionDetail>(`/api/dossiers/${id}/revisions/${revisionId}`);
 }

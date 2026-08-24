@@ -1,6 +1,6 @@
 services:
   ollama:
-    image: ollama/ollama:0.30.11
+    image: ollama/ollama:0.32.15
     container_name: nova-ollama
     ports:
       - "127.0.0.1:11434:11434"
@@ -169,6 +169,10 @@ services:
       # so they survive loss/corruption of the nova_data volume itself.
       # Lives on the host filesystem next to the compose tree (gitignored).
       - ./backups:/backups
+      # True OFFSITE leg on a different physical drive (2026-08-14): the E:
+      # mirror was fed by a one-shot manual robocopy — the daily leg silently
+      # didn't exist. Maintenance now copies+verifies snapshots here directly.
+      - "E:/nova-offsite:/offsite"
       # Job hand-off to the network-isolated exec sidecar (audit 2026-07-08).
       # Presence of this mount routes code_exec through nova-exec.
       - exec_queue:/exec_queue
@@ -191,6 +195,11 @@ services:
       - ALL
     mem_limit: 4g
     cpus: 4.0
+    # Fork-bomb backstop (audit 2026-08-22): custom_tools can exec model-authored
+    # code in-process here (code_exec/code_verify route to the network-isolated
+    # sidecar, but custom_tools does not). Steady state is ~186 tasks; 4096 leaves
+    # ample room for the chromium/Xvfb process tree while capping a runaway fork.
+    pids_limit: 4096
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
       interval: 30s
@@ -224,6 +233,15 @@ services:
       - ./frontend/index.html:/app/index.html
     mem_limit: 512m
     cpus: 1.0
+    healthcheck:
+      # node-only image (no curl/wget): probe the Vite dev server over HTTP so a
+      # silently-crashed dev server surfaces as unhealthy instead of "running"
+      # (audit 2026-08-22).
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5173/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
     logging:
       driver: json-file
       options:
@@ -245,6 +263,15 @@ services:
       - minicheck_cache:/cache
     mem_limit: 6g
     cpus: 4.0
+    healthcheck:
+      # python-only image (no curl/wget); /health 200 means the entailment
+      # verifier is up. Fail-open still applies, but a hung minicheck now shows
+      # unhealthy instead of silently degrading the entail gate (audit 2026-08-22).
+      test: ["CMD", "python3", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health', timeout=5)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
     logging:
       driver: json-file
       options:
@@ -275,6 +302,13 @@ services:
     mem_limit: 512m
     cpus: 1.0
     pids_limit: 128
+    cap_drop:
+      - ALL
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "3"
     restart: unless-stopped
     depends_on:
       - nova
@@ -289,8 +323,16 @@ services:
     container_name: nova-socket-proxy
     environment:
       CONTAINERS: 1       # GET /containers/* (list + inspect/health)
-      POST: 1             # required for the restart POST
-      ALLOW_RESTARTS: 1   # /containers/{id}/restart|stop|kill only
+      # POST=1 is the tecnativa proxy's MASTER switch for every POST endpoint —
+      # LIVE-TESTED 2026-08-20: with POST=0 the watchdog's restart returns 403
+      # (ALLOW_RESTARTS alone is insufficient), so POST=1 is mandatory for the
+      # watchdog to recover nova-app. The cost is that POST /containers/create
+      # is also reachable (returns 201) — a host-escape *primitive*, but blunted
+      # because ALLOW_START is unset (default 0): a created container cannot be
+      # started, so no code executes. Residual risk requires the watchdog itself
+      # (static shell script, cap_drop ALL, internal-only net) to be compromised.
+      POST: 1
+      ALLOW_RESTARTS: 1   # /containers/{id}/restart|stop|kill
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
     networks:
@@ -299,6 +341,11 @@ services:
       - no-new-privileges:true
     mem_limit: 64m
     cpus: 0.25
+    logging:
+      driver: json-file
+      options:
+        max-size: "5m"
+        max-file: "2"
     restart: unless-stopped
 
   watchdog:
@@ -312,14 +359,22 @@ services:
     # 54h silent freeze — Docker flagged unhealthy but nothing acted). Talks to
     # the docker API through socket-proxy (list+restart only) — the raw socket
     # is no longer mounted here (audit 2026-07-08).
-    env_file: .env   # DISCORD_TOKEN / DISCORD_CHANNEL_ID for out-of-band alerts
+    # Only the two Discord secrets are needed — interpolated from ./.env at parse
+    # time, NOT injected as the whole env. WATCHDOG_* tuning uses the script's
+    # defaults (which already match the prior behavior). Avoids handing the
+    # watchdog NOVA_API_KEY + TELEGRAM_TOKEN + ~30 other vars (2026-08-14 audit).
     environment:
       WATCHDOG_DOCKER_API: http://socket-proxy:2375
+      DISCORD_TOKEN: ${DISCORD_TOKEN:-}
+      DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
     networks:
       - default        # Discord alerts need egress
       - watchdog_net   # docker API via the proxy
     volumes:
-      - nova_data:/data   # read-only queries of monitors.last_check_at (WAL-safe)
+      # NOT :ro — WAL reads need a writable -shm; :ro would break the staleness
+      # read (verified working). watchdog.sh issues SELECTs only; cap_drop ALL +
+      # internal net make the rw mount a negligible write vector (2026-08-20 sweep).
+      - nova_data:/data
     read_only: true
     tmpfs:
       - /tmp

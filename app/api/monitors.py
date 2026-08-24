@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import re
 import logging
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -12,6 +13,15 @@ from app.config import config
 
 logger = logging.getLogger(__name__)
 router = APIRouter(tags=["monitors"], dependencies=[Depends(require_auth)])
+
+# Serialize on-demand eval runs. Each run fires real brain.think() generations on
+# the single GPU; without this a click-storm or overlapping POSTs would queue
+# dozens of runs ahead of live chat (multi-minute TTFT). A plain flag (not a
+# Lock) so the check-and-set is atomic on the single-threaded event loop — no
+# await between the read and the set, so two racing requests can't both pass
+# (a Lock + .locked() pre-check has that race). The finetune path has its own
+# lock; eval had none (audit 2026-08-22).
+_eval_running = {"active": False}
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +432,16 @@ async def run_eval_categories(categories: str = Query("memory-learning,kg-retrie
     tasks = [t for t in harness.load_suite() if t.category in cats]
     if not tasks:
         raise HTTPException(status_code=400, detail=f"No tasks for categories {cats}")
-    report = await harness.run_all(tasks)
+    if _eval_running["active"]:
+        raise HTTPException(
+            status_code=409,
+            detail="An eval run is already in progress; retry once it finishes.",
+        )
+    _eval_running["active"] = True
+    try:
+        report = await harness.run_all(tasks)
+    finally:
+        _eval_running["active"] = False
     return {
         "categories": {
             cat: {
@@ -440,6 +459,127 @@ async def run_eval_categories(categories: str = Query("memory-learning,kg-retrie
             for r in report.task_results
         ],
     }
+
+
+# Internal QA/meta annotations that get appended to storyline_events but are
+# NOT narrative events — hide them from the user-facing timeline (2026-08-20
+# visual pass; screenshots showed a "Fresh-check could NOT be confirmed" note
+# rendered as a story beat). `\_%` needs ESCAPE (LIKE `_` is a wildcard).
+_EVENT_META_EXCL = (
+    "AND summary NOT LIKE '⚠%' "
+    "AND summary NOT LIKE '\\_%' ESCAPE '\\' "
+    "AND summary NOT LIKE '%Fresh-check%' "
+    "AND summary NOT LIKE '%Sourcing note%' "
+    "AND summary NOT LIKE '%could NOT be confirmed%' "
+    "AND summary NOT LIKE 'read %sources%'"
+)
+
+
+@router.get("/storylines")
+async def list_storylines(
+    status: str = Query(default="active", pattern="^(active|closed|all)$"),
+    limit: int = Query(default=40, ge=1, le=200),
+):
+    """Tracked narrative threads (2026-08-20): ongoing multi-update stories Nova
+    maintains across monitors — 'where does X stand'. Had no UI despite being a
+    headline capability. List carries each thread's summary + event count;
+    detail (/{id}) carries the full event timeline."""
+    from app.database import get_db
+    db = get_db()
+
+    def _sync():
+        where = "" if status == "all" else "WHERE s.status = ?"
+        params = () if status == "all" else (status,)
+        rows = db.fetchall(
+            f"SELECT s.id, s.title, s.status, s.summary, s.monitors_csv, "
+            f"       s.first_seen, s.last_updated, s.update_count, "
+            f"       (SELECT COUNT(*) FROM storyline_events e WHERE e.storyline_id = s.id "
+            f"        {_EVENT_META_EXCL}) AS event_count "
+            f"FROM storylines s {where} "
+            f"ORDER BY CASE s.status WHEN 'active' THEN 0 ELSE 1 END, s.last_updated DESC "
+            f"LIMIT ?", (*params, limit))
+        counts = {r["status"]: r["c"] for r in db.fetchall(
+            "SELECT status, COUNT(*) c FROM storylines GROUP BY status")}
+        out = []
+        for r in rows:
+            d = dict(r)
+            d["monitors"] = [m.strip() for m in (r["monitors_csv"] or "").split(",") if m.strip()]
+            d.pop("monitors_csv", None)
+            out.append(d)
+        return {"stats": {"active": counts.get("active", 0), "closed": counts.get("closed", 0)},
+                "storylines": out}
+
+    return await asyncio.to_thread(_sync)
+
+
+@router.get("/storylines/{storyline_id}")
+async def get_storyline(storyline_id: int):
+    """One storyline with its full event timeline (newest first)."""
+    from app.database import get_db
+    db = get_db()
+
+    def _sync():
+        s = db.fetchone("SELECT * FROM storylines WHERE id = ?", (storyline_id,))
+        if s is None:
+            return None
+        events = [
+            {"id": e["id"], "summary": e["summary"], "source": e["source_monitor"],
+             "url": e["item_url"] or None, "is_new": bool(e["is_new"]),
+             "published": e["published"], "created_at": e["created_at"]}
+            for e in db.fetchall(
+                f"SELECT * FROM storyline_events WHERE storyline_id = ? "
+                f"{_EVENT_META_EXCL} ORDER BY created_at DESC LIMIT 60", (storyline_id,))
+        ]
+        d = dict(s)
+        d["monitors"] = [m.strip() for m in (s["monitors_csv"] or "").split(",") if m.strip()]
+        d.pop("monitors_csv", None)
+        d["events"] = events
+        return d
+
+    result = await asyncio.to_thread(_sync)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Storyline not found")
+    return result
+
+
+@router.get("/forecasts")
+async def list_forecasts(limit: int = Query(default=40, ge=1, le=200)):
+    """Nova's self-grading forecasts (2026-08-20): open predictions + recently
+    graded ones, with the calibration record. This apparatus was invisible in
+    the UI — Nova mints falsifiable predictions from consolidation and grades
+    them at resolution, but nothing surfaced them."""
+    from app.database import get_db
+    db = get_db()
+
+    def _sync():
+        counts = {r["status"]: r["c"] for r in db.fetchall(
+            "SELECT status, COUNT(*) c FROM forecasts GROUP BY status")}
+        n_hit, n_miss = counts.get("hit", 0), counts.get("miss", 0)
+        graded = n_hit + n_miss
+        # Brier-style skill would need per-forecast outcomes; the resolved
+        # hit-rate is the honest headline number here.
+        accuracy = (n_hit / graded) if graded else None
+
+        def _row(r):
+            return {"id": r["id"], "claim": r["claim"], "confidence": r["confidence"],
+                    "status": r["status"], "created_at": r["created_at"],
+                    "resolves_at": r["resolves_at"], "resolved_at": r["resolved_at"],
+                    "resolution": r["resolution"], "source": r["source_monitor"]}
+
+        open_rows = [_row(r) for r in db.fetchall(
+            "SELECT * FROM forecasts WHERE status='open' "
+            "ORDER BY resolves_at ASC LIMIT ?", (limit,))]
+        resolved_rows = [_row(r) for r in db.fetchall(
+            "SELECT * FROM forecasts WHERE status IN ('hit','miss') "
+            "ORDER BY resolved_at DESC LIMIT ?", (limit,))]
+        return {
+            "stats": {"open": counts.get("open", 0), "hit": n_hit, "miss": n_miss,
+                      "graded": graded, "accuracy": accuracy},
+            "open": open_rows,
+            "resolved": resolved_rows,
+        }
+
+    return await asyncio.to_thread(_sync)
 
 
 class InstructionCreate(BaseModel):

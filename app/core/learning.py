@@ -63,8 +63,13 @@ class Lesson:
 # ---------------------------------------------------------------------------
 
 _CORRECTION_PATTERNS = [
-    # Direct corrections
-    re.compile(r"(?i)\b(?:actually|no,?\s|that'?s?\s+(?:wrong|incorrect|not\s+right))"),
+    # Direct corrections. A bare "no" only signals a correction when it OPENS
+    # the message ("No, it's..."). Mid-sentence it's ordinary English — the old
+    # anywhere-match `no,?\s` classified "... Answer yes or no and explain
+    # why." as a correction, which disabled auto-thinking on reasoning queries
+    # (live eval failure 2026-08-24). Short reactive negations that don't open
+    # with "no" still reach the LLM confirm via has_soft_correction_signal.
+    re.compile(r"(?i)(?:\bactually\b|\bthat'?s?\s+(?:wrong|incorrect|not\s+right)|^\s*no\b)"),
     re.compile(r"(?i)\b(?:you'?re\s+wrong|that\s+is\s+(?:wrong|incorrect|false))"),
     re.compile(r"(?i)\b(?:the\s+(?:correct|right|actual)\s+(?:answer|information)\s+is)"),
     re.compile(r"(?i)\b(?:it'?s?\s+actually|it\s+should\s+be)"),
@@ -304,6 +309,36 @@ class LearningEngine:
             logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
             return 0
         return self._backfill_collection(collection)
+
+    def prune_and_backfill_lesson_vectors(self) -> tuple[int, int]:
+        """Lifecycle hygiene for the lessons vector index (2026-08-20 sweep).
+
+        The KG index got prune_stale_vectors on 2026-08-14, but the lessons
+        index never did — so lesson churn (procedural consolidation creating
+        canonicals + demoting members, MAX_LESSONS eviction) left GHOST vectors
+        for deleted lessons AND left freshly-created lessons UNINDEXED when the
+        embedder hiccuped at create time. Observed 8 ghosts + 9 missing in a
+        36-lesson store. Two-way repair: delete vectors whose id is no longer in
+        the lessons table, then upsert to add any missing. Returns (deleted,
+        indexed_total). Wired into daily maintenance beside the KG prune.
+        """
+        collection = self._get_lessons_collection()
+        if collection is None:
+            return (0, 0)
+        try:
+            got = set(collection.get(include=[]).get("ids") or [])
+            live = {str(r["id"]) for r in self._db.fetchall("SELECT id FROM lessons")}
+            ghosts = [i for i in got if i not in live]
+            for j in range(0, len(ghosts), 500):
+                collection.delete(ids=ghosts[j:j + 500])
+            indexed = self._backfill_collection(collection)  # upsert — adds missing
+            if ghosts:
+                logger.info("Lessons vector hygiene: pruned %d ghost(s), reindexed %d",
+                            len(ghosts), indexed)
+            return (len(ghosts), indexed)
+        except Exception as e:
+            logger.warning("Lessons vector hygiene failed: %s", e)
+            return (0, 0)
 
     async def detect_correction(
         self,
@@ -1015,11 +1050,31 @@ class LearningEngine:
 
         max_jaccard = 0.0  # track best near-miss across both fuzzy passes
 
-        # Topic-level dedup — same topic, looser answer match
+        # Topic-level dedup — same topic, looser answer match. NOCASE + fuzzy
+        # fallback: LLM-generated topics restate the same intent with case and
+        # word variants ("Factual Art History Questions" / "Famous or factual
+        # art history questions") — exact equality let 12 near-identical
+        # lessons accumulate in a 34-lesson store (audit 2026-08-19).
         same_topic = self._db.fetchall(
-            "SELECT id, confidence, correct_answer FROM lessons WHERE topic = ?",
+            "SELECT id, confidence, correct_answer FROM lessons WHERE topic = ? COLLATE NOCASE",
             (topic,),
         )
+        if not same_topic:
+            topic_words = _normalize_words(topic) - _STOP_WORDS
+            if len(topic_words) >= 2:
+                recent = self._db.fetchall(
+                    "SELECT id, confidence, topic, correct_answer FROM lessons "
+                    "ORDER BY created_at DESC LIMIT 500"
+                )
+                fuzzy = []
+                for row in recent:
+                    tw = _normalize_words(row["topic"] or "") - _STOP_WORDS
+                    if not tw:
+                        continue
+                    tscore = len(topic_words & tw) / len(topic_words | tw)
+                    if tscore >= 0.55:
+                        fuzzy.append(row)
+                same_topic = fuzzy  # downstream answer-overlap + conflict veto still gate the merge
         if same_topic:
             new_answer_words = _normalize_words(correct_answer) - _STOP_WORDS
             if len(new_answer_words) >= 2:

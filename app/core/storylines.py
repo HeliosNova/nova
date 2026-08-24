@@ -30,10 +30,44 @@ from app.core.cross_monitor import _gather_recent_outputs, _extract_signals
 
 logger = logging.getLogger(__name__)
 
+
+async def _bg_invoke(*args, **kwargs):
+    """llm.invoke_nothink with the GPU-yield checkpoint (parity with
+    deep_research._invoke_bg, added 2026-08-19): this module's background
+    chains make many sequential 27B calls — without the checkpoint an owner
+    chat arriving mid-chain contends for the GPU for the whole run (probe:
+    350 tokens at ~2 tok/s during a consolidation cycle)."""
+    try:
+        from app.core.llm import wait_for_interactive_quiet as _w
+        waited = await _w(max_wait_s=240.0)
+        if waited:
+            logger.info("[gpu-yield] %s yielded to chat for %.0fs", __name__, waited)
+    except Exception:
+        pass
+    return await llm.invoke_nothink(*args, **kwargs)
+
+
 # How far back to scan monitor outputs for developments.
 _WINDOW_HOURS = 48
 # Cap stories per cycle so the LLM passes stay bounded on a single GPU.
 _MAX_STORIES = 8
+
+# Grammar-constrained array output (Ollama `format`). Replaces the json_prefix="[{"
+# prefill that broke on Ollama 0.32.13 (the model returned a bare {object}, the
+# provider re-prepend corrupted it to "[{{…", json.loads failed → cluster
+# returned [] → "no ongoing stories" every cycle from 2026-08-15). See
+# brain_kg._KG_TRIPLES_SCHEMA for the full root-cause note.
+_STORIES_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "title": {"type": "string"},
+            "items": {"type": "array", "items": {"type": "integer"}},
+        },
+        "required": ["title", "items"],
+    },
+}
 
 
 def _story_key(title: str) -> str:
@@ -90,8 +124,10 @@ _UPDATE_PROMPT = (
     "line 'STATE: <main entity> | <short current status>' — the status in 2-6 words. "
     "Use the SAME main-entity wording each cycle so the status can be tracked. Omit "
     "the line entirely if there is no clear trackable status.\n"
-    "If — and only if — there is a clear, falsifiable near-term expectation, add a "
-    "final line 'FORECAST: <specific testable claim> | <N> days | <0.x confidence>'.\n"
+    "Then end with one final line, always present: 'FORECAST: <specific testable "
+    "claim> | <N> days | <0.x confidence>' when there is a clear falsifiable "
+    "near-term expectation (a dated event or scheduled decision usually supports "
+    "one), else exactly 'FORECAST: none'.\n"
     "If the new developments add nothing substantive, reply exactly 'NO CHANGE'."
 )
 
@@ -140,9 +176,9 @@ async def _cluster_into_stories(items: list[dict], existing_titles: list[str] | 
         )
     prompt = _CLUSTER_PROMPT.format(max_stories=_MAX_STORIES, items=numbered, existing=existing_block)
     try:
-        raw = await llm.invoke_nothink(
+        raw = await _bg_invoke(
             [{"role": "user", "content": prompt}],
-            json_mode=True, json_prefix="[{", max_tokens=700, temperature=0.2,
+            json_mode=True, json_schema=_STORIES_SCHEMA, max_tokens=700, temperature=0.2,
             # num_ctx REQUIRED (2026-08-11): 120 items × ~300 chars ≈ 20-36k chars
             # (~5-9k tokens) — far past the 4096 model default. Without it Ollama
             # silently truncated the prompt and the model returned hallucinated
@@ -291,11 +327,15 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
 
     # One LLM pass to update the narrative state + name what changed.
     try:
-        out = await llm.invoke_nothink(
+        out = await _bg_invoke(
             [{"role": "user", "content": _UPDATE_PROMPT.format(
                 title=story["title"], prior=prior_summary or "(new story — no prior state)",
                 developments=dev_text)}],
-            max_tokens=260, temperature=0.2,
+            # 300 (was 260), 2026-08-13: the FORECAST tail is now mandatory
+            # ('FORECAST: none' opt-out — the v1 optional hedge was never taken;
+            # zero storyline mints since June 29); headroom so the tail can't
+            # truncate away.
+            max_tokens=300, temperature=0.2,
         )
     except Exception as e:
         logger.warning("[Storyline] update LLM failed for %r: %s", story["title"], e)
@@ -334,8 +374,11 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
         from app.config import config as _cfg
         if getattr(_cfg, "ENABLE_FORECASTS", True):
             from app.core.forecasts import parse_and_store_forecast
-            parse_and_store_forecast(db, out, storyline_key=eff_key,
-                                     source_monitor="Storyline Tracker")
+            _fid = parse_and_store_forecast(db, out, storyline_key=eff_key,
+                                            source_monitor="Storyline Tracker")
+            if not _fid and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
+                logger.warning("[Storyline] FORECAST line present but not stored for %r "
+                               "— mint format drift?", eff_key)
     except Exception:
         pass
 
@@ -380,6 +423,25 @@ def _record(db, row, story, developments, *, summary):
             (sid, dev[:300], story["monitors"][0] if story["monitors"] else ""),
         )
     return sid
+
+
+def close_stale(db, days: int = 21) -> int:
+    """Close active storylines that haven't moved in `days` days — a thread that
+    hasn't developed in three weeks has stopped being 'ongoing'. Closing is NOT
+    deletion: the storyline + its events stay queryable, and the next development
+    flips status back to 'active' (see _record's UPDATE). Storylines were
+    previously insert/update-only with no close side (31/48 active were stale
+    >14d, 2026-08-14 audit). Runs from daily maintenance. Returns count closed."""
+    try:
+        cur = db.execute(
+            "UPDATE storylines SET status = 'closed' "
+            "WHERE status = 'active' AND last_updated < datetime('now', ?)",
+            (f"-{days} days",),
+        )
+        return cur.rowcount
+    except Exception as e:
+        logger.warning("[Storylines] close_stale failed: %s", e)
+        return 0
 
 
 def get_relevant_storylines(db, query: str, *, limit: int = 2) -> list[dict]:

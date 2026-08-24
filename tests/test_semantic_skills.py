@@ -145,14 +145,11 @@ class TestSemanticFallback:
         assert result is None
         mock_col.query.assert_not_called()
 
-    @pytest.mark.xfail(
-        reason="Config reset timing race: ENABLE_SEMANTIC_SKILL_MATCHING env var set by "
-               "_make_store + reset_config doesn't propagate reliably when a prior test "
-               "in the same session already loaded config with semantic=true. "
-               "Production behavior is correct (verified via runtime tests); this is "
-               "a test-isolation limitation, not a code bug.",
-        strict=False,
-    )
+    # xfail marker removed 2026-08-19: the "test-isolation limitation" was
+    # masking a REAL bug — _regex_match ended with an unconditional
+    # _semantic_match tail call that bypassed ENABLE_SEMANTIC_SKILL_MATCHING
+    # (and ran the semantic pass twice per query). With the tail call gone,
+    # this passes deterministically; a future regression must fail loudly.
     def test_semantic_disabled_skips_lookup(self, db, monkeypatch):
         """With ENABLE_SEMANTIC_SKILL_MATCHING=false, semantic path never runs."""
         store = _make_store(db, monkeypatch, semantic=False)
@@ -334,7 +331,11 @@ class TestSemanticDedupGuard:
         return col
 
     def test_duplicate_above_threshold_rejected(self, db, monkeypatch):
-        """create_skill() returns None when similarity ≥ threshold."""
+        """create_skill() returns None when similarity ≥ _SKILL_DUP_SIM (0.94).
+
+        0.96 = the true-duplicate tier (a reworded same-intent skill measures
+        0.968 doc-vs-doc; distinct siblings top out at 0.914 — see the
+        _SKILL_DUP_SIM calibration note in skills.py, 2026-08-18)."""
         store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
         # Plant an existing skill in the DB so the name-check doesn't short-circuit
         db.execute(
@@ -342,7 +343,7 @@ class TestSemanticDedupGuard:
             "VALUES (?, ?, ?, ?)",
             ("existing_skill", r"existing trigger (\w+)", "[]", 0.7),
         )
-        mock_col = self._dup_collection(similarity=0.92, existing_id=1)
+        mock_col = self._dup_collection(similarity=0.96, existing_id=1)
         store._chroma_collection = mock_col
 
         result = store.create_skill(
@@ -354,6 +355,27 @@ class TestSemanticDedupGuard:
         # Nothing new should have been inserted
         rows = db.fetchall("SELECT * FROM skills")
         assert len(rows) == 1  # only the pre-existing one
+
+    def test_sibling_skill_below_dup_bar_accepted(self, db, monkeypatch):
+        """A DISTINCT sibling skill (0.92 — scaffold-inflated but different
+        intent) must NOT be swallowed as a duplicate: at the old 0.55 bar the
+        eval harness seeded 6 skills and only 1 survived, silently holding
+        semantic-match recall at 25%."""
+        store = _make_store(db, monkeypatch, semantic=True, threshold=0.65)
+        db.execute(
+            "INSERT INTO skills (name, trigger_pattern, steps, success_rate) "
+            "VALUES (?, ?, ?, ?)",
+            ("existing_skill", r"existing trigger (\w+)", "[]", 0.7),
+        )
+        mock_col = self._dup_collection(similarity=0.92, existing_id=1)
+        store._chroma_collection = mock_col
+
+        result = store.create_skill(
+            name="distinct_sibling_skill",
+            trigger_pattern=r"related but different trigger (\w+)",
+            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
+        )
+        assert result is not None, "Distinct sibling below the dup bar must be accepted"
 
     def test_unique_below_threshold_accepted(self, db, monkeypatch):
         """create_skill() succeeds when similarity is below threshold."""
@@ -487,3 +509,140 @@ class TestSemanticTopicalGuard:
     def test_empty_query_rejected(self):
         from app.core.skills import _query_skill_topically_related as ok
         assert ok("", "any_skill", "pattern") is False
+
+
+class TestSemanticGateRedesign2026_08_18:
+    """The 2026-06-13 gate held semantic-match eval recall at 25%: it demanded a
+    lexical anchor AFTER genericizing the very domain nouns paraphrases share
+    (price/cost/today/latest/convert), so every true paraphrase was vetoed
+    (live-traced: all 5 failing eval tasks died at the gate, embedder sims were
+    0.65-0.77). Redesign: computational-intent veto (the real FP signature) +
+    3-char lexical anchor + strong-sim (>=0.70) bypass."""
+
+    def _ok(self, *a, **k):
+        from app.core.skills import _query_skill_topically_related
+        return _query_skill_topically_related(*a, **k)
+
+    # -- the 5 real eval paraphrases, at their live-measured similarities --
+    def test_crypto_paraphrase_kept_via_btc_anchor(self):
+        # "btc" (3 chars) now anchors — floor was 4.
+        assert self._ok("how much does BTC cost right now", "Eval: Crypto Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*price\s+of\s+(?:bitcoin|btc|ethereum|eth)\b",
+                        similarity=0.769) is True
+
+    def test_stock_paraphrase_kept_via_price_anchor(self):
+        # "price" is no longer genericized away.
+        assert self._ok("NVDA share price today", "Eval: Stock Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*stock\s+price\s+of\s+\w+",
+                        similarity=0.649) is True
+
+    def test_weather_paraphrase_kept_via_strong_sim(self):
+        # Zero shared tokens ("rain/forecast" vs "weather") — strong sim admits.
+        assert self._ok("will it rain today, what is the forecast outside",
+                        "Eval: Weather Probe", r"(?i)\beval-probe[:\s]+.*weather\s+in\s+\w+",
+                        similarity=0.740) is True
+
+    def test_units_paraphrase_kept_via_strong_sim(self):
+        assert self._ok("10km in miles please", "Eval: Unit Convert Probe",
+                        r"(?i)\beval-probe[:\s]+.*convert\s+\d+\s*(?:km|mi|kg|lb)",
+                        similarity=0.763) is True
+
+    def test_news_paraphrase_kept_via_strong_sim(self):
+        assert self._ok("show me recent AI developments and breakthroughs",
+                        "Eval: News Probe", r"(?i)\beval-probe[:\s]+.*latest\s+news\s+on\s+\w+",
+                        similarity=0.730) is True
+
+    # -- FP protection still holds --
+    def test_bat_and_ball_rejected_even_at_strong_sim(self):
+        # Computational veto fires BEFORE the strong-sim bypass.
+        q = ("A bat and ball cost 1.10 total. The bat costs 1.00 more than the "
+             "ball. The shop doubles every price. What is the new price difference?")
+        assert self._ok(q, "real_time_price_lookup",
+                        r"(?i)\b(?:current|latest)\b.{0,80}\b(?:price|cost)\b",
+                        similarity=0.90) is False
+
+    def test_percent_math_rejected(self):
+        assert self._ok("what is 15% of 240 dollars", "Eval: Stock Price Probe",
+                        "stock price", similarity=0.80) is False
+
+    def test_weak_sim_no_anchor_still_rejected(self):
+        # Below the strong-sim bypass with no shared token -> still vetoed.
+        assert self._ok("what is the weather tomorrow", "real_time_price_lookup",
+                        "current price", similarity=0.60) is False
+
+    def test_cross_domain_scaffold_fp_rejected(self):
+        # Live-measured FP: a NEWS query scored 0.703 vs the CRYPTO skill purely
+        # via shared doc scaffolding ("Eval: ... Probe: eval-probe ...").
+        # The bypass sits at 0.72 to exclude exactly this band; the true
+        # zero-overlap paraphrases measure 0.730-0.763.
+        assert self._ok("show me recent AI developments and breakthroughs",
+                        "Eval: Crypto Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*price\s+of\s+(?:bitcoin|btc|ethereum|eth)\b",
+                        similarity=0.703) is False
+
+    def test_skill_dup_bar_is_strict(self):
+        # create_skill's duplicate check must NOT reuse the loose query bar —
+        # sibling skills sharing scaffolding collapsed into one at 0.55.
+        from app.core.skills import _SKILL_DUP_SIM
+        from app.config import config
+        assert _SKILL_DUP_SIM >= 0.80
+        assert _SKILL_DUP_SIM > config.SKILL_SEMANTIC_THRESHOLD
+
+    def test_typo_fuzzy_anchor_admits(self):
+        # "wether" (typo) ~ "weather" at SequenceMatcher ratio 0.92 — the fuzzy
+        # anchor admits it even below the strong-sim bypass.
+        assert self._ok("What is the wether like in San Francisco today",
+                        "Eval: Weather Probe",
+                        r"(?i)\beval-probe[:\s]+.*weather\s+in\s+\w+",
+                        similarity=0.65) is True
+
+    def test_fuzzy_anchor_needs_close_tokens(self):
+        # Distant tokens must not fuzzy-anchor ("rain" vs "price" etc.).
+        assert self._ok("will it rain in the city", "real_time_price_lookup",
+                        "current price of things", similarity=0.60) is False
+
+
+class TestNegationScoping2026_08_18:
+    """Scoped negation: tokens in a rejection cue's window can't anchor, and a
+    skill whose domain appears ONLY under negation is rejected — lifts the
+    suite's pinned negation limitation."""
+
+    def _ok(self, *a, **k):
+        from app.core.skills import _query_skill_topically_related
+        return _query_skill_topically_related(*a, **k)
+
+    def test_negated_domain_rejected(self):
+        # The eval negation probe: crypto/stock skill must NOT fire.
+        assert self._ok("I do NOT want today's Bitcoin price — just the historical low",
+                        "Eval: Crypto Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*price\s+of\s+(?:bitcoin|btc|ethereum|eth)\b",
+                        similarity=0.74) is False
+
+    def test_negation_of_other_domain_keeps_match(self):
+        # Mixed intent: weather is negated, bitcoin is the live ask.
+        assert self._ok("I don't need the weather forecast, what's the bitcoin price",
+                        "Eval: Crypto Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*price\s+of\s+(?:bitcoin|btc|ethereum|eth)\b",
+                        similarity=0.70) is True
+
+    def test_negated_weather_rejected_for_weather_skill(self):
+        # Same mixed query, weather skill side: its only anchors are negated.
+        assert self._ok("I don't need the weather forecast, what's the bitcoin price",
+                        "Eval: Weather Probe",
+                        r"(?i)\beval-probe[:\s]+.*weather\s+in\s+\w+",
+                        similarity=0.74) is False
+
+    def test_inability_phrasing_still_matches(self):
+        # "can't find" is a frustrated REQUEST, not a rejection — must match.
+        assert self._ok("I can't find the bitcoin price anywhere",
+                        "Eval: Crypto Price Probe",
+                        r"(?i)\beval-probe[:\s]+.*price\s+of\s+(?:bitcoin|btc|ethereum|eth)\b",
+                        similarity=0.70) is True
+
+    def test_unrelated_negation_does_not_block_bypass(self):
+        # Negation about something else entirely; zero-overlap paraphrase still
+        # rides the strong-sim bypass.
+        assert self._ok("don't be verbose — will it rain today, what's the outlook outside",
+                        "Eval: Weather Probe",
+                        r"(?i)\beval-probe[:\s]+.*weather\s+in\s+\w+",
+                        similarity=0.74) is True

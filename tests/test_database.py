@@ -298,13 +298,22 @@ class TestMigration22MonitorResultsIndex:
 
 
 class TestEventLoopGuardrail:
-    """SafeDB warns (once per statement) when a sync call runs on the event loop."""
+    """SafeDB warns (once per statement) when a sync call runs on the event loop.
+
+    Grace note (audit 2026-08-23): the tripwire is gated by SafeDB._startup_grace
+    (silent during app startup; main.py flips it off at 'Nova ready'). These
+    tests exercise STEADY-STATE behavior, so grace is disabled for their
+    duration and restored after.
+    """
 
     def setup_method(self):
         SafeDB._loop_thread_warned.clear()
+        self._prior_grace = SafeDB._startup_grace
+        SafeDB._startup_grace = False
 
     def teardown_method(self):
         SafeDB._loop_thread_warned.clear()
+        SafeDB._startup_grace = self._prior_grace
 
     def test_warns_on_event_loop(self, db, caplog):
         import asyncio

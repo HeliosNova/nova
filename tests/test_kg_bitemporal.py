@@ -38,8 +38,7 @@ class TestMigration:
         must get superseded_at = valid_to on first KG init."""
         # Pre-populate a row that looks like it was superseded pre-migration:
         # KG hasn't been instantiated yet, so the table doesn't exist. Init once
-        # to create it, then manually wipe the new column and re-init to trigger
-        # the backfill path.
+        # to create it, then seed the pre-migration-shaped row.
         KnowledgeGraph(db)
         db.execute(
             "INSERT INTO kg_facts (subject, predicate, object, confidence, source, "
@@ -47,10 +46,21 @@ class TestMigration:
             "VALUES ('alice', 'lives_in', 'paris', 0.9, 'user', "
             "'2026-01-01 00:00:00', '2026-02-01 00:00:00', NULL)"
         )
-        # Re-init to trigger the backfill UPDATE
-        KnowledgeGraph(db)
-        row = db.fetchone("SELECT superseded_at FROM kg_facts WHERE subject='alice'")
-        assert row["superseded_at"] == "2026-02-01 00:00:00"
+        # The backfill runs on the FIRST construction per SafeDB instance (the
+        # schema-ensure memo, audit 2026-08-23, skips repeat DDL in-process).
+        # Production migrations happen at RESTART — model that with a fresh
+        # SafeDB on the same file, whose memo is empty.
+        from app.database import SafeDB
+
+        restarted = SafeDB(db._db_path)
+        try:
+            KnowledgeGraph(restarted)
+            row = restarted.fetchone(
+                "SELECT superseded_at FROM kg_facts WHERE subject='alice'"
+            )
+            assert row["superseded_at"] == "2026-02-01 00:00:00"
+        finally:
+            restarted.close()
 
     def test_index_created(self, db):
         KnowledgeGraph(db)

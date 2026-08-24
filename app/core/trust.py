@@ -71,6 +71,12 @@ class TrustManager:
         self._success_delta = success_delta
         self._failure_delta = failure_delta
 
+        # Schema-ensure memo (audit 2026-08-23): table DDL + singleton-row
+        # bootstrap + legacy-reset are all one-time per process; re-running
+        # them per construction put write-lock work on the event-loop thread.
+        if getattr(db, "schema_ensured", lambda _t: False)("trust_scores"):
+            return
+
         for stmt in self._SCHEMA.strip().split(";"):
             stmt = stmt.strip()
             if stmt:
@@ -99,6 +105,7 @@ class TrustManager:
                     starting_score, old_deltas["c"],
                 )
             logger.info("Trust: reset inflated score (was 100) to %.0f", starting_score)
+        getattr(db, "mark_schema_ensured", lambda _t: None)("trust_scores")
 
     def get_score(self) -> float:
         """Get current trust score (0-100)."""

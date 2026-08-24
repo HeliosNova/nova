@@ -91,7 +91,28 @@ class DaemonOrchestrator:
             return
         self._running = True
         self._task = asyncio.create_task(self._loop())
+        self._task.add_done_callback(self._on_task_done)
         logger.info("[Daemon] Orchestrator started (tick=%ds)", DAEMON_TICK)
+
+    def _on_task_done(self, task: "asyncio.Task") -> None:
+        """The loop is meant to run until stop(). If it ends while we still
+        expect it up, it died on an unhandled exception (the per-tick try/except
+        only guards _tick) — nothing else watches the daemon (the KG dead-man
+        switches live in the heartbeat loop), so proactive dream/curiosity/goal
+        work would silently stop. Log loudly and respawn; _loop's leading 30s
+        sleep bounds any crash-loop to one respawn / 30s (audit 2026-08-22)."""
+        if task.cancelled() or not self._running:
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.error("[Daemon] loop died unhandled: %s — respawning", exc, exc_info=exc)
+        else:
+            logger.error("[Daemon] loop exited unexpectedly while running — respawning")
+        try:
+            self._task = asyncio.get_running_loop().create_task(self._loop())
+            self._task.add_done_callback(self._on_task_done)
+        except Exception as e:  # pragma: no cover - respawn is best-effort
+            logger.error("[Daemon] respawn failed: %s", e)
 
     async def stop(self):
         """Stop the daemon loop."""
@@ -407,12 +428,36 @@ class DaemonOrchestrator:
             )
             return
 
+        # A capability-gap goal's job is to INVESTIGATE the failing-query batch —
+        # the (successful) investigation IS the review. Mark the matching gaps
+        # reviewed so (a) the metric below can actually improve (execute_goal runs
+        # ephemerally and writes nothing, so NOTHING marked them reviewed → every
+        # gap goal failed 'no metric improvement' by construction) and (b) the same
+        # batch stops re-clustering into a new goal forever. A still-missing
+        # capability re-surfaces as fresh unreviewed gaps on the next failure
+        # (audit 2026-08-23).
+        if ctx.get("source") == "capability_gap_cluster":
+            kw = (ctx.get("keyword") or "").strip().lower()
+            if kw:
+                await asyncio.to_thread(
+                    self._db.execute,
+                    "UPDATE capability_gaps SET reviewed = 1 "
+                    "WHERE reviewed = 0 AND LOWER(query) LIKE ?",
+                    (f"%{kw}%",),
+                )
+
         # Verify the action actually moved the underlying metric. If the goal
         # was about a capability gap and the gap count didn't decrease, this
         # was cosmetic — mark failed so it doesn't pollute the "completed"
         # bucket and so the deriver can re-attempt with a better strategy.
+        # before_metric > 0: a zero baseline cannot regress and must not fail —
+        # every recurring_curiosity goal was failed by construction on 0 >= 0
+        # (the hourly Curiosity Research monitor drains the pending items long
+        # before the daemon's pursue tick, so the baseline was already zero;
+        # the work the goal was minted for is done — a successful execution
+        # completes). Audit 2026-08-23.
         after_metric, _ = await asyncio.to_thread(_snapshot_goal_metric, self._db, ctx)
-        if before_metric is not None and after_metric is not None and after_metric >= before_metric:
+        if before_metric is not None and after_metric is not None and before_metric > 0 and after_metric >= before_metric:
             reason = (
                 f"verification: {metric_query} did not improve "
                 f"(before={before_metric} after={after_metric})"

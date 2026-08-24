@@ -180,7 +180,11 @@ class TestValidLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
 
 # ===========================================================================
@@ -204,7 +208,11 @@ class TestMalformedLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
     @pytest.mark.asyncio
     async def test_invalid_regex_rejected(self, db, monkeypatch):
@@ -225,7 +233,11 @@ class TestMalformedLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
     @pytest.mark.asyncio
     async def test_unknown_tool_in_steps_rejected(self, db, monkeypatch):
@@ -248,7 +260,11 @@ class TestMalformedLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
     @pytest.mark.asyncio
     async def test_llm_exception_does_not_crash(self, db, monkeypatch):
@@ -265,7 +281,11 @@ class TestMalformedLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
     @pytest.mark.asyncio
     async def test_empty_trigger_pattern_rejected(self, db, monkeypatch):
@@ -286,7 +306,11 @@ class TestMalformedLLMResponse:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
 
 # ===========================================================================
@@ -313,7 +337,11 @@ class TestBroadPatternRejection:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
     @pytest.mark.asyncio
     async def test_single_word_pattern_rejected(self, db, monkeypatch):
@@ -334,7 +362,11 @@ class TestBroadPatternRejection:
             await maybe_extract_skill("hello", _make_tool_results(2), "answer", skills)
 
         rows = db.fetchall("SELECT * FROM skills")
-        assert len(rows) == 0
+        # New contract (migration 30): the strict EXEC skill is rejected, but a
+        # multi-tool interaction is memorialized as a PROCEDURE skill instead
+        # of being discarded.
+        assert all(r["kind"] == "procedure" for r in rows)
+        assert not any((r["trigger_pattern"] or "") for r in rows)
 
 
 # ===========================================================================
@@ -562,7 +594,10 @@ class TestCaptureGroupMismatchGuard:
 
             await maybe_extract_skill("bitcoin price", _make_tool_results(2), "BTC is $70k", skills)
 
-        assert len(db.fetchall("SELECT * FROM skills")) == 0
+        # Strict exec skill blocked; multi-tool interaction lands as a
+        # procedure skill instead (migration 30 contract).
+        rows = db.fetchall("SELECT * FROM skills")
+        assert all(r["kind"] == "procedure" for r in rows)
 
 
 # ===========================================================================

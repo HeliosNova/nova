@@ -182,7 +182,9 @@ async def _synthesise(question: str, evidence: list[dict]) -> str:
         out = await invoke_nothink(
             [{"role": "user", "content": _SYNTHESIS_PROMPT.format(
                 question=question, evidence="\n".join(blocks))}],
-            max_tokens=600, temperature=0.2,
+            # 900, was 600: this is the user-visible tool answer — a mid-sentence
+            # cut here surfaces directly in chat (truncation tripwire 2026-08-19).
+            max_tokens=900, temperature=0.2,
         )
     except Exception as e:
         logger.warning("[SearchAgent] synth failed: %s", e)

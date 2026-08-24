@@ -57,6 +57,12 @@ CANONICAL_PREDICATES = frozenset({
     # acquire", "who partnered with Y", "who sued Z").
     "acquired", "owns", "subsidiary_of", "invested_in", "partnered_with",
     "competes_with", "supplies", "sued", "sanctioned", "launched", "regulates",
+    # Self-distilled principles (principles.distill) — the durable facts that
+    # survive lesson decay. Canonical so they are NOT flattened to related_to,
+    # which had made distilled principles indistinguishable from generic
+    # associations in retrieval (audit 2026-08-23). Functional (not multi-valued):
+    # a refined principle for a topic supersedes the prior one.
+    "principle_says", "principle_consensus",
 })
 
 # Predicates where a subject legitimately holds MANY simultaneous objects, so a
@@ -400,11 +406,20 @@ _DATE_FRAGMENT_RE = re.compile(
 # dominant surviving junk class in the live KG (full-system exploration 2026-07-09:
 # top-retrieved related_to facts were "Match ~ 1:00 AM UTC", "GLM-5.2 ~ 1 hour 10
 # minutes", "training centers ~ 10,000 repetitions per skill").
+_UNDERSCORE_NUMERIC_RE = re.compile(r"^[<>~≈]?\s*\d[\d,.]*_")
 _QUANTITY_ENDPOINT_RE = re.compile(
     r"^(?:>|~|<|≈|over|under|more\s+than|at\s+least|nearly|about|around|roughly|"
     r"approximately)?\s*(?:"
+    # money / counts / percentages (trailing (?:\b|$) so symbol units like %
+    # and end-of-string terminate correctly — the plain \b never fired after %)
     r"\$?[€£]?\d[\d,.]*\s*(?:billion|million|trillion|thousand|bn|mn|k|%|percent|"
-    r"units?|repetitions?|packages?|points?|times|teams?|people|users?)\b"
+    r"units?|repetitions?|packages?|points?|times|teams?|people|users?)(?:\b|$)"
+    # physical measurements — a bare number+unit is an attribute value that lost
+    # its predicate ("Swift Observatory ~ 363 miles"), junk AS a related_to edge
+    r"|\d[\d,.]*\s*(?:miles?|kilometers?|km|meters?|metres?|feet|foot|ft|inch(?:es)?|"
+    r"yards?|pounds?|lbs?|kg|kilograms?|grams?|tons?|tonnes?|mph|kph|acres?|hectares?|"
+    r"barrels?|bpd|watts?|kilowatts?|megawatts?|gigawatts?|[kmg]w|volts?|"
+    r"[kmgt]b|gigabytes?|terabytes?|megabytes?|[kmg]hz|degrees?|°[cf]?)(?:\b|$)"
     r"|\d{1,2}:\d{2}\s*(?:[ap]\.?m\.?)?\s*(?:utc|gmt|est|pst|cet|cst|edt|pdt|bst)?\b"
     r"|\d[\d,.]*\s*(?:second|minute|hour|day|week|month|year|decade)s?\b"
     r")", re.IGNORECASE,
@@ -502,6 +517,12 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
             return True
         if _EMBEDDED_EVENT_DATE_RE.search(s) or _EMBEDDED_EVENT_DATE_RE.search(o):
             return True
+        # Underscore-mangled numeric artifacts ("20_percent",
+        # "2.6_million_barrels_per_day") — a digit immediately joined by an
+        # underscore is a machine-mangled attribute value, never a real
+        # entity (2026-08-14). High-precision: no legitimate name has this.
+        if _UNDERSCORE_NUMERIC_RE.match(s) or _UNDERSCORE_NUMERIC_RE.match(o):
+            return True
 
     return False
 
@@ -565,6 +586,13 @@ class KnowledgeGraph:
 
     def __init__(self, db):
         self._db = db
+        # Schema-ensure memo (audit 2026-08-23): this DDL block re-ran on every
+        # construction — and KnowledgeGraph is constructed repeatedly in async
+        # contexts, putting write-lock DDL on the event-loop thread (live: x8/2h).
+        # First construction per SafeDB runs it; later ones skip to _finish_init.
+        if getattr(db, "schema_ensured", lambda _t: False)("kg"):
+            self._finish_init()
+            return
         # Create table if not exists (safe to call multiple times)
         for stmt in self._SCHEMA.strip().split(";"):
             stmt = stmt.strip()
@@ -626,7 +654,11 @@ class KnowledgeGraph:
             "UPDATE kg_facts SET superseded_at = valid_to "
             "WHERE superseded_at IS NULL AND valid_to IS NOT NULL"
         )
+        getattr(db, "mark_schema_ensured", lambda _t: None)("kg")
+        self._finish_init()
 
+    def _finish_init(self) -> None:
+        """Non-DDL instance state — runs on every construction."""
         # Insert counter for batched pruning (only prune every 50 inserts)
         self._inserts_since_prune = 0
         # Lock for concurrent supersession safety
@@ -635,6 +667,33 @@ class KnowledgeGraph:
         self._collection = None
 
     # --- ChromaDB vector collection for semantic KG search ---
+
+    async def prune_stale_vectors(self) -> int:
+        """Remove vector entries for facts that are no longer live
+        (superseded / expired / quarantined). The index had NO lifecycle
+        hygiene: deletes and supersessions never touched their vectors, and it
+        grew to 3× the live set in two months (15,018 vectors vs 5,023 live
+        facts, 2026-08-14) — every top-k neighborhood was ~2/3 dead rows,
+        silently diluting paraphrase recall. Runs from daily maintenance."""
+        col = self._get_collection()
+        if col is None:
+            return 0
+
+        def _sync() -> int:
+            # Snapshot the collection BEFORE reading the live set: a fact banked
+            # between the two reads is then absent from `got` (never a delete
+            # candidate) rather than absent from `live` (wrongly deleted while
+            # live). The inverted order merely leaves a stale vector one more day.
+            got = col.get(include=[])
+            live = {str(r["id"]) for r in self._db.fetchall(
+                "SELECT id FROM kg_facts WHERE superseded_at IS NULL "
+                "AND valid_to IS NULL AND quarantined = 0")}
+            stale = [i for i in (got.get("ids") or []) if i not in live]
+            for i in range(0, len(stale), 500):
+                col.delete(ids=stale[i:i + 500])
+            return len(stale)
+
+        return await asyncio.to_thread(_sync)
 
     def _get_collection(self):
         """Lazy-init ChromaDB collection for semantic KG fact search."""
@@ -654,9 +713,13 @@ class KnowledgeGraph:
 
     def _backfill_collection(self, collection) -> int:
         """Populate `collection` from current KG facts, unconditionally.
-        Shared by reindex_kg_facts (guarded) and the embedder-rebuild path."""
+        Shared by reindex_kg_facts (guarded) and the embedder-rebuild path.
+        Strict live-set filter (2026-08-14): indexing merely valid_to-IS-NULL
+        rows let superseded/quarantined facts into the index — combined with
+        no lifecycle hygiene the index grew to 3× the live set."""
         all_rows = self._db.fetchall(
-            "SELECT id, subject, predicate, object FROM kg_facts WHERE valid_to IS NULL"
+            "SELECT id, subject, predicate, object FROM kg_facts "
+            "WHERE superseded_at IS NULL AND valid_to IS NULL AND quarantined = 0"
         )
         if not all_rows:
             return 0
@@ -875,10 +938,17 @@ class KnowledgeGraph:
             )
             if corroborated and (existing["quarantined"] or existing["trust"] < 0.9):
                 new_trust = max(float(existing["trust"]), min(0.9, float(existing["trust"]) + 0.2))
+                was_quarantined = bool(existing["quarantined"])
                 self._db.execute(
                     "UPDATE kg_facts SET quarantined = 0, trust = ? WHERE id = ?",
                     (new_trust, existing["id"]),
                 )
+                # Re-index on release: prune_stale_vectors deletes a jailed fact's
+                # vector, so a fact corroborated >1 day after banking would be
+                # invisible to paraphrase retrieval without this (add_to_vector is
+                # an idempotent upsert).
+                if was_quarantined:
+                    self._add_to_vector(existing["id"], subject, predicate, object_)
             if confidence > existing["confidence"]:
                 self._db.execute(
                     "UPDATE kg_facts SET confidence = ?, source = ?, "
@@ -1114,11 +1184,18 @@ class KnowledgeGraph:
                     [{"role": "user", "content": prompt}],
                     json_mode=True,
                     json_prefix="{",
-                    max_tokens=50,
+                    # 80 (was 50), 2026-08-14: the truncation tripwire caught
+                    # the 9B rambling past 50 tokens — the JSON verdict was cut
+                    # mid-object, extraction failed, and the silent `continue`
+                    # below left BOTH conflicting facts live with no trace.
+                    max_tokens=80,
                     temperature=0.1,
                 )
                 obj = llm.extract_json_object(raw)
                 if not obj:
+                    logger.warning(
+                        "KG contradiction judge returned unparseable verdict "
+                        "(%r vs %r) — both facts stay live", old_object[:60], new_object[:60])
                     continue
                 keep = str(obj.get("keep", "both")).upper()
                 decisions.append((conflict, keep))
@@ -1127,6 +1204,15 @@ class KnowledgeGraph:
                 # that's a silent current-state contradiction, so surface it (was
                 # DEBUG-only, invisible to the operator).
                 logger.warning("KG contradiction check failed (allowing both): %s", e)
+
+        # Keyed judge identity (TOKI, arXiv:2606.06240, adopted 2026-08-13):
+        # replay consistency of a memory store REQUIRES logging which judge
+        # adjudicated each contradiction — an unlabeled belief revision cannot
+        # be audited or replayed. The losing row carries the annotation in its
+        # provenance; a keep=A rejection has no stored row to annotate, so the
+        # judge is named in the log line instead.
+        from app.config import config as _cfg
+        _judge = (getattr(_cfg, "LLM_MODEL", "") or "llm").strip()
 
         # Phase 3: Re-read and write under lock — verify data hasn't gone stale
         def _sync_resolve() -> bool | None:
@@ -1142,12 +1228,17 @@ class KnowledgeGraph:
                         continue
                     now = _now_iso()
                     self._db.execute(
-                        "UPDATE kg_facts SET valid_to = ? WHERE id = ? AND valid_to IS NULL",
-                        (now, conflict["id"]),
+                        "UPDATE kg_facts SET valid_to = ?, "
+                        "provenance = COALESCE(provenance, '') || ? "
+                        "WHERE id = ? AND valid_to IS NULL",
+                        (now, f" | adjudicated:{_judge}@{now[:10]} verdict:superseded",
+                         conflict["id"]),
                     )
-                    logger.info("KG contradiction resolved: superseded old '%s' for new '%s'", conflict["object"], new_object)
+                    logger.info("KG contradiction resolved by %s: superseded old '%s' for new '%s'",
+                                _judge, conflict["object"], new_object)
                 elif keep == "A":
-                    logger.info("KG contradiction resolved: kept old '%s', rejected new '%s'", conflict["object"], new_object)
+                    logger.info("KG contradiction resolved by %s: kept old '%s', rejected new '%s'",
+                                _judge, conflict["object"], new_object)
                     return False
             return None
 
@@ -2036,14 +2127,50 @@ class KnowledgeGraph:
         """
         async with self._write_lock:
             def _do():
+                rows = self._db.fetchall(
+                    "SELECT id, subject, predicate, object FROM kg_facts "
+                    "WHERE COALESCE(quarantined,0)=1 AND valid_to IS NULL "
+                    "AND superseded_at IS NULL AND created_at < datetime('now', ?) LIMIT ?",
+                    (f"-{days} days", max_count),
+                )
+                if not rows:
+                    return 0
+                ids = [r["id"] for r in rows]
+                placeholders = ",".join("?" for _ in ids)
+                self._db.execute(
+                    "UPDATE kg_facts SET quarantined = 0, "
+                    "trust = MIN(COALESCE(trust,0.5), 0.6) "
+                    f"WHERE id IN ({placeholders})",
+                    ids,
+                )
+                # Re-index released facts — prune_stale_vectors deleted their
+                # vectors while jailed; without this the released fact is
+                # invisible to paraphrase retrieval (memory-poisoning literature's
+                # corroborate-before-inject only helps if the released fact is
+                # actually findable again).
+                for r in rows:
+                    self._add_to_vector(r["id"], r["subject"], r["predicate"], r["object"])
+                return len(ids)
+            return await asyncio.to_thread(_do)
+
+    async def prune_dead_aliases(self) -> int:
+        """Delete entity aliases whose canonical no longer has any LIVE fact.
+        kg_entity_aliases was insert-only (INSERT OR IGNORE) and grew to ~64%
+        dead (2026-08-14 audit), so alias expansion resolved into a mostly-dead
+        namespace. An alias is dead when its canonical is neither subject nor
+        object of a live (unsuperseded, unexpired, unquarantined) fact. Runs from
+        daily maintenance. Returns count pruned."""
+        async with self._write_lock:
+            def _do():
                 cur = self._db.execute(
-                    "UPDATE kg_facts SET quarantined = 0, trust = MIN(COALESCE(trust,0.5), 0.6) "
-                    "WHERE COALESCE(quarantined,0) = 1 AND valid_to IS NULL "
-                    "AND superseded_at IS NULL AND created_at < datetime('now', ?) "
-                    "AND id IN (SELECT id FROM kg_facts WHERE COALESCE(quarantined,0)=1 "
-                    "           AND valid_to IS NULL AND superseded_at IS NULL "
-                    "           AND created_at < datetime('now', ?) LIMIT ?)",
-                    (f"-{days} days", f"-{days} days", max_count),
+                    "DELETE FROM kg_entity_aliases WHERE canonical NOT IN ("
+                    "  SELECT subject FROM kg_facts WHERE subject IS NOT NULL "
+                    "    AND valid_to IS NULL AND superseded_at IS NULL "
+                    "    AND COALESCE(quarantined,0)=0 "
+                    "  UNION "
+                    "  SELECT object FROM kg_facts WHERE object IS NOT NULL "
+                    "    AND valid_to IS NULL AND superseded_at IS NULL "
+                    "    AND COALESCE(quarantined,0)=0)"
                 )
                 return cur.rowcount
             return await asyncio.to_thread(_do)

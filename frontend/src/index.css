@@ -2,31 +2,42 @@
 @plugin "@tailwindcss/typography";
 
 @theme {
-  --color-nova-bg: #0a0a0f;
-  --color-nova-surface: #12121a;
-  --color-nova-surface-elevated: #1a1a26;
-  --color-nova-border: #1e1e2e;
-  --color-nova-border-bright: #2a2a3e;
-  --color-nova-accent: #6366f1;
-  --color-nova-accent-hover: #4f46e5;
-  --color-nova-glow: #818cf8;
-  --color-nova-text: #e2e4f0;
-  --color-nova-text-dim: #64668a;
-  --color-nova-success: #34d399;
-  --color-nova-warning: #fbbf24;
-  --color-nova-error: #f87171;
+  /* WARM INTELLIGENCE CONSOLE (2026-08-21 rethink — the cool-purple boxy look
+     read as generic admin/HR software). Near-black neutral ink, warm
+     paper-white text (like a brief under a desk lamp), a single EMBER signal
+     used sparingly, and verdict green/coral that carry meaning. Boxes are
+     replaced by hairline rules throughout — hierarchy comes from type + space. */
+  --color-nova-bg: #0b0b0d;              /* ink */
+  --color-nova-surface: #121214;         /* barely-raised panel (used rarely) */
+  --color-nova-surface-elevated: #17181b;
+  --color-nova-border: #242320;          /* warm hairline */
+  --color-nova-border-bright: #38362f;
+  --color-nova-accent: #e08a3c;          /* ember — the one signal, used sparingly */
+  --color-nova-accent-hover: #f0a057;
+  --color-nova-glow: #f2b878;
+  --color-nova-text: #eae7df;            /* warm paper white */
+  --color-nova-text-dim: #b3ae9e;        /* brighter secondary — legible even at /50-/60 opacity over the near-black + cosmos (owner: text was too dim) */
+  --color-nova-success: #79d89b;         /* verdict: hit */
+  --color-nova-warning: #e8b862;
+  --color-nova-error: #e8776a;           /* verdict: miss */
 
-  /* Glassmorphism */
-  --nova-glass-bg: rgba(18, 18, 26, 0.7);
-  --nova-glass-border: rgba(99, 102, 241, 0.08);
+  /* Type roles (2026-08-21 design pass): display has a point of view, mono is
+     the instrument-reading layer for all data/timestamps/counts. */
+  --font-display: 'Space Grotesk Variable', 'Inter Variable', system-ui, sans-serif;
+  --font-body: 'Inter Variable', 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono Variable', ui-monospace, 'SF Mono', monospace;
+
+  /* Glassmorphism — warm ink tint, ember hairline (was cold indigo) */
+  --nova-glass-bg: rgba(18, 18, 20, 0.6);
+  --nova-glass-border: rgba(224, 138, 60, 0.1);
   --nova-glass-blur: 16px;
 
-  /* Shadows */
+  /* Shadows — glow is ember now, not indigo */
   --shadow-nova-sm: 0 1px 3px rgba(0, 0, 0, 0.3);
   --shadow-nova-md: 0 4px 12px rgba(0, 0, 0, 0.4);
   --shadow-nova-lg: 0 8px 30px rgba(0, 0, 0, 0.5);
-  --shadow-nova-glow: 0 0 20px rgba(99, 102, 241, 0.15);
-  --shadow-nova-glow-strong: 0 0 30px rgba(99, 102, 241, 0.25);
+  --shadow-nova-glow: 0 0 20px rgba(224, 138, 60, 0.16);
+  --shadow-nova-glow-strong: 0 0 30px rgba(224, 138, 60, 0.26);
 
   /* Transitions */
   --ease-nova: cubic-bezier(0.25, 0.1, 0.25, 1);
@@ -63,8 +74,8 @@
     50% { opacity: 0.1; }
   }
   @keyframes glow-pulse {
-    0%, 100% { box-shadow: 0 0 8px rgba(99, 102, 241, 0.2); }
-    50% { box-shadow: 0 0 20px rgba(99, 102, 241, 0.4); }
+    0%, 100% { box-shadow: 0 0 8px rgba(224, 138, 60, 0.2); }
+    50% { box-shadow: 0 0 20px rgba(224, 138, 60, 0.4); }
   }
   @keyframes orb-spin {
     from { transform: rotate(0deg); }
@@ -106,10 +117,75 @@
 }
 
 body {
-  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  font-family: 'Inter Variable', 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  /* Inter OpenType features for the crisp, engineered look (contextual
+     alternates, tabular-friendly). Slight negative tracking as Linear does. */
+  font-feature-settings: 'cv02', 'cv03', 'cv04', 'cv11', 'ss01';
+  letter-spacing: -0.006em;
+  text-rendering: optimizeLegibility;
 }
+
+/* Display headings use Space Grotesk with tight tracking — a technical,
+   engineered voice that reads as an instrument, not a marketing page. */
+h1, h2, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.02em;
+  font-feature-settings: 'ss01', 'ss02';
+}
+h1 { letter-spacing: -0.03em; }
+h3 { letter-spacing: -0.012em; }
+
+/* The instrument-reading layer: mono, tabular, slightly condensed tracking.
+   Timestamps, confidences, counts, coordinates all wear this. */
+.font-mono, .tnum {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.01em;
+}
+
+/* Signature: a single slow scanline that drifts across the world-brief hero —
+   the one "alive/observing" gesture, used exactly once (restraint). */
+@keyframes brief-scan {
+  0% { transform: translateY(-100%); opacity: 0; }
+  8%, 92% { opacity: 0.5; }
+  100% { transform: translateY(1200%); opacity: 0; }
+}
+.brief-scanline {
+  position: absolute; left: 0; right: 0; height: 1px; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(139,141,252,0.35), transparent);
+  animation: brief-scan 9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) { .brief-scanline { display: none; } }
+
+/* Arrival choreography — content rises + un-blurs as the cosmos ignites. Stagger
+   with inline animation-delay. The one orchestrated moment (award research:
+   a page-load sequence lands harder than scattered effects). */
+@keyframes rise-in {
+  from { opacity: 0; filter: blur(12px); transform: translateY(18px); }
+  to   { opacity: 1; filter: blur(0);    transform: translateY(0); }
+}
+.reveal { opacity: 0; animation: rise-in 1.15s var(--ease-nova) forwards; }
+
+@keyframes cue-bob {
+  0%, 100% { transform: translateY(0); opacity: 0.5; }
+  50%      { transform: translateY(5px); opacity: 1; }
+}
+.scroll-cue { animation: cue-bob 2.2s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .reveal { animation: none; opacity: 1; filter: none; transform: none; }
+  .scroll-cue { animation: none; }
+}
+
+/* Observatory HUD — hairline corner brackets that frame the immersive canvas
+   like an instrument viewport. */
+.hud-bracket { position: absolute; width: 22px; height: 22px; pointer-events: none; }
+.hud-bracket.tl { top: 18px; left: 18px; border-top: 1px solid var(--color-nova-border-bright); border-left: 1px solid var(--color-nova-border-bright); }
+.hud-bracket.tr { top: 18px; right: 18px; border-top: 1px solid var(--color-nova-border-bright); border-right: 1px solid var(--color-nova-border-bright); }
+.hud-bracket.bl { bottom: 18px; left: 18px; border-bottom: 1px solid var(--color-nova-border-bright); border-left: 1px solid var(--color-nova-border-bright); }
+.hud-bracket.br { bottom: 18px; right: 18px; border-bottom: 1px solid var(--color-nova-border-bright); border-right: 1px solid var(--color-nova-border-bright); }
 
 /* Custom scrollbar */
 * {

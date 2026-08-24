@@ -153,7 +153,8 @@ class TestRedirectFollowing:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.tools.action_webhook._is_safe_url", return_value=True):
+        with patch("app.tools.action_webhook._is_safe_url", return_value=True), \
+             patch("app.tools.action_webhook._is_url_allowed", return_value=True):
             with patch("httpx.AsyncClient", return_value=mock_client):
                 result = await WebhookTool._call(
                     "https://hooks.example.com/old-endpoint",
@@ -185,7 +186,8 @@ class TestRedirectFollowing:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.tools.action_webhook._is_safe_url", return_value=True):
+        with patch("app.tools.action_webhook._is_safe_url", return_value=True), \
+             patch("app.tools.action_webhook._is_url_allowed", return_value=True):
             with patch("httpx.AsyncClient", return_value=mock_client):
                 result = await WebhookTool._call(
                     "https://hooks.example.com/old-endpoint",
@@ -216,7 +218,8 @@ class TestRedirectFollowing:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.tools.action_webhook._is_safe_url", return_value=True):
+        with patch("app.tools.action_webhook._is_safe_url", return_value=True), \
+             patch("app.tools.action_webhook._is_url_allowed", return_value=True):
             with patch("httpx.AsyncClient", return_value=mock_client):
                 result = await WebhookTool._call(
                     "https://hooks.example.com/v1",
@@ -248,7 +251,8 @@ class TestMaxRedirects:
         mock_client.__aenter__ = AsyncMock(return_value=mock_client)
         mock_client.__aexit__ = AsyncMock(return_value=False)
 
-        with patch("app.tools.action_webhook._is_safe_url", return_value=True):
+        with patch("app.tools.action_webhook._is_safe_url", return_value=True), \
+             patch("app.tools.action_webhook._is_url_allowed", return_value=True):
             with patch("httpx.AsyncClient", return_value=mock_client):
                 with pytest.raises(ValueError, match="Too many redirects"):
                     await WebhookTool._call(

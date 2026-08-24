@@ -101,6 +101,33 @@ def _posix_rlimits() -> None:
         pass
 
 
+async def _sidecar_run_raw(code: str, queue: Path, timeout: int) -> dict:
+    """Submit `code` to the network-isolated nova-exec sidecar via the file
+    queue and return the raw result dict {stdout, stderr, returncode,
+    timed_out}. Shared execution primitive so CodeExecTool (formatted output)
+    and CodeVerifyTool (JSON-parsed harness output) get identical isolation.
+    Raises TimeoutError if the sidecar never answers within timeout+slack."""
+    import json as _json
+    import uuid as _uuid
+
+    job_id = _uuid.uuid4().hex
+    jobs_dir = queue / "jobs"
+    result_path = queue / "results" / f"{job_id}.json"
+    jobs_dir.mkdir(parents=True, exist_ok=True)
+    tmp = jobs_dir / f"{job_id}.tmp"
+    tmp.write_text(_json.dumps({"code": code, "timeout": int(timeout)}), encoding="utf-8")
+    tmp.replace(jobs_dir / f"{job_id}.json")  # atomic hand-off
+
+    deadline = asyncio.get_event_loop().time() + timeout + 10
+    while asyncio.get_event_loop().time() < deadline:
+        if result_path.exists():
+            res = _json.loads(result_path.read_text(encoding="utf-8"))
+            result_path.unlink(missing_ok=True)
+            return res
+        await asyncio.sleep(0.2)
+    raise TimeoutError("exec sidecar did not return a result")
+
+
 def _check_code_safety(code: str) -> str | None:
     """Check code against tier-aware blocked imports and builtins using AST analysis.
 

@@ -44,17 +44,28 @@ class WhisperTranscriber:
 
     async def transcribe(self, audio_path: Path, language: str | None = None) -> TranscriptionResult:
         """Transcribe an audio file. Runs in thread pool since Whisper is synchronous."""
-        self._ensure_loaded()
 
         def _run():
+            # Model load happens IN the worker thread: whisper.load_model takes
+            # seconds (cold cache: minutes) and was called on the event loop,
+            # stalling chat/monitors/health — 3 stalled health probes trips the
+            # watchdog restart (audit 2026-08-19).
+            self._ensure_loaded()
+            import whisper
+            # Enforce VOICE_MAX_DURATION BEFORE the expensive transcription —
+            # the config knob existed but was checked nowhere; a multi-hour
+            # 25MB file transcribed in full (audit 2026-08-19). load_audio is
+            # cheap relative to transcribe.
+            audio = whisper.load_audio(str(audio_path))
+            duration = len(audio) / whisper.audio.SAMPLE_RATE
+            max_s = float(getattr(config, "VOICE_MAX_DURATION", 300))
+            if duration > max_s:
+                raise ValueError(
+                    f"Audio is {duration:.0f}s — exceeds VOICE_MAX_DURATION ({max_s:.0f}s)")
             options = {}
             if language:
                 options["language"] = language
             result = self._model.transcribe(str(audio_path), **options)
-            # Get audio duration
-            import whisper
-            audio = whisper.load_audio(str(audio_path))
-            duration = len(audio) / whisper.audio.SAMPLE_RATE
             return TranscriptionResult(
                 text=result["text"].strip(),
                 language=result.get("language", "unknown"),
@@ -138,7 +149,6 @@ class PiperSynthesizer:
 
         Runs in a thread because Piper inference is CPU-bound and synchronous.
         """
-        self._ensure_loaded()
         text = (text or "").strip()
         if not text:
             return b"", 0
@@ -146,14 +156,16 @@ class PiperSynthesizer:
         def _run():
             import io
             import wave
+            self._ensure_loaded()  # in-thread, same rationale as transcribe()
             buf = io.BytesIO()
-            sample_rate = self._voice.config.sample_rate
+            # piper-tts 1.7 API (2026-08-19): synthesize_wav sets the wav
+            # format itself; the old synthesize(text, wf) signature is gone.
             with wave.open(buf, "wb") as wf:
-                wf.setnchannels(1)
-                wf.setsampwidth(2)  # 16-bit PCM
-                wf.setframerate(sample_rate)
-                self._voice.synthesize(text, wf)
-            return buf.getvalue(), sample_rate
+                self._voice.synthesize_wav(text, wf)
+            data = buf.getvalue()
+            with wave.open(io.BytesIO(data), "rb") as rf:
+                sample_rate = rf.getframerate()
+            return data, sample_rate
 
         return await asyncio.to_thread(_run)
 
