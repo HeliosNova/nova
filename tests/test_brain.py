@@ -368,17 +368,7 @@ class TestReasoningPatterns:
         # Short queries (< 25 chars) skipped even if they match
         assert not _should_use_deliberation("Walk me through OAuth")
 
-    def test_definitional_compare_skipped(self):
-        from app.core.decomposer import should_decompose
-        # "Difference between X and Y" is a textbook definition; should not decompose
-        assert not should_decompose(
-            "What is the difference between a stack and a queue in computer science?",
-            "general", False, False,
-        )
-        assert not should_decompose(
-            "What is the distinction between TCP and UDP?",
-            "general", False, False,
-        )
+    # (decomposer gate tests removed 2026-08-25 — capability archived)
 
     def test_inherently_uncertain_query(self):
         from app.core.brain import _INHERENTLY_UNCERTAIN_RE
@@ -425,12 +415,6 @@ class TestReasoningPatterns:
         # Query has no identity terms — confusion filter should be inert
         result = _filter_confused_kg_facts("What is the price of Bitcoin?", facts)
         assert len(result) == 2
-
-    def test_numbered_group_split(self):
-        from app.core.decomposer import _NUMBERED_GROUP_RE
-        assert len(_NUMBERED_GROUP_RE.findall("(1) X (2) Y (3) Z")) == 3
-        assert len(_NUMBERED_GROUP_RE.findall("(A) foo (B) bar")) == 2
-        assert len(_NUMBERED_GROUP_RE.findall("Just plain text")) == 0
 
     def test_hard_reasoning_query(self):
         from app.core.agent_loop import _is_hard_reasoning_query

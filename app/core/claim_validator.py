@@ -172,18 +172,27 @@ def build_evidence(
     tool_results: list[dict] | None = None,
     query: str = "",
     lessons_text: str = "",
+    history_text: str = "",
 ) -> str:
     """Assemble grounding evidence for claim validation.
 
     Evidence = retrieved context + KG facts + user facts + learned lessons +
-    tool outputs. Lessons are first-class grounding: the memory loop stores a
-    correction as a lesson, so an answer derived from a lesson IS supported.
-    Without this, the validator would strip the very answers the memory loop
-    just taught (e.g. "Dr. X is based in <city>"), silently defeating the loop.
+    prior-turn statements + tool outputs. Lessons are first-class grounding:
+    the memory loop stores a correction as a lesson, so an answer derived
+    from a lesson IS supported. Without this, the validator would strip the
+    very answers the memory loop just taught (e.g. "Dr. X is based in
+    <city>"), silently defeating the loop.
 
-    The query is intentionally NOT included: presupposition attacks
+    `history_text` carries PRIOR-turn user messages (2026-08-25): a fact the
+    user stated one turn ago is evidence — the same statement becomes
+    top-authority user_facts one async step later in live chat, and without
+    it the validator blanked "your colleague's name is X" right after the
+    user said it (multiturn_recall_name failed 5 consecutive nightly evals).
+
+    The CURRENT query is intentionally NOT included: presupposition attacks
     ("Who is Dr. X, the creator of Y?") would otherwise self-validate
-    because the fabricated entity appears in the question text.
+    because the fabricated entity appears in the question text. Callers must
+    pass only completed prior turns in history_text, never the live query.
     """
     del query
     parts: list[str] = []
@@ -195,6 +204,8 @@ def build_evidence(
         parts.append(user_facts_text)
     if lessons_text:
         parts.append(lessons_text)
+    if history_text:
+        parts.append(history_text)
     if tool_results:
         for tr in tool_results:
             out = tr.get("output") if isinstance(tr, dict) else None

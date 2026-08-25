@@ -450,6 +450,14 @@ class SkillStore:
     # Matching
     # ------------------------------------------------------------------
 
+    # Monitor/daemon traffic prepends an enriched context block to the real
+    # prompt. Matching on the FULL text made the boilerplate dominate the
+    # embedding — the same wrong skill cleared the 0.72 strong-sim bypass at
+    # a constant 0.737 on '=== System Context ===' prefixed queries ~20×/day
+    # (audit 2026-08-24). Strip it so both stages match the real prompt.
+    _CONTEXT_PREAMBLE_RE = re.compile(
+        r"(?s)^\s*=== System Context ===.*?=== End Context ===\s*")
+
     def get_matching_skill(self, query: str) -> Skill | None:
         """Find the best matching skill for a query.
 
@@ -460,6 +468,9 @@ class SkillStore:
         match is found and ENABLE_SEMANTIC_SKILL_MATCHING is true.
         Uses SKILL_SEMANTIC_THRESHOLD to avoid false positives.
         """
+        stripped = self._CONTEXT_PREAMBLE_RE.sub("", query).strip()
+        if stripped:
+            query = stripped
         regex_hit = self._regex_match(query)
         if regex_hit:
             return regex_hit

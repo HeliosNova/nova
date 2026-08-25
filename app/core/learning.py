@@ -69,11 +69,18 @@ _CORRECTION_PATTERNS = [
     # why." as a correction, which disabled auto-thinking on reasoning queries
     # (live eval failure 2026-08-24). Short reactive negations that don't open
     # with "no" still reach the LLM confirm via has_soft_correction_signal.
-    re.compile(r"(?i)(?:\bactually\b|\bthat'?s?\s+(?:wrong|incorrect|not\s+right)|^\s*no\b)"),
+    # "actually" / "not quite" / "I think it's" are anchored to the message
+    # OPENING (at most one lead-in word, e.g. "Well, actually…") — the same
+    # fix as bare-"no" above: mid-sentence they're ordinary English ("can
+    # you actually run…", "results are not quite aligned…") and the
+    # anywhere-match flipped intent=correction, disabling auto-thinking
+    # (audit 2026-08-24). Mid-message phrasings still reach the LLM confirm
+    # via has_soft_correction_signal on short reactive replies.
+    re.compile(r"(?i)(?:^\s*(?:[\w']+[,:;—-]*\s+)?actually\b|\bthat'?s?\s+(?:wrong|incorrect|not\s+right)|^\s*no\b)"),
     re.compile(r"(?i)\b(?:you'?re\s+wrong|that\s+is\s+(?:wrong|incorrect|false))"),
     re.compile(r"(?i)\b(?:the\s+(?:correct|right|actual)\s+(?:answer|information)\s+is)"),
     re.compile(r"(?i)\b(?:it'?s?\s+actually|it\s+should\s+be)"),
-    re.compile(r"(?i)\b(?:correction:|wrong!|incorrect!|not\s+quite)"),
+    re.compile(r"(?i)(?:\b(?:correction:|wrong!|incorrect!)|^\s*(?:[\w']+[,:;—-]*\s+)?not\s+quite\b)"),
     # Flexible "that ... is wrong/incomplete" (catches "that data is wrong", "that info is incomplete")
     re.compile(r"(?i)\bthat\b.{1,30}\b(?:wrong|incorrect|incomplete|inaccurate|misleading)\b"),
     # Preference / procedural corrections
@@ -104,7 +111,7 @@ _CORRECTION_PATTERNS = [
     re.compile(r"(?i)\bthat(?:'?s|\s+is)\s+(?:a\s+)?(?:myth|misconception)\b"),
     re.compile(r"(?i)\bmixing\s+(?:it|them|that|those|up)\b"),
     re.compile(r"(?i)\blast\s+(?:time\s+)?I\s+checked\b"),
-    re.compile(r"(?i)\bI\s+think\s+it'?s\b"),
+    re.compile(r"(?i)^\s*(?:[\w']+[,:;—-]*\s+)?I\s+think\s+it'?s\b"),
     re.compile(r"(?i)\bhalf\s+(?:the\s+)?(?:story|picture|truth)\b"),
 ]
 
@@ -309,6 +316,44 @@ class LearningEngine:
             logger.info("Lessons collection already has %d entries, skipping reindex", collection.count())
             return 0
         return self._backfill_collection(collection)
+
+    def rebuild_lessons_vectors(self, reason: str = "manual") -> int:
+        """Drop and rebuild the lessons collection from the lessons table.
+
+        The ONLY cure for hnswlib tombstone saturation: upserts and ghost
+        prunes just add more delete-marks, and the guarded reindex
+        early-returns on count>0. 42 lessons re-embed in seconds on the
+        CPU embedder. Records the churn watermark so historical deletes
+        stop counting toward the next rot assessment.
+        """
+        from . import vector_health
+
+        try:
+            import chromadb
+
+            client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
+            try:
+                client.delete_collection("lessons")
+            except Exception:
+                pass  # absent collection — nothing to drop
+            self._lessons_collection = None
+            collection = self._get_lessons_collection()
+            if collection is None:
+                return 0
+            n = self._backfill_collection(collection)
+            row = self._db.fetchone(
+                "SELECT COALESCE(MAX(id), 0) AS m, COUNT(*) AS c FROM lessons"
+            )
+            vector_health.set_watermark(
+                self._db, "lessons", ever=row["m"], live=row["c"]
+            )
+            logger.warning(
+                "Lessons vector index REBUILT (%s): %d lessons re-embedded", reason, n
+            )
+            return n
+        except Exception as e:
+            logger.error("Lessons vector rebuild failed: %s", e)
+            return 0
 
     def prune_and_backfill_lesson_vectors(self) -> tuple[int, int]:
         """Lifecycle hygiene for the lessons vector index (2026-08-20 sweep).
@@ -612,13 +657,35 @@ class LearningEngine:
         vector_ranked: list[int] = []  # lesson IDs in ranked order
         vector_strong: set[int] = set()  # clear semantic matches (paraphrase-grade)
         try:
+            from . import vector_health
+
             collection = self._get_lessons_collection()
             if collection is not None and collection.count() > 0:
-                results = collection.query(
-                    query_texts=[query],
-                    n_results=min(limit * 2, collection.count()),
-                    include=["distances"],
-                )
+                _k = min(limit * 2, collection.count())
+                try:
+                    results = collection.query(
+                        query_texts=[query],
+                        n_results=_k,
+                        include=["distances"],
+                    )
+                except Exception as e:
+                    if not vector_health.is_tombstone_error(e):
+                        raise
+                    # Tombstone-saturated index: k>=8 dies but small k still
+                    # works. Retry below the failure floor so the vector arm
+                    # degrades instead of dying, record for the System Health
+                    # alert, and let the maintenance sweep schedule a rebuild.
+                    vector_health.record_failure("lessons")
+                    logger.error(
+                        "Lessons vector index tombstone-saturated (k=%d failed) — "
+                        "degrading to k=%d until the maintenance rebuild",
+                        _k, vector_health.DEGRADE_K,
+                    )
+                    results = collection.query(
+                        query_texts=[query],
+                        n_results=min(vector_health.DEGRADE_K, collection.count()),
+                        include=["distances"],
+                    )
                 if results and results["ids"] and results["ids"][0]:
                     distances = results.get("distances", [[]])[0]
                     for i, id_str in enumerate(results["ids"][0]):

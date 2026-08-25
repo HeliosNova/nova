@@ -48,6 +48,7 @@ def _make_result(
     response_text="The answer is 42.",
     failed_assertions=None,
     timed_out=False,
+    expect_tools=None,
 ) -> TaskResult:
     return TaskResult(
         task_id=task_id,
@@ -57,6 +58,7 @@ def _make_result(
         response_text=response_text,
         tools_invoked=tools_invoked or [],
         skill_used=skill_used,
+        expect_tools=expect_tools or [],
         reflexion_score=reflexion_score,
         latency_seconds=latency,
         failed_assertions=failed_assertions or [],
@@ -353,11 +355,20 @@ class TestComputeCategoryMetrics:
         assert cm.recall_at_threshold == 0.5
 
     def test_autonomous_tool_multi_tool_rate(self):
+        # 2026-08-25 semantics: computed over tasks DECLARING >=2
+        # expect_tools ("did it orchestrate ALL expected tools"), not over
+        # every task ("did it happen to use >=2") — the old definition
+        # punished forced math routing for correctly making pure-math tasks
+        # single-tool. See tests/test_eval_harness_fixes.py.
         results = [
             _make_result(task_id="a1", category="autonomous-tool",
-                         tools_invoked=["web_search", "calculator"]),  # 2 tools
+                         tools_invoked=["web_search", "calculator"],
+                         expect_tools=["web_search", "calculator"]),  # hit
             _make_result(task_id="a2", category="autonomous-tool",
-                         tools_invoked=["web_search"]),  # 1 tool
+                         tools_invoked=["web_search"],
+                         expect_tools=["web_search", "calculator"]),  # miss
+            _make_result(task_id="a3", category="autonomous-tool",
+                         tools_invoked=["calculator"]),  # undeclared — excluded
         ]
         metrics = compute_category_metrics(results)
         cm = metrics["autonomous-tool"]
@@ -555,7 +566,6 @@ class TestSuiteLoading:
         required = {
             "reasoning", "tool-use", "skill-match",
             "semantic-match", "autonomous-tool", "reflexion-calibration",
-            "multi-agent",
         }
         assert required.issubset(categories), f"Missing categories: {required - categories}"
 
@@ -961,47 +971,8 @@ class TestCheckAssertionDecomposition:
         assert check_assertion({"type": "decomposition_not_fired"}, "", [], None, None)
 
 
-class TestComputeCategoryMetricsMultiAgent:
-    """compute_category_metrics() handles multi-agent category."""
-
-    def _make_ma_result(self, task_id, passed, decomposed):
-        r = _make_result(task_id=task_id, category="multi-agent", passed=passed)
-        r.decomposed = decomposed
-        return r
-
-    def test_decomposition_rate_computed(self):
-        results = [
-            self._make_ma_result("m1", passed=True, decomposed=True),
-            self._make_ma_result("m2", passed=True, decomposed=True),
-            self._make_ma_result("m3", passed=True, decomposed=False),
-        ]
-        metrics = compute_category_metrics(results)
-        cm = metrics.get("multi-agent")
-        assert cm is not None
-        assert cm.decomposition_rate is not None
-        assert abs(cm.decomposition_rate - 2 / 3) < 0.001
-
-    def test_decomposition_rate_all_decomposed(self):
-        results = [
-            self._make_ma_result("m1", passed=True, decomposed=True),
-            self._make_ma_result("m2", passed=True, decomposed=True),
-        ]
-        metrics = compute_category_metrics(results)
-        assert metrics["multi-agent"].decomposition_rate == 1.0
-
-    def test_decomposition_rate_none_decomposed(self):
-        results = [
-            self._make_ma_result("m1", passed=False, decomposed=False),
-            self._make_ma_result("m2", passed=True, decomposed=False),
-        ]
-        metrics = compute_category_metrics(results)
-        assert metrics["multi-agent"].decomposition_rate == 0.0
-
-    def test_non_multi_agent_has_no_decomposition_rate(self):
-        results = [_make_result("r1", category="reasoning")]
-        metrics = compute_category_metrics(results)
-        assert metrics["reasoning"].decomposition_rate is None
-
+# (TestComputeCategoryMetricsMultiAgent removed 2026-08-25 — decomposition
+# metric archived with the multi-agent capability.)
 
 class TestDetectRegressionsMultiAgent:
     """detect_regressions() flags decomposition_rate drops."""
@@ -1051,132 +1022,8 @@ class TestDetectRegressionsMultiAgent:
         assert all(not f.flagged for f in ma_flags)
 
 
-class TestMultiAgentEmpiricalRegression:
-    """Empirical regression proof: MULTI_AGENT_TRIGGER_THRESHOLD=1 → everything decomposes
-    → non-decomposable task fails decomposition_not_fired → decomposition_rate drifts
-    → regression flagged automatically.
-    """
-
-    @staticmethod
-    def _make_multi_agent_suite(tmp_path: Path) -> Path:
-        suite = tmp_path / "ma_suite.yaml"
-        suite.write_text(textwrap.dedent("""\
-            version: "ma-regression-test"
-            tasks:
-              - id: ma_parallel
-                category: multi-agent
-                query: "Compare Python and JavaScript performance"
-                timeout: 30
-                tags: [parallel-decomposable]
-                assertions:
-                  - type: response_not_empty
-                  - type: decomposition_fired
-
-              - id: ma_sequential
-                category: multi-agent
-                query: "First search for Python version then calculate years since 1994"
-                timeout: 30
-                tags: [sequential-decomposable]
-                assertions:
-                  - type: response_not_empty
-                  - type: decomposition_fired
-
-              - id: ma_no_decompose
-                category: multi-agent
-                query: "What is 2 plus 2?"
-                timeout: 30
-                tags: [should-not-decompose]
-                assertions:
-                  - type: answer_contains
-                    value: "4"
-                  - type: decomposition_not_fired
-        """))
-        return suite
-
-    @staticmethod
-    async def _brain_decomposed(query: str, ephemeral: bool = True, **_):
-        """Stub: always reports decomposed=True (threshold=1 behavior)."""
-        from app.schema import EventType, StreamEvent
-        if "2 plus 2" in query.lower():
-            text = "The answer is 4."
-        else:
-            text = "Comparison result: Python and JavaScript differ in typing, execution, and use cases."
-        yield StreamEvent(type=EventType.TOKEN, data={"text": text})
-        yield StreamEvent(type=EventType.DONE, data={
-            "conversation_id": "stub", "intent": "general",
-            "skill_used": None, "tool_results_count": 0,
-            "decomposed": True, "agent_count": 2,
-        })
-
-    @staticmethod
-    async def _brain_calibrated(query: str, ephemeral: bool = True, **_):
-        """Stub: reports decomposed correctly — True for compare/search, False for simple."""
-        from app.schema import EventType, StreamEvent
-        is_complex = "compare" in query.lower() or "search" in query.lower()
-        if "2 plus 2" in query.lower():
-            text = "The answer is 4."
-        else:
-            text = "Comparison result: Python and JavaScript differ in typing, execution, and use cases."
-        yield StreamEvent(type=EventType.TOKEN, data={"text": text})
-        yield StreamEvent(type=EventType.DONE, data={
-            "conversation_id": "stub", "intent": "general",
-            "skill_used": None, "tool_results_count": 0,
-            "decomposed": is_complex, "agent_count": 2 if is_complex else 0,
-        })
-
-    @pytest.mark.asyncio
-    async def test_threshold_too_low_triggers_regression(self, tmp_path):
-        """Baseline: calibrated decomposition. Broken: everything decomposes.
-        The non-decomposable task fails decomposition_not_fired.
-        decomposition_rate drifts up → regression flagged.
-        """
-        suite_path = self._make_multi_agent_suite(tmp_path)
-        harness = EvalHarness(
-            suite_path=suite_path,
-            report_dir=tmp_path / "reports",
-            regression_tolerance=0.10,
-        )
-
-        # Establish baseline with correctly calibrated decomposition
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
-            with patch("app.core.brain.think", side_effect=self._brain_calibrated):
-                baseline = await harness.run_all()
-        harness.write_baseline(baseline)
-
-        # Calibrated: 2 decomposed, 1 not → rate = 0.67; all 3 tasks pass
-        assert baseline.categories["multi-agent"].decomposition_rate is not None
-        assert baseline.passed == 3
-
-        # Now simulate threshold=1 (everything decomposes, including simple query)
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
-            with patch("app.core.brain.think", side_effect=self._brain_decomposed):
-                broken = await harness.run_all()
-
-        # The no-decompose task must fail (decomposition_not_fired fails when decomposed=True)
-        assert broken.passed < 3
-        ma_results = [r for r in broken.task_results if r.category == "multi-agent"]
-        no_decompose_result = next(
-            (r for r in ma_results if r.task_id == "ma_no_decompose"), None
-        )
-        assert no_decompose_result is not None
-        assert not no_decompose_result.passed  # decomposition_not_fired fails
-
-        # decomposition_rate drifts up to 1.0 (was ~0.67)
-        broken_rate = broken.categories["multi-agent"].decomposition_rate
-        assert broken_rate == 1.0
-
-        # Harness must flag the decomposition_rate regression
-        flagged = [r for r in broken.regressions if r.flagged]
-        flagged_metrics = {r.metric for r in flagged}
-        assert "multi-agent.decomposition_rate" in flagged_metrics or broken.passed < 3, (
-            "Either decomposition_rate regression or pass_rate regression must be flagged "
-            f"when threshold fires everything; flagged: {flagged_metrics}"
-        )
-
-
-# ===========================================================================
-# Heartbeat integration — seed count
-# ===========================================================================
+# (TestMultiAgentEmpiricalRegression removed 2026-08-25 — decomposition
+# capability + regression probe archived.)
 
 class TestHeartbeatSeedCount:
     def test_eval_monitor_seeded(self, db):
@@ -1190,14 +1037,15 @@ class TestHeartbeatSeedCount:
         assert monitor.schedule_seconds == 86400
 
     def test_seed_count_includes_eval(self, db):
-        """Total seeded monitors = 74 (61 catalog + 3 system + 4 loop closers + 1
+        """Total seeded monitors = 75 (61 catalog + 3 system + 4 loop closers + 1
         added later + 3 v2: Source Health, Storyline Tracker, Forecast Resolution
-        + 1 East Asia region, 2026-06-29 + 1 Knowledge Consolidation, 2026-08-12)."""
+        + 1 East Asia region, 2026-06-29 + 1 Knowledge Consolidation, 2026-08-12
+        + 1 Digest Health Canary, 2026-08-25)."""
         from app.monitors.heartbeat import MonitorStore
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 74
+        assert len(all_monitors) == 75
 
 
 class TestMemoryLearningEval:

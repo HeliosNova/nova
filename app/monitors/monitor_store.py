@@ -79,6 +79,7 @@ _SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
     "Cross-Monitor Synthesis",
     "Auto-Tool Synthesis",
     "Output Quality Eval",
+    "Digest Health Canary",
 })
 
 _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
@@ -88,6 +89,7 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "skill_quality",
     "chromadb_integrity",
     "kg_health",
+    "digest_health",
     "maintenance",
     "finetune",
     "consolidation",
@@ -470,8 +472,12 @@ class MonitorStore:
         "Lesson Quiz",
         "Skill Validation",
         "Auto-Monitor Detector",
-        "Fine-Tune Check",
+        # ("Fine-Tune Check" removed from core 2026-08-25 — the trainer is
+        # archived; the seed stays in the catalog, disabled.)
         "Hacker News Top Stories",
+        # Weekly digest-output dead-man's switch (2026-08-25) — core: the
+        # "link-only digests" failure recurred twice with no coverage.
+        "Digest Health Canary",
         # Self-improvement loop closers (added 2026-04-25)
         "Goal Derivation",
         "Cross-Monitor Synthesis",
@@ -720,6 +726,11 @@ class MonitorStore:
              "check_config": {"threshold_pct": 10}},
             {"name": "KG Health Monitor", "check_type": "kg_health", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
              "check_config": {"threshold_pct": 10}},
+            # Weekly digest-output canary (2026-08-25): the "link-only
+            # digests" bug recurred twice with zero automated coverage, and
+            # entail-gate attrition was log-archaeology-only.
+            {"name": "Digest Health Canary", "check_type": "digest_health", "schedule_seconds": 604800, "cooldown_minutes": 1440, "notify_condition": "on_change",
+             "check_config": {}},
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
              "check_config": {"query": "Use web_search to find 3 notable AI/ML developments from TODAY or the past 24-48 hours: new model releases, research breakthroughs, benchmark results, or major company announcements. For each: what happened, who did it, the date, and why it matters.\n• Development 1: ...\n• Development 2: ...\n• Development 3: ..."}},

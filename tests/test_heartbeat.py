@@ -182,8 +182,9 @@ class TestMonitorStore:
         # Output Quality Eval) + 1 added later = 69, then +3 (Source Health
         # Monitor, Storyline Tracker, Forecast Resolution) = 72, +1 (East Asia
         # region, 2026-06-29) = 73, +1 (Knowledge Consolidation — the knowing
-        # tier's daily distillation cycle, 2026-08-12) = 74.
-        assert count == 74
+        # tier's daily distillation cycle, 2026-08-12) = 74, +1 (Digest Health
+        # Canary — weekly digest-output canary, 2026-08-25) = 75.
+        assert count == 75
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)

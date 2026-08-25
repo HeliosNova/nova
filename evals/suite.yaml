@@ -1,4 +1,6 @@
-# Nova automated evaluation suite — 63 tasks across 10 categories.
+# Nova automated evaluation suite — 60 tasks across 11 categories.
+# (multi-agent category archived 2026-08-25 with the decomposition capability;
+# the deliberation probe moved to `reasoning`.)
 #
 # Each task runs through the real brain pipeline (ephemeral=True so no
 # conversation history is written).  seed_skill entries are created in the
@@ -26,15 +28,12 @@ version: "2"
 #
 # Intent: reasoning is pure model capability — should be tight (5pp).
 # tool-use depends on external services (search engines, real-time data)
-# so its noise floor is higher (15pp). multi-agent is sensitive to
-# decomposer-gate tuning; loosen to avoid flapping when the threshold
-# moves.
+# so its noise floor is higher (15pp). (multi-agent removed 2026-08-25 —
+# capability archived to archive/multi_agent/.)
 categories_meta:
   reasoning:
     regression_tolerance: 0.05
   tool-use:
-    regression_tolerance: 0.15
-  multi-agent:
     regression_tolerance: 0.15
   memory-learning:
     regression_tolerance: 0.05
@@ -455,9 +454,16 @@ tasks:
     category: autonomous-tool
     query: "Search for the latest Python version and calculate how many years have passed since Python 1.0 released in 1994"
     timeout: 120
+    # The one genuinely multi-tool task in this category — expect_tools
+    # drives multi_tool_rate (metric-only; pass/fail unchanged). 2026-08-25:
+    # also assert the arithmetic (2026−1994 → 31/32) — an autonomous task
+    # with no correctness assertion was a fake test.
+    expect_tools: [web_search, calculator]
     assertions:
       - type: tool_invoked
         value: web_search
+      - type: answer_matches
+        value: "\\b3[12]\\b"
       - type: response_not_empty
 
   # =========================================================================
@@ -507,54 +513,13 @@ tasks:
         min: 0.1
         max: 0.9
 
-  # =========================================================================
-  # Category: multi-agent  (3 tasks)
-  # Tests structural decomposition.  Two tasks should trigger decomposition
-  # (parallel-decomposable, sequential-decomposable); one should NOT.
-  #
-  # The decomposition_fired / decomposition_not_fired assertion types check
-  # the DONE event's `decomposed` field, which is set by _run_multi_agent_path.
-  # Regression probe: set MULTI_AGENT_TRIGGER_THRESHOLD=1 → everything fires →
-  # non-decomposable task fails decomposition_not_fired → decomposition_rate
-  # drifts away from baseline → regression flagged automatically.
-  # =========================================================================
-
-  - id: multi_agent_parallel_compare
-    category: multi-agent
-    query: "Compare Python and JavaScript: how are they different in terms of typing system, execution model, and primary use cases? Give me a detailed comparison of both."
-    timeout: 300
-    tags: [parallel-decomposable]
-    assertions:
-      - type: response_not_empty
-      - type: decomposition_fired
-      - type: answer_matches
-        value: "\\b(?:Python|JavaScript|typing|static|dynamic|execution)\\b"
-
-  - id: multi_agent_sequential_research
-    category: multi-agent
-    query: "First search for the current Python version, then based on that result calculate how many years have passed since Python 1.0 was released in 1994 and how many major versions there have been."
-    timeout: 300
-    tags: [sequential-decomposable]
-    assertions:
-      - type: response_not_empty
-      - type: decomposition_fired
-      - type: tool_invoked
-        value: web_search
-
-  - id: multi_agent_no_decompose
-    category: multi-agent
-    query: "What is 2 plus 2?"
-    timeout: 300
-    tags: [should-not-decompose]
-    assertions:
-      - type: answer_contains
-        value: "4"
-      - type: decomposition_not_fired
-
-  # SHARP3 reasoning probes — deliberation route + reasoning-shape tests
+  # SHARP3 reasoning probe — deliberation route + reasoning-shape test.
   # Timeouts sized for RTX 3090 + nova-ft Q8 + ToT sample_n=3 + multi-step deliberation.
+  # Re-categorized multi-agent → reasoning 2026-08-25: it exercises the KEPT
+  # AgentLoop deliberation route, but sat in the archived decomposition
+  # category and was collaterally SKIPPED from every nightly run since 08-14.
   - id: deliberation_chain_of_reasoning
-    category: multi-agent
+    category: reasoning
     query: "Walk me through how you would design a rate limiter for a REST API that must sustain 100,000 requests per second, step by step."
     timeout: 1200
     tags: [deliberation-route]
@@ -588,20 +553,6 @@ tasks:
       - type: response_not_empty
       - type: answer_matches
         value: "\\b(?:TCP|UDP|connection|reliable|fast|datagram|protocol|handshake)\\b"
-      - type: decomposition_not_fired
-
-  - id: multi_agent_recursive_depth_2
-    category: multi-agent
-    query: "Compare two backend stack pairs side by side: (1) Python+FastAPI vs Python+Django for a high-throughput JSON API; and (2) Node.js+Express vs Node.js+Fastify for the same use case. For each pair, give the winner and a one-line reason. Then synthesize across both pairs."
-    timeout: 600
-    tags: [recursive-decomposable]
-    assertions:
-      - type: response_not_empty
-      - type: decomposition_fired
-      - type: decomposition_depth_at_least
-        value: 2
-      - type: answer_matches
-        value: "\\b(?:FastAPI|Django|Express|Fastify)\\b"
 
   # =========================================================================
   # Category: retrieval  (3 tasks)
@@ -680,32 +631,6 @@ tasks:
   # These tests are slow (multi-agent latency) but worth running nightly to
   # catch regressions in capacity-related code.
   # =========================================================================
-
-  - id: stress_multi_agent_5_entities
-    category: multi-agent
-    # 5-entity compare should decompose to ~5 sub-agents under MAX_AGENT_COUNT.
-    # Validates the merge-budget-scales-with-agent-count code path (regression
-    # was: N≥5 used to truncate output mid-enumeration).
-    query: "Compare the climates of Tokyo, Osaka, Kyoto, Sapporo, and Fukuoka in summer."
-    timeout: 240
-    assertions:
-      - type: decomposition_fired
-      - type: response_not_empty
-      - type: answer_matches
-        value: "(?i)(tokyo|osaka|kyoto|sapporo|fukuoka)"
-
-  - id: stress_decomposition_depth_cap
-    category: multi-agent
-    # Two-level decomposable query. Should fire at depth 1 but NOT recurse
-    # past MAX_STRUCTURAL_DEPTH (default 2). Pins the depth-cap behavior so
-    # a future relaxation of the cap is visible.
-    query: "Compare Python and JavaScript, and within each, compare async vs threading."
-    timeout: 240
-    assertions:
-      - type: decomposition_fired
-      - type: decomposition_depth_at_least
-        value: 1
-      - type: response_not_empty
 
   - id: stress_long_tool_output_trim
     category: tool-use

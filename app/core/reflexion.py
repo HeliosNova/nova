@@ -1141,15 +1141,40 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
         if not obj or "lesson" not in obj:
             return True
 
+        topic = obj.get("topic", task_summary[:100])
+        # CONVERGENCE (2026-08-25): the daily sweep re-promoted the SAME
+        # quiz-failure cluster into paraphrase lessons (#376/#377 duplicated
+        # #374/#375 one day apart — token-Jaccard dedup can't see the
+        # paraphrase). A recent same-topic lesson means the cluster is
+        # already taught; REINFORCE it (retrieval rank + confidence) instead
+        # of minting a sibling that competes with it.
+        recent = learning_engine._db.fetchone(
+            "SELECT id FROM lessons WHERE topic = ? COLLATE NOCASE "
+            "AND created_at >= datetime('now', '-7 days') LIMIT 1",
+            (topic,),
+        )
+        if recent:
+            learning_engine._db.execute(
+                "UPDATE lessons SET times_helpful = times_helpful + 1, "
+                "confidence = MIN(0.95, confidence + 0.05) WHERE id = ?",
+                (recent["id"],),
+            )
+            logger.info(
+                "Recurring failure REINFORCED lesson #%d ('%s') instead of "
+                "re-minting (from %d failures)",
+                recent["id"], topic[:60], len(similar),
+            )
+            return True
+
         lesson_id = learning_engine.add_knowledge_lesson(
-            topic=obj.get("topic", task_summary[:100]),
+            topic=topic,
             correct_answer=obj["lesson"],
             lesson_text=f"Auto-lesson: {obj['lesson']}",
             context=task_summaries[0] if task_summaries else "",
         )
         logger.info(
             "Recurring failure promoted to lesson #%d: '%s' (from %d failures)",
-            lesson_id, obj.get("topic", "")[:60], len(similar),
+            lesson_id, topic[:60], len(similar),
         )
     except Exception as e:
         logger.debug("Recurring failure promotion failed: %s", e)

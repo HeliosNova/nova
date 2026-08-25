@@ -50,8 +50,8 @@ _SELF_MOD_ALLOWED_MODULES: frozenset[str] = frozenset({
     "critique_prompt",           # reflexion.py: _CRITIQUE_PROMPT
     "extraction_prompt",         # learning.py: _EXTRACTION_PROMPT
     "skill_extraction_prompt",   # skills.py: inline system message
-    "merge_instruction_parallel",  # decomposer.py: parallel strategy template
-    "merge_instruction_sequential",  # decomposer.py: sequential strategy template
+    # merge_instruction_parallel/_sequential removed 2026-08-25 with the
+    # multi-agent decomposition archive (their source module is gone).
     "kg_extraction_prompt",      # brain.py: KG triple extraction template
 })
 
@@ -764,7 +764,7 @@ _DRIFT_RULES: list[tuple[str, str, str, float, str, str]] = [
     ("reasoning", "pass_rate", "down", 3.0, "extraction_prompt", "reasoning"),
     ("tool-use", "pass_rate", "down", 3.0, "extraction_prompt", "tool-use"),
     ("skill-match", "hit_rate", "down", 3.0, "skill_extraction_prompt", "skill-match"),
-    ("multi-agent", "pass_rate", "down", 3.0, "merge_instruction_parallel", "multi-agent"),
+    # (multi-agent rule removed 2026-08-25 — capability archived)
     ("semantic-match", "recall_at_threshold", "down", 3.0, "kg_extraction_prompt", "semantic-match"),
 ]
 

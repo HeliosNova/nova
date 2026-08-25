@@ -744,6 +744,51 @@ class KnowledgeGraph:
             return 0
         return self._backfill_collection(collection)
 
+    def rebuild_vectors(self, reason: str = "manual") -> int:
+        """Drop and rebuild the kg_facts collection from the live SQL set.
+
+        prune_stale_vectors keeps the CHROMA view clean, but every one of
+        its deletes is only a tombstone to the underlying HNSW graph —
+        hnswlib never compacts, so a churny index eventually fails all
+        k>=8 queries (the lessons collection died exactly this way on
+        2026-08-22 while holding 9× tombstones). Runs off-GPU on the
+        dedicated CPU embedder; ~5k live facts re-embed in minutes.
+        Records the churn watermark so historical supersessions stop
+        counting toward the next rot assessment.
+        """
+        from . import vector_health
+
+        try:
+            import chromadb
+            from ..config import config as _cfg
+
+            client = chromadb.PersistentClient(path=_cfg.CHROMADB_PATH)
+            try:
+                client.delete_collection("kg_facts")
+            except Exception:
+                pass  # absent collection — nothing to drop
+            self._collection = None
+            collection = self._get_collection()
+            if collection is None:
+                return 0
+            n = self._backfill_collection(collection)
+            row = self._db.fetchone(
+                "SELECT COALESCE(MAX(id), 0) AS m,"
+                " (SELECT COUNT(*) FROM kg_facts WHERE superseded_at IS NULL"
+                "  AND valid_to IS NULL AND quarantined = 0) AS c"
+                " FROM kg_facts"
+            )
+            vector_health.set_watermark(
+                self._db, "kg_facts", ever=row["m"], live=row["c"]
+            )
+            logger.warning(
+                "KG vector index REBUILT (%s): %d facts re-embedded", reason, n
+            )
+            return n
+        except Exception as e:
+            logger.error("KG vector rebuild failed: %s", e)
+            return 0
+
     def _add_to_vector(self, fact_id: int, subject: str, predicate: str, object_: str) -> None:
         """Add a single fact to the vector collection."""
         collection = self._get_collection()
@@ -1565,11 +1610,33 @@ class KnowledgeGraph:
         collection = self._get_collection()
         if collection is not None and collection.count() > 0:
             try:
-                results = collection.query(
-                    query_texts=[query],
-                    n_results=min(limit * 3, collection.count()),
-                    include=["distances"],
-                )
+                from . import vector_health
+
+                _k = min(limit * 3, collection.count())
+                try:
+                    results = collection.query(
+                        query_texts=[query],
+                        n_results=_k,
+                        include=["distances"],
+                    )
+                except Exception as e:
+                    if not vector_health.is_tombstone_error(e):
+                        raise
+                    # Tombstone-saturated HNSW index (the failure that killed
+                    # the lessons collection 2026-08-22): retry below the
+                    # observed k>=8 failure floor so the vector arm degrades
+                    # instead of dying; the maintenance sweep rebuilds.
+                    vector_health.record_failure("kg_facts")
+                    logger.error(
+                        "KG vector index tombstone-saturated (k=%d failed) — "
+                        "degrading to k=%d until the maintenance rebuild",
+                        _k, vector_health.DEGRADE_K,
+                    )
+                    results = collection.query(
+                        query_texts=[query],
+                        n_results=min(vector_health.DEGRADE_K, collection.count()),
+                        include=["distances"],
+                    )
                 if results and results["ids"] and results["ids"][0]:
                     # Filter by cosine distance threshold (0 = identical, 2 = opposite).
                     # Default 0.8 (sim > 0.6) suits MiniLM; configurable because

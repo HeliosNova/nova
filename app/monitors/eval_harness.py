@@ -66,6 +66,12 @@ class EvalTask:
     # conversation before `query` (the final turn, which assertions grade).
     # Each turn gets the task's full `timeout` budget.
     turns: list[str] = field(default_factory=list)
+    # Tools this task EXPECTS the model to orchestrate (metric-only, not
+    # pass/fail). multi_tool_rate is computed over tasks declaring >=2 —
+    # the old any-task ">=2 tools used" definition collapsed 0.5→0.0 when
+    # forced math routing correctly made pure-math tasks single-tool
+    # (2026-08-24), flagging an improvement as a regression.
+    expect_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -94,6 +100,8 @@ class TaskResult:
     memory_before_correct: bool | None = None
     memory_after_correct: bool | None = None
     memory_caused_fix: bool | None = None
+    # Copied from EvalTask.expect_tools by the run loop (metric-only).
+    expect_tools: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -174,6 +182,11 @@ class EvalReport:
     # Runs that hit the time budget without proving correctness. Excluded
     # from the pass_rate denominator — latency is tracked separately.
     timeouts: int = 0
+    # Task ids failing in this run AND the 2 prior persisted runs
+    # (2026-08-25). Baseline-equality normalizes a permanently broken task
+    # (multiturn_recall_name sat red 5 straight nightly runs with zero
+    # escalation) — chronic reds get their own loud channel.
+    chronic_failures: list[str] = field(default_factory=list)
 
 
 # ---------------------------------------------------------------------------
@@ -369,12 +382,23 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             cm.recall_at_threshold = skill_hits / n_completed if n_completed else 0.0
 
         if cat == "autonomous-tool":
-            multi_tool = sum(1 for r in completed if len(r.tools_invoked) >= 2)
-            cm.multi_tool_rate = multi_tool / n_completed if n_completed else 0.0
+            # Scoped to tasks DECLARING >=2 expected tools (2026-08-25). The
+            # old "any task that used >=2 tools" definition punished forced
+            # math routing for correctly making pure-math tasks single-tool
+            # (0.5→0.0 flagged as regression on an improvement). Now the
+            # metric asks: did each genuinely-multi-tool task orchestrate
+            # ALL its expected tools? None when no task declares any.
+            expected = [r for r in completed if len(r.expect_tools) >= 2]
+            if expected:
+                multi_tool = sum(
+                    1 for r in expected
+                    if set(r.expect_tools) <= set(r.tools_invoked))
+                cm.multi_tool_rate = multi_tool / len(expected)
+            else:
+                cm.multi_tool_rate = None
 
-        if cat == "multi-agent":
-            decomposed = sum(1 for r in completed if r.decomposed)
-            cm.decomposition_rate = decomposed / n_completed if n_completed else 0.0
+        # (multi-agent decomposition_rate block removed 2026-08-25 —
+        # capability + suite category archived to archive/multi_agent/.)
 
         if cat == "retrieval":
             # retrieval_recall = fraction of tasks where the seeded fact was found
@@ -715,6 +739,7 @@ class EvalHarness:
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
                 turns=raw.get("turns", []),
+                expect_tools=raw.get("expect_tools", []),
             ))
         # Opt-in category skip (empty by default → load_suite() stays pure for
         # tests that exercise every category directly). The nightly monitor sets
@@ -1509,6 +1534,7 @@ class EvalHarness:
                     "[EvalHarness] Task %d/%d: %s (%s)", i, len(tasks), task.id, task.category
                 )
                 result = await self.run_task(task)
+                result.expect_tools = list(task.expect_tools)
                 task_results.append(result)
                 status = "PASS" if result.passed else ("TIMEOUT" if result.timed_out else "FAIL")
                 logger.info(
@@ -1684,11 +1710,49 @@ class EvalHarness:
         with open(history_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(line) + "\n")
 
+    def detect_chronic_failures(self, report: EvalReport, *, runs: int = 3) -> list[str]:
+        """Task ids failing in this run AND the (runs-1) prior persisted runs.
+
+        Baseline-delta regression can never flag a task that was ALREADY red
+        at baseline time — multiturn_recall_name failed 5 consecutive nightly
+        runs invisibly (2026-08-24 audit). N consecutive reds is a product
+        bug regardless of what the baseline says.
+        """
+        current_failed = {r.task_id for r in report.task_results
+                          if not r.passed and not r.timed_out}
+        if not current_failed:
+            return []
+        try:
+            priors = sorted(
+                (p for p in self.report_dir.glob("eval_2*.json")
+                 if p.name != f"eval_{report.run_id}.json"),
+                reverse=True,
+            )[: runs - 1]
+            if len(priors) < runs - 1:
+                return []
+            for p in priors:
+                with open(p, encoding="utf-8") as f:
+                    data = json.load(f)
+                prior_failed = {t["task_id"] for t in data.get("task_results", [])
+                                if not t.get("passed") and not t.get("timed_out")}
+                current_failed &= prior_failed
+                if not current_failed:
+                    return []
+        except Exception as e:
+            logger.warning("[EvalHarness] chronic-failure scan failed: %s", e)
+            return []
+        return sorted(current_failed)
+
     # --- Convenience: run and persist in one call ---
 
     async def run_and_persist(self) -> tuple[EvalReport, Path, Path]:
         """Run the full suite, write reports, update history, write baseline if first run."""
         report = await self.run_all()
+        report.chronic_failures = self.detect_chronic_failures(report)
+        if report.chronic_failures:
+            logger.error(
+                "[EvalHarness] CHRONIC failures (red 3+ consecutive runs): %s",
+                ", ".join(report.chronic_failures))
         json_path, md_path = self.write_report(report)
         self.append_history(report)
 

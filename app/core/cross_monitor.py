@@ -18,6 +18,7 @@ Called from heartbeat_loop.py via check_type='synthesis'.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
 from collections import defaultdict
@@ -485,8 +486,11 @@ async def synthesize_across_monitors(
     """Top-level entry — read recent monitor outputs, find cross-cutting
     themes, write syntheses to KG, return a summary dict.
     """
-    grouped = _gather_recent_outputs(
-        db, hours=hours, max_per_monitor=max_per_monitor
+    # to_thread: this fetchall scans up to 2000 monitor_results rows — a
+    # sync DB read on the event loop (self-flagged by _warn_if_event_loop
+    # live on 2026-08-24) blocks every coroutine while SQLite pages.
+    grouped = await asyncio.to_thread(
+        _gather_recent_outputs, db, hours=hours, max_per_monitor=max_per_monitor
     )
     if not grouped:
         return {
@@ -650,7 +654,8 @@ async def meta_synthesis(db, *, hours: int = 36) -> str:
     digest can't see). Operates on the leads, not raw digests, so it can't be fooled
     by template words. This is the user-facing cross-domain intelligence."""
     from app.core.llm import invoke_nothink
-    grouped = _gather_recent_outputs(db, hours=hours, max_per_monitor=1)
+    grouped = await asyncio.to_thread(
+        _gather_recent_outputs, db, hours=hours, max_per_monitor=1)
     leads = []
     for name, vals in grouped.items():
         lead = _extract_lead(vals[0]) if vals else ""

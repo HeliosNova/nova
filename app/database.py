@@ -1372,6 +1372,18 @@ class SafeDB:
         # when the DB is quiescent. check_same_thread=False lets us close
         # other threads' connections from here.
         with self._all_conns_lock:
+            # Checkpoint the WAL into the main DB on graceful shutdown
+            # (2026-08-25): with 3 hard power-losses in 24h, minimizing the
+            # WAL surface at every CLEAN stop shrinks what an unclean one
+            # can threaten; TRUNCATE also resets the -wal file so a cold
+            # copy of the .db alone is complete. Best-effort — a busy
+            # reader just leaves the WAL for autocheckpoint.
+            for conn in list(self._all_conns):
+                try:
+                    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                    break  # one checkpoint serves the whole database
+                except Exception:
+                    continue
             for conn in self._all_conns:
                 try:
                     conn.close()

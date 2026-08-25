@@ -797,11 +797,16 @@ def _reader_main_content(md: str) -> str:
 
 
 # Article-body cap. The entailment gate (MiniCheck) needs enough of the cited
-# page to locate the claim; a 5000-char cap here made the 2026-08-21 entail
-# window widen to [:12000] INERT because every body arrived pre-truncated at
-# 5000 (live doc_len never exceeded ~5607). 12000 matches that window; the
-# synthesis path re-caps bodies to 900/28000 of its own accord, so raising this
-# only improves grounding (audit 2026-08-22).
+# page to locate the claim; a 5000-char cap here starved the gate's window
+# SELECTION POOL — windows are chosen from the fetched body, so nothing beyond
+# 5000 chars could ever be selected. (Note: observed doc_len tops out at ~5607
+# regardless of this cap — that is the gate's own windowing arithmetic, 2
+# articles × 2 windows × 1400 chars + separators, NOT a body truncation. See
+# _windows/_doc_for. Audit 2026-08-24 re-derived this.) The synthesis path
+# re-caps bodies to 900/28000 of its own accord, so raising this only improves
+# grounding (audit 2026-08-22). Any _invoke_bg caller embedding a full body
+# MUST pass num_ctx sized for ~12k chars (the 4096 default truncates —
+# _findings hit exactly that on 2026-08-23/24, ~95×/day).
 _BODY_MAX_CHARS = 12000
 
 
@@ -1354,7 +1359,12 @@ async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
                 # 320 (was 240), 2026-08-14: the truncation tripwire caught
                 # findings cut mid-sentence several times per day — dangling
                 # fragments were entering the evidence pool.
-                max_tokens=320, temperature=0.2)
+                # num_ctx 8192 (2026-08-25): the 08-22 body-cap raise
+                # (5k→12k chars ≈ up to ~4k tokens) overflowed the 4096
+                # model default — prompt_eval+eval hit exactly 4096 and
+                # findings truncated mid-sentence ~95×/day, re-opening the
+                # 08-14 defect from the prompt side.
+                max_tokens=320, temperature=0.2, num_ctx=8192)
             f = (f or "").strip()
             # Drop empties, relevance-rejects, and "the page has no real content"
             # outputs (nav/boilerplate pages that slipped the body gate) — these
@@ -2920,7 +2930,30 @@ def _scrub_chrome(body: str) -> str:
     return "\n".join(keep)
 
 
-async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tuple[str, int]:
+_CLAIM_TOKEN_RE = re.compile(r"[a-z0-9]{4,}")
+_CLAIM_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _claim_tokens(claim: str) -> set[str]:
+    """Tokens that participate in IDF evidence selection (entail gate).
+
+    The base pattern keeps alphanumeric runs of ≥4 chars, which silently
+    discarded SHORT numbers — "surging 68.5% to $44 million" contributed
+    no numeric anchor, so number-bearing claims selected their evidence
+    window on prose words alone and missed it in long articles (the
+    dominant share of the gate's ~51%/day cited-sentence drops, audit
+    2026-08-24). Digit tokens of ≥2 chars now participate; IDF still
+    zeroes the ubiquitous ones (years, day-of-month), so only the
+    distinctive figures steer selection.
+    """
+    low = claim.lower()
+    toks = set(_CLAIM_TOKEN_RE.findall(low))
+    toks.update(t for t in _CLAIM_NUM_RE.findall(low) if len(t) >= 2)
+    return toks
+
+
+async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24,
+                           label: str = "") -> tuple[str, int]:
     """MiniCheck entailment gate (#48, gated by ENABLE_MINICHECK, fail-open).
 
     v3 semantics (2026-08-12, from live [entail-miss] forensics): a cited
@@ -2966,9 +2999,10 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tu
     def _weights(claim: str) -> dict[str, float]:
         """IDF weight per claim token: a token found in most read articles
         (dates, site chrome, stock phrases) is worth ~nothing; a rare content
-        token (a name, a technical term) dominates window/article selection."""
+        token (a name, a technical term, an exact figure) dominates
+        window/article selection."""
         wts: dict[str, float] = {}
-        for tok in set(re.findall(r"[a-z0-9]{4,}", claim.lower())):
+        for tok in _claim_tokens(claim):
             if tok not in _df_cache:
                 _df_cache[tok] = sum(1 for bl in art_lowers if tok in bl)
             wts[tok] = 1.0 / (1.0 + _df_cache[tok])
@@ -3188,9 +3222,13 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24) -> tu
             lines[li] = lines[li].replace(st, "").rstrip()
             n_changed += 1
             logger.info("[entail-drop] claim=%r", _claim_of(st)[:140])
+    # One greppable line per digest so drop-rate TRENDS are a metric, not
+    # log archaeology (audit 2026-08-24: ~51%/day attrition went unnoticed
+    # because only per-claim misses were logged).
     logger.info(
-        "[DeepResearch] entailment gate: %d checked, %d unsupported → %d anchored (clause), "
+        "[entail-gate] %s: %d checked, %d unsupported → %d anchored (clause), "
         "%d re-cited, %d de-cited (analysis), %d dropped",
+        label or "digest",
         len(checks), len(unsupported), len(anchored), len(entailed_by), decited, len(drop))
     out = "\n".join(l for l in lines)
     return out, n_changed
@@ -3565,7 +3603,7 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
-    final, _ = await _entailment_gate(final, articles)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
+    final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
     final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
     final, _corr = await _corroborate_numbers(final, articles)   # set of figures ≥2 sources confirm (for Lever A)
     final = _tidy_citations(final)   # strip $-wrapped citations + leaked title fragments
@@ -3970,7 +4008,7 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
-    final, _ = await _entailment_gate(final, articles)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
+    final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
     final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
     final, _corr = await _corroborate_numbers(final, articles)   # set of figures ≥2 sources confirm (for Lever A)
     final = _tidy_citations(final)   # strip $-wrapped citations + leaked title fragments

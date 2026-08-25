@@ -310,6 +310,37 @@ _INDUCTION_SYSTEM_PROMPT = (
 )
 
 
+_STEM_SUFFIXES = ("ings", "ing", "tion", "ions", "ers", "er", "ed", "es", "s")
+
+
+def _stem(word: str) -> str:
+    """Light suffix-stripping stem, applied to fixpoint so inflectional
+    variants converge symmetrically ("answering"→"answer"→"answ" and
+    "answer"→"answ" — a single pass left them unequal)."""
+    while True:
+        for suf in _STEM_SUFFIXES:
+            if word.endswith(suf) and len(word) - len(suf) >= 4:
+                word = word[: -len(suf)]
+                break
+        else:
+            return word
+
+
+def _cluster_covered(key, existing_names: str) -> bool:
+    """Is every cluster keyword already represented in an enabled skill name?
+
+    Raw-substring comparison minted semantic twins (2026-08-24:
+    'factual_question_answering' created seconds after the inductor logged
+    the {'questions','factual'} cluster as covered by
+    'answer_factual_questions' — "answering" is not a substring of
+    "answer"). Compare stems both ways so inflectional variants count.
+    """
+    name_stems = {_stem(w) for w in re.findall(r"[a-z0-9]+", existing_names.lower())}
+    return all(
+        kw in existing_names or _stem(kw) in name_stems for kw in key
+    )
+
+
 async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -> int:
     """Scheduled pass: distill procedure skills from proven memory.
 
@@ -385,9 +416,9 @@ async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -
     )
     consumed: set[int] = set()
 
-    # Cheap pre-dedup: skip clusters whose keywords already appear in an
-    # enabled skill's name (the real gate is the 0.94 semantic dup bar inside
-    # create_procedure_skill — this just avoids burning LLM calls).
+    # Cheap pre-dedup: skip clusters whose (stemmed) keywords already appear
+    # in an enabled skill's name (the real gate is the 0.94 semantic dup bar
+    # inside create_procedure_skill — this just avoids burning LLM calls).
     existing_names = " ".join(
         (r["name"] or "").lower()
         for r in db.fetchall("SELECT name FROM skills WHERE enabled = 1")
@@ -401,7 +432,7 @@ async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -
         members = [items[i] for i in dict.fromkeys(idxs) if i not in consumed]
         if len(members) < 2:
             continue  # remaining evidence already backed an induced skill
-        if existing_names and all(kw in existing_names for kw in key):
+        if existing_names and _cluster_covered(key, existing_names):
             logger.info("Skill-induction: cluster %s already covered by an existing skill", set(key))
             continue
         evidence = "\n".join(m["evidence"] for m in members[:8])

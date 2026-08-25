@@ -116,15 +116,35 @@ class Retriever:
     def _vector_search(self, query: str, top_k: int) -> list[Chunk]:
         """Search ChromaDB using embeddings."""
         try:
+            from . import vector_health
+
             collection = self._get_collection()
             if collection.count() == 0:
                 return []
 
-            results = collection.query(
-                query_texts=[query],
-                n_results=min(top_k, collection.count()),
-                include=["documents", "metadatas", "distances"],
-            )
+            _k = min(top_k, collection.count())
+            try:
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=_k,
+                    include=["documents", "metadatas", "distances"],
+                )
+            except Exception as e:
+                if not vector_health.is_tombstone_error(e):
+                    raise
+                # Tombstone-saturated HNSW index (lessons died this way
+                # 2026-08-22): degrade to a small k instead of losing the
+                # whole vector arm; telemetry drives the health alert.
+                vector_health.record_failure("documents")
+                logger.error(
+                    "Documents vector index tombstone-saturated (k=%d failed) — "
+                    "degrading to k=%d", _k, vector_health.DEGRADE_K,
+                )
+                results = collection.query(
+                    query_texts=[query],
+                    n_results=min(vector_health.DEGRADE_K, collection.count()),
+                    include=["documents", "metadatas", "distances"],
+                )
 
             chunks = []
             if results and results["ids"] and results["ids"][0]:

@@ -76,7 +76,7 @@ _MUTABLE_FIELDS = {
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
     "ENABLE_MONITOR_DIGEST", "MONITOR_DIGEST_ITEM_MAX_CHARS",
-    "ENABLE_MULTI_AGENT", "MULTI_AGENT_TRIGGER_THRESHOLD", "MAX_AGENT_COUNT", "AGENT_TASK_TIMEOUT", "MAX_PARALLEL_AGENTS", "MAX_STRUCTURAL_DEPTH",
+    "ENABLE_DELIBERATION",
     "ENABLE_TREE_OF_THOUGHT", "TOT_SAMPLE_N",
     "ENABLE_BEST_OF_N", "BEST_OF_N_SAMPLES", "BEST_OF_N_QUALITY_THRESHOLD",
     "RETRIEVAL_HARD_FLOOR",
@@ -341,22 +341,17 @@ class Config:
     ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
     MAX_DELEGATION_DEPTH: int = field(default_factory=lambda: _env_int("MAX_DELEGATION_DEPTH", 1))
 
-    # Multi-agent structural decomposition
-    ENABLE_MULTI_AGENT: bool = field(default_factory=lambda: _env("ENABLE_MULTI_AGENT", "true").lower() == "true")
-    MULTI_AGENT_TRIGGER_THRESHOLD: int = field(default_factory=lambda: _env_int("MULTI_AGENT_TRIGGER_THRESHOLD", 4))
-    MAX_AGENT_COUNT: int = field(default_factory=lambda: _env_int("MAX_AGENT_COUNT", 10))
-    AGENT_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("AGENT_TASK_TIMEOUT", 300))
-    # Concurrent sub-agent ceiling. Was hard-coded to 3; lifted now that
-    # AGENT_TASK_TIMEOUT is 300s (RTX 3090 + 9B Q8 can sustain 5+ in parallel).
-    MAX_PARALLEL_AGENTS: int = field(default_factory=lambda: _env_int("MAX_PARALLEL_AGENTS", 6))
-    # Recursive sub-agents. Default 1 (2026-08-20 sweep): at 2, a depth-1
-    # sub-agent could decompose AGAIN (the gate is `depth >= MAX_STRUCTURAL_DEPTH`,
-    # so 1 >= 2 is False), letting one crafted message fan out to ~10 + 10x10 =
-    # 110 think() calls with no tree-wide concurrency cap — a single-GPU DoS.
-    # Depth 1 restores the documented "max depth = 1" invariant: the top-level
-    # query decomposes once into ≤MAX_AGENT_COUNT sub-agents; those cannot
-    # re-decompose. The threshold gate still keeps trivial sub-tasks from firing.
-    MAX_STRUCTURAL_DEPTH: int = field(default_factory=lambda: _env_int("MAX_STRUCTURAL_DEPTH", 1))
+    # Deliberation route (AgentLoop plan→act→critique→synthesize). Own flag
+    # since 2026-08-25: it used to share ENABLE_MULTI_AGENT as a "master
+    # agentic kill switch", so disabling decomposition on 08-14 silently
+    # disabled DELIBERATION too — a kept capability dead for 10 days.
+    ENABLE_DELIBERATION: bool = field(default_factory=lambda: _env("ENABLE_DELIBERATION", "true").lower() == "true")
+
+    # (Multi-agent structural decomposition flags removed 2026-08-25 —
+    # the capability is archived in archive/multi_agent/; it had been
+    # disabled in production since 08-14 at a measured 0.286 pass rate.
+    # ENABLE_MULTI_AGENT / MULTI_AGENT_TRIGGER_THRESHOLD / MAX_AGENT_COUNT /
+    # AGENT_TASK_TIMEOUT / MAX_PARALLEL_AGENTS / MAX_STRUCTURAL_DEPTH.)
     # Tree-of-thought: when enabled, AgentLoop samples multiple action chains for hard steps
     # and picks the most consistent one. Adds latency proportional to sample count.
     ENABLE_TREE_OF_THOUGHT: bool = field(default_factory=lambda: _env("ENABLE_TREE_OF_THOUGHT", "true").lower() == "true")

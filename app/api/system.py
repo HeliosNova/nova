@@ -315,10 +315,7 @@ class ConfigUpdateRequest(BaseModel):
     CRITIQUE_FACTS_LIMIT: int | None = Field(None, ge=100, le=10000)
     MAX_CRITIQUE_ROUNDS: int | None = Field(None, ge=1, le=10)
     DIGEST_HOUR: int | None = Field(None, ge=0, le=23)
-    ENABLE_MULTI_AGENT: bool | None = None
-    MULTI_AGENT_TRIGGER_THRESHOLD: int | None = Field(None, ge=1, le=20)
-    MAX_AGENT_COUNT: int | None = Field(None, ge=1, le=20)
-    AGENT_TASK_TIMEOUT: int | None = Field(None, ge=10, le=600)
+    # (multi-agent decomposition fields removed 2026-08-25 — archived)
     MONITOR_SYNTHESIS_MODEL: str | None = None
     # NOTE (audit 2026-07-08): this request model drifted from _MUTABLE_FIELDS —
     # ~80 mutable fields are absent here, and extra="forbid" 422s any attempt to

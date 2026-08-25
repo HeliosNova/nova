@@ -66,6 +66,66 @@ _ANALYTICAL_TOPIC_RE = re.compile(
     r"|what\s+(?:happens|if|would|will)"
     r"|is\s+it\s+likely|are\s+\w+\s+likely)\b")
 
+# Session-summary / tool-log shaped "answers" (2026-08-25): the provisional
+# path bypasses the closure judge by design, and one resolution stored
+# "Based on the tools executed in this session, here is a summary of your
+# recent activities: ### ✅ Completed" as the ANSWER to a Broadcom/Lumentum
+# question. A provisional answer must at least be ABOUT the topic and must
+# not be the assistant narrating its own tool session.
+_SESSION_SUMMARY_RE = re.compile(
+    r"(?i)(?:\btools?\s+(?:executed|used|invoked)\b|\bin\s+this\s+session\b"
+    r"|\byour\s+recent\s+activit|\bhere\s+is\s+a\s+summary\s+of\s+your\b"
+    r"|✅\s*Completed)")
+
+
+# Digest Health Canary thresholds (weekly check_type="digest_health").
+# The per-digest summary line the entail gate emits since 2026-08-25:
+#   [entail-gate] <label>: N checked, ... M dropped
+_ENTAIL_GATE_LINE_RE = re.compile(
+    r"\[entail-gate\] .*?: (\d+) checked.*?(\d+) dropped")
+
+
+def _digest_health_verdict(lengths: list[int], linkish: int,
+                           checked: int, dropped: int) -> tuple[str, str]:
+    """(status, summary) for the digest-health canary. Pure for tests.
+
+    error  — pipeline broken: no digests in 7d, thin output (avg < 2000
+             chars — healthy live average is ~8k), or >10% link-only.
+    warning — degradation: avg < 4000 chars, or entail drop-rate > 55%
+             (the pre-fix live rate was ~51%; digit-aware windows should
+             push it DOWN, so exceeding 55% means a new regression).
+    """
+    if not lengths:
+        return "error", "no content digests stored in 7 days — pipeline dead?"
+    avg = sum(lengths) / len(lengths)
+    link_share = linkish / len(lengths)
+    drop_rate = (dropped / checked) if checked else 0.0
+    stats = (f"{len(lengths)} digests, avg {avg:.0f} chars, "
+             f"{link_share:.0%} link-only, entail drop {drop_rate:.0%}")
+    if avg < 2000 or link_share > 0.10:
+        return "error", f"digest substance degraded — {stats}"
+    if avg < 4000 or drop_rate > 0.55:
+        return "warning", f"digest quality drifting — {stats}"
+    return "info", stats
+
+
+def _provisional_acceptable(topic: str, result: str) -> bool:
+    """Is `result` an acceptable PROVISIONAL answer for `topic`?
+
+    Two cheap screens (the closure judge was already bypassed for
+    analytical topics): reject session-summary-shaped text, and require at
+    least one substantive topic token to appear in the answer.
+    """
+    if not result or _SESSION_SUMMARY_RE.search(result):
+        return False
+    topic_tokens = {t for t in re.findall(r"[a-z0-9]{4,}", (topic or "").lower())
+                    if t not in ("what", "will", "could", "might", "would",
+                                 "should", "does", "have", "likely", "happens")}
+    if not topic_tokens:
+        return True   # nothing substantive to anchor on — don't over-reject
+    low = result.lower()
+    return any(t in low for t in topic_tokens)
+
 
 _PERSON_TITLE_RE = re.compile(r"(?i)^(?:dr|mr|mrs|ms|prof|gen|sen|rep|gov|amb)\.?\s")
 _ORG_WORDS = frozenset({
@@ -849,6 +909,7 @@ class HeartbeatLoop:
         "skill_quality": lambda self, m, cfg: self._execute_skill_quality_check(),
         "chromadb_integrity": lambda self, m, cfg: self._execute_chromadb_integrity_check(),
         "kg_health": lambda self, m, cfg: self._execute_kg_health_check(),
+        "digest_health": lambda self, m, cfg: self._execute_digest_health(),
         "training_job": lambda self, m, cfg: self._execute_training_job_check(),
         "kg_growth": lambda self, m, cfg: self._execute_kg_growth_check(m),
         "ollama_model": lambda self, m, cfg: self._execute_ollama_model_check(),
@@ -1735,7 +1796,8 @@ class HeartbeatLoop:
                     # already passed to reach the judge), keep the knowledge:
                     # resolve as PROVISIONAL and bank grounded facts below.
                     # Factual topics keep the strict requeue-on-fail path.
-                    if _ANALYTICAL_TOPIC_RE.search(item.topic or ""):
+                    if (_ANALYTICAL_TOPIC_RE.search(item.topic or "")
+                            and _provisional_acceptable(item.topic or "", result)):
                         if svc.kg and len(result) > 50:
                             from app.core.brain import _extract_kg_triples
                             try:
@@ -2258,6 +2320,66 @@ class HeartbeatLoop:
                         parts.append(f"stale lesson vectors pruned: {l_del}")
             except Exception as e:
                 logger.warning("[Heartbeat] vector hygiene failed: %s", e)
+            # ROT SWEEP (2026-08-25): the prunes above keep the Chroma VIEW
+            # clean, but every delete is only an hnswlib tombstone — never
+            # compacted — and a churny index eventually fails all k>=8
+            # queries (lessons died at ~9x tombstones on 2026-08-22 with no
+            # self-heal path). Assess canary + churn-watermark and
+            # drop+rebuild from SQL before queries start failing. The
+            # documents store is excluded: near-zero churn, and the
+            # in-request degrade + telemetry cover it.
+            try:
+                from app.core import vector_health as _vh
+
+                def _rot_sweep() -> list[str]:
+                    def _canary_for(col):
+                        def _run():
+                            if col is not None and col.count() > 0:
+                                col.query(
+                                    query_texts=["vector index health canary"],
+                                    n_results=min(10, col.count()),
+                                )
+                        return _run
+
+                    targets = []
+                    if _svc.learning:
+                        _le = _svc.learning
+                        _lrow = db.fetchone(
+                            "SELECT COALESCE(MAX(id),0) AS m, COUNT(*) AS c FROM lessons")
+                        targets.append({
+                            "name": "lessons",
+                            "live": _lrow["c"], "ever": _lrow["m"],
+                            "canary": _canary_for(_le._get_lessons_collection()),
+                            "watermark": _vh.get_watermark(db, "lessons"),
+                            "rebuild": lambda: _le.rebuild_lessons_vectors(
+                                reason="maintenance rot sweep"),
+                            "record_watermark": lambda: None,  # rebuild records it
+                        })
+                    if _svc.kg:
+                        _kgr = _svc.kg
+                        _krow = db.fetchone(
+                            "SELECT COALESCE(MAX(id),0) AS m,"
+                            " (SELECT COUNT(*) FROM kg_facts WHERE superseded_at IS NULL"
+                            "  AND valid_to IS NULL AND quarantined = 0) AS c"
+                            " FROM kg_facts")
+                        targets.append({
+                            "name": "kg_facts",
+                            "live": _krow["c"], "ever": _krow["m"],
+                            "canary": _canary_for(_kgr._get_collection()),
+                            "watermark": _vh.get_watermark(db, "kg_facts"),
+                            "rebuild": lambda: _kgr.rebuild_vectors(
+                                reason="maintenance rot sweep"),
+                            "record_watermark": lambda: None,  # rebuild records it
+                        })
+                    return _vh.sweep(targets)
+
+                _rot_lines = await asyncio.to_thread(_rot_sweep)
+                _rot_events = [ln for ln in _rot_lines
+                               if "REBUILT" in ln or "FAILED" in ln]
+                if _rot_events:
+                    parts.append("vector rot sweep: " + "; ".join(_rot_events))
+            except Exception as e:
+                logger.warning("[Heartbeat] vector rot sweep failed: %s", e)
             try:
                 n_inv = await asyncio.to_thread(_curate_inverted_leads, db)
                 if n_inv:
@@ -3223,13 +3345,8 @@ class HeartbeatLoop:
         report_dir = cfg.get("report_dir") or config.EVAL_REPORT_PATH
 
         harness = EvalHarness(suite_path=suite_path, report_dir=report_dir)
-        # Multi-agent tasks assert decomposition behavior; with structural
-        # decomposition disabled at runtime they fail structurally and pollute
-        # pass_rate + flag false regressions (2026-08-14 audit: pass 0.29,
-        # decomposition_rate 0.00 under ENABLE_MULTI_AGENT=false). Skip them so
-        # real drift in other categories isn't masked.
-        if not config.ENABLE_MULTI_AGENT:
-            harness._skip_categories = {"multi-agent"}
+        # (multi-agent category skip removed 2026-08-25 — the capability and
+        # its suite category are archived in archive/multi_agent/.)
 
         # Verify suite file exists before attempting to run
         import pathlib
@@ -3243,12 +3360,17 @@ class HeartbeatLoop:
             return f"[Eval harness run failed: {e}]"
 
         flagged = [r for r in report.regressions if r.flagged]
-        status = "REGRESSION" if flagged else "OK"
+        chronic = getattr(report, "chronic_failures", []) or []
+        status = "REGRESSION" if flagged else ("CHRONIC" if chronic else "OK")
         reg_str = ""
         if flagged:
             reg_str = " | regressions: " + ", ".join(
                 f"{r.metric}({r.baseline:.2f}->{r.current:.2f})" for r in flagged
             )
+        if chronic:
+            # Baseline-equality can never flag a task that was red at baseline
+            # time — 3+ consecutive reds get their own escalation channel.
+            reg_str += " | CHRONIC (3+ runs red): " + ", ".join(chronic)
 
         cat_summary = " | ".join(
             f"{cat}:{cm.pass_rate:.0%}"
@@ -3512,7 +3634,81 @@ class HeartbeatLoop:
         except Exception:
             pass
 
+        # Dead-man's switch for the vector ARM (2026-08-25): the lessons
+        # HNSW index was tombstone-dead for 3 days — 133 warnings, zero
+        # alerts — because nothing watched query failures. Any store
+        # failing repeatedly in 24h is an ERROR, not a log line.
+        try:
+            from app.core import vector_health as _vh
+            _fails = _vh.failures_in_window(hours=24)
+            _bad = {s: n for s, n in _fails.items() if n >= 5}
+            for s, n in _fails.items():
+                if n:
+                    fields[f"vector_failures_{s}"] = n
+            if _bad:
+                status = "error"
+                summary = (
+                    "vector index failing: "
+                    + ", ".join(f"{s} ({n}x/24h)" for s, n in sorted(_bad.items()))
+                    + " — tombstone rot; maintenance rebuild pending"
+                )
+        except Exception:
+            pass
+
         return format_monitor_result("ChromaDB Integrity", status, summary, fields)
+
+    async def _execute_digest_health(self) -> str:
+        """Weekly canary over the digest pipeline's output-quality signals.
+
+        The "monitors deliver only hyperlinks" failure recurred TWICE with
+        zero automated coverage (2026-08-19, 2026-08-21), and the entail
+        gate silently dropped ~51% of cited sentences per day until log
+        archaeology found it (audit 2026-08-24). Deterministic — no GPU,
+        no network: 7d of stored content digests (substance + link-only
+        share) plus the [entail-gate] per-digest summary lines from the
+        persistent log (drop-rate trend).
+        """
+        from app.database import get_db
+
+        db = get_db()
+
+        def _stats() -> tuple[list[int], int]:
+            rows = db.fetchall(
+                "SELECT mr.value AS value FROM monitor_results mr "
+                "JOIN monitors m ON m.id = mr.monitor_id "
+                "WHERE m.category = 'content' "
+                "AND mr.created_at > datetime('now', '-7 days') "
+                "AND mr.status IN ('ok','changed','alert') "
+                "AND mr.value IS NOT NULL AND length(mr.value) > 0")
+            lengths = [len(r["value"]) for r in rows]
+            linkish = sum(1 for r in rows
+                          if len(r["value"]) < 600 and "http" in r["value"])
+            return lengths, linkish
+
+        lengths, linkish = await asyncio.to_thread(_stats)
+
+        checked = dropped = 0
+        try:
+            import glob as _glob
+            for lp in _glob.glob("/data/logs/nova-app.log*"):
+                with open(lp, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        m = _ENTAIL_GATE_LINE_RE.search(line)
+                        if m:
+                            checked += int(m.group(1))
+                            dropped += int(m.group(2))
+        except OSError:
+            pass
+
+        status, summary = _digest_health_verdict(lengths, linkish, checked, dropped)
+        fields: dict[str, str | int | float] = {
+            "digests_7d": len(lengths),
+            "avg_chars": int(sum(lengths) / len(lengths)) if lengths else 0,
+            "link_only": linkish,
+            "entail_checked": checked,
+            "entail_dropped": dropped,
+        }
+        return format_monitor_result("Digest Health Canary", status, summary, fields)
 
     async def _execute_kg_health_check(self) -> str:
         """Check Knowledge Graph health: node count, edge count, fragmentation."""

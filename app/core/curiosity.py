@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import logging
 import re
+from contextvars import ContextVar
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -22,6 +23,26 @@ _URGENCY_CRITICAL = 0.8
 _URGENCY_HIGH = 0.6
 _URGENCY_MEDIUM = 0.4
 _URGENCY_LOW = 0.3
+
+# Ephemeral-run suppression (2026-08-25). Eval-harness runs go through the
+# SAME think()/tool pipeline as real traffic, so a zero-result web search
+# on a FICTIONAL eval fixture minted a real curiosity item — "Dr. Ferrand
+# photonics group Lyon" etc. burned ≥6 hourly research cycles, each ending
+# closure_check_failed (unresolvable by construction). brain.think() sets
+# this for ephemeral non-monitor runs; CuriosityQueue.add() drops organic
+# minting while it's set. Monitor traffic (also ephemeral) keeps minting —
+# its zero-result searches are genuine curiosity signal.
+_SUPPRESS_ORGANIC: ContextVar[bool] = ContextVar(
+    "curiosity_suppress_organic", default=False)
+
+
+def set_suppress_organic_minting(value: bool):
+    """Set the ephemeral-run suppression flag; returns a reset token."""
+    return _SUPPRESS_ORGANIC.set(value)
+
+
+def reset_suppress_organic_minting(token) -> None:
+    _SUPPRESS_ORGANIC.reset(token)
 
 # ---------------------------------------------------------------------------
 # Gap detection — heuristic, no LLM call
@@ -276,6 +297,11 @@ class CuriosityQueue:
 
     def add(self, topic: str, source: str = "gap_detection", urgency: float = 0.5) -> int:
         """Add a topic to the queue. Deduplicates by boosting urgency if already pending."""
+        if _SUPPRESS_ORGANIC.get():
+            logger.debug(
+                "Curiosity add suppressed (ephemeral run): %r [%s]",
+                topic[:80], source)
+            return -1
         topic = topic.strip()[:500]
         if not topic:
             return -1

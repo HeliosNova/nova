@@ -41,8 +41,12 @@ class TestBareNoPattern:
     def test_message_starting_with_no_without_comma_still_matches(self):
         assert is_likely_correction("no that answer was wrong") is True
 
-    def test_actually_still_matches_anywhere(self):
-        assert is_likely_correction("The answer is actually 42") is True
+    def test_actually_anchored_to_message_opening(self):
+        # 2026-08-25: "actually" anchored like bare-"no" — mid-sentence it is
+        # ordinary English and the anywhere-match disabled auto-thinking.
+        assert is_likely_correction("Actually, the answer is 42") is True
+        assert is_likely_correction("Well, actually it launched in 2019") is True
+        assert is_likely_correction("Can you actually run that benchmark?") is False
 
     def test_thats_wrong_still_matches_anywhere(self):
         assert is_likely_correction("Hmm, that's wrong — it launched in 2019") is True

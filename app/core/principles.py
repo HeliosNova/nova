@@ -35,6 +35,19 @@ def _topic_keywords(topic: str) -> frozenset[str]:
     return frozenset(w for w in words if w not in _STOPWORDS)
 
 
+# Lesson-machinery boilerplate that must never become principle TEXT
+# (2026-08-25): procedural-consolidation stubs carry conf 0.95 and the
+# literal lesson_text "Procedural-consolidation: merged 3 lessons" — picked
+# by confidence, that string became the ONLY principle ever minted (08-08)
+# and its subject then blocked the cluster from re-minting forever.
+_BOILERPLATE_TEXT_RE = re.compile(
+    r"(?i)^\s*(?:procedural-consolidation\b|auto-merged\b|merged\s+\d+\s+lessons)")
+
+
+def _is_principle_text(text: str) -> bool:
+    return bool(text) and not _BOILERPLATE_TEXT_RE.search(text)
+
+
 async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int = 3) -> int:
     """Find clusters of agreeing lessons and write each as a principle KG fact.
 
@@ -54,7 +67,7 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
     for r in rows:
         topic = r["topic"] or ""
         text = (r["lesson_text"] or "")[:300]
-        if not topic or not text:
+        if not topic or not _is_principle_text(text):
             continue
         # Skip if already a principle for this topic
         existing = db.fetchone(
@@ -95,13 +108,16 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
     for key, members in clusters.items():
         if len(members) < min_cluster:
             continue
-        # Compose a principle statement: pick the highest-confidence member's text
+        # Compose a principle statement: pick the highest-confidence member
+        # whose text is a REAL lesson (consolidation stubs outrank real
+        # lessons on confidence but their text is machinery boilerplate).
         members.sort(key=lambda m: (m["confidence"], m["times_helpful"]), reverse=True)
-        best = members[0]
+        best = next((m for m in members
+                     if _is_principle_text((m["lesson_text"] or ""))), None)
+        if best is None:
+            continue
         topic_label = " + ".join(sorted(key))
         text = (best["lesson_text"] or "")[:200]
-        if not text:
-            continue
         # Dedupe
         existing = db.fetchone(
             "SELECT id FROM kg_facts WHERE source='principle' AND subject=? LIMIT 1",

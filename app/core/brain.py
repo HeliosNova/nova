@@ -27,7 +27,6 @@ if TYPE_CHECKING:
     from app.core.curiosity import CuriosityQueue, TopicTracker
     from app.tools.base import ToolRegistry
     from app.monitors.heartbeat import MonitorStore, HeartbeatLoop
-    from app.core.agent_spawner import DecompositionPlan
 from app.core import llm
 from app.core.claim_validator import build_evidence, count_claim_candidates, validate_claims
 from app.core.learning import is_likely_correction, response_pushes_back
@@ -85,14 +84,6 @@ _SIDE_EFFECT_TOOLS = frozenset({
     "shell_exec", "code_exec", "integration", "delegate", "browser",
     "desktop", "background_task", "tool_create", "monitor",
 })
-
-# Tools allowed at structural depth >= 2 — sub-sub-agents must reason deeply,
-# not spawn more research. Web/browser/http_fetch removed; calculator + code_exec
-# kept for in-context computation.
-_DEPTH2_ALLOWED_TOOLS = frozenset({
-    "calculator", "code_exec", "memory_search", "knowledge_search", "context_detail",
-})
-
 
 # Per-query pivot tracking — one backtrack pivot allowed per conversation per query.
 # Keyed by conversation_id; auto-cleared after the tool loop finishes (in _run_generation_loop).
@@ -287,16 +278,40 @@ def _nums_equal(a: str, b: str) -> bool:
         return False
 
 
+_BARE_NUMBER_RE = re.compile(r"-?\d[\d,]{3,}(?:\.\d+)?")
+
+
+def _prior_user_turns_text(history: list[dict] | None, *, cap: int = 8000) -> str:
+    """PRIOR-turn user messages as claim-validator evidence (2026-08-25).
+
+    A fact the user stated last turn is evidence — the validator blanked
+    "your colleague's name is X" one turn after the user said it because
+    build_evidence never saw history. Only 'user' roles are included (the
+    assistant's own prior claims must not self-validate) and the CURRENT
+    query is never in `history` at this point, so the anti-presupposition
+    rule holds.
+    """
+    if not history:
+        return ""
+    parts = [str(m.get("content") or "") for m in history
+             if m.get("role") == "user"]
+    return "\n".join(p for p in parts if p)[:cap]
+
+
 def _fix_calculator_transcriptions(answer: str, tool_results: list[dict]) -> str:
     if not answer or not tool_results:
         return answer
     correct: dict[str, str] = {}
+    calc_outputs: list[tuple[str, str]] = []   # (norm_expr, value)
     for tr in tool_results:
         if tr.get("tool") != "calculator":
             continue
         m = _CALC_OUTPUT_RE.match(str(tr.get("output", tr.get("result", ""))).strip())
         if m:
-            correct[_norm_expr(m.group(1))] = m.group(2).replace(",", "")
+            norm = _norm_expr(m.group(1))
+            val = m.group(2).replace(",", "")
+            correct[norm] = val
+            calc_outputs.append((norm, val))
     if not correct:
         return answer
 
@@ -310,7 +325,31 @@ def _fix_calculator_transcriptions(answer: str, tool_results: list[dict]) -> str
             num, expr.strip(), want)
         return f"{expr.rstrip()} = {bold_open}{want}{bold_close}"
 
-    return _ANSWER_EQ_CLAIM_RE.sub(_sub, answer)
+    answer = _ANSWER_EQ_CLAIM_RE.sub(_sub, answer)
+
+    # Bare-number pass (2026-08-25): the expr-form pass above only fires on
+    # "expr = number" restatements; a prose answer stating just the (wrong)
+    # number shipped uncorrected — and the 9B mis-copied 2 of 3 calculator
+    # results on 2026-08-24, so this hole WILL be hit. Conservative rule:
+    # exactly one calculator result, the correct value appears nowhere in
+    # the answer, and exactly ONE large number that is neither the result
+    # nor one of the expression's operands — that number is a transcription
+    # of the result by construction; substitute it. Anything ambiguous is
+    # left alone.
+    if len(calc_outputs) == 1:
+        norm_expr, want = calc_outputs[0]
+        operands = set(re.findall(r"\d+(?:\.\d+)?", norm_expr))
+        answer_nums = [(m.start(), m.group(0)) for m in _BARE_NUMBER_RE.finditer(answer)]
+        if not any(_nums_equal(n, want) for _, n in answer_nums):
+            strays = [(pos, n) for pos, n in answer_nums
+                      if n.replace(",", "").lstrip("-") not in operands]
+            if len(strays) == 1:
+                pos, stray = strays[0]
+                logger.warning(
+                    "[calc-transcription] answer wrote bare %r but calculator "
+                    "returned %s — fixed", stray, want)
+                answer = answer[:pos] + want + answer[pos + len(stray):]
+    return answer
 
 # Time-sensitive queries (current price, latest news, today's weather) must
 # never serve from workspace cache or stale lessons — the "fact" they cached
@@ -448,7 +487,14 @@ async def _handle_tool_create(svc: Services, args: dict) -> str:
         if not name or not code:
             return "[Tool creation failed: name and code are required.]"
 
-        tool_id = svc.custom_tools.create_tool(name, description, parameters, code)
+        # screen_network=True (2026-08-25): this was the ONLY create_tool
+        # call site without the network screen — the code author here is
+        # the chat LLM, whose context carries retrieved web/KG content, so
+        # an injection-steered turn could mint an httpx/socket-importing
+        # tool. The three autonomous paths (agent_loop, auto_tools,
+        # tool_triggers) all screen; the chat path must too.
+        tool_id = svc.custom_tools.create_tool(
+            name, description, parameters, code, screen_network=True)
         if tool_id == -1:
             return "[Tool creation failed: name already exists, code blocked, or limit reached.]"
 
@@ -1523,6 +1569,28 @@ def _kg_answers_query(query: str, kg_facts_text: str) -> bool:
     return False
 
 
+def _auto_think_eligible(*, query: str, intent: str, image: str | None,
+                         selected_model: str, channel: str) -> bool:
+    """Should the hard-reasoning heuristic auto-enable extended thinking?
+
+    channel=="monitor" is excluded (2026-08-25): monitor/daemon traffic
+    prepends an enriched '=== System Context ===' blob whose dates and
+    owner facts trip the constraint-word heuristic — ~20 background
+    thinking generations/day on the 9B, pure GPU tax on work that never
+    needs visible reasoning. Eval traffic (channel='api', ephemeral) is
+    deliberately NOT excluded — the reasoning category requires thinking.
+    """
+    if image or selected_model == config.FAST_MODEL:
+        return False
+    if intent != "general" or channel == "monitor":
+        return False
+    try:
+        from app.core.agent_loop import _is_hard_reasoning_query
+        return _is_hard_reasoning_query(query)
+    except Exception:
+        return False
+
+
 async def _run_generation_loop(
     messages: list[dict],
     tools: list[dict],
@@ -1534,6 +1602,7 @@ async def _run_generation_loop(
     ephemeral: bool,
     gen: _GenerationResult,
     query: str = "",
+    channel: str = "api",
 ) -> AsyncGenerator[StreamEvent, None]:
     """The tool loop — generate, check for tool calls, execute tools, re-generate.
 
@@ -1552,27 +1621,20 @@ async def _run_generation_loop(
 
     # Extended thinking: enabled by global flag OR auto-enabled for hard-reasoning queries
     # (where visible chain-of-thought before answer materially improves quality on a smaller model).
-    # Auto-enable does NOT fire on fast model or vision queries.
-    _hard_query_auto_thinking = (
-        not image
-        and selected_model != config.FAST_MODEL
-        and intent == "general"
+    # Auto-enable does NOT fire on fast model, vision, or monitor-channel queries.
+    _hard_query_auto_thinking = _auto_think_eligible(
+        query=query, intent=intent, image=image,
+        selected_model=selected_model, channel=channel,
     )
-    if _hard_query_auto_thinking:
-        try:
-            from app.core.agent_loop import _is_hard_reasoning_query
-            _hard_query_auto_thinking = _is_hard_reasoning_query(query)
-        except Exception:
-            _hard_query_auto_thinking = False
     use_thinking = (
         (config.ENABLE_EXTENDED_THINKING or _hard_query_auto_thinking)
         and not image
         and selected_model != config.FAST_MODEL
     )
     logger.info(
-        "[thinking-gate] hard=%s use_thinking=%s model=%s intent=%s qhead=%r",
+        "[thinking-gate] hard=%s use_thinking=%s model=%s intent=%s channel=%s qhead=%r",
         _hard_query_auto_thinking, use_thinking,
-        selected_model or config.LLM_MODEL, intent, query[:60],
+        selected_model or config.LLM_MODEL, intent, channel, query[:60],
     )
     if _hard_query_auto_thinking:
         # System-2 nudge for reasoning / constraint word problems. The 9B
@@ -3565,307 +3627,13 @@ async def _run_post_processing(
 
 
 # ---------------------------------------------------------------------------
-# Multi-agent path
+# Multi-agent structural decomposition — ARCHIVED 2026-08-25.
+# Disabled in production since 2026-08-14 (chat-under-load hardening); last
+# measured pass_rate 0.286 (08-14) with its eval category skipped ever since.
+# The deliberation AgentLoop + DelegateTool cover multi-step needs. Code:
+# archive/multi_agent/ (decomposer.py, agent_spawner.py, tests). Revival =
+# restore the modules + the Step-6.6 gate in think() + the suite category.
 # ---------------------------------------------------------------------------
-
-async def _run_multi_agent_path(
-    svc: Services,
-    query: str,
-    conversation_id: str,
-    intent: str,
-    ctx: "_ThinkContext",
-    decomp_plan: "DecompositionPlan",
-    is_new_conversation: bool,
-    ephemeral: bool,
-    channel: str,
-) -> AsyncGenerator[StreamEvent, None]:
-    """Execute the structural multi-agent decomposition path.
-
-    Yields the same SSE event stream as the normal think() path plus four
-    new event types: AGENT_META, AGENT_START, AGENT_DONE, AGENT_MERGE.
-    Post-processing (corrections, facts, reflexion) runs on the merged
-    response text, same as the normal path.
-    """
-    from app.core.agent_spawner import AgentSpawner, merge_agent_results
-
-    agent_count = len(decomp_plan.tasks)
-
-    # --- META: announce decomposition to the client ---
-    yield StreamEvent(
-        type=EventType.AGENT_META,
-        data={
-            "type": "decomposition",
-            "strategy": decomp_plan.strategy,
-            "agent_count": agent_count,
-            "fallback": False,
-        },
-    )
-
-    # --- AGENT_START: one event per task ---
-    for task in decomp_plan.tasks:
-        yield StreamEvent(
-            type=EventType.AGENT_START,
-            data={
-                "run_id": conversation_id,
-                "task_id": task.task_id,
-                "role": task.role,
-                "query": task.query[:200],
-            },
-        )
-
-    # --- Execute all sub-agents ---
-    # Total timeout scales with agent count and parallelism budget. Previously
-    # hardcoded to TOOL_TIMEOUT*2=360s, which throttled recursive decomposition
-    # under serialized GPU load. New formula: AGENT_TASK_TIMEOUT * ceil(N / max_parallel)
-    # + 30s merge headroom. Sized for RTX 3090 + 9B Q8 + recursive depth-2.
-    import math
-    n = len(decomp_plan.tasks)
-    waves = max(1, math.ceil(n / max(1, decomp_plan.max_parallel)))
-    total_timeout = config.AGENT_TASK_TIMEOUT * waves + 30
-    logger.info(
-        "[Multi-agent] total_timeout=%ds (n=%d waves=%d agent_timeout=%d)",
-        total_timeout, n, waves, config.AGENT_TASK_TIMEOUT,
-    )
-    spawner = AgentSpawner(decomp_plan, conversation_id)
-    try:
-        results = await asyncio.wait_for(spawner.run(), timeout=float(total_timeout))
-    except asyncio.TimeoutError:
-        logger.warning("Multi-agent decomposition timed out after %ds", total_timeout)
-        yield StreamEvent(
-            type=EventType.AGENT_META,
-            data={"type": "fallback", "reason": "total_timeout"},
-        )
-        fallback_text = "[Multi-agent decomposition timed out. Please try again.]"
-        yield StreamEvent(type=EventType.TOKEN, data={"text": fallback_text})
-        yield StreamEvent(
-            type=EventType.DONE,
-            data={
-                "conversation_id": conversation_id,
-                "intent": intent,
-                "tool_results_count": 0,
-                "lessons_used": len(ctx.used_lesson_ids),
-                "kg_facts_used": ctx.kg_facts_count,
-                "reflexions_used": ctx.reflexions_count,
-                "skill_used": None,
-                "decomposed": True,
-                "agent_count": agent_count,
-            },
-        )
-        return
-
-    # --- AGENT_DONE: one event per completed task ---
-    all_tools: list[str] = []
-    completed_count = 0
-    failed_count = 0
-    max_depth_observed = 0
-    for result in results:
-        all_tools.extend(result.tools_invoked)
-        if result.error:
-            failed_count += 1
-        else:
-            completed_count += 1
-        # Track the deepest level any sub-agent reached. If a sub-agent itself
-        # decomposed further, the effective depth is one greater than its own.
-        d = getattr(result, "depth", 1)
-        if getattr(result, "sub_decomposed", False):
-            d = d + 1
-        if d > max_depth_observed:
-            max_depth_observed = d
-        yield StreamEvent(
-            type=EventType.AGENT_DONE,
-            data={
-                "task_id": result.task_id,
-                "role": result.role,
-                "latency_seconds": result.latency_seconds,
-                "tools": result.tools_invoked,
-                "skill_used": result.skill_used,
-                "error": result.error,
-                "depth": getattr(result, "depth", 1),
-                "sub_decomposed": getattr(result, "sub_decomposed", False),
-            },
-        )
-
-    # --- AGENT_MERGE: announce synthesis ---
-    yield StreamEvent(
-        type=EventType.AGENT_MERGE,
-        data={
-            "strategy": decomp_plan.strategy,
-            "agents_completed": completed_count,
-            "agents_failed": failed_count,
-        },
-    )
-
-    # --- Merge sub-agent results ---
-    successful = [r for r in results if r.response and not r.error]
-    if not successful:
-        final_content = "[All sub-agents failed to produce results. Please try again.]"
-        is_error = True
-    else:
-        try:
-            final_content = await merge_agent_results(
-                results, decomp_plan.merge_instruction, query
-            )
-            is_error = False
-        except Exception as e:
-            logger.warning("Merge step failed: %s", e)
-            final_content = "\n\n".join(r.response for r in successful if r.response)
-            is_error = False
-
-    if final_content is None:
-        final_content = ""
-
-    # --- Emit TOOL_USE events for each unique tool used across sub-agents ---
-    # Required so the eval harness's tool_invoked assertions work correctly.
-    seen_tools: set[str] = set()
-    for tool_name in all_tools:
-        if tool_name not in seen_tools:
-            seen_tools.add(tool_name)
-            yield StreamEvent(
-                type=EventType.TOOL_USE,
-                data={"tool": tool_name, "args": {}, "source": "sub-agent"},
-            )
-
-    # --- Stream merged response ---
-    if final_content:
-        final_content = _sanitize_answer(final_content)
-        sub_agent_evidence = "\n\n".join(r.response for r in successful if r.response)
-        evidence = build_evidence(
-            retrieved_context=(ctx.retrieved_context or "") + "\n\n" + sub_agent_evidence,
-            kg_facts_text=ctx.kg_facts_text,
-            user_facts_text=ctx.user_facts_text,
-            lessons_text=ctx.lessons_text,
-            tool_results=None,
-            query=query,
-        )
-        _pre_validate_content = final_content
-        final_content, stripped_reasons = validate_claims(
-            final_content, evidence, current_model_tag=config.LLM_MODEL,
-        )
-        final_content = _guard_validated_content(_pre_validate_content, final_content)
-        if stripped_reasons:
-            for r in stripped_reasons:
-                logger.warning("[claim-validator-multi-agent] %s", r)
-        # RLVR — only record when the validator actually had claim candidates
-        # to inspect. Without this gate, ~100% of responses (which contain no
-        # person-title-org or numeric-spec patterns) record value=1.0 and the
-        # signal becomes degenerate (zero variance, unusable for GRPO).
-        try:
-            if getattr(config, "ENABLE_RLVR_SIGNALS", False):
-                _candidates = count_claim_candidates(_pre_validate_content)
-                if _candidates > 0:
-                    from app.core import rlvr as _rlvr
-                    _val = 1.0 if not stripped_reasons else max(
-                        0.0, 1.0 - min(1.0, len(stripped_reasons) / 5.0)
-                    )
-                    await asyncio.to_thread(
-                        _rlvr.record_signal,
-                        "claim_grounded",
-                        _val,
-                        query=query[:500],
-                        response=final_content[:500],
-                        evidence=f"stripped={len(stripped_reasons)} checked={_candidates} multi_agent=true",
-                        conversation_id=conversation_id,
-                    )
-        except Exception:
-            pass
-        chunk_size = 20
-        for i in range(0, len(final_content), chunk_size):
-            yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
-
-    # --- Persist to conversation (non-ephemeral only) ---
-    saved_msg_id = None
-    if not ephemeral and svc.conversations:
-        saved_msg_id = await asyncio.to_thread(
-            lambda: svc.conversations.add_message(
-                conversation_id,
-                "assistant",
-                final_content,
-                tool_calls=None,
-                sources=None,
-            )
-        )
-        if is_new_conversation and final_content:
-            # Fire-and-forget — don't block DONE on title generation.
-            async def _safe_title2():
-                try:
-                    title = await _generate_title(query)
-                    await asyncio.to_thread(svc.conversations.update_title, conversation_id, title)
-                except Exception as e:
-                    logger.warning("Failed to generate title: %s", e)
-            _t2 = asyncio.create_task(_safe_title2())
-            _background_tasks.add(_t2)
-            _t2.add_done_callback(_background_tasks.discard)
-
-    # --- DONE event (includes decomposed=True + agent_count + max_depth) ---
-    yield StreamEvent(
-        type=EventType.DONE,
-        data={
-            "conversation_id": conversation_id,
-            "intent": intent,
-            "tool_results_count": len(all_tools),
-            "lessons_used": len(ctx.used_lesson_ids),
-            "kg_facts_used": ctx.kg_facts_count,
-            "reflexions_used": ctx.reflexions_count,
-            "skill_used": None,
-            "decomposed": True,
-            "agent_count": agent_count,
-            "max_decomposition_depth": max_depth_observed,
-        },
-    )
-
-    # --- Post-processing on merged response (non-ephemeral only) ---
-    if not ephemeral:
-        # Grounded reflexion critique on the MERGE. Sub-agents are judged
-        # individually inside their own think() runs; this catches
-        # merge-stage fabrication — claims in the merged text that no
-        # sub-agent actually produced. Runs after DONE: zero perceived
-        # latency. Evidence = the sub-agents' answers.
-        merge_quality: float | None = None
-        merge_reason = ""
-        if final_content and intent == "general" and not is_error:
-            try:
-                from app.core.reflexion import critique_response, should_use_llm_critique
-                # Failed sub-agents are included as error entries — if all of
-                # them failed, the judge must see "evidence was attempted but
-                # unavailable", not "(none — no tools were used)" (which
-                # misgraded a timeless-knowledge answer grounded=0.00 on
-                # 2026-06-12 when the only sub-agent timed out).
-                merge_evidence = [
-                    {
-                        "tool": f"sub-agent:{r.role}",
-                        "output": (r.response or "") if not r.error else "",
-                        "error": str(r.error or "") if (r.error or not r.response) else "",
-                    }
-                    for r in results
-                    if r.response or r.error
-                ]
-                if should_use_llm_critique(intent, final_content, merge_evidence):
-                    merge_quality, merge_reason = await critique_response(
-                        query, final_content, merge_evidence,
-                        user_facts=ctx.user_facts_text,
-                        kg_facts=ctx.kg_facts_text,
-                    )
-                    logger.info(
-                        "[QUALITY] path=multi-agent score=%.2f reason=%s",
-                        merge_quality, merge_reason[:100],
-                    )
-            except Exception as e:
-                logger.debug("[Multi-agent] merge reflexion critique failed: %s", e)
-        tool_results_for_pp = [
-            {"tool": t, "args": {}, "output": ""} for t in list(dict.fromkeys(all_tools))
-        ]
-        async for event in _run_post_processing(
-            svc, query, final_content, intent, conversation_id,
-            tool_results_for_pp, None, ctx.used_lesson_ids,
-            is_error, merge_quality, merge_reason,
-            had_kg=bool(ctx.kg_facts_text),
-            had_docs=bool(ctx.retrieved_context),
-            channel=channel,
-            saved_msg_id=saved_msg_id,
-            ephemeral=ephemeral,
-        ):
-            yield event
-
 
 # ---------------------------------------------------------------------------
 # Per-stage latency instrumentation (always on — microsecond cost)
@@ -4034,6 +3802,15 @@ async def think(
         await _conv_lock.acquire()
         _conv_lock_acquired = True
 
+    # Suppress ORGANIC curiosity minting for ephemeral non-monitor runs
+    # (2026-08-25): eval-harness traffic minted fictional fixtures into the
+    # live curiosity queue (Dr. Ferrand — ≥6 wasted GPU research cycles).
+    # Monitor traffic is ephemeral too but its signal is genuine, so it is
+    # exempted by channel.
+    from app.core import curiosity as _curiosity_mod
+    _curiosity_token = _curiosity_mod.set_suppress_organic_minting(
+        bool(ephemeral) and channel != "monitor")
+
     try:
 
         # --- Step 2: History ---
@@ -4114,9 +3891,12 @@ async def think(
         # 2026-05-07: deliberation_chain_of_reasoning timed out at structural
         # decomposition because the deliberation gate refused to take it.
         # Trust the deliberation regex; it's already tight enough.
+        # Own kill switch since 2026-08-25: this used to share
+        # ENABLE_MULTI_AGENT, so the 08-14 decomposition disable silently
+        # killed deliberation too — 10 days with the route dead in prod.
         if (
             intent == "general"
-            and config.ENABLE_MULTI_AGENT  # share the master agentic kill switch
+            and config.ENABLE_DELIBERATION
             and _should_use_deliberation(query)
         ):
             logger.info("[Deliberation] gate fired for query: %r (ephemeral=%s)", query[:100], ephemeral)
@@ -4130,21 +3910,9 @@ async def think(
             except Exception as e:
                 logger.warning("[Deliberation] failed, falling through to standard generation: %s", e)
 
-        # --- Step 6.6: Multi-agent structural decomposition gate ---
-        # should_decompose() is heuristic-only (no LLM).  decompose_query() is also
-        # heuristic-only.  The actual sub-agents run inside _run_multi_agent_path().
-        # If decomposition fires and produces a valid plan, we bypass the normal
-        # generation loop entirely and return from _run_multi_agent_path().
-        from app.core.decomposer import should_decompose, decompose_query
-        if should_decompose(query, intent, was_planned, ephemeral):
-            decomp_plan = decompose_query(query, intent, was_planned, plan, conversation_id)
-            if decomp_plan is not None:
-                async for event in _run_multi_agent_path(
-                    svc, query, conversation_id, intent, ctx,
-                    decomp_plan, is_new_conversation, ephemeral, channel,
-                ):
-                    yield event
-                return
+        # (Step 6.6 — multi-agent structural decomposition — ARCHIVED
+        # 2026-08-25; see the archive note above _StageTimer and
+        # archive/multi_agent/.)
 
         # --- Step 7: Generate + Tool Loop ---
         yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})
@@ -4168,21 +3936,9 @@ async def think(
         if ephemeral:
             tools = [t for t in tools if t["name"] != "delegate"]
 
-        # Depth-aware tool restriction: at structural depth >= 2 (sub-sub-agents),
-        # restrict to in-context reasoning tools only — no web/browser/http_fetch.
-        # Sub-sub-agents should reason deeply from already-gathered context, not
-        # spawn more research that serializes on the GPU and times out.
-        try:
-            from app.core.agent_spawner import get_structural_depth
-            current_depth = get_structural_depth()
-        except Exception:
-            current_depth = 0
-        if current_depth >= 2:
-            tools = [t for t in tools if t["name"] in _DEPTH2_ALLOWED_TOOLS]
-            logger.info(
-                "[depth-restrict] depth=%d: restricted tools to %s",
-                current_depth, sorted(t["name"] for t in tools),
-            )
+        # (Structural-depth tool restriction removed with the multi-agent
+        # archive 2026-08-25 — structural depth was always 0 without the
+        # decomposition path; DelegateTool has its own depth guard.)
 
         # Facts-first gate: the answer is already in the Known Facts block →
         # generate WITHOUT tools so the model reads its facts instead of
@@ -4195,7 +3951,7 @@ async def think(
         gen = _GenerationResult()
         async for event in _run_generation_loop(
             messages, _gen_tools, svc, conversation_id, image, intent,
-            was_planned, ephemeral, gen, query=query,
+            was_planned, ephemeral, gen, query=query, channel=channel,
         ):
             yield event
         # Facts-first misfire guard (2026-08-19): the gate can match a NEWS
@@ -4217,7 +3973,7 @@ async def think(
                 gen = _GenerationResult()
                 async for event in _run_generation_loop(
                     messages, tools, svc, conversation_id, image, intent,
-                    was_planned, ephemeral, gen, query=query,
+                    was_planned, ephemeral, gen, query=query, channel=channel,
                 ):
                     yield event
 
@@ -4238,7 +3994,7 @@ async def think(
             _repair = _GenerationResult()
             async for event in _run_generation_loop(
                 messages, [], svc, conversation_id, image, intent,
-                was_planned, ephemeral, _repair, query=query,
+                was_planned, ephemeral, _repair, query=query, channel=channel,
             ):
                 yield event
             if (_repair.final_content or "").strip() and not _draft_is_unfinished(_repair.final_content):
@@ -4272,7 +4028,7 @@ async def think(
                 _rescue = _GenerationResult()
                 async for event in _run_generation_loop(
                     messages, [], svc, conversation_id, image, intent,
-                    was_planned, ephemeral, _rescue, query=query,
+                    was_planned, ephemeral, _rescue, query=query, channel=channel,
                 ):
                     yield event
                 if (_rescue.final_content or "").strip():
@@ -4297,6 +4053,7 @@ async def think(
                     lessons_text=ctx.lessons_text,
                     tool_results=gen.tool_results,
                     query=query,
+                    history_text=_prior_user_turns_text(history),
                 )
                 _pre_validate_content_ephemeral = final_content
                 final_content, stripped_reasons = validate_claims(
@@ -4329,6 +4086,26 @@ async def think(
                             )
                 except Exception:
                     pass
+                # Skill scoring for EPHEMERAL traffic (2026-08-25): nearly all
+                # skill matches happen on monitor/eval runs, which exit here —
+                # before the non-ephemeral scoring block — so times_used /
+                # success_rate froze while skills matched 50×/day. Record the
+                # structural outcome (no reflexion quality on this path).
+                if ctx.matched_skill:
+                    try:
+                        _eph_ok = not gen.is_error
+                        if ctx.matched_skill.steps:
+                            _eph_ok = _eph_ok and len(gen.tool_results) > 0 and not any(
+                                isinstance(tr.get("output", ""), str)
+                                and tr["output"].startswith("[Tool") and "failed" in tr["output"]
+                                for tr in gen.tool_results
+                            )
+                        await asyncio.to_thread(
+                            svc.skills.record_use, ctx.matched_skill.id, _eph_ok,
+                            hard_failure=not _eph_ok,
+                        )
+                    except Exception as e:
+                        logger.debug("Ephemeral skill scoring failed: %s", e)
                 chunk_size = 20
                 for i in range(0, len(final_content), chunk_size):
                     yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
@@ -4358,6 +4135,7 @@ async def think(
             lessons_text=ctx.lessons_text,
             tool_results=gen.tool_results,
             query=query,
+            history_text=_prior_user_turns_text(history),
         )
         if ctx.retrieved_sources:
             yield StreamEvent(type=EventType.SOURCES, data={"sources": ctx.retrieved_sources})
@@ -4385,22 +4163,17 @@ async def think(
             _latch_llm2.note_interactive_activity()
         _timer.mark("draft_emit")
 
-        # Refine (critique + reflexion) — unchanged semantics; operates on the raw
-        # generation exactly as before. Skip the full critique chain at structural
-        # depth >= 2 — sub-sub-agents should produce raw fast output; the parent
-        # critiques the merged result.
-        if current_depth >= 2:
-            final_content = gen.final_content
-            reflexion_quality, reflexion_reason = None, ""
-            logger.info("[depth-restrict] depth=%d: skipping _refine_response", current_depth)
-        else:
-            final_content, reflexion_quality, reflexion_reason = await _refine_response(
-                messages, tools, gen.final_content, query, intent,
-                gen.tool_results, was_planned, plan,
-                retrieved_context=ctx.retrieved_context,
-                user_facts_text=ctx.user_facts_text,
-                kg_facts_text=ctx.kg_facts_text,
-            )
+        # Refine (critique + reflexion) — unchanged semantics; operates on the
+        # raw generation exactly as before. (The structural-depth>=2 skip
+        # branch was removed with the multi-agent archive 2026-08-25 — depth
+        # was always 0 without the decomposition path.)
+        final_content, reflexion_quality, reflexion_reason = await _refine_response(
+            messages, tools, gen.final_content, query, intent,
+            gen.tool_results, was_planned, plan,
+            retrieved_context=ctx.retrieved_context,
+            user_facts_text=ctx.user_facts_text,
+            kg_facts_text=ctx.kg_facts_text,
+        )
         _timer.mark("refine")
 
         # --- Step 10: validate the refined answer + emit a REVISION if it changed ---
@@ -4714,6 +4487,7 @@ async def think(
                 logger.debug("Success pattern A/B record failed: %s", e)
 
     finally:
+        _curiosity_mod.reset_suppress_organic_minting(_curiosity_token)
         if _conv_lock is not None and _conv_lock_acquired and _conv_lock.locked():
             _conv_lock.release()
             _conv_lock_acquired = False
