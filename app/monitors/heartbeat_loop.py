@@ -109,6 +109,34 @@ def _digest_health_verdict(lengths: list[int], linkish: int,
     return "info", stats
 
 
+# Stat-line canaries whose numbers drift every run by design (counts,
+# latencies). Generic numeric change-detection re-delivered their HEALTHY
+# readouts forever ("kg growth normal" 3x/day, "✅ ollama healthy (6ms)"
+# whenever latency jittered a few ms — live 2026-08-26, both stored as
+# status=alert). Maps check_type -> the marker that identifies a healthy
+# verdict line.
+_CANARY_NORMAL_MARKERS: dict[str, str] = {
+    "kg_growth": "kg growth normal",
+    "ollama_latency": "ollama healthy",
+}
+
+
+def _canary_should_alert(check_type: str, last_result: str | None,
+                         new_value: str | None) -> bool:
+    """Delivery gate for stat-line canary monitors.
+
+    The only deliverable states are: any non-healthy verdict (spike/drop/
+    FLATLINE/slow/error — active alarms must repeat), and the single
+    recovery edge back to healthy. healthy → healthy is suppressed.
+    """
+    marker = _CANARY_NORMAL_MARKERS.get(check_type)
+    if marker is None:
+        return True
+    was_normal = marker in (last_result or "")
+    is_normal = marker in (new_value or "")
+    return not (was_normal and is_normal)
+
+
 def _provisional_acceptable(topic: str, result: str) -> bool:
     """Is `result` an acceptable PROVISIONAL answer for `topic`?
 
@@ -777,8 +805,21 @@ class HeartbeatLoop:
                 # (years, percentages) — skip numeric comparison, use text-only
                 if monitor.check_type in ("quiz", "skill_test"):
                     threshold = 999999  # Force text-only comparison
-                change_info = detect_change(monitor.last_result, new_value, threshold)
-                should_alert = change_info is not None
+                if monitor.check_type in _CANARY_NORMAL_MARKERS:
+                    # Stat-line canaries: numbers drift every run by design,
+                    # so numeric detect_change re-delivered healthy readouts
+                    # every cycle (stored status=alert), burying the canaries'
+                    # real signal (live 2026-08-26: 3 "growth normal" + 3
+                    # "ollama healthy" alerts/day). Deliver only warnings
+                    # (which must repeat) and the recovery edge to healthy.
+                    should_alert = _canary_should_alert(
+                        monitor.check_type, monitor.last_result, new_value)
+                    if should_alert:
+                        change_info = detect_change(
+                            monitor.last_result, new_value, threshold)
+                else:
+                    change_info = detect_change(monitor.last_result, new_value, threshold)
+                    should_alert = change_info is not None
             else:
                 # First check — always alert
                 should_alert = True
@@ -1812,6 +1853,18 @@ class HeartbeatLoop:
                                     item.topic[:80])
                         return (f"CURIOSITY PROVISIONAL | topic={item.topic[:80]} | "
                                 f"analytical question — hedged synthesis stored")
+                    # Degraded-search guard (2026-08-26): when most recent web
+                    # searches are coming back empty (network/engine outage —
+                    # e.g. the DDG IP block), a thin answer that fails closure
+                    # is the NETWORK's fault, not the topic's. Mirror the
+                    # LLM-down guard above: requeue without burning an attempt.
+                    from app.tools.native_search import search_health
+                    if search_health() < 0.25:
+                        logger.info("[Curiosity] closure failed under degraded search "
+                                    "(health=%.2f) — deferred without attempt burn: %s",
+                                    search_health(), item.topic[:80])
+                        return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                                f"reason=search_degraded")
                     await asyncio.to_thread(svc.curiosity.fail, item.id)
                     logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
                     return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
@@ -2326,8 +2379,12 @@ class HeartbeatLoop:
             # queries (lessons died at ~9x tombstones on 2026-08-22 with no
             # self-heal path). Assess canary + churn-watermark and
             # drop+rebuild from SQL before queries start failing. The
-            # documents store is excluded: near-zero churn, and the
-            # in-request degrade + telemetry cover it.
+            # documents store was originally excluded ("near-zero churn, the
+            # in-request degrade + telemetry cover it") — WRONG on both
+            # counts by 2026-08-26: the index rotted anyway and the k=5
+            # degrade failed with the same hnsw error, so every retrieval
+            # lost its vector arm. It sweeps canary-only (uuid ids can't
+            # form a churn watermark).
             try:
                 from app.core import vector_health as _vh
 
@@ -2370,6 +2427,23 @@ class HeartbeatLoop:
                             "rebuild": lambda: _kgr.rebuild_vectors(
                                 reason="maintenance rot sweep"),
                             "record_watermark": lambda: None,  # rebuild records it
+                        })
+                    if _svc.retriever:
+                        _ret = _svc.retriever
+                        _drow = db.fetchone(
+                            "SELECT COUNT(*) AS c FROM chunks_fts")
+                        _dc = _drow["c"] if _drow else 0
+                        targets.append({
+                            "name": "documents",
+                            # uuid chunk ids can't form an ever/churn
+                            # watermark — ever=live keeps the churn arm
+                            # inert; the canary is the trigger here.
+                            "live": _dc, "ever": _dc,
+                            "canary": _canary_for(_ret._get_collection()),
+                            "watermark": None,
+                            "rebuild": lambda: _ret.rebuild_vectors(
+                                reason="maintenance rot sweep"),
+                            "record_watermark": lambda: None,
                         })
                     return _vh.sweep(targets)
 
@@ -2765,7 +2839,7 @@ class HeartbeatLoop:
         scripts/finetune_auto.py", but that script no longer ships. It now
         no-ops so the (possibly still-seeded) monitor can't surface a stale
         command. To revive training, restore `archive/training/` and remove
-        this guard. See CLAUDE.md "Fine-Tuning".
+        this guard. See archive/training/README.md.
         """
         return "FINETUNE ARCHIVED | weight training is retired; the in-context memory loop is the product"
 
@@ -3614,7 +3688,7 @@ class HeartbeatLoop:
                 if doc_count == 0:
                     # Not "healthy" (2026-08-18): a zero count is either a genuinely
                     # empty store OR the known stale-handle-after-reindex failure
-                    # (CLAUDE.md) where the app holds a dropped collection and every
+                    # (known failure mode) where the app holds a dropped collection and every
                     # retrieval silently returns nothing. Surface it as a warning so a
                     # wiped index is visible instead of reading as normal.
                     status = "warning"

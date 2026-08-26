@@ -454,7 +454,7 @@ def export_gguf(adapter_dir: str, output_dir: str, model_name: str = DEFAULT_MOD
           the previous run's weights;
       (b) dynamic-module loading: downloads a temp script that fails
           with `ModuleNotFoundError: No module named 'conversion'`.
-    See CLAUDE.md "Fine-Tuning -> Two quirks" for context.
+    See archive/training/README.md for context.
 
     Returns path to the Q8_0 GGUF file.
     """

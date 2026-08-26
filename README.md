@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-2%2C931-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-3%2C100%2B-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
@@ -89,7 +89,7 @@ User query -> brain.think()
   -> retrieve documents (ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)
   -> build system prompt (8 prioritized blocks with truncation budget)
   -> generate response (Ollama — local inference)
-  -> tool loop if needed (max 5 rounds, 20 built-in tools)
+  -> tool loop if needed (max 6 rounds, 22 built-in tools)
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
@@ -137,7 +137,7 @@ Each monitor produces a deep-research briefing — Nova's richest thinking. Thos
 
 Chat is the surface where you interrogate all of this: relevant dossier prose is pulled into context, so "where does the Iran situation stand?" answers from maintained understanding, not a cold search.
 
-## Tools (20 built-in)
+## Tools (22 built-in)
 
 | Tool | What it does |
 |------|-------------|
@@ -199,7 +199,7 @@ Every query-type monitor auto-extracts knowledge graph triples. All results incl
 
 Temporal knowledge graph that grows autonomously from the scheduled monitors:
 
-- 31 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, `works_at`, `member_of`, etc.)
+- 45 canonical predicates (`is_a`, `located_in`, `created_by`, `price_of`, `developed_by`, `works_at`, `member_of`, etc.)
 - `valid_from` / `valid_to` — when a fact was true
 - `superseded_by` — tracks how facts change over time (old facts aren't deleted, they're versioned)
 - `provenance` — which source/conversation created it
@@ -255,7 +255,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-2,931 tests across ~130 files: brain pipeline, memory loop, knowing tier, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
+3,100+ tests across ~170 files: brain pipeline, memory loop, knowing tier, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
 
 ## Hardware Requirements
 
@@ -290,7 +290,7 @@ Or just run `./install.sh` — it detects your hardware and picks the right tier
 
 ## Configuration
 
-All settings via `.env`. See [CLAUDE.md](CLAUDE.md) for the full list of 150+ config fields.
+All settings via `.env` — [.env.example](.env.example) documents the common fields with their defaults; [app/config.py](app/config.py) is the authoritative list (200+ fields).
 
 ## Contributing
 

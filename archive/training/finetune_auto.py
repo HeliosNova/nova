@@ -644,7 +644,7 @@ async def run_pipeline(
     # Honest deploy requires an INDEPENDENT judge. Self-judging (judge == a model
     # under test) inflates scores, so we refuse to auto-promote on it — a deploy
     # is only as trustworthy as its judge. (Empirically, fine-tunes here tie the
-    # base under a real cross-family judge; see MODEL_CARD / CLAUDE.md.)
+    # base under a real cross-family judge; see MODEL_CARD.md.)
     _judge = os.getenv("EVAL_JUDGE_MODEL") or ""
     _independent_judge = bool(_judge) and _judge not in (base_model_ollama, ft_model_name)
     if eval_results.candidate_is_better and not _independent_judge:

@@ -91,13 +91,60 @@ restart_target() {
     sleep "$COOLDOWN"
 }
 
+# Secondary targets (2026-08-25): a hung nova-ollama or nova-embed used to
+# stall monitors until the heartbeat went stale — then the watchdog restarted
+# the WRONG container (nova-app) forever. These have compose healthchecks;
+# sustained `unhealthy` gets the same limit+cooldown treatment as the primary.
+# Space-separated, override with WATCHDOG_AUX_TARGETS.
+AUX_TARGETS=${WATCHDOG_AUX_TARGETS:-nova-ollama nova-embed}
+
+aux_health() {
+    docker_api 10 "/containers/$1/json" \
+        | jq -r '.State.Health.Status // .State.Status // "unknown"' 2>/dev/null \
+        || echo unknown
+}
+
+restart_aux() {
+    # $1 = container, $2 = reason
+    if [ "$DRY_RUN" = "1" ]; then
+        log "DRY RUN — would restart $1: $2"
+        alert "DRY RUN — would restart $1: $2"
+        return
+    fi
+    log "restarting $1: $2"
+    alert "$1 is unhealthy ($2) — restarting it."
+    docker_api 90 "/containers/$1/restart?t=30" -X POST >/dev/null 2>&1
+}
+
+check_aux_targets() {
+    now=$(date +%s)
+    for c in $AUX_TARGETS; do
+        ast=$(aux_health "$c")
+        if [ "$ast" = "unhealthy" ]; then
+            n=$(eval "echo \${AUXFAIL_$(echo "$c" | tr -c 'A-Za-z0-9' '_'):-0}")
+            n=$((n + 1))
+            eval "AUXFAIL_$(echo "$c" | tr -c 'A-Za-z0-9' '_')=$n"
+            log "aux $c health=unhealthy (${n}/${UNHEALTHY_LIMIT})"
+            last=$(eval "echo \${AUXRESTART_$(echo "$c" | tr -c 'A-Za-z0-9' '_'):-0}")
+            if [ "$n" -ge "$UNHEALTHY_LIMIT" ] && [ $((now - last)) -ge "$COOLDOWN" ]; then
+                restart_aux "$c" "health check failing ${n}x"
+                eval "AUXRESTART_$(echo "$c" | tr -c 'A-Za-z0-9' '_')=$now"
+                eval "AUXFAIL_$(echo "$c" | tr -c 'A-Za-z0-9' '_')=0"
+            fi
+        else
+            eval "AUXFAIL_$(echo "$c" | tr -c 'A-Za-z0-9' '_')=0"
+        fi
+    done
+}
+
 fails=0
 unknowns=0
 # Startup counts as a grace start: the watchdog has no restart history yet and
 # the app may be mid-recovery from whatever preceded this watchdog boot.
 LAST_RESTART=$(date +%s)
-log "started (target=${TARGET} interval=${INTERVAL}s unhealthy_limit=${UNHEALTHY_LIMIT} hb_stale=${HB_STALE_MIN}m grace=${GRACE_SEC}s dry_run=${DRY_RUN})"
+log "started (target=${TARGET} aux=[${AUX_TARGETS}] interval=${INTERVAL}s unhealthy_limit=${UNHEALTHY_LIMIT} hb_stale=${HB_STALE_MIN}m grace=${GRACE_SEC}s dry_run=${DRY_RUN})"
 while true; do
+    check_aux_targets
     st=$(health)
     # "unknown" means the watchdog itself is blind (socket-proxy dead, target
     # renamed/gone) — both detectors silently skip in that state, so a blind

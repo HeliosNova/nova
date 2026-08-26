@@ -1,19 +1,13 @@
-"""Native web search — direct HTML scraping of public search engines.
+"""Native web search — SearXNG-primary with direct-scrape fallbacks.
 
-Removes the SearXNG dependency. SearXNG was returning garbage rankings (AT&T
-forums and Albuquerque census results for "current population of Japan"),
-which made tool-using agents fabricate around bad data.
+SearXNG (local container, category-routed: general/news/science/it/social) is
+the primary aggregator; Wikipedia's API augments factual queries; direct HTML
+scrapes of Bing and Brave fill in when SearXNG comes up short. DuckDuckGo's
+HTML driver is retained but out of every ladder — duckduckgo.com became
+TCP-unreachable from this network on ~2026-08-26 (IP-level block).
 
-This module hits public search frontends directly and parses the result HTML.
-No API keys, no third-party services, no SearXNG container.
-
-Engines (in priority order, with quick failover):
-  1. DuckDuckGo HTML (https://html.duckduckgo.com/html/) — no API, no JS, fast
-  2. Bing HTML (https://www.bing.com/search) — fallback
-  3. Brave Search HTML (https://search.brave.com/search) — second fallback
-
-Each engine is parsed with stdlib `html.parser` (no BeautifulSoup dep). If one
-returns 0 results or errors, we fall through to the next.
+Direct engines are parsed with stdlib `html.parser` (no BeautifulSoup dep).
+If one returns 0 results or errors, we fall through to the next.
 
 Output is a normalized list of {title, url, snippet}.
 """
@@ -24,6 +18,7 @@ import asyncio
 import html
 import logging
 import re
+from collections import deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, unquote, urlparse
@@ -31,6 +26,22 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 
 logger = logging.getLogger(__name__)
+
+# Rolling health signal over the last 50 search() calls (True = ≥1 result).
+# Consumers (curiosity closure, research loops) use this to tell "the topic is
+# unanswerable" apart from "the network/engines are down" — during the
+# 2026-08-26 DDG block, ~50% of searches returned nothing and closure checks
+# punished the ITEMS for it, burning retry attempts on a network fault.
+_RECENT_OUTCOMES: deque[bool] = deque(maxlen=50)
+
+
+def search_health() -> float:
+    """Fraction of the last 50 search() calls that returned ≥1 result.
+
+    Returns 1.0 when no searches have run yet (cold start = assume healthy)."""
+    if not _RECENT_OUTCOMES:
+        return 1.0
+    return sum(_RECENT_OUTCOMES) / len(_RECENT_OUTCOMES)
 
 # 12s was too tight for SearXNG: it talks to multiple upstream engines
 # (Bing, Startpage, Yandex, etc.) sequentially, and a single slow upstream
@@ -335,6 +346,7 @@ async def _search_duckduckgo(query: str, max_results: int) -> list[SearchResult]
         "https://html.duckduckgo.com/html/",
         data={"q": query, "kl": "us-en", "df": ""},
         method="POST",
+        timeout=SEARCH_TIMEOUT,
     )
     if not text:
         return []
@@ -351,6 +363,7 @@ async def _search_bing(query: str, max_results: int) -> list[SearchResult]:
     text = await _fetch(
         "https://www.bing.com/search",
         params={"q": query, "form": "QBLH", "setlang": "en-US"},
+        timeout=SEARCH_TIMEOUT,
     )
     if not text:
         return []
@@ -361,6 +374,7 @@ async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
     text = await _fetch(
         "https://search.brave.com/search",
         params={"q": query, "source": "web"},
+        timeout=SEARCH_TIMEOUT,
     )
     if not text:
         return []
@@ -558,11 +572,17 @@ async def search(
             effective_mode = "general"
 
     # Build engine ladder. Each tuple = (async callable taking (q,n), label).
+    # DDG dropped from every ladder 2026-08-26: duckduckgo.com became
+    # TCP-unreachable from this network (host AND containers — IP-level block),
+    # so _search_duckduckgo burned a 30s connect-timeout on 88% of calls.
+    # Bing/Brave HTML drivers take its slot; the DDG driver is kept above for
+    # easy revival if the block ever lifts.
     if effective_mode == "news":
         ladder = [
             (lambda q, n: _search_searxng(q, n, categories="news"), "searxng:news"),
             (lambda q, n: _search_searxng(q, n, categories="general"), "searxng:general"),
-            (_search_duckduckgo, "duckduckgo"),
+            (_search_bing, "bing"),
+            (_search_brave, "brave"),
         ]
     elif effective_mode == "factual":
         ladder = [
@@ -589,7 +609,8 @@ async def search(
         ladder = [
             (lambda q, n: _search_searxng(q, n, categories="general"), "searxng:general"),
             (_search_wikipedia, "wikipedia"),
-            (_search_duckduckgo, "duckduckgo"),
+            (_search_bing, "bing"),
+            (_search_brave, "brave"),
         ]
 
     # Run the first 3 engines concurrently — gives a rich merged result set
@@ -624,6 +645,7 @@ async def search(
             except Exception as e:
                 logger.warning("native_search: %s failed: %s", name, e)
 
+    _RECENT_OUTCOMES.append(bool(merged))
     return _demote_low_credibility(merged)
 
 

@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import time
 from datetime import datetime, timedelta
 
 from app.config import config
@@ -82,6 +83,13 @@ class DaemonOrchestrator:
         self._running = False
         self._dream_running = False
         self._task: asyncio.Task | None = None
+        # Last daemon-initiated curiosity research (monotonic seconds). A
+        # pending critical item that repeatedly fails its closure check stays
+        # pending — without a cooldown the daemon re-researched the SAME item
+        # every 5-minute tick (observed live 2026-08-26: 3 full GPU research
+        # runs in 20 min, all discarded). The hourly Curiosity Research monitor
+        # remains the steady cadence; the daemon only supplements.
+        self._last_curiosity_research: float = 0.0
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -274,8 +282,11 @@ class DaemonOrchestrator:
                 and not self._dream_running):
             return {"action": "dream"}
 
-        # Critical curiosity research — idle and have urgent items
-        if budget in (BUDGET_LIGHT, BUDGET_FULL) and context["critical_curiosity"] > 0:
+        # Critical curiosity research — idle and have urgent items. 30-min
+        # cooldown between daemon-initiated runs (see __init__ note).
+        if (budget in (BUDGET_LIGHT, BUDGET_FULL)
+                and context["critical_curiosity"] > 0
+                and time.monotonic() - self._last_curiosity_research >= 1800):
             return {"action": "research_curiosity"}
 
         # Process pending events
@@ -487,6 +498,7 @@ class DaemonOrchestrator:
         if not svc.curiosity or not svc.heartbeat:
             return
 
+        self._last_curiosity_research = time.monotonic()
         self._log("decision", "Researching critical curiosity items", "daemon")
         try:
             # Delegate to the existing curiosity research monitor handler

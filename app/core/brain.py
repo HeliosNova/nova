@@ -2198,7 +2198,14 @@ async def _run_generation_loop(
                     )},
                 ]
                 try:
-                    synthesis = await llm.invoke_nothink(synthesis_messages, max_tokens=1500)
+                    # messages[0] is the FULL system pack (~10-12k tokens); at
+                    # the model-default 4096 ctx Ollama context-shifted this
+                    # prompt down to its last ~2k tokens (keep=4), so the model
+                    # synthesized from the transcript TAIL — "I performed these
+                    # actions"-style answers that the curiosity closure judge
+                    # rejected 6/6 times on 2026-08-26. Match the chat lattice.
+                    synthesis = await llm.invoke_nothink(
+                        synthesis_messages, max_tokens=1500, num_ctx=24576)
                     if synthesis and synthesis.strip():
                         gen.final_content = synthesis.strip()
                     else:
@@ -4409,23 +4416,30 @@ async def think(
                     _background_tasks.add(_kg_task)
                     _kg_task.add_done_callback(_background_tasks.discard)
 
-                    # GSW: update episodic summary for this conversation. Background task
-                    # so we don't block the response. Internal gating decides whether the
-                    # message count has crossed the re-summarize threshold.
-                    async def _gsw_update(_cid=conversation_id):
-                        try:
-                            from app.core import gsw as _gsw_mod
-                            if _gsw_mod.is_enabled() and _cid:
-                                await _gsw_mod.maybe_update_summary(get_db(), _cid)
-                        except Exception as e:
-                            logger.warning("[GSW] update task failed: %s", e)
-
-                    if conversation_id:
-                        _gsw_task = asyncio.create_task(_gsw_update())
-                        _background_tasks.add(_gsw_task)
-                        _gsw_task.add_done_callback(_background_tasks.discard)
             except Exception as e:
                 logger.warning("Workspace save failed: %s", e)
+
+        # GSW: update episodic summary for this conversation. Background task
+        # so we don't block the response. Internal gating decides whether the
+        # message count has crossed the re-summarize threshold. This used to
+        # be nested inside the workspace branch's grounded-success `if`, so it
+        # only ran for general-intent + tool-grounded + 200-6000-char answers —
+        # conversation_summaries had ZERO rows ever while the read side ran on
+        # every general query (found 2026-08-26). The module's own is_enabled()
+        # + message-count gates are the intended filters; schedule per turn.
+        if conversation_id and final_content:
+            async def _gsw_update(_cid=conversation_id):
+                try:
+                    from app.core import gsw as _gsw_mod
+                    if _gsw_mod.is_enabled() and _cid:
+                        from app.database import get_db as _get_db
+                        await _gsw_mod.maybe_update_summary(_get_db(), _cid)
+                except Exception as e:
+                    logger.warning("[GSW] update task failed: %s", e)
+
+            _gsw_task = asyncio.create_task(_gsw_update())
+            _background_tasks.add(_gsw_task)
+            _gsw_task.add_done_callback(_background_tasks.discard)
 
         # --- Step 12: Done event ---
         _timer.mark("stream")

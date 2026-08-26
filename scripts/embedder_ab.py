@@ -162,6 +162,7 @@ def main():
     header = f"{'config':<28} {'r@1':>5} {'r@3':>5} {'r@5':>5} {'r@10':>5} {'MRR':>6} {'embed_s':>8}"
     print(header)
     print("-" * len(header))
+    artifact_rows = []
     for label, model, qpfx, dpfx in CONFIGS:
         t0 = time.time()
         dv = embed(model, docs, dpfx)
@@ -176,6 +177,25 @@ def main():
         r = {k: float((ranks <= k).mean()) for k in (1, 3, 5, 10)}
         mrr = float((1.0 / ranks).mean())
         print(f"{label:<28} {r[1]:>5.2f} {r[3]:>5.2f} {r[5]:>5.2f} {r[10]:>5.2f} {mrr:>6.3f} {dt:>8.1f}")
+        artifact_rows.append({"config": label, "model": model,
+                              "recall": r, "mrr": mrr, "embed_s": round(dt, 1)})
+
+    # Persist the run (2026-08-25): the 08-24 "bge-m3 WINS" verdict existed
+    # only as stdout + session memory — A/B evidence must outlive the session.
+    import os
+    from datetime import datetime, timezone
+    out_dir = os.environ.get("AB_RESULTS_DIR", "/data/ceiling/results")
+    try:
+        os.makedirs(out_dir, exist_ok=True)
+        out_path = os.path.join(
+            out_dir,
+            f"embedder_ab_{datetime.now(timezone.utc):%Y%m%d_%H%M%S}.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump({"seed": SEED, "n_queries": len(queries),
+                       "n_docs": len(docs), "results": artifact_rows}, f, indent=2)
+        print(f"\nartifact: {out_path}")
+    except OSError as e:
+        print(f"\n[warn] artifact not written ({e}) — set AB_RESULTS_DIR")
 
     print("\ndecision rule: promote only if a qwen3-emb config beats bge-m3 on "
           "r@3 AND MRR; instructed-query wins additionally require wiring "

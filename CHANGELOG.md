@@ -1,5 +1,143 @@
 # Changelog
 
+## [1.7.1] - 2026-08-26
+
+Live-audit fix batch: search availability, curiosity churn, alert noise,
+vector rot, silent truncation.
+
+### Search stack (the day's headline: DuckDuckGo became TCP-unreachable
+from this network — IP-level block, host and containers alike)
+- SearXNG engine lineup rebuilt from 24h error telemetry: DDG family
+  disabled (every query hung its 10s timeout, pushing SearXNG's response
+  past nova-app's 12s deadline — ~50% of searches returned nothing all
+  day), qwant disabled (2,691 CAPTCHAs/24h), wikiquote/wikibooks/wiktionary
+  disabled (Wikimedia 429s burned the per-IP budget the direct Wikipedia
+  arm needs). `outgoing` timeouts cut 15/20s → 8/10s so SearXNG always
+  answers inside the caller's deadline. Measured: 15.0s/query → 0.6-1.2s,
+  20-36 results.
+- `native_search`: DDG dropped from every ladder (driver kept for revival);
+  Bing + Brave direct-scrape drivers take its slots and now fail fast at
+  SEARCH_TIMEOUT instead of hanging 30s; stale module docstring rewritten
+  (it still claimed SearXNG had been removed).
+- New `search_health()` rolling signal (last 50 searches) so research loops
+  can tell "topic unanswerable" from "search outage".
+
+### Curiosity churn (a 7-day-old urgency-0.9 item was re-researched every
+5-minute daemon tick, every run discarded)
+- Dream consolidation now grants at most ONE `attempts=0` reset per item
+  (`[dream-reset]` marker in `resolution`) — unconditional resets had made
+  MAX_CURIOSITY_ATTEMPTS meaningless.
+- Daemon-initiated curiosity research gets a 30-min cooldown (the hourly
+  monitor remains the steady cadence).
+- Closure-check failures under degraded search (health < 0.25) defer
+  without burning an attempt, mirroring the LLM-down guard.
+- Exhausted-tool-rounds synthesis in `brain.think()` passes
+  `num_ctx=24576` — its ~11.8k-token prompt was context-shifted down to
+  ~2k tokens at the model default, so the model answered from the
+  transcript tail ("I performed these actions...") and the closure judge
+  rejected 6/6 such runs on 2026-08-26.
+
+### Alert noise
+- Stat-line canaries (KG Growth Rate, Ollama Latency) no longer deliver
+  healthy readouts on numeric jitter ("kg growth normal" / "✅ ollama
+  healthy (6ms)" were each alerting 3×/day). Warnings still repeat; the
+  recovery edge back to healthy delivers once.
+
+### Vector rot
+- The documents Chroma collection had rotted exactly like lessons/kg_facts
+  before it (every retrieval logged "tombstone-saturated (k=4 failed)" and
+  the k=5 degrade ALSO failed — the vector arm returned nothing while
+  looking "covered by telemetry"). New `Retriever.rebuild_vectors()` +
+  documents added to the daily rot sweep (canary-only; uuid ids can't form
+  a churn watermark). Live index rebuilt same night.
+
+### Silent truncation + misc
+- `[num_ctx]` tripwire extended to catch server-side context-shift
+  truncation (prompt_eval_count lands far below the estimated prompt size —
+  previously invisible: 6 such truncations that day, 0 tripwire lines).
+- deep_research `_findings` max_tokens 320 → 512 (~20 mid-sentence cuts/day
+  were putting dangling fragments into the evidence pool).
+- GSW episodic summaries: the `maybe_update_summary` call was accidentally
+  nested inside the workspace branch's grounded-success gate, so
+  `conversation_summaries` had zero rows ever while the read side ran on
+  every general query. Now scheduled per completed turn (the module's own
+  is_enabled + ≥4-message gates are the filters).
+
+## [1.7.0] - 2026-08-25
+
+Catch-up release: the changelog had been silent since June while ~50 commits
+landed. Highlights since 1.6.0, newest first.
+
+### Fix-all from the 2026-08-24 A-Z audit (this release)
+- **Vector-index rot defenses** (`app/core/vector_health.py`): hnswlib never
+  compacts delete-tombstones — the lessons HNSW index died on 2026-08-22
+  (~9× tombstones; every k≥10 query failed; vector arm silently keyword-only
+  for 3 days). Now: in-request k-degrade retry, failure telemetry that turns
+  into a ChromaDB-Integrity ERROR, churn-watermark + canary rot assessment in
+  daily maintenance, and drop+rebuild paths for lessons and kg_facts.
+- **deep_research**: `_findings` passes num_ctx=8192 (the 08-22 body-cap
+  raise silently overflowed the 4096 default — ~95 truncated findings/day);
+  entail-gate evidence windows are digit-aware (short figures like "68.5"
+  carried zero selection weight — the bulk of ~700 dropped cited
+  sentences/day); per-digest `[entail-gate]` summary line with monitor label.
+- **Chat**: conversation history (prior USER turns) now counts as
+  claim-validator evidence (the validator refused to repeat a name the user
+  stated one turn earlier — 5 consecutive nightly eval reds); calculator
+  digit-guard extended to bare-number restatements; auto-thinking gate skips
+  channel="monitor" (~20 pointless background thinking runs/day); chat-path
+  `tool_create` gets `screen_network=True` (the one unscreened call site);
+  "actually"/"I think it's"/"not quite" correction patterns anchored to the
+  message opening (mid-sentence false positives disabled thinking).
+- **Self-improvement loop closure**: failure-sweep reinforces a same-topic
+  recent lesson instead of re-minting paraphrases daily; curiosity minting is
+  suppressed for ephemeral eval runs (fictional eval fixtures burned real GPU
+  research cycles) and provisional resolutions must be topical non-summaries;
+  principles skip consolidation-boilerplate text (Path A and B); skill
+  matching strips the monitor context preamble (constant-0.737 wrong match);
+  skill induction coverage is stem-normalized (semantic-twin skills);
+  ephemeral traffic now records skill usage (times_used was frozen).
+- **Eval**: `multi_tool_rate` re-scoped to tasks declaring `expect_tools`
+  (forced math routing had correctly made pure-math tasks single-tool and the
+  old metric flagged the improvement as a regression); chronic-failure
+  escalation (a task red 3+ consecutive runs alerts even when the baseline
+  says it's "normal"); weekly Digest Health Canary monitor (substance,
+  link-only share, entail drop-rate trend); embedder A/B writes JSON
+  artifacts.
+- **Ops**: WAL checkpoint(TRUNCATE) on graceful DB close; watchdog also
+  restarts a sustained-unhealthy nova-ollama/nova-embed (it used to restart
+  the WRONG container); searxng + socket-proxy pinned by digest; host offsite
+  backup now carries `.env` + `searxng/settings.yml` and compares by
+  mtime+size; first evidenced restore drill (offsite snapshot → integrity ok,
+  all tables).
+- **CI**: frontend vitest job added — the markdown-defang exfiltration guard
+  now actually gates commits.
+
+### Archived: multi-agent structural decomposition (2026-08-25)
+- `decomposer.py` + `agent_spawner.py` + tests → `archive/multi_agent/`.
+  Disabled in production since 08-14; last measured pass_rate 0.286; its eval
+  category had been skipped ever since. Flags removed from config/API.
+- **The deliberation route got its own flag** (`ENABLE_DELIBERATION`,
+  default on): it had shared `ENABLE_MULTI_AGENT` as a kill switch, so
+  disabling decomposition silently disabled deliberation too — a kept
+  capability dead in production for 10 days. The deliberation eval probe
+  moved to the `reasoning` category (it had been collaterally skipped).
+
+### Since 1.6.0, before this release (June–August)
+- Selective extended thinking + forced math routing + calculator
+  digit-transcription guard (2026-08-24; reasoning eval 0.714 → 1.0).
+- SQLite 3.53.4 baked from source (Debian's 3.46.1 carries the WAL-reset
+  corruption bug); Ollama pinned 0.32.15 (2026-08-24).
+- Skills revived: scheduled procedure-skill induction from proven memory —
+  first organic skills ever (2026-08-23); failure-sweep revived.
+- Frontend exfiltration closed on all panels + repo-wide defang guard test
+  (2026-08-23); calculator `**` DoS fix; code_verify routed through the
+  nova-exec sidecar (2026-08-22).
+- Knowing tier: living dossiers + State of the World meta-dossier +
+  KNOWN-VS-NEW digest priming (2026-08-12); qwen3.8:27b promoted for monitor
+  synthesis after A/B (2026-08-16); MiniCheck entailment gate v3–v4.1 live.
+- Watchdog sidecar + docker-socket-proxy + exec sidecar; delivery journal;
+  multi-tier verified backups with true offsite leg.
+
 ## [Unreleased]
 
 ### Archived the weight-training stack (2026-06-12)

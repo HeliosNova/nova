@@ -36,7 +36,7 @@ It is a *lightweight behavioral alignment* on a small correction set, **not** a 
 | **Batch size** | 1 (gradient accumulation: 2, effective batch: 2) |
 | **Learning rate** | 5e-5 |
 | **Epochs** | 3 |
-| **Training pairs** | 341 |
+| **Training pairs** | 341 (early run; the deployed v16 was trained on 699 — this card describes the original recipe) |
 | **Hardware** | NVIDIA RTX 3090 (24GB VRAM) |
 | **Framework** | Unsloth + TRL + Transformers |
 

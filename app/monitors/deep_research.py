@@ -1356,15 +1356,17 @@ async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
                 f"Extract 2-3 concrete findings (facts, numbers, named events) from this article "
                 f"relevant to '{subject}'. Reply IRRELEVANT only if the article is about a COMPLETELY "
                 f"different field. Only what is stated.\n\nTITLE: {title}\n\n{body}"}],
-                # 320 (was 240), 2026-08-14: the truncation tripwire caught
-                # findings cut mid-sentence several times per day — dangling
-                # fragments were entering the evidence pool.
+                # 512 (was 240 → 320), 2026-08-26: the tripwire still caught
+                # ~20 truncations/day at 320 — "2-3 concrete findings" from a
+                # dense 12k-char body legitimately runs 1.3-1.6k chars, and a
+                # mid-sentence cut puts a dangling fragment into the evidence
+                # pool. max_tokens only CAPS: short findings pay nothing.
                 # num_ctx 8192 (2026-08-25): the 08-22 body-cap raise
                 # (5k→12k chars ≈ up to ~4k tokens) overflowed the 4096
                 # model default — prompt_eval+eval hit exactly 4096 and
                 # findings truncated mid-sentence ~95×/day, re-opening the
                 # 08-14 defect from the prompt side.
-                max_tokens=320, temperature=0.2, num_ctx=8192)
+                max_tokens=512, temperature=0.2, num_ctx=8192)
             f = (f or "").strip()
             # Drop empties, relevance-rejects, and "the page has no real content"
             # outputs (nav/boilerplate pages that slipped the body gate) — these

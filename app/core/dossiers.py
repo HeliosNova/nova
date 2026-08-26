@@ -23,7 +23,7 @@ Consumers:
 
 Reuses llm.invoke_nothink (27B via MONITOR_SYNTHESIS_MODEL when set — this is
 background/latency-tolerant, quality wins). Every LLM call passes an explicit
-num_ctx (num_ctx discipline, CLAUDE.md 2026-08-11).
+num_ctx (num_ctx discipline, 2026-08-11: background calls that can exceed ~12k chars must size their own context).
 """
 
 from __future__ import annotations

@@ -199,10 +199,26 @@ class OllamaProvider:
             # stories identified" every cycle). Mirrors the generate_with_tools
             # num_ctx tripwire.
             _effective_ctx = num_ctx or 4096
+            _est_prompt_tokens = sum(
+                len(m.get("content") or "") for m in messages) // 4
             if data.get("prompt_eval_count", 0) >= _effective_ctx:
                 logger.error("[num_ctx] invoke_nothink prompt_eval_count=%d hit num_ctx=%d (model=%s) — "
                              "Ollama silently truncated the PROMPT; the caller must pass num_ctx sized "
                              "for its prompt", data.get("prompt_eval_count", 0), _effective_ctx, model)
+            elif (_est_prompt_tokens > _effective_ctx
+                  and data.get("prompt_eval_count", 0) < _est_prompt_tokens * 0.75):
+                # Context-shift blind spot (2026-08-26): when the server runs
+                # with --context-shift it truncates the prompt BEFORE eval, so
+                # prompt_eval_count comes back ~half of ctx and the >= check
+                # above can never fire (6 silent 11.8k-token truncations that
+                # day, 0 tripwire lines). A prompt estimated well past ctx
+                # whose eval count lands far below the estimate is the
+                # fingerprint of the same failure.
+                logger.error("[num_ctx] invoke_nothink context-shift truncation: ~%d prompt tokens "
+                             "sent but only %s evaluated at num_ctx=%d (model=%s) — the caller must "
+                             "pass num_ctx sized for its prompt",
+                             _est_prompt_tokens, data.get("prompt_eval_count", 0),
+                             _effective_ctx, model)
 
             content = _strip_think_tags(content)
 

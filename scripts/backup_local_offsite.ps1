@@ -23,13 +23,36 @@ if (-not (Test-Path $src)) { Write-Error "Source backup dir missing: $src"; exit
 New-Item -ItemType Directory -Force $dst | Out-Null
 
 # Mirror the DB snapshots + the small manifests (models list, config overrides).
-# Copy .db by whole-file (they're immutable per-day snapshots); overwrite manifests.
+# Copy .db by whole-file (they're immutable per-day snapshots). Manifests are
+# compared by LastWriteTime + Length (2026-08-25: a same-size content change —
+# e.g. a flipped boolean in config_overrides.json — never refreshed under the
+# old size-only compare; E:'s copy sat stale from 8/16).
 $copied = 0
 Get-ChildItem $src -File | Where-Object { $_.Extension -in '.db','.txt','.json' } | ForEach-Object {
     $target = Join-Path $dst $_.Name
-    if (-not (Test-Path $target) -or (Get-Item $target).Length -ne $_.Length) {
+    $t = if (Test-Path $target) { Get-Item $target } else { $null }
+    if (-not $t -or $t.Length -ne $_.Length -or $t.LastWriteTimeUtc -lt $_.LastWriteTimeUtc) {
         Copy-Item $_.FullName $target -Force
         $copied++
+    }
+}
+
+# Secrets/config that exist ONLY on F: (2026-08-25 audit: .env — every token
+# and API key — had a single copy on the same disk as the live system; F: loss
+# = unrecoverable credentials). Same machine, same trust domain as the source;
+# the encrypted off-machine tier remains restic (backup_offsite.ps1).
+$repo = "F:\Helios Project\nova_"
+foreach ($rel in @(".env", "searxng\settings.yml")) {
+    $srcFile = Join-Path $repo $rel
+    if (Test-Path $srcFile) {
+        $flat = "repo-" + ($rel -replace '[\\/]', '_')
+        $target = Join-Path $dst $flat
+        $s = Get-Item $srcFile
+        $t = if (Test-Path $target) { Get-Item $target } else { $null }
+        if (-not $t -or $t.Length -ne $s.Length -or $t.LastWriteTimeUtc -lt $s.LastWriteTimeUtc) {
+            Copy-Item $srcFile $target -Force
+            $copied++
+        }
     }
 }
 

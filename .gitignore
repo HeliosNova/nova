@@ -75,3 +75,6 @@ searxng/settings.yml
 
 # one-off audit/verification scratch scripts (not part of the app)
 _audit/
+
+# Assistant working notes — local only
+CLAUDE.md

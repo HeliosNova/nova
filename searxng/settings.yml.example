@@ -48,7 +48,7 @@ engines:
     engine: qwant
     shortcut: qw
     categories: [general, web]
-    disabled: false
+    disabled: true   # 2,691 CAPTCHA rejections in 24h (2026-08-26) — hard-blocked, pure latency
     timeout: 10.0
   - name: mojeek
     engine: mojeek
@@ -56,11 +56,24 @@ engines:
     categories: [general, web]
     disabled: false
     timeout: 10.0
+  # DuckDuckGo became TCP-unreachable from this network ~2026-08-26 (connect
+  # timeout on duckduckgo.com / html.duckduckgo.com / lite.duckduckgo.com from
+  # host AND containers — IP-level block). Every enabled DDG engine hung its
+  # 10s timeout on EVERY query, dragging total SearXNG response time past
+  # nova-app's 12s SEARCH_TIMEOUT → ~50% of searches returned nothing.
+  # Re-enable only after `curl https://duckduckgo.com` succeeds from the host.
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    disabled: false
-    timeout: 10.0
+    disabled: true
+    timeout: 6.0
+  - name: duckduckgo news
+    engine: duckduckgo_extra
+    categories: [news]
+    ddg_category: news
+    shortcut: ddn
+    disabled: true   # same network block (391 timeouts in 24h); default-settings entry must be overridden explicitly
+    timeout: 6.0
   - name: brave
     engine: brave
     shortcut: br
@@ -118,7 +131,7 @@ engines:
     categories: [general]
     base_url: 'https://en.wikiquote.org/'
     number_of_results: 5
-    disabled: false
+    disabled: true   # 429 TooManyRequests from Wikimedia (2026-08-26) — marginal content, burns the shared per-IP budget that native_search's direct Wikipedia arm needs
     timeout: 10.0
   - name: wikibooks
     engine: mediawiki
@@ -126,33 +139,33 @@ engines:
     categories: [general]
     base_url: 'https://en.wikibooks.org/'
     number_of_results: 5
-    disabled: false
+    disabled: true   # 429 TooManyRequests — same rationale as wikiquote
     timeout: 10.0
   # ---------- Science / academic ----------
   - name: arxiv
     engine: arxiv
     shortcut: arx
     categories: [science]
-    timeout: 15.0
+    timeout: 10.0   # capped to outgoing.max_request_timeout so science queries stay under nova-app's 12s deadline
     disabled: false
   - name: semantic scholar
     engine: semantic_scholar
     shortcut: se
     categories: [science]
     disabled: false
-    timeout: 15.0
+    timeout: 10.0   # capped to outgoing.max_request_timeout so science queries stay under nova-app's 12s deadline
   - name: pubmed
     engine: pubmed
     shortcut: pub
     categories: [science]
     disabled: false
-    timeout: 15.0
+    timeout: 10.0   # capped to outgoing.max_request_timeout so science queries stay under nova-app's 12s deadline
   - name: crossref
     engine: crossref
     shortcut: cr
     categories: [science]
     disabled: false
-    timeout: 15.0
+    timeout: 10.0   # capped to outgoing.max_request_timeout so science queries stay under nova-app's 12s deadline
   - name: openairedatasets
     engine: json_engine
     paging: true
@@ -164,7 +177,7 @@ engines:
     categories: [science]
     shortcut: oad
     disabled: true   # Sometimes returns malformed JSON; keep off by default
-    timeout: 15.0
+    timeout: 10.0   # capped to outgoing.max_request_timeout so science queries stay under nova-app's 12s deadline
   # ---------- Code / IT ----------
   - name: github
     engine: github
@@ -254,7 +267,7 @@ engines:
     shortcut: wt
     categories: [general]
     base_url: 'https://en.wiktionary.org/'
-    disabled: false
+    disabled: true   # 193 Wikimedia 429s/24h (2026-08-26); dictionary hits add nothing to news/research queries
     timeout: 10.0
   # ---------- Images (so multimodal queries have a real source) ----------
   - name: bing images
@@ -267,8 +280,8 @@ engines:
     categories: [images, web]
     ddg_category: images
     shortcut: ddi
-    disabled: false
-    timeout: 10.0
+    disabled: true   # DDG network block (see duckduckgo entry above)
+    timeout: 6.0
   # ---------- Videos ----------
   - name: youtube
     engine: youtube_noapi
@@ -284,8 +297,12 @@ engines:
     timeout: 10.0
 
 outgoing:
-  request_timeout: 15.0
-  max_request_timeout: 20.0
+  # nova-app's native_search gives up on a SearXNG call at SEARCH_TIMEOUT=12s.
+  # These ceilings must keep worst-case SearXNG response UNDER that deadline —
+  # at 15/20s a single hung upstream made every response arrive after nova-app
+  # had already timed out (measured 15.0s/query on 2026-08-26, ~50% loss).
+  request_timeout: 8.0
+  max_request_timeout: 10.0
   pool_connections: 100
   pool_maxsize: 20
   enable_http2: true

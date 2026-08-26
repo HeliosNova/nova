@@ -37,3 +37,28 @@ jobs:
           SEARXNG_URL: http://localhost:8080
           TRAINING_DATA_PATH: /tmp/training_data.jsonl
           MAX_SYSTEM_TOKENS: "6000"
+
+  # Frontend vitest (2026-08-25): the markdown-defang guard test
+  # (markdownDefang.guard.test.tsx) enforces the exfiltration invariant —
+  # every <ReactMarkdown> must pass components= — but CI never ran it, so
+  # a future bare-ReactMarkdown panel would regress silently.
+  frontend-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Run frontend tests (defang guard invariant)
+        working-directory: frontend
+        run: npm test

@@ -17,13 +17,8 @@ services:
       # from this volume's disk takes ~10m; 20m gives headroom. Once loaded,
       # KEEP_ALIVE holds it resident so the slow load is a one-time cost.
       OLLAMA_LOAD_TIMEOUT: "20m"
-      # Ollama 0.17.5 + qwen35 architecture on the OLD engine (default) does
-      # NOT honor OLLAMA_NUM_PARALLEL — see startup log:
-      #   "model architecture does not currently support parallel requests
-      #    architecture=qwen35"
-      # OLLAMA_NEW_ENGINE=true *does* enable parallel for qwen35 but the new
-      # engine is less battle-tested for our throughput profile. Keep disabled
-      # until proven; tests have to set num_parallel themselves if they care.
+      # NEW_ENGINE=true is the settled production state (enabled 2026-06-30;
+      # the old engine silently ignored OLLAMA_NUM_PARALLEL for qwen35).
       OLLAMA_NEW_ENGINE: "true"
       # NEW_ENGINE=true honors NUM_PARALLEL for qwen35; old engine silently
       # ignored it. NUM_PARALLEL slots each carve out their own KV-cache VRAM and
@@ -47,9 +42,11 @@ services:
       # 3 GiB = 3221225472 bytes.
       OLLAMA_GPU_OVERHEAD: "3221225472"
       # Required models (pull manually or via entrypoint):
-      #   ollama pull qwen3.5:27b      (main model)
-      #   ollama pull qwen3.5:9b       (vision model)
-      #   ollama pull qwen3.5:4b       (fast model for routing)
+      #   nova-ft            (production chat model — 9B fine-tune tag)
+      #   qwen3.8:27b        (monitor digest synthesis, via MONITOR_SYNTHESIS_MODEL)
+      #   gemma4:e4b         (independent judge — JUDGE_MODEL)
+      #   qwen3.5:9b         (vision model; also nova-ft's base family)
+      #   bge-m3             (embedder — pulled on the `embed` CPU instance)
     deploy:
       resources:
         reservations:
@@ -147,11 +144,10 @@ services:
       ENABLE_DESKTOP_AUTOMATION: "true"
       ENABLE_PLANNING: "true"
       ENABLE_CRITIQUE: "true"
-      # Auto-finetune: heartbeat fires DPO training when ≥50 new pairs accumulate.
-      # Stops Ollama for 30-60 min during training; the script reruns A/B and
-      # rolls back on regression so chat is unavailable but never gets worse.
       # MCP: expose Nova as MCP server (for Claude Code/Cursor) and consume
-      # external MCP tools. Both default-on now that auto-finetune protects model quality.
+      # external MCP tools. (Auto-finetune text removed 2026-08-25: the
+      # training stack was archived 2026-06-12 — no runtime pathway exists;
+      # manual fine-tuning runs from the host via archive/training/.)
       ENABLE_MCP: "true"
       ENABLE_MCP_SERVER: "true"
       # Voice: Whisper STT + Piper TTS (both already installed in image).
@@ -319,7 +315,9 @@ services:
   # restart; exec/build/images/volumes/networks are denied by default.
   # Isolated on its own network so nova-app can never reach it.
   socket-proxy:
-    image: tecnativa/docker-socket-proxy:latest
+    # Pinned by digest 2026-08-25 (was :latest — silent-drift risk on a
+    # security-boundary container). Bump deliberately, with a changelog read.
+    image: tecnativa/docker-socket-proxy@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
     container_name: nova-socket-proxy
     environment:
       CONTAINERS: 1       # GET /containers/* (list + inspect/health)
@@ -390,7 +388,9 @@ services:
     restart: unless-stopped
 
   searxng:
-    image: searxng/searxng:latest
+    # Pinned by digest 2026-08-25 (was :latest — a surprise upstream change
+    # to the search stack would alter research quality invisibly).
+    image: searxng/searxng@sha256:11a9b34cdc0b1ec2b991470a2762ecb5a1a531898289fb51dcd015260450729e
     container_name: nova-searxng
     ports:
       - "127.0.0.1:8888:8080"

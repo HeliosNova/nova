@@ -307,7 +307,7 @@ async def finetune_trigger(force: bool = False):
 async def _finetune_trigger_inner(force: bool = False):
     global _active_finetune_job
 
-    # Weight training was archived 2026-06-12 (archive/training/ + CLAUDE.md):
+    # Weight training was archived 2026-06-12 (archive/training/README.md):
     # 0 successful train->A/B->deploy, ties the base per the one honest A/B. The
     # in-context memory loop is the product. scripts/finetune_auto.py no longer
     # ships, so this endpoint reports the retirement instead of minting a job

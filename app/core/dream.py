@@ -208,9 +208,11 @@ class DreamConsolidator:
         )
         signals.kg_chains_to_compact = [dict(r) for r in rows]
 
-        # 6. Failed curiosity (exhausted all attempts)
+        # 6. Failed curiosity (exhausted all attempts). `resolution` carries the
+        # [dream-reset] marker so _handle_failed_curiosity grants at most ONE
+        # second life per item.
         rows = await self._db.fetchall(
-            "SELECT id, topic, source, urgency, attempts "
+            "SELECT id, topic, source, urgency, attempts, resolution "
             "FROM curiosity_queue WHERE status='failed' "
             "ORDER BY urgency DESC LIMIT 20"
         )
@@ -454,11 +456,20 @@ class DreamConsolidator:
                     result.curiosity_dismissed += 1
                 except Exception as e:
                     result.errors.append(f"dismiss curiosity: {e}")
-            else:
-                # Factual questions with transient failures → reset for retry
+            elif not (item.get("resolution") or "").startswith("[dream-reset"):
+                # Factual questions with transient failures → ONE reset for retry.
+                # Unconditional resets made MAX_CURIOSITY_ATTEMPTS meaningless:
+                # every dream cycle handed exhausted items a fresh attempts=0, so
+                # unanswerable topics churned research forever (observed live
+                # 2026-08-26 — a 7-day-old urgency-0.9 item re-researched every
+                # daemon tick). The marker in `resolution` grants exactly one
+                # second life; an item that exhausts its attempts AGAIN stays
+                # failed as the audit trail. resolve() overwrites the marker on
+                # success, so resolved items are unaffected.
                 try:
                     await self._db.execute(
-                        "UPDATE curiosity_queue SET status='pending', attempts=0 WHERE id=?",
+                        "UPDATE curiosity_queue SET status='pending', attempts=0, "
+                        "resolution='[dream-reset ' || datetime('now') || ']' WHERE id=?",
                         (item["id"],),
                     )
                     result.curiosity_reset += 1

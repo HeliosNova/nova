@@ -282,6 +282,55 @@ class Retriever:
 
         return doc_id, len(chunks)
 
+    def rebuild_vectors(self, reason: str = "manual") -> int:
+        """Drop and rebuild the documents collection from chunks_fts.
+
+        The ONLY cure for hnswlib tombstone saturation (the lessons and
+        kg_facts stores died this way 2026-08-22/25; documents followed on
+        2026-08-26 — every retrieval logged "tombstone-saturated (k=4
+        failed)" AND the k=5 degrade failed too, so the vector arm returned
+        nothing while the index looked "covered" by telemetry). chunks_fts
+        is the SQL source of truth; re-embedding a handful of documents
+        takes seconds on the CPU embedder.
+        """
+        try:
+            import chromadb
+
+            client = chromadb.PersistentClient(path=config.CHROMADB_PATH)
+            try:
+                client.delete_collection("documents")
+            except Exception:
+                pass  # absent collection — nothing to drop
+            with self._collection_lock:
+                self._collection = None
+                self._chroma_client = None
+            collection = self._get_collection()
+            rows = self._db.fetchall(
+                "SELECT c.chunk_id, c.document_id, c.content, d.source, d.title "
+                "FROM chunks_fts c LEFT JOIN documents d ON d.id = c.document_id"
+            )
+            n = 0
+            for j in range(0, len(rows), 200):
+                batch = rows[j:j + 200]
+                collection.add(
+                    ids=[r["chunk_id"] for r in batch],
+                    documents=[r["content"] for r in batch],
+                    metadatas=[{
+                        "document_id": r["document_id"],
+                        "source": r["source"] or "",
+                        "title": r["title"] or "",
+                    } for r in batch],
+                )
+                n += len(batch)
+            logger.warning(
+                "Documents vector index REBUILT (%s): %d chunks re-embedded",
+                reason, n,
+            )
+            return n
+        except Exception as e:
+            logger.error("Documents vector rebuild failed: %s", e)
+            return 0
+
     def backfill_fts5(self, *, batch_size: int = 500) -> dict:
         """Reconcile FTS5 with ChromaDB — re-insert any chunks missing from FTS5.
 
