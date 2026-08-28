@@ -6,6 +6,7 @@ Ported from Nova's battle-tested SafeDB pattern.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import sqlite3
 import threading
@@ -1193,6 +1194,58 @@ class SafeDB:
                     except sqlite3.OperationalError:
                         pass  # column already exists (fresh installs)
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (30,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 31 (2026-08-27): wall-clock anchor for Morning Check-in.
+        # Daily monitors schedule as last_check_at + 86400s, and last_check_at
+        # is stamped when the check actually RAN — so queue latency compounds
+        # and a "morning" monitor drifted ~2h/day (observed live: 18:19 →
+        # 20:11 → 22:34 UTC across three consecutive days, i.e. mid-afternoon
+        # local and sliding). anchor_hour pins it to a local-time hour;
+        # get_due() understands the key.
+        if 31 not in applied:
+            conn.execute("BEGIN")
+            try:
+                row = conn.execute(
+                    "SELECT id, check_config FROM monitors WHERE name = 'Morning Check-in'"
+                ).fetchone()
+                if row is not None:
+                    try:
+                        cfg = json.loads(row[1]) if row[1] else {}
+                    except Exception:
+                        cfg = {}
+                    if "anchor_hour" not in cfg:
+                        cfg["anchor_hour"] = 7
+                        # cooldown 23h → 12h alongside: a late run day would
+                        # otherwise put the next 8am inside the cooldown and
+                        # silently suppress the delivery.
+                        conn.execute(
+                            "UPDATE monitors SET check_config = ?, "
+                            "cooldown_minutes = 720 WHERE id = ?",
+                            (json.dumps(cfg), row[0]),
+                        )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (31,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 32 (2026-08-27): Forecast Resolution daily → 6-hourly.
+        # Minting runs ~40 forecasts/day; the daily run grades ≤12, so once
+        # the future-dated wave matures the grader would fall ~5x behind and
+        # the self-scoring loop degrades to an oldest-first sample.
+        if 32 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "UPDATE monitors SET schedule_seconds = 21600, "
+                    "cooldown_minutes = 300 WHERE check_type = 'forecast_resolve' "
+                    "AND schedule_seconds = 86400"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (32,))
                 conn.commit()
             except Exception:
                 conn.rollback()

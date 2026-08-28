@@ -229,6 +229,17 @@ class MonitorStore:
         for m in monitors:
             if not m.enabled:
                 continue
+            anchor = (m.check_config or {}).get("anchor_hour")
+            if anchor is not None and m.schedule_seconds >= 86400:
+                # Wall-clock anchored daily monitor (2026-08-27). Interval
+                # scheduling stamps last_check_at when the check RAN, so queue
+                # latency compounds day over day — Morning Check-in drifted
+                # ~2h/day into mid-afternoon. Anchored: due once per LOCAL
+                # date, any time after anchor_hour local.
+                if not self._anchored_due(m, int(anchor)):
+                    continue
+                due.append(m)
+                continue
             if m.last_check_at:
                 last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
                 if (now - last).total_seconds() < m.schedule_seconds:
@@ -243,6 +254,35 @@ class MonitorStore:
 
         due.sort(key=_overdue_ratio, reverse=True)
         return due
+
+    @staticmethod
+    def _local_now():
+        """Owner-local current time (falls back to UTC on a bad tz name)."""
+        from app.config import config as _cfg
+        tz = timezone.utc
+        try:
+            from zoneinfo import ZoneInfo
+            if _cfg.USER_TIMEZONE:
+                tz = ZoneInfo(_cfg.USER_TIMEZONE)
+        except Exception:
+            pass
+        return datetime.now(timezone.utc).astimezone(tz)
+
+    @classmethod
+    def _anchored_due(cls, m: "Monitor", anchor_hour: int) -> bool:
+        """Due iff local time has passed anchor_hour AND the monitor hasn't
+        already run on the current local date. last_check_at is naive UTC."""
+        now_local = cls._local_now()
+        if now_local.hour < anchor_hour:
+            return False
+        if not m.last_check_at:
+            return True
+        last_local = (
+            datetime.fromisoformat(m.last_check_at)
+            .replace(tzinfo=timezone.utc)
+            .astimezone(now_local.tzinfo)
+        )
+        return last_local.date() < now_local.date()
 
     # Storage cap for digests/results. Must be ≥ the posted-digest cap (12000,
     # heartbeat_loop) — a 4000 cap silently amputated every rich digest IN THE DB
@@ -499,9 +539,16 @@ class MonitorStore:
                         "monitor health, any notable alerts from overnight, recent learning "
                         "activity, and one interesting thing about today's date."
                     ),
+                    # Wall-clock anchor (2026-08-27): interval scheduling made
+                    # this drift ~2h/day into mid-afternoon (see get_due).
+                    # Existing installs get the key via migration 31.
+                    "anchor_hour": 7,
                 },
                 "schedule_seconds": 86400,  # daily
-                "cooldown_minutes": 1380,   # 23 hours
+                # 12h, not 23h: with the 8am anchor, a day where the check ran
+                # late (queue depth) would put the NEXT morning inside a 23h
+                # cooldown and silently suppress the delivery.
+                "cooldown_minutes": 720,
                 "notify_condition": "always",
             },
             {
@@ -683,8 +730,12 @@ class MonitorStore:
                 "name": "Forecast Resolution",
                 "check_type": "forecast_resolve",
                 "check_config": {},
-                "schedule_seconds": 86400,   # daily — grade calls whose horizon passed
-                "cooldown_minutes": 1380,
+                # 6-hourly (was daily, 2026-08-27): minting runs ~40 forecasts/
+                # day; daily×8-per-run graded a 20% sample once the wave came
+                # due. 4×12/day = 48 capacity, ahead of intake. Existing
+                # installs get the new cadence via migration 32.
+                "schedule_seconds": 21600,
+                "cooldown_minutes": 300,
                 "notify_condition": "on_change",
             },
             {

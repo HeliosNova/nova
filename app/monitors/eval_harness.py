@@ -1680,7 +1680,24 @@ class EvalHarness:
             f.write(render_markdown(report))
 
         logger.info("[EvalHarness] Report written: %s / %s", json_path.name, md_path.name)
+        self._prune_reports()
         return json_path, md_path
+
+    # Per-run eval_<ts>.{json,md} pairs had NO delete-side (2026-08-27): every
+    # run wrote a pair forever (103 files / 4.3M and climbing), and each
+    # nightly detect_chronic_failures globbed the whole growing set. The
+    # eval_history.jsonl time series is the durable record; the per-run files
+    # only need a window for chronic detection (3) + human audit. Keep 30.
+    _REPORT_KEEP = 30
+
+    def _prune_reports(self) -> None:
+        try:
+            reports = sorted(self.report_dir.glob("eval_2*.json"), reverse=True)
+            for stale in reports[self._REPORT_KEEP:]:
+                stale.unlink(missing_ok=True)
+                stale.with_suffix(".md").unlink(missing_ok=True)
+        except Exception as e:
+            logger.warning("[EvalHarness] report prune failed: %s", e)
 
     def append_history(self, report: EvalReport) -> None:
         """Append a one-line summary to the time-series history log."""

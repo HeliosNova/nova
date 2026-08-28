@@ -1,6 +1,6 @@
 """Nova MCP Server — expose Nova's intelligence as MCP tools.
 
-Allows external agents (Claude Code, Cursor, etc.) to query Nova's
+Allows external MCP clients (Cursor, VS Code, and others) to query Nova's
 long-term memory, knowledge graph, lessons, and document store.
 
 This module defines the MCP server and its tools. It does NOT start the

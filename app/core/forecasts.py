@@ -68,7 +68,11 @@ def parse_and_store_forecast(db, text: str, *, storyline_key: str = "",
                            storyline_key=storyline_key, source_monitor=source_monitor)
 
 
-def list_due(db, limit: int = 8) -> list[dict]:
+def list_due(db, limit: int = 12) -> list[dict]:
+    # limit 8→12 + the monitor going 6-hourly (2026-08-27) = 48 gradings/day
+    # capacity. Minting runs ~40/day (measured); at the old daily×8 the
+    # self-scoring loop would drown as soon as the mint wave matured, grading
+    # a 20% oldest-first sample and growing the overdue pile forever.
     """Open forecasts whose resolution date has passed."""
     try:
         return [dict(r) for r in db.fetchall(

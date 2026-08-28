@@ -33,6 +33,28 @@ _MAX_DOC_CHARS = 8000
 _MAX_CLAIM_CHARS = 1200
 _MAX_BATCH = 64
 
+# Scoring serialization (2026-08-26). FastAPI runs these sync endpoints in a
+# THREADPOOL, so concurrent digest/eval batches interleaved on the CPU and
+# thrashed torch inference — under that contention nova-app's 12-pair chat
+# entail batch blew its 60s deadline and failed open 27x/48h. One lock
+# serializes inference (fastest on CPU anyway), and large batches release it
+# between sub-chunks so a small waiting batch slips in after ≤8 items
+# instead of behind a whole 64-pair digest batch.
+_score_lock = threading.Lock()
+_SUBCHUNK = 8
+
+
+def _score_serialized(scorer, docs: list[str], claims: list[str]):
+    labels_all: list = []
+    probs_all: list = []
+    for j in range(0, len(docs), _SUBCHUNK):
+        with _score_lock:
+            out = scorer.score(docs=docs[j:j + _SUBCHUNK],
+                               claims=claims[j:j + _SUBCHUNK])
+        labels_all.extend(out[0])
+        probs_all.extend(out[1])
+    return labels_all, probs_all
+
 
 def _get_scorer():
     global _scorer
@@ -67,7 +89,6 @@ def check_batch(batch: Batch):
     scorer = _get_scorer()
     docs = [p.doc[:_MAX_DOC_CHARS] for p in batch.pairs]
     claims = [p.claim[:_MAX_CLAIM_CHARS] for p in batch.pairs]
-    out = scorer.score(docs=docs, claims=claims)
-    labels, probs = out[0], out[1]
+    labels, probs = _score_serialized(scorer, docs, claims)
     return {"results": [{"supported": bool(int(l)), "prob": float(p)}
                         for l, p in zip(labels, probs)]}

@@ -246,7 +246,7 @@ _BLOCKED_HOSTS = {
     # misframings; coinalertnews pushes crypto presale shill copy as "whale" intel.
     "zerohedge.com", "coinalertnews.com",
     # 2026-06-30 LIVE-digest audit: creati.ai is an AI-content mill whose synthesized
-    # narrative ("Claude Mythos / Project Lightwell / Rebel Alliance") anchored an Open
+    # narrative (a fabricated codename/conspiracy story) anchored an Open
     # Source lead; counterfire.org is an activist outlet that anchored a Commodities lead
     # ("largest oil supply shock on record") as a lone weak source. Neither is intel.
     "creati.ai", "counterfire.org",

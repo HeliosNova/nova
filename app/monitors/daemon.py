@@ -1,8 +1,8 @@
 """Daemon Orchestrator — proactive agent with LLM tick reasoning.
 
-Inspired by Claude Code's KAIROS feature. Sits above the heartbeat loop and
-makes strategic decisions about what to investigate, when to trigger dream
-consolidation, and when to proactively alert the user.
+Sits above the heartbeat loop and makes strategic decisions about what to
+investigate, when to trigger dream consolidation, and when to proactively
+alert the user.
 
 Runs every DAEMON_TICK (default 5min). Most ticks result in "no action."
 """

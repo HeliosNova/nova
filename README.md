@@ -213,7 +213,7 @@ Nova is both an MCP **client** and **server** — unique in the landscape:
 
 **As client:** Drop MCP tool configs in `/data/mcp/` and Nova discovers and uses them.
 
-**As server:** Exposes 5 tools for Claude Code, Cursor, or any MCP client:
+**As server:** Exposes 5 tools for any MCP client (Cursor, VS Code, and others):
 - `nova_memory_query` — search user facts and conversations
 - `nova_knowledge_graph` — query the KG
 - `nova_lessons` — retrieve learned lessons

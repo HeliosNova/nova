@@ -1,6 +1,5 @@
 """Dream Consolidation Engine — memory consolidation during idle time.
 
-Inspired by Claude Code's autoDream (KAIROS feature).
 4-phase pipeline:
   Phase 1: ORIENT  — read-only inventory of all memory stores
   Phase 2: GATHER  — scan for consolidation targets (stale, overlapping, broken)
@@ -442,7 +441,32 @@ class DreamConsolidator:
                 result.errors.append(f"disable skill {skill['name']}: {e}")
 
     async def _handle_failed_curiosity(self, signals: GatherSignals, result: ConsolidationResult):
-        """Dismiss or reset failed curiosity items based on failure reason."""
+        """Dismiss or reset failed curiosity items based on failure reason.
+
+        Also ages out the pending tail: the queue drains ~2/day against
+        ~15/day intake (measured 2026-08-27), and urgency-ordered get_next
+        starves the low-urgency tail FOREVER — 99 pending, two-thirds of
+        them 2+ days old. An item still pending after 14 days of hourly
+        research cycles is stale (the dossier/digest that spawned it has
+        re-consolidated several times since); dismiss with an audit marker
+        so the queue stays bounded.
+        """
+        try:
+            stale = await self._db.fetchall(
+                "SELECT id FROM curiosity_queue WHERE status='pending' "
+                "AND created_at < datetime('now','-14 days')"
+            )
+            if stale:
+                await self._db.execute(
+                    "UPDATE curiosity_queue SET status='dismissed', "
+                    "resolution='[expired ' || datetime('now') || ' — unresolved after 14 days]' "
+                    "WHERE status='pending' AND created_at < datetime('now','-14 days')"
+                )
+                result.curiosity_dismissed += len(stale)
+                logger.info("[Dream] Expired %d stale curiosity item(s) (>14d pending)",
+                            len(stale))
+        except Exception as e:
+            result.errors.append(f"expire curiosity: {e}")
         for item in signals.failed_curiosity:
             topic = item.get("topic", "")
             # Subjective/unanswerable questions → dismiss

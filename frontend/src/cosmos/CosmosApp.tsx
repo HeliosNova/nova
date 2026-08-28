@@ -1,5 +1,5 @@
 import { lazy, Suspense, useEffect, useMemo, useRef, useState } from "react";
-import { X, Settings2 } from "lucide-react";
+import { X, Settings2, Lock } from "lucide-react";
 import CosmosWorld from "./CosmosWorld";
 import { REGIONS, regionById, type RegionId } from "./regions";
 import { useWorldBrief, briefParts, fmtBriefDate } from "../pages/WorldBrief";
@@ -34,7 +34,21 @@ export default function CosmosApp() {
   const [tel, setTel] = useState<Telemetry | null>(null);
   const [palette, setPalette] = useState(false);
   const [picked, setPicked] = useState<{ node: KGGraphNode; facts: EntityFact[] } | null>(null);
+  const [authLocked, setAuthLocked] = useState(false);
   const brief = useWorldBrief();
+
+  // Backend 401s: every data caller swallows its own error, so without this
+  // the cosmos shows confident zeros when the browser simply has no API key.
+  useEffect(() => {
+    const lock = () => setAuthLocked(true);
+    const unlock = () => setAuthLocked(false);
+    window.addEventListener("nova:auth-required", lock);
+    window.addEventListener("nova:auth-ok", unlock);
+    return () => {
+      window.removeEventListener("nova:auth-required", lock);
+      window.removeEventListener("nova:auth-ok", unlock);
+    };
+  }, []);
 
   // hash <-> focus (deep-linkable, back-button friendly)
   useEffect(() => {
@@ -126,6 +140,19 @@ export default function CosmosApp() {
       {/* corner instrument frame */}
       <span className="hud-bracket tl" /><span className="hud-bracket tr" />
       <span className="hud-bracket bl" /><span className="hud-bracket br" />
+
+      {/* auth lock — the backend is refusing this browser, say so plainly */}
+      {authLocked && (
+        <div className="pointer-events-none absolute inset-x-0 top-24 z-20 flex justify-center">
+          <button
+            onClick={() => go("systems")}
+            className="pointer-events-auto flex items-center gap-2 rounded-md border border-nova-accent/40 bg-nova-surface/70 px-4 py-2 font-mono text-[10px] uppercase tracking-[0.22em] text-nova-accent backdrop-blur-md transition-colors hover:border-nova-accent/70"
+          >
+            <Lock size={11} />
+            backend locked — set the API key in Systems ▸ Settings
+          </button>
+        </div>
+      )}
 
       {/* HUD — identity + where you are */}
       <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-6 sm:p-8">

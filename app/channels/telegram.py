@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import collections
 import logging
+import re
 
 from telegram import Update
 from telegram.ext import (
@@ -168,6 +169,58 @@ class TelegramBot:
             logger.error("[Telegram] Query failed: %s", e, exc_info=True)
             return "Sorry, something went wrong while processing your message."
 
+    # Telegram's HTML parser accepts only this tag set and rejects the whole
+    # message on any imbalance ("unmatched end tag" → plain-text fallback,
+    # ~4x/48h observed 2026-08-26). Two sources of imbalance: _split_message
+    # cutting across an open tag (chunk 1 unclosed + chunk 2 orphan closer —
+    # BOTH chunks bounce), and the model emitting a stray closer.
+    _TG_TAG_RE = re.compile(
+        r"<(/?)(b|strong|i|em|u|ins|s|strike|del|code|pre|a|tg-spoiler|blockquote)"
+        r"(\s[^>]*)?>",
+        re.IGNORECASE,
+    )
+
+    @classmethod
+    def _balance_html_chunks(cls, chunks: list[str]) -> list[str]:
+        """Deterministic tag repair across split chunks.
+
+        Carries tags still open at a chunk boundary into the next chunk
+        (close at the end, reopen at the start), strips orphan closers, and
+        closes anything left dangling — so every chunk is independently
+        valid Telegram HTML."""
+        out: list[str] = []
+        carried: list[tuple[str, str]] = []  # (tag_name, full_open_tag)
+        for chunk in chunks:
+            prefix = "".join(open_tag for _, open_tag in carried)
+            stack = list(carried)
+            rebuilt: list[str] = [prefix]
+            pos = 0
+            for m in cls._TG_TAG_RE.finditer(chunk):
+                rebuilt.append(chunk[pos:m.start()])
+                pos = m.end()
+                is_close, name = bool(m.group(1)), m.group(2).lower()
+                if not is_close:
+                    stack.append((name, m.group(0)))
+                    rebuilt.append(m.group(0))
+                elif any(n == name for n, _ in stack):
+                    # Close improperly-nested inner tags first, pop through
+                    # the match, then reopen the inner ones (standard fixup).
+                    inner: list[tuple[str, str]] = []
+                    while stack and stack[-1][0] != name:
+                        inner.append(stack.pop())
+                        rebuilt.append(f"</{inner[-1][0]}>")
+                    stack.pop()
+                    rebuilt.append(f"</{name}>")
+                    for n, open_tag in reversed(inner):
+                        stack.append((n, open_tag))
+                        rebuilt.append(open_tag)
+                # else: orphan closer — drop it
+            rebuilt.append(chunk[pos:])
+            rebuilt.append("".join(f"</{n}>" for n, _ in reversed(stack)))
+            out.append("".join(rebuilt))
+            carried = stack
+        return out
+
     @staticmethod
     def _split_message(text: str, limit: int = 4096) -> list[str]:
         """Split a message into chunks that fit Telegram's character limit."""
@@ -196,7 +249,7 @@ class TelegramBot:
         try:
             from app.channels.format_for_channel import to_telegram_html
             html_message = to_telegram_html(message)
-            _chunks = self._split_message(html_message)
+            _chunks = self._balance_html_chunks(self._split_message(html_message))
             async with self._send_lock:
               for _ci, chunk in enumerate(_chunks):
                 if _ci:

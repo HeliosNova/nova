@@ -59,11 +59,25 @@ function getHeaders(): HeadersInit {
   return headers;
 }
 
+// Auth-lock signal (2026-08-27): with NOVA_API_KEY set on the backend, a
+// browser without the stored key gets 401 on EVERY data call — but each
+// caller swallows its error, so the cosmos rendered zeros with full
+// confidence ("Knowledge 0", "Watching 0/0") and no hint that the fix is
+// one Settings field away. Signal the shell once per lock/unlock edge.
+let authLockSignaled = false;
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   const res = await fetch(`${getBaseUrl()}${path}`, {
     ...init,
     headers: { ...getHeaders(), ...init?.headers },
   });
+  if (res.status === 401 && !authLockSignaled) {
+    authLockSignaled = true;
+    window.dispatchEvent(new CustomEvent("nova:auth-required"));
+  } else if (res.ok && authLockSignaled) {
+    authLockSignaled = false;
+    window.dispatchEvent(new CustomEvent("nova:auth-ok"));
+  }
   if (!res.ok) {
     const body = await res.text();
     throw new Error(`${res.status}: ${body}`);

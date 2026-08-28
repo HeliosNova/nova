@@ -63,6 +63,32 @@ from this network — IP-level block, host and containers alike)
   every general query. Now scheduled per completed turn (the module's own
   is_enabled + ≥4-message gates are the filters).
 
+### Round 2 (same audit, second batch)
+- **Outage-proof boot**: after every unclean Windows shutdown, Docker
+  Desktop's WSL2 file-share materialized single-file bind mounts as stale
+  DIRECTORY placeholders — searxng exited 127 and nova-app blocked behind
+  depends_on, turning every power outage into a manual recovery runbook
+  (2026-08-17, again 2026-08-27). The last single-file bind (searxng
+  settings.yml) is now a directory mount; the failure mode is gone.
+- **Bing scraper revived**: markup drift (`<li class="b_algo" data-id...>`,
+  `<h2 class="">`) made the old exact-match regex parse 0 results from
+  pages carrying 10, and Bing now wraps URLs in a base64url redirect
+  (`/ck/a?...&u=a1<b64>`) that hid the real host from credibility scoring.
+  Regex loosened + redirect unwrapped (federalreserve.gov, not bing.com).
+- **Telegram HTML repair**: Telegram rejects a whole message on any tag
+  imbalance; _split_message could cut across an open tag (both chunks
+  bounced to plain text). Deterministic stack repair now carries open tags
+  across chunk boundaries, strips orphan closers, and fixes improper
+  nesting — every chunk is independently valid.
+- **MiniCheck sidecar serialization**: FastAPI ran the sync scoring
+  endpoint in a threadpool, so concurrent digest/eval batches thrashed CPU
+  inference and nova-app's 12-pair chat entail batch blew its 60s deadline
+  (fail-open 27x/48h). One lock serializes inference, released between
+  8-pair sub-chunks so small batches slip in quickly.
+- **Geopolitics feed**: moderndiplomacy.eu is bot-walled (302 → security
+  challenge, every fetch failed silently) — replaced with SCMP world news
+  (validated: parses clean, 50 items).
+
 ## [1.7.0] - 2026-08-25
 
 Catch-up release: the changelog had been silent since June while ~50 commits

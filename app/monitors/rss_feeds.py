@@ -127,7 +127,11 @@ _FEEDS: dict[str, list[str]] = {
         # establishment think-tank lean above (bias audit 2026-06-21).
         "https://asiatimes.com/feed/",
         "https://responsiblestatecraft.org/feeds/feed.rss",
-        "https://moderndiplomacy.eu/feed/",
+        # moderndiplomacy.eu replaced 2026-08-26: its /feed/ now 302s to a
+        # "server-security-challenge" bot wall — every fetch failed (silent
+        # coverage gap). SCMP world news keeps the non-Western slot
+        # (validated from the container: parses clean, 50 items).
+        "https://www.scmp.com/rss/91/feed",
         "https://geopoliticalfutures.com/feed/",
     ],
     # Topic-filter regex — items whose title/summary doesn't match these
@@ -503,7 +507,7 @@ class FeedItem:
 
 
 _TIMEOUT = 10.0
-_USER_AGENT = "Mozilla/5.0 (compatible; NovaBot/1.0; +https://github.com/anthropics/nova)"
+_USER_AGENT = "Mozilla/5.0 (compatible; NovaBot/1.0; +https://github.com/HeliosNova/nova)"
 # SEC enforces a fair-access policy that 403s any UA that doesn't include
 # real contact info. Format must be "<name/tool> <email>".
 _SEC_USER_AGENT = "Nova Personal Assistant espinozarogelio323@gmail.com"

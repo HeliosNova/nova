@@ -72,7 +72,7 @@ COPY tests/ tests/
 COPY evals/ evals/
 COPY pytest.ini .
 # scripts/ package marker only. The fine-tuning / GRPO / RLVR-trainer stack was
-# archived 2026-06-12 (see archive/training/ + CLAUDE.md) — the in-context memory
+# archived 2026-06-12 (see archive/training/) — the in-context memory
 # loop is the product, weight training was 0-successful-deploy experimental. The
 # runtime image no longer ships any trainer.
 COPY scripts/__init__.py scripts/__init__.py

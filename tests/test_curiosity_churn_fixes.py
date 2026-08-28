@@ -114,6 +114,32 @@ class TestDreamResetOnce:
         assert row["status"] == "dismissed"
 
 
+class TestPendingAgeOut:
+    def _seed_pending(self, db, *, topic, age_days):
+        item_id = db.seed(topic=topic, status="pending", attempts=0)
+        db._conn.execute(
+            "UPDATE curiosity_queue SET created_at = datetime('now', ?) WHERE id=?",
+            (f"-{age_days} days", item_id))
+        db._conn.commit()
+        return item_id
+
+    def test_stale_pending_expires_at_14d(self):
+        db = _FakeAsyncDB()
+        old_id = self._seed_pending(db, topic="ancient open question", age_days=15)
+        result = _run_handle_failed(db, [])
+        row = db.row(old_id)
+        assert row["status"] == "dismissed"
+        assert (row["resolution"] or "").startswith("[expired")
+        assert result.curiosity_dismissed == 1
+
+    def test_fresh_pending_survives(self):
+        db = _FakeAsyncDB()
+        new_id = self._seed_pending(db, topic="fresh open question", age_days=3)
+        result = _run_handle_failed(db, [])
+        assert db.row(new_id)["status"] == "pending"
+        assert result.curiosity_dismissed == 0
+
+
 # ---------------------------------------------------------------------------
 # 2. Daemon curiosity cooldown
 # ---------------------------------------------------------------------------

@@ -121,6 +121,14 @@ _CANARY_NORMAL_MARKERS: dict[str, str] = {
 }
 
 
+# Lessons whose "answer" is a process instruction, not a gradable fact —
+# the Lesson Quiz skips these (see _execute_quiz).
+_UNQUIZZABLE_ANSWER_RE = re.compile(
+    r"(?i)\b(use (a |the |your )?(calculator|web[ _]?search|browser|tool)"
+    r"|search the web|perform a (web )?search|look (it )?up"
+    r"|consult (the|a|current)|verify (with|using|by))\b")
+
+
 def _canary_should_alert(check_type: str, last_result: str | None,
                          new_value: str | None) -> bool:
     """Delivery gate for stat-line canary monitors.
@@ -1451,9 +1459,8 @@ class HeartbeatLoop:
         # they've been waiting for a re-test to either close (#167) or escalate.
         # Otherwise NULLS FIRST → unquizzed; then oldest-quizzed by failure count.
         db = svc.learning._db
-        lesson = None
-        row = await asyncio.to_thread(
-            db.fetchone,
+        candidate_rows = await asyncio.to_thread(
+            db.fetchall,
             "SELECT id FROM lessons "
             "WHERE (quiz_failures < 5 "
             "   OR last_quizzed_at < datetime('now', '-7 days') "
@@ -1465,27 +1472,73 @@ class HeartbeatLoop:
             "        THEN 0 ELSE 1 END), "
             "  last_quizzed_at ASC NULLS FIRST, "
             "  quiz_failures DESC "
-            "LIMIT 1"
+            "LIMIT 10"
         )
-        if row:
-            lesson = next((l for l in lessons if l.id == row["id"]), None)
+        # Technique lessons are unquizzable (2026-08-27): a correct_answer
+        # that says "do a web search" / "use the calculator" is a PROCESS
+        # instruction, not a gradable fact — the generator has nothing
+        # factual to ask for, and the grader then fails whatever the student
+        # says against it. The art-history lesson looped this way for weeks:
+        # quiz fail → curiosity re-research → same lesson → fail again.
+        # 29 of 44 current lessons are this shape, so stamp EVERY gated one
+        # encountered (the spaced-repetition picker moves past them) and quiz
+        # the first factual candidate — one cycle drains gated backlog AND
+        # still runs a real quiz. Behavior-shaped lessons are covered by the
+        # nightly eval's tool-use category instead.
+        lesson = None
+        gated = 0
+        by_id = {l.id: l for l in lessons}
+        for r in candidate_rows or []:
+            cand = by_id.get(r["id"])
+            if cand is None:
+                continue
+            if _UNQUIZZABLE_ANSWER_RE.search((cand.correct_answer or "")[:200]):
+                await asyncio.to_thread(
+                    db.execute,
+                    "UPDATE lessons SET last_quizzed_at=datetime('now') WHERE id=?",
+                    (cand.id,))
+                gated += 1
+                continue
+            lesson = cand
+            break
         if not lesson:
-            # Fallback: pick a random lesson that has usable content
-            usable = [l for l in lessons if l.correct_answer and len(l.correct_answer) > 20]
+            # Fallback: pick a random lesson that has usable, gradable content
+            usable = [l for l in lessons
+                      if l.correct_answer and len(l.correct_answer) > 20
+                      and not _UNQUIZZABLE_ANSWER_RE.search(l.correct_answer[:200])]
             if not usable:
-                return "[No lessons with sufficient content to quiz on — skipped]"
+                return (f"[No quizzable lessons — {gated} technique lesson(s) "
+                        f"stamped this cycle]")
             lesson = random.choice(usable)
+        if gated:
+            logger.info("[Quiz] stamped %d unquizzable technique lesson(s) this cycle", gated)
 
-        # Step 1: Generate a question from the lesson
-        # Pick the longest available text source for context
-        context_candidates = [lesson.context or '', lesson.lesson_text or '', lesson.correct_answer or '']
+        # Step 1: Generate a question from the lesson.
+        # NOT lesson.context: that field holds provenance/bookkeeping text
+        # ("Promoted from success reflexion (quality 0.82)"), and max-by-
+        # length kept selecting it — a live quiz asked "what is the quality
+        # score associated with 'Promoted from success reflexion'"
+        # (2026-08-27). Ground questions in the knowledge fields only.
+        context_candidates = [lesson.lesson_text or '', lesson.correct_answer or '']
         context_text = max(context_candidates, key=len)
         if len(context_text.strip()) < 20:
             return f"[Lesson '{lesson.topic}' has insufficient context for quiz — skipped]"
+        # The question MUST be answerable by the stored correct_answer — that
+        # is the only reference the grader has. The old free-form prompt let
+        # the model invent NEW problems from technique lessons ("Use
+        # calculators..." → "Calculate 12×45 + (80−67)÷9"), which the grader
+        # then failed against the UNRELATED stored answer it is ordered to
+        # treat as ground truth. Structural false failures on the whole
+        # math/tool-technique lesson family (2 of the last 3 quizzes,
+        # observed 2026-08-27), feeding false negatives into lesson
+        # confidence and curiosity re-research.
         gen_prompt = (
             f"Topic: {lesson.topic}\n"
-            f"Context: {context_text}\n\n"
-            "Write a single, specific quiz question that tests knowledge of this topic. "
+            f"The correct answer (the question must ask for THIS): {lesson.correct_answer}\n"
+            f"Additional context: {context_text[:400]}\n\n"
+            "Write a single quiz question whose correct answer is exactly the "
+            "answer given above. Do NOT invent new calculations, numbers, or "
+            "scenarios that the given answer does not cover. "
             "Just the question, nothing else."
         )
         try:

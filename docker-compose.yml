@@ -395,7 +395,16 @@ services:
     ports:
       - "127.0.0.1:8888:8080"
     volumes:
-      - ./searxng/settings.yml:/etc/searxng/settings.yml:ro
+      # DIRECTORY mount, deliberately not the single file: after every unclean
+      # Windows shutdown, Docker Desktop's WSL2 file-share materialized
+      # single-file binds as stale DIRECTORY placeholders → searxng Exited(127)
+      # "not a directory" and nova-app blocked behind depends_on. That made
+      # every power outage a manual runbook (compose stop → wsl --terminate
+      # docker-desktop → up). Directory binds don't hit the bug — Nova now
+      # boots normally after an outage (recurred 2026-08-17 and 2026-08-27;
+      # this was the LAST single-file bind in the stack). The dir holds only
+      # settings.yml + settings.yml.example (inert to searxng).
+      - ./searxng:/etc/searxng:ro
     mem_limit: 384m
     cpus: 1.0
     healthcheck:

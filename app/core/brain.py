@@ -3796,10 +3796,16 @@ async def think(
             conversation_id = await asyncio.to_thread(svc.conversations.create_conversation)
         conv = await asyncio.to_thread(svc.conversations.get_conversation, conversation_id)
         if conv is None:
-            old_id = conversation_id
-            conversation_id = await asyncio.to_thread(svc.conversations.create_conversation)
+            # A client-supplied conversation_id that doesn't exist yet: CREATE
+            # IT under that id rather than minting a fresh UUID and discarding
+            # the caller's (2026-08-27). The old fallback silently fragmented
+            # every external-client multi-turn thread into one-conversation-
+            # per-turn — no cross-turn recall, and GSW episodic summaries never
+            # accumulated the ≥4 messages they need. The frontend is unaffected
+            # (it echoes the server-issued id, so its turn-2+ always finds conv).
+            conversation_id = await asyncio.to_thread(
+                svc.conversations.create_conversation, None, conversation_id)
             is_new_conversation = True
-            logger.warning("Conversation '%s' not found, created new '%s'", old_id, conversation_id)
 
     # Acquire per-conversation lock to serialize concurrent think() calls
     _conv_lock = None

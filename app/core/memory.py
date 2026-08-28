@@ -42,11 +42,21 @@ class ConversationStore:
     def __init__(self, db=None):
         self._db = db or get_db()
 
-    def create_conversation(self, title: str | None = None) -> str:
-        """Create a new conversation. Returns its ID."""
-        conv_id = str(uuid.uuid4())
+    def create_conversation(self, title: str | None = None,
+                            conv_id: str | None = None) -> str:
+        """Create a new conversation. Returns its ID.
+
+        `conv_id` honors a client-supplied id (already schema-validated to
+        alphanumeric+hyphen/underscore, ≤100 chars) so an external API caller
+        that chooses its own conversation id gets real multi-turn continuity —
+        the id it sends is the id that persists. INSERT OR IGNORE makes it
+        idempotent under the concurrent-first-turn race (the per-conversation
+        lock in think() is acquired just after this call). Absent conv_id, a
+        UUID is minted as before.
+        """
+        conv_id = conv_id or str(uuid.uuid4())
         self._db.execute(
-            "INSERT INTO conversations (id, title) VALUES (?, ?)",
+            "INSERT OR IGNORE INTO conversations (id, title) VALUES (?, ?)",
             (conv_id, title or "New Chat"),
         )
         return conv_id

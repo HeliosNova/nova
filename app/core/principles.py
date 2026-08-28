@@ -14,9 +14,10 @@ This module is called from the daily maintenance cycle.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import re
-from collections import defaultdict
+from collections import Counter
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +49,42 @@ def _is_principle_text(text: str) -> bool:
     return bool(text) and not _BOILERPLATE_TEXT_RE.search(text)
 
 
+def _cluster_by_overlap(rows) -> list[tuple[frozenset, list]]:
+    """Greedy keyword-overlap grouping: lessons sharing ≥2 substantive topic
+    tokens join the same cluster.
+
+    Replaces the alphabetical-first-2-keywords key (2026-08-27), which
+    FRAGMENTED natural families: "Factual Art History Questions" keyed
+    {art, factual}, "Historical Art Facts" keyed {art, facts}, "Famous Art
+    History Questions" keyed {art, famous} — the same family scattered
+    across distinct keys, so no cluster ever reached min_cluster=3 and
+    Path B never minted a principle in the system's LIFETIME (verified
+    against the live corpus: old keying max cluster = 2).
+
+    Returns [(label_key, members)] where label_key is the 2 most common
+    tokens across the cluster's member topics (a stable, meaningful label).
+    """
+    groups: list[list] = []  # [set_of_kws, [rows]]
+    for r in rows:
+        kws = set(_topic_keywords(r["topic"] or ""))
+        if len(kws) < 2:
+            continue
+        for g in groups:
+            if len(g[0] & kws) >= 2:
+                g[1].append(r)
+                g[0] |= kws
+                break
+        else:
+            groups.append([kws, [r]])
+    out: list[tuple[frozenset, list]] = []
+    for gkws, members in groups:
+        token_counts = Counter(
+            t for m in members for t in _topic_keywords(m["topic"] or ""))
+        label = frozenset(t for t, _n in token_counts.most_common(2)) or frozenset(gkws)
+        out.append((label, members))
+    return out
+
+
 async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int = 3) -> int:
     """Find clusters of agreeing lessons and write each as a principle KG fact.
 
@@ -56,7 +93,8 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
     distilled = 0
 
     # --- Path A: very-high-helpful single lessons → promote directly ---
-    rows = db.fetchall(
+    rows = await asyncio.to_thread(
+        db.fetchall,
         "SELECT id, topic, lesson_text, confidence, times_helpful "
         "FROM lessons "
         "WHERE times_helpful >= ? AND confidence >= 0.85 "
@@ -70,7 +108,8 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
         if not topic or not _is_principle_text(text):
             continue
         # Skip if already a principle for this topic
-        existing = db.fetchone(
+        existing = await asyncio.to_thread(
+            db.fetchone,
             "SELECT id FROM kg_facts WHERE source='principle' AND subject=? LIMIT 1",
             (topic[:200],),
         )
@@ -92,20 +131,15 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
             logger.warning("principle add failed: %s", e)
 
     # --- Path B: cluster lessons by topic-keyword overlap, distill consensus ---
-    candidate_rows = db.fetchall(
+    candidate_rows = await asyncio.to_thread(
+        db.fetchall,
         "SELECT id, topic, lesson_text, confidence, times_helpful "
         "FROM lessons WHERE confidence >= 0.6 AND times_helpful >= 2 "
         "ORDER BY times_helpful DESC LIMIT 200"
     )
-    clusters: dict[frozenset, list[dict]] = defaultdict(list)
-    for r in candidate_rows:
-        kws = _topic_keywords(r["topic"] or "")
-        if len(kws) >= 2:
-            # Use top-2 substantive keywords as cluster key
-            key = frozenset(sorted(kws)[:2])
-            clusters[key].append(r)
+    clusters = _cluster_by_overlap(candidate_rows)
 
-    for key, members in clusters.items():
+    for key, members in clusters:
         if len(members) < min_cluster:
             continue
         # Compose a principle statement: pick the highest-confidence member
@@ -119,7 +153,8 @@ async def distill_principles(db, kg, *, min_helpful: int = 5, min_cluster: int =
         topic_label = " + ".join(sorted(key))
         text = (best["lesson_text"] or "")[:200]
         # Dedupe
-        existing = db.fetchone(
+        existing = await asyncio.to_thread(
+            db.fetchone,
             "SELECT id FROM kg_facts WHERE source='principle' AND subject=? LIMIT 1",
             (topic_label[:200],),
         )

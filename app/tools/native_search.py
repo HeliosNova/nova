@@ -186,18 +186,47 @@ class _DDGParser(HTMLParser):
 # Bing HTML parser
 # ---------------------------------------------------------------------------
 
+# Markup drift 2026-08-26: results are now `<li class="b_algo" data-id iid=...>`
+# with `<h2 class="">` and the snippet under `<div class="b_caption"><p
+# class="b_lineclamp2">` — the old exact-match `<li class="b_algo">.*?<h2><a`
+# regex matched NOTHING (bing silently returned 0 in every ladder while the
+# page carried 10 real results).
 _BING_RESULT_RE = re.compile(
-    r'<li class="b_algo">.*?<h2><a href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>.*?'
-    r'(?:<p[^>]*>(?P<snippet>.*?)</p>|<div class="b_caption"[^>]*><p[^>]*>(?P<snippet2>.*?)</p>)',
+    r'<li class="b_algo"[^>]*>.*?<h2[^>]*>\s*<a\b[^>]*?href="(?P<url>[^"]+)"[^>]*>(?P<title>.*?)</a>'
+    r'.*?(?:<div class="b_caption"[^>]*>.*?<p[^>]*>(?P<snippet>.*?)</p>|<p[^>]*>(?P<snippet2>.*?)</p>)',
     re.DOTALL,
 )
+
+
+def _bing_real_url(href: str) -> str:
+    """Unwrap Bing's redirect links (same drift as the markup change).
+
+    Result hrefs are now `https://www.bing.com/ck/a?...&u=a1<base64url>&ntb=1`
+    where the real URL is base64url-encoded after an `a1` prefix. Downstream
+    host-credibility scoring and body fetches need the REAL host, not
+    bing.com. Falls back to the wrapped URL if decoding fails."""
+    href = html.unescape(href)
+    try:
+        parsed = urlparse(href)
+        if parsed.netloc.endswith("bing.com") and parsed.path.startswith("/ck/"):
+            u = parse_qs(parsed.query).get("u", [""])[0]
+            if u.startswith("a1"):
+                import base64
+                b64 = u[2:]
+                b64 += "=" * (-len(b64) % 4)
+                decoded = base64.urlsafe_b64decode(b64).decode("utf-8", "replace")
+                if decoded.startswith("http"):
+                    return decoded
+    except Exception:
+        pass
+    return href
 
 
 def _parse_bing(text: str) -> list[SearchResult]:
     results = []
     for m in _BING_RESULT_RE.finditer(text):
         title = re.sub(r"<[^>]+>", "", m.group("title")).strip()
-        url = m.group("url").strip()
+        url = _bing_real_url(m.group("url").strip())
         snippet = re.sub(r"<[^>]+>", "", m.group("snippet") or m.group("snippet2") or "").strip()
         if title and url:
             results.append(SearchResult(
@@ -275,7 +304,7 @@ async def _search_wikipedia(query: str, max_results: int) -> list[SearchResult]:
         # Including a contact URL avoids being flagged as anonymous bot traffic.
         async with httpx.AsyncClient(
             headers={
-                "User-Agent": "NovaBot/1.0 (https://github.com/anthropics/nova; sovereign personal assistant) python-httpx",
+                "User-Agent": "NovaBot/1.0 (https://github.com/HeliosNova/nova; sovereign personal assistant) python-httpx",
                 "Accept": "application/json",
             },
             timeout=DEFAULT_TIMEOUT,

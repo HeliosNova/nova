@@ -208,7 +208,7 @@ class MCPManager:
 
         # Support both flat format and nested "mcpServers" format
         if "mcpServers" in server_config:
-            # Handle claude-style config: {"mcpServers": {"name": {"command": ..., "args": [...]}}}
+            # Handle nested mcpServers config: {"mcpServers": {"name": {"command": ..., "args": [...]}}}
             count = 0
             for name, srv_cfg in server_config["mcpServers"].items():
                 count += await self._connect_and_register(name, srv_cfg, registry)

@@ -24,7 +24,7 @@ service_account.json
 .DS_Store
 Thumbs.db
 
-# Claude Code
+# AI assistant working files
 .claude/
 
 # Local archive of internal/superseded docs — never public
