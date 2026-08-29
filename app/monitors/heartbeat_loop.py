@@ -3016,7 +3016,27 @@ class HeartbeatLoop:
         except Exception as e:
             suggestion = f"[LLM review failed: {e}]"
 
-        # Mark all reviewed gaps as reviewed
+        # Take ACTION on the suggestions: enqueue gaps as goals so KAIROS picks
+        # them up. Without this hook the suggestions just sit in the alert
+        # text and never drive any work.
+        #
+        # ORDER MATTERS (fixed 2026-08-29). This ran AFTER the "mark reviewed"
+        # block below, but derive_goals() selects `WHERE reviewed = 0` — so the
+        # review consumed every gap and then asked the deriver to derive from
+        # them, guaranteeing an empty input. The capability_gap source could
+        # therefore never mint a goal. Live evidence: 18 gaps, ALL reviewed=1,
+        # 9 of them created in the last 7 days, 0 unreviewed — and no goal
+        # created in 12 days, with the only capability-gap goals dating from
+        # 2026-06-20. Derive first, then mark.
+        actions_taken = []
+        try:
+            from app.core.goal_deriver import derive_goals
+            new_goals = await derive_goals(db, max_new_goals=3)
+            actions_taken.extend(f"goal #{g['id']} ({g['source_kind']})" for g in new_goals)
+        except Exception as e:
+            logger.warning("[Heartbeat] Capability review goal-derivation failed: %s", e)
+
+        # Mark the gaps reviewed only AFTER derivation has had its chance.
         try:
             gap_ids = [row["id"] for row in rows]
             await asyncio.to_thread(
@@ -3026,17 +3046,6 @@ class HeartbeatLoop:
             )
         except Exception as e:
             logger.warning("[Heartbeat] Failed to mark gaps reviewed: %s", e)
-
-        # Take ACTION on the suggestions: enqueue gaps as goals so KAIROS picks
-        # them up. Without this hook the suggestions just sit in the alert
-        # text and never drive any work.
-        actions_taken = []
-        try:
-            from app.core.goal_deriver import derive_goals
-            new_goals = await derive_goals(db, max_new_goals=3)
-            actions_taken.extend(f"goal #{g['id']} ({g['source_kind']})" for g in new_goals)
-        except Exception as e:
-            logger.warning("[Heartbeat] Capability review goal-derivation failed: %s", e)
 
         action_summary = (
             "\n\nActions taken: " + "; ".join(actions_taken)

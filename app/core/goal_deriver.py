@@ -151,11 +151,22 @@ def _derive_goals_sync(db, *, max_new_goals: int = 5) -> list[dict]:
         clusters: Counter[str] = Counter()
         for r in gap_rows:
             q = (r["query"] or "").lower()
-            # Pull the top 1-2 substantive words
-            words = re.findall(r"\b[a-z][a-z0-9_-]{3,}\b", q)
-            for w in words[:3]:
-                if w not in STOP_WORDS and w not in _GOAL_KEYWORD_JUNK:
-                    clusters[w] += 1
+            # Filter FIRST, then take the leading terms (2026-08-29). This used
+            # to slice words[:3] and filter afterwards, so the whole window was
+            # spent on whatever tokens happened to OPEN the query — and research
+            # queries all open with an imperative ("Explain…", "Identify…",
+            # "Detail…"). The surviving goals show the damage: "recurring
+            # capability gap: does", "…: higher", "…: clock" — three separate
+            # goals minted from one question about CPU clock speed, all failed.
+            # Same defect class as the 2026-08 principles bug: a cluster key
+            # chosen by position rather than by content.
+            words = [
+                w for w in re.findall(r"\b[a-z][a-z0-9_-]{3,}\b", q)
+                if w not in STOP_WORDS and w not in _GOAL_KEYWORD_JUNK
+            ]
+            # set(): a single verbose query must not stack its own counter.
+            for w in set(words[:8]):
+                clusters[w] += 1
         for keyword, count in clusters.most_common(3):
             if count < 3:
                 continue
