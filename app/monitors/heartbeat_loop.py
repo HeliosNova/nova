@@ -2115,6 +2115,18 @@ class HeartbeatLoop:
             r"^(?:what|who|where|when|how|is|are|was|were|do|does|did|can|could|will|would|should|find|search|look\s+up|show|tell|give|list)\b"  # questions + imperative verbs
             r"|\b(?:price|cost|worth|trading at|how much)\b"  # price queries
             r"|\b(?:dont search|don.t search|just tell|from memory)\b"  # test queries
+            # Operator sanity probes (2026-08-29). The owner pings Nova with
+            # liveness checks — "reply with exactly: operational", "in one word,
+            # are you operational", "sanity probe: reply with the single word
+            # aligned and nothing else". Those were recorded as topics, one hit
+            # min_count=3 and auto-spawned "Auto: reply with exactly:
+            # operational" (monitor 77), a 12-hourly deep-research job on
+            # nonsense that burned GPU and fed junk into the KG. The imperative
+            # list above starts at what/who/find/show/tell/give/list and never
+            # covered reply/respond/say/answer.
+            r"|^(?:reply|respond|say|answer|echo|repeat|confirm)\b"
+            r"|\b(?:sanity probe|in one word|single word|one word|nothing else)\b"
+            r"|\bare\s+you\s+(?:operational|alive|working|online|there|ok|up)\b"
             r"|\b(?:time is it|what time|current time)\b"  # time queries
             r"|\b(?:calculate|compute|solve|equation|multipl[yi](?:ed)?|divid(?:e|ed)|plus|minus|equals?)\b"  # math
             r"|\b(?:write|generate|create|make me)\b"  # generation requests
