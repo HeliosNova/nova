@@ -580,8 +580,10 @@ class DynamicTool(BaseTool):
             if len(output) > 5000:
                 output = output[:5000] + "\n[... output truncated]"
 
-            # Record usage
-            self._store.record_use(self.name, success=success)
+            # Record usage. to_thread (2026-08-29): record_use is a sync UPDATE
+            # and execute() is async, so this wrote to SQLite from the
+            # event-loop thread on every custom-tool invocation.
+            await asyncio.to_thread(self._store.record_use, self.name, success=success)
 
             if not success:
                 return ToolResult(
@@ -594,14 +596,14 @@ class DynamicTool(BaseTool):
             return ToolResult(output=output, success=True)
 
         except subprocess.TimeoutExpired:
-            self._store.record_use(self.name, success=False)
+            await asyncio.to_thread(self._store.record_use, self.name, success=False)
             return ToolResult(
                 output="", success=False,
                 error=f"Tool timed out after {config.CODE_EXEC_TIMEOUT}s",
                 error_category=ErrorCategory.TRANSIENT,
             )
         except Exception as e:
-            self._store.record_use(self.name, success=False)
+            await asyncio.to_thread(self._store.record_use, self.name, success=False)
             return ToolResult(output="", success=False, error=f"Tool failed: {e}", error_category=ErrorCategory.INTERNAL)
         finally:
             # Clean up the entire sandbox directory

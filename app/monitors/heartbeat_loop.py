@@ -1829,7 +1829,9 @@ class HeartbeatLoop:
         )
 
         passed = score >= 0.6
-        svc.skills.record_use(skill.id, passed)
+        # to_thread (2026-08-29): record_use is a sync UPDATE on skills and this
+        # is an async monitor path — it wrote from the event-loop thread.
+        await asyncio.to_thread(svc.skills.record_use, skill.id, passed)
         status = "PASSED" if passed else "FAILED"
         return (
             f"SKILL TEST {status} | skill={skill.name} | "

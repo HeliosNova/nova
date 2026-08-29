@@ -182,7 +182,10 @@ async def resolve_one(db, fc: dict) -> str:
         return _bump_attempts(db, fc)  # count it; retire if chronically ungradeable
     reason = str(data.get("reason", ""))[:300]
     try:
-        db.execute(
+        # to_thread (2026-08-29): sync UPDATE on the event-loop thread from an
+        # async resolver — takes the write lock on the loop (54h-freeze class).
+        await asyncio.to_thread(
+            db.execute,
             "UPDATE forecasts SET status = ?, resolution = ?, resolved_at = datetime('now') WHERE id = ?",
             (verdict, reason, fc["id"]),
         )

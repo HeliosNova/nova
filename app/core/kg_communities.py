@@ -16,6 +16,7 @@ unavailable or the graph is too sparse to cluster.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -155,7 +156,9 @@ async def _summarize_community(entities: set[str], facts: list[dict]) -> dict | 
 async def build_and_store(db, *, max_communities: int = _MAX_COMMUNITIES) -> int:
     """Full pass: detect communities, summarize the largest, replace the stored
     set. Returns the number of community summaries written."""
-    ensure_schema(db)
+    # to_thread (2026-08-29): ensure_schema runs CREATE TABLE/INDEX DDL and this
+    # is an async function, so the DDL executed on the event-loop thread.
+    await asyncio.to_thread(ensure_schema, db)
     rows = db.fetchall(
         "SELECT subject, predicate, object, confidence FROM kg_facts "
         "WHERE valid_to IS NULL AND COALESCE(quarantined, 0) = 0"
