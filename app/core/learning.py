@@ -656,6 +656,7 @@ class LearningEngine:
         # --- Vector search via ChromaDB ---
         vector_ranked: list[int] = []  # lesson IDs in ranked order
         vector_strong: set[int] = set()  # clear semantic matches (paraphrase-grade)
+        vector_dist: dict[int, float] = {}  # lid -> cosine distance, for ranking
         try:
             from . import vector_health
 
@@ -700,6 +701,8 @@ class LearningEngine:
                             lid = int(id_str)
                             if lid in lesson_by_id:
                                 vector_ranked.append(lid)
+                                if dist is not None:
+                                    vector_dist[lid] = dist
                                 if dist is not None and dist <= config.LESSON_VECTOR_STRONG_DISTANCE:
                                     vector_strong.add(lid)
                         except ValueError:
@@ -763,6 +766,27 @@ class LearningEngine:
             lid for lid in sorted_ids
             if rrf_scores[lid] >= config.MIN_RRF_SCORE or lid in vector_strong
         ]
+        # STRONG vector hits rank FIRST, closest distance first (2026-08-29).
+        # Exempting them from the floor above kept them in the LIST but not in
+        # the top-`limit` SLICE, which is what the caller actually sees. Measured
+        # on the chronic mem_scheduler_codename_paraphrase eval: the seeded lesson
+        # was Chroma's rank-1 match at d=0.386 (next best 0.62) and flagged
+        # strong, yet came out RANK 6 of 9 and was cut — because the blended score
+        # is 30% retrieval_score, and a brand-new lesson carries the 0.5 default
+        # while long-serving lessons had ~0.96. That is a rich-get-richer loop in
+        # which a newly learned fact can never displace an established one, no
+        # matter how well it matches. For a paraphrase there is no keyword arm by
+        # definition, so — exactly as the comment above argues for the floor —
+        # the strong distance gate is the real relevance check, and it must drive
+        # ORDER as well as inclusion. Non-strong hits keep their blended order.
+        if vector_strong:
+            sorted_ids.sort(
+                key=lambda lid: (
+                    0 if lid in vector_strong else 1,
+                    vector_dist.get(lid, 0.0) if lid in vector_strong
+                    else -rrf_scores[lid],
+                )
+            )
 
         lessons = []
         retrieved_ids = []
