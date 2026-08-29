@@ -834,6 +834,18 @@ async def _fetch_via_jina(url: str, max_len: int = _BODY_MAX_CHARS) -> str | Non
             return None
         body = _reader_main_content(raw)                          # article prose only (nav/related dropped)
         if body and not _stale_body(body):
+            # Sanitize like every other fetch path (2026-08-29). The two primary
+            # readers wrap their output — HttpFetchTool at http_fetch.py:485 and
+            # BrowserTool at browser.py:631/751 — but this bypass returned raw
+            # reader text straight to the synthesis and KG-extraction prompts.
+            # It is the path used for exactly the content we trust least to be
+            # clean: third-party-rendered paywalled pages, plus every fallback
+            # once the browser budget is spent. Untrusted page text reaching a
+            # fact-extraction prompt unwrapped is the memory-poisoning vector.
+            from app.config import config as _icfg
+            if getattr(_icfg, "ENABLE_INJECTION_DETECTION", True):
+                from app.core.injection import sanitize_content
+                body = sanitize_content(body, context="paywall bypass")
             logger.info("[DeepResearch] paywall bypass (jina) read %s (%d chars)", _host(url), len(body))
             return body[:max_len]
     except Exception as e:
