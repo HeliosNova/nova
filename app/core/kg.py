@@ -395,6 +395,36 @@ _DATE_FRAGMENT_RE = re.compile(
     r"(?:second|minute|hour|day|week|month|year|decade)s?)$",
     re.IGNORECASE,
 )
+
+# Objects that describe Nova's OWN pipeline output rather than the world. The
+# extractor occasionally banks "<topic> is_a domain overview" while writing a
+# digest; that is bookkeeping, not knowledge. Measured 2026-08-29: 16 such
+# triples were 0.3% of live facts but 9.6% of ALL retrievals.
+_PIPELINE_ARTIFACT_OBJECTS = frozenset({
+    "domain overview", "domain_overview", "domain study", "domain_study",
+    "domain intelligence overview", "domain_intelligence_overview",
+    "researched briefing", "research briefing", "briefing", "digest",
+    "date of facts learned", "facts learned", "monitor output",
+    "intelligence overview", "overview", "summary", "report",
+})
+
+# A BARE date as the subject of a fact — "July 08, 2026 has_status …". A date is
+# not an entity. Deliberately anchored and strict so a titled document that
+# merely contains a date ("Contracts for Aug. 3, 2026") still qualifies as a
+# legitimate subject.
+_MONTH_ALT = (
+    r"jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?"
+    r"|aug(?:ust)?|sep(?:t)?(?:ember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?"
+)
+_BARE_DATE_SUBJECT_RE = re.compile(
+    # Abbreviated forms included: the live KG carries "Aug. 14, 2026" as well as
+    # "August 14, 2026", and a full-name-only pattern silently missed the former
+    # (caught by test_bare_date_cannot_be_a_subject).
+    rf"^(?:{_MONTH_ALT})\.?\s+\d{{1,2}},?\s+\d{{4}}$"
+    rf"|^\d{{1,2}}\s+(?:{_MONTH_ALT})\.?,?\s+\d{{4}}$"
+    r"|^\d{4}-\d{2}-\d{2}$",
+    re.IGNORECASE,
+)
 # A related_to endpoint that is really a QUANTITY / TIME / MEASUREMENT with no
 # named-entity anchor — the extraction lost the actual fact and kept the number.
 # Broader than _DATE_FRAGMENT_RE (which only anchors bare dates/simple durations):
@@ -481,6 +511,23 @@ def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     if _looks_like_fragment(s) or _looks_like_fragment(o):
         return True
     if ":" in s and re.match(r"^[a-z0-9_]+:", s):  # "cross_pattern:..." synthesis artifact
+        return True
+
+    # Pipeline self-description (2026-08-29). The extractor sometimes banks a
+    # triple ABOUT Nova's own output instead of about the world:
+    # "semiconductors is_a domain overview", "geopolitics is_a researched
+    # briefing", "July 08, 2026 has_status date of facts learned". These are
+    # bookkeeping, not knowledge, and they are catastrophically over-retrieved:
+    # measured 2026-08-29, 16 such triples were 0.3% of live facts but 9.6% of
+    # ALL retrievals (a 32x over-representation), crowding real knowledge out of
+    # every prompt while `acquired` facts sat 83% never-retrieved.
+    if o in _PIPELINE_ARTIFACT_OBJECTS:
+        return True
+    # A bare date is not an entity, so it cannot be the SUBJECT of a fact.
+    # ("July 08, 2026 has_status date of facts learned" — 2321 retrievals.)
+    # Only bare dates: a titled document that contains a date ("Contracts for
+    # Aug. 3, 2026") is a legitimate subject and must survive.
+    if _BARE_DATE_SUBJECT_RE.match(subject.strip()):
         return True
 
     # Predicate-direction sanity (rejects obvious reversals)
