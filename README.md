@@ -1,9 +1,13 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-3%2C100%2B-brightgreen)](tests/)
+[![Tests](https://img.shields.io/badge/tests-3%2C000%2B-brightgreen)](tests/)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
+
+<p align="center">
+  <img src="docs/social-preview.png" alt="Nova — the personal AI that remembers what you teach it" width="820">
+</p>
 
 **The personal AI that actually remembers what you teach it.**
 
@@ -25,12 +29,6 @@ Nova: "Canberra"  ← recalled from memory, not retrained
 
 Few self-hosted assistants combine all of these — and unlike most, the learning loop is *measured*, not just asserted (see the memory-learning eval below).
 
-### See it in action
-
-<p align="center">
-  <img src="docs/demo.svg" alt="Nova learning loop demo" width="700">
-</p>
-
 ---
 
 ## Why Nova
@@ -45,7 +43,7 @@ Nova is a sovereign personal AI that runs entirely on your hardware with zero cl
 | Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No | No |
 | Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
-| Proactive monitors | **72 across 35+ domains** | Automations | No |
+| Proactive monitors | **70+ across 35+ domains** | Automations | No |
 | Builds its own understanding | **Living dossiers + forecasts** | No | No |
 | MCP (client + server) | **Both** | No | Client only |
 | Self fine-tune (DPO) | Experimental¹ | No | No |
@@ -93,7 +91,7 @@ User query -> brain.think()
   -> stream tokens via SSE
   -> post-response: correction detection, fact extraction, reflexion, curiosity
 
-Meanwhile, 72 monitors run autonomously:
+Meanwhile, 70+ monitors run autonomously:
   -> deep-research each domain: multi-source gather -> synthesize a cited briefing
      (entailment-gated so every claim traces to a source) -> deliver via Discord/Telegram
   -> extract knowledge graph triples from every result
@@ -179,7 +177,7 @@ All channels support phone-number allowlisting, message splitting, and graceful 
 
 ## Heartbeat Monitors
 
-72 monitors are seeded by default and run on schedule across 35+ domains — Nova works even when you're not talking to it. Each domain monitor doesn't just search; it runs a **deep-research pass** (multi-source gather → cited synthesis → entailment gate that drops or de-cites any claim it can't trace to a source) and delivers a briefing:
+70+ monitors are seeded by default and run on schedule across 35+ domains — Nova works even when you're not talking to it. Each domain monitor doesn't just search; it runs a **deep-research pass** (multi-source gather → cited synthesis → entailment gate that drops or de-cites any claim it can't trace to a source) and delivers a briefing:
 
 | Category | Monitors | Schedule | What they do |
 |----------|----------|----------|-------------|
@@ -255,7 +253,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 docker exec nova-app sh -c "python -m pytest tests/ -v"
 ```
 
-3,100+ tests across ~170 files: brain pipeline, memory loop, knowing tier, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
+3,000+ tests across ~170 files: brain pipeline, memory loop, knowing tier, tools, channels, monitors, security, stress/concurrency, behavioral, and e2e. Note: these validate **behavior and plumbing**. The claim that Nova *learns* is validated separately and quantitatively by the **memory-learning eval** (`evals/suite.yaml`, category `memory-learning`), which measures whether a stored correction actually changes a later answer.
 
 ## Hardware Requirements
 

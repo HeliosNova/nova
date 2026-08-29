@@ -1,0 +1,72 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html,body { background:#000; }
+  #card {
+    width:1280px; height:640px; overflow:hidden;
+    background:
+      radial-gradient(900px 520px at 82% 22%, rgba(224,138,60,0.16), transparent 60%),
+      radial-gradient(700px 700px at 12% 88%, rgba(80,120,220,0.10), transparent 62%),
+      #08080a;
+    color:#eae7df;
+    font-family:'Inter',system-ui,sans-serif;
+    position:relative;
+    display:flex; flex-direction:column; justify-content:center;
+    padding:76px 84px;
+  }
+  /* faint starfield */
+  .stars { position:absolute; inset:0; background-image:
+      radial-gradient(1.4px 1.4px at 20% 30%, rgba(255,255,255,0.35), transparent),
+      radial-gradient(1.2px 1.2px at 70% 20%, rgba(255,255,255,0.28), transparent),
+      radial-gradient(1.6px 1.6px at 88% 62%, rgba(224,138,60,0.5), transparent),
+      radial-gradient(1.2px 1.2px at 40% 80%, rgba(255,255,255,0.22), transparent),
+      radial-gradient(1.1px 1.1px at 60% 68%, rgba(255,255,255,0.20), transparent),
+      radial-gradient(1.5px 1.5px at 33% 52%, rgba(255,255,255,0.18), transparent);
+    opacity:.9; }
+  .frame { position:absolute; inset:22px; border:1px solid rgba(224,138,60,0.16); border-radius:14px; }
+  .brand { display:flex; align-items:center; gap:14px; margin-bottom:30px; position:relative; }
+  .dot { width:14px; height:14px; border-radius:50%; background:#e08a3c; box-shadow:0 0 18px rgba(224,138,60,.7); }
+  .brand .name { font-weight:700; font-size:30px; letter-spacing:-0.02em; }
+  .brand .tag { font-family:'JetBrains Mono',monospace; font-size:12px; letter-spacing:.28em; text-transform:uppercase; color:rgba(234,231,223,.55); margin-left:4px; }
+  h1 { font-size:60px; line-height:1.06; font-weight:700; letter-spacing:-0.03em; max-width:19ch; position:relative; }
+  h1 .accent { color:#e08a3c; }
+  .sub { margin-top:22px; font-size:22px; line-height:1.45; color:rgba(234,231,223,.72); max-width:52ch; font-weight:400; position:relative; }
+  .chips { display:flex; gap:12px; margin-top:40px; position:relative; flex-wrap:wrap; }
+  .chip { font-family:'JetBrains Mono',monospace; font-size:13.5px; letter-spacing:.02em;
+    border:1px solid rgba(234,231,223,.14); background:rgba(255,255,255,.03);
+    padding:9px 15px; border-radius:999px; color:rgba(234,231,223,.82); }
+  .chip b { color:#e08a3c; font-weight:500; }
+  .foot { position:absolute; right:84px; bottom:70px; font-family:'JetBrains Mono',monospace;
+    font-size:13px; letter-spacing:.06em; color:rgba(234,231,223,.4); text-align:right; }
+</style>
+</head>
+<body>
+ <div id="card">
+  <div class="stars"></div>
+  <div class="frame"></div>
+
+  <div class="brand">
+    <span class="dot"></span>
+    <span class="name">Nova</span>
+    <span class="tag">sovereign personal AI</span>
+  </div>
+
+  <h1>The personal AI that <span class="accent">remembers</span> what you teach it.</h1>
+
+  <p class="sub">Correct it once — the fix becomes a lesson and a temporal knowledge-graph fact, retrieved on every future answer. No retraining. Fully local. Your data never leaves.</p>
+
+  <div class="chips">
+    <span class="chip"><b>72</b> autonomous monitors</span>
+    <span class="chip">temporal <b>knowledge graph</b></span>
+    <span class="chip">measured, <b>not asserted</b></span>
+    <span class="chip"><b>100%</b> local · Ollama</span>
+  </div>
+
+  <div class="foot">github.com/HeliosNova/nova</div>
+ </div>
+</body>
+</html>
