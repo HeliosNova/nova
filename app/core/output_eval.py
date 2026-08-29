@@ -63,7 +63,27 @@ Grade each dimension 0-10 (10 = excellent, 0 = useless):
       on 89% of output.)
   - DO NOT downgrade because the article BODY references earlier dates ("19th century cables", "since 2024", "filed February 17") — those are normal historical context inside articles and are not freshness penalties.
   - DO NOT downgrade just because an article from a Bloomberg/Reuters/FT URL has a date — the article IS the news, the date IS its publish date, score it on that date alone.
-- format:      VISUAL STRUCTURE ONLY — does each item have a numbered headline, source line, date, URL, and a summary in consistent style? Score 10 if every item follows the same template; 7-8 only if the visual structure varies notably between items. Do NOT downgrade format for content issues like off-topic items, hallucinations, ellipsis truncation in summaries, or irrelevance — those are scored under relevance/facts dimensions, not format. The "📌 N items sourced from X" closing summary IS part of the intended format and should not be penalised.
+- format:      VISUAL STRUCTURE ONLY — TWO FORMATS, same split as freshness.
+  (A) LIST digests (numbered items with "📅" lines): does each item have a
+      numbered headline, source line, date, URL and a summary in consistent
+      style? 10 if every item follows the same template; 7-8 only if the visual
+      structure varies notably between items. The "📌 N items sourced from X"
+      closing summary IS part of the intended format — do not penalise it.
+  (B) PROSE digests (a domain overview, NO numbered items): the correct shape is
+      a "## <topic> — domain overview" header, a "_read N sources: … · <date>_"
+      line, several **bold section leads**, and prose carrying inline
+      "(source.com)" citations. Score 10 when those are present and consistent.
+      A prose digest MUST NOT be marked down for lacking numbered headlines,
+      per-item URL lines or "📅" dates — it is not that format and was never
+      meant to be. Only mark down for genuinely broken presentation: unclosed
+      markdown, a missing header, dangling/truncated sentences, duplicated
+      section leads, or citations that are bare URLs instead of "(source.com)".
+      (Measured 2026-08-29 over 142 prose digests: 100% carry the header, the
+      "_read N sources_" line and 2+ bold leads, 98% carry inline citations,
+      and 0% contain numbered items — so scoring them against the list template
+      graded every one of them against a structure they never emit.)
+  Do NOT downgrade format for content issues like off-topic items,
+  hallucinations, or irrelevance — those are scored under relevance/facts.
 - one_line_critique: one sentence of the worst problem (or "none" if all good).
 
 EVIDENCE RULE — for any score below 8 in any dimension, the one_line_critique
