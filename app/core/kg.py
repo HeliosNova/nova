@@ -1378,12 +1378,41 @@ class KnowledgeGraph:
                 json_prefix="{",
                 max_tokens=500,
                 temperature=0.1,
+                # Schema-pinned (2026-08-29): the 9B returned "id" as a STRING,
+                # so `1 <= idx` raised TypeError and the except below aborted the
+                # WHOLE batch — 1 failure / 0 successes in 48h, i.e. LLM garbage
+                # retirement never ran and only the heuristic pass did. Same
+                # unconstrained-output class as the contradiction judge.
+                json_schema={
+                    "type": "object",
+                    "properties": {
+                        "results": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "id": {"type": "integer"},
+                                    "verdict": {"type": "string",
+                                                "enum": ["keep", "garbage"]},
+                                },
+                                "required": ["id", "verdict"],
+                            },
+                        },
+                    },
+                    "required": ["results"],
+                },
             )
             obj = llm_mod.extract_json_object(raw)
             if obj and "results" in obj:
                 garbage_ids = []
                 for r in obj["results"]:
-                    idx = r.get("id", 0)
+                    # Coerce anyway: the schema is the fix, this is the seatbelt.
+                    # A single bad element must not abort the batch (that is what
+                    # the string "id" did), so skip it and keep going.
+                    try:
+                        idx = int(r.get("id", 0))
+                    except (TypeError, ValueError):
+                        continue
                     if 1 <= idx <= len(low_facts) and r.get("verdict") == "garbage":
                         garbage_ids.append(low_facts[idx - 1]["id"])
                 if garbage_ids:

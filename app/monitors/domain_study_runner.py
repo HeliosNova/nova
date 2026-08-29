@@ -280,27 +280,65 @@ async def _entail_gate_enrich_summaries(monitor_name: str, cand: list[tuple], mi
     # Wider doc window: enrichment bodies (esp. multi-item rollup pages) can carry
     # the claim's supporting sentence well past 5k chars; a too-small window makes
     # MiniCheck false-drop grounded summaries (the needle sat past the cut).
-    pairs = [{"doc": body[:12000], "claim": s} for _it, body, s in cand]
+    # 8000 is where the sidecar caps anyway (_MAX_DOC_CHARS), so asking for 12000
+    # only paid transfer cost for bytes the verifier never read.
+    pairs = [{"doc": body[:8000], "claim": s} for _it, body, s in cand]
+    # Chunked (2026-08-29). This posted every pair in ONE 120s request, which a
+    # 10-pair batch cannot finish, so under digest contention it timed out and
+    # fail-opened. Observed live the same day: "entailment unavailable
+    # (ReadTimeout('')) — fail-open" immediately followed by "10 summaries
+    # written, 0 entail-dropped" — a timeout wearing the costume of a clean run.
+    # A fail-open HERE does not yield bare links, it PUBLISHES UNVERIFIED
+    # SUMMARIES, i.e. exactly the confabulation this gate exists to stop.
+    # Sizes are measured, not taste: on the live sidecar under contention,
+    # 4 pairs x 8000 chars took 70.3s and 12 pairs took 132.1s. 3 per chunk on a
+    # 90s budget leaves real headroom, and a failed chunk now degrades only its
+    # own 3 items. Enrichment is background work — a longer tail is far cheaper
+    # than an ungrounded publish.
+    _CHUNK, _CHUNK_TIMEOUT = 3, 90.0
+    results: list[dict] = []
     try:
-        async with httpx.AsyncClient(timeout=120) as client:
-            r = await client.post(f"{url}/check_batch", json={"pairs": pairs})
-            r.raise_for_status()
-            results = r.json()["results"]
+        async with httpx.AsyncClient(timeout=_CHUNK_TIMEOUT) as client:
+            for i in range(0, len(pairs), _CHUNK):
+                chunk = pairs[i:i + _CHUNK]
+                try:
+                    r = await client.post(f"{url}/check_batch", json={"pairs": chunk})
+                    r.raise_for_status()
+                    results.extend(r.json()["results"])
+                except Exception as e:
+                    logger.warning("[DomainRunner] native enrich chunk %d unavailable (%r) — "
+                                   "%d summary(s) kept unverified", i // _CHUNK, e, len(chunk))
+                    results.extend({"supported": True, "prob": -1.0} for _ in chunk)
     except Exception as e:
         logger.warning("[DomainRunner] native enrich entailment unavailable (%r) — fail-open", e)
         return cand
     kept = []
+    unverified = 0
     for (it, body, s), res in zip(cand, results):
+        prob = res.get("prob", 0.0)
+        if prob == -1.0:
+            # Fail-open sentinel from a failed chunk. Must be handled BEFORE the
+            # min_prob branch: -1.0 >= 0.05 is False, so a low floor would have
+            # turned "service unavailable" into "drop the item" — inverting the
+            # documented fail-open posture precisely when the gate is degraded.
+            kept.append((it, body, s))
+            unverified += 1
+            continue
         # Title-authoritative feeds pass an explicit low floor (the page IS the
         # item's own; MiniCheck's ~0.5 "supported" bar false-drops faithful
         # compression of short blogs/READMEs). Everyone else uses the service's
         # verdict, where a synthesized claim can genuinely invent a fact.
-        ok = (res.get("prob", 0.0) >= min_prob) if min_prob is not None else res.get("supported")
+        ok = (prob >= min_prob) if min_prob is not None else res.get("supported")
         if ok:
             kept.append((it, body, s))
         else:
             logger.info("[DomainRunner] native enrich entail-drop %s p=%.3f claim=%r",
-                        monitor_name, res.get("prob", 0.0), s[:110])
+                        monitor_name, prob, s[:110])
+    if unverified:
+        # Loud on purpose: these summaries shipped WITHOUT grounding. A silent
+        # fail-open is how "0 entail-dropped" came to look like a clean run.
+        logger.warning("[DomainRunner] native enrich %s: %d/%d summary(s) published "
+                       "UNVERIFIED (entail gate degraded)", monitor_name, unverified, len(cand))
     return kept
 
 
