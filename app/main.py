@@ -547,8 +547,15 @@ async def lifespan(app: FastAPI):
         try:
             from app.core import llm
             t0 = time.monotonic()
+            # max_tokens=16 + a prompt with a natural 1-word answer (was "ok"
+            # at max_tokens=2). Warmup only needs the weights resident, but
+            # cutting it off mid-generation made done_reason="length" fire the
+            # [truncation] tripwire on EVERY startup — a guaranteed false
+            # positive in the same log the real mid-sentence truncations use.
+            # Let it stop on its own so the tripwire keeps meaning something.
             await llm.invoke_nothink(
-                [{"role": "user", "content": "ok"}], max_tokens=2, temperature=0.0,
+                [{"role": "user", "content": "Reply with exactly one word: ok"}],
+                max_tokens=16, temperature=0.0,
             )
             logger.info("Model warmup complete (%.1fs)", time.monotonic() - t0)
         except Exception as e:
@@ -641,8 +648,13 @@ async def lifespan(app: FastAPI):
     # process tree relied solely on the 10-min idle timeout, which only fires
     # on the NEXT browser call — so shutdown leaked a chromium subprocess
     # (the 2026-07-06 13-zombie incident class).
+    # NB: no local `from app.tools.browser import BrowserTool` here. This
+    # function-level import (removed 2026-08-29) rebound BrowserTool as a LOCAL
+    # of lifespan for the WHOLE function body, so the registration lambda ~430
+    # lines above closed over an unbound local instead of the module-level
+    # import — "cannot access free variable 'BrowserTool'" on every startup,
+    # and the browser tool silently never registered. Use the module import.
     try:
-        from app.tools.browser import BrowserTool
         await BrowserTool._close_session()
     except Exception as e:
         logger.warning("Browser close on shutdown failed: %s", e)

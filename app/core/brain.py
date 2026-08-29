@@ -603,6 +603,41 @@ _VALIDATION_BLANKED_MSG = (
 )
 
 
+_CHAT_ENTAIL_MAX_CLAIMS = 8      # was 12 — see _entail_gate_chat timing note
+_CHAT_ENTAIL_WINDOW = 1800       # chars of evidence shown per claim
+_CHAT_ENTAIL_CHUNK = 4           # pairs per HTTP post
+_CHAT_ENTAIL_CHUNK_TIMEOUT = 45.0
+_CHAT_ENTAIL_BUDGET_S = 100.0    # wall-clock ceiling for the whole gate
+
+
+def _best_evidence_window(doc: str, claim: str, width: int = _CHAT_ENTAIL_WINDOW) -> str:
+    """The slice of `doc` that best matches `claim`, by rare-token overlap.
+
+    The chat gate used to hand MiniCheck the entire tool-output blob for every
+    claim, which is what made it too slow to finish inside its own timeout.
+    Selecting the best window first is not a quality trade: the verifier already
+    chunks its premise internally and keeps the single best-scoring chunk, so
+    the deleted text is text it would have discarded anyway.
+    """
+    if len(doc) <= width:
+        return doc
+    toks = {t for t in re.findall(r"[a-z0-9][\w.%$-]{2,}", claim.lower())}
+    # Common words match everywhere and cannot discriminate windows; rare ones
+    # (names, figures, units) are what actually locate the evidence.
+    toks = {t for t in toks if doc.lower().count(t) <= 8} or toks
+    if not toks:
+        return doc[:width]
+    low = doc.lower()
+    step = max(1, width // 2)
+    best_score, best_start = -1.0, 0
+    for start in range(0, max(1, len(doc) - step), step):
+        seg = low[start:start + width]
+        score = sum(1.0 for t in toks if t in seg)
+        if score > best_score:
+            best_score, best_start = score, start
+    return doc[best_start:best_start + width]
+
+
 async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str:
     """MiniCheck gate for tool-backed chat answers (2026-08-19).
 
@@ -638,19 +673,42 @@ async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str
         cands.append((s, plain))
     if not cands:
         return final_content
-    # Digit-bearing claims first (most checkable), then the rest, cap 12.
+    # Digit-bearing claims first (most checkable), then the rest.
     cands.sort(key=lambda t: (not any(c.isdigit() for c in t[1])))
-    cands = cands[:12]
+    cands = cands[:_CHAT_ENTAIL_MAX_CLAIMS]
 
     import httpx
-    pairs = [{"doc": doc, "claim": plain} for _s, plain in cands]
-    try:
-        async with httpx.AsyncClient(timeout=60) as client:
-            r = await client.post(f"{url}/check_batch", json={"pairs": pairs})
-            r.raise_for_status()
-            results = r.json()["results"]
-    except Exception as e:
-        logger.warning("[chat-entail] MiniCheck unavailable (%r) — fail-open", e)
+    # Per-claim evidence window, chunked posts, partial results (2026-08-29).
+    # Measured against the live sidecar, the old shape — 12 pairs x the whole
+    # 8000-char blob in ONE 60s request — takes 132s, so it could not finish:
+    # 28 of 37 gate runs in 48h timed out and fail-opened, i.e. ~76% of
+    # tool-backed chat answers went out UNGROUNDED. Three changes: give each
+    # claim only its best-matching window (MiniCheck max-pools over chunks, so a
+    # focused premise is both faster AND no less sensitive), post in small
+    # chunks so one slow chunk cannot void the whole batch, and fail open
+    # PER-CLAIM instead of for every claim at once.
+    pairs = [{"doc": _best_evidence_window(doc, plain), "claim": plain}
+             for _s, plain in cands]
+    results: list[dict] = []
+    started = time.monotonic()
+    async with httpx.AsyncClient(timeout=_CHAT_ENTAIL_CHUNK_TIMEOUT) as client:
+        for i in range(0, len(pairs), _CHAT_ENTAIL_CHUNK):
+            chunk = pairs[i:i + _CHAT_ENTAIL_CHUNK]
+            if time.monotonic() - started > _CHAT_ENTAIL_BUDGET_S:
+                logger.warning("[chat-entail] budget %.0fs spent after %d/%d claims — "
+                               "remaining fail-open", _CHAT_ENTAIL_BUDGET_S, len(results), len(pairs))
+                results.extend({"supported": True, "prob": -1.0} for _ in chunk)
+                continue
+            try:
+                r = await client.post(f"{url}/check_batch", json={"pairs": chunk})
+                r.raise_for_status()
+                results.extend(r.json()["results"])
+            except Exception as e:
+                logger.warning("[chat-entail] chunk %d unavailable (%r) — %d claim(s) fail-open",
+                               i // _CHAT_ENTAIL_CHUNK, e, len(chunk))
+                results.extend({"supported": True, "prob": -1.0} for _ in chunk)
+    if all(r.get("prob") == -1.0 for r in results):
+        logger.warning("[chat-entail] every chunk failed — gate inert this turn")
         return final_content
 
     out = final_content

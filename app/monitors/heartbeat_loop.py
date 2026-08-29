@@ -3159,7 +3159,13 @@ class HeartbeatLoop:
             try:
                 from app.monitors.dedup import is_duplicate
                 from app.database import get_db
-                if is_duplicate(get_db(), monitor.name, message):
+                # to_thread (2026-08-29): is_duplicate runs FIVE sync DB ops —
+                # two CREATE IF NOT EXISTS, a DELETE prune, a SELECT and an
+                # INSERT — on what is an async path, so all five landed on the
+                # event-loop thread (5 of the tripwire's daily warnings came
+                # from dedup.py alone). The three WRITES take the write lock on
+                # the loop thread, which is the 54h-freeze bug class.
+                if await asyncio.to_thread(is_duplicate, get_db(), monitor.name, message):
                     logger.info(
                         "[Heartbeat] '%s' suppressed by cross-monitor dedup",
                         monitor.name,

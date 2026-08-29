@@ -234,7 +234,11 @@ async def create_plan(
             "key_risk": str(plan.get("key_risk", "")).strip()[:200],
         }
     except Exception as e:
-        logger.warning("Planning failed: %s", e)
+        # %r, not %s (2026-08-29): this fired 7x/48h rendering "Planning failed: "
+        # with an empty message, because the exceptions that actually reach here
+        # are httpx timeouts whose str() is "". repr() keeps the class name, which
+        # is the only part that identifies the fault.
+        logger.warning("Planning failed: %r", e)
         return None
 
 

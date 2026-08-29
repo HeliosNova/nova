@@ -1234,6 +1234,22 @@ class KnowledgeGraph:
                     # mid-object, extraction failed, and the silent `continue`
                     # below left BOTH conflicting facts live with no trace.
                     max_tokens=80,
+                    # Schema-constrained (2026-08-29). Raising the cap treated the
+                    # symptom; the cause is an UNREQUESTED field. Live repro of the
+                    # four pairs that fail-opened in 24h: the 9B volunteers a
+                    # "reasoning" string — 374 chars for a verdict needing 16 —
+                    # which overruns the cap, cuts the JSON mid-string, and
+                    # fail-opens (7/32 judgments = 22%, both facts left live).
+                    # An enum schema makes the extra field structurally impossible,
+                    # so the verdict cannot outgrow its budget no matter how
+                    # chatty the model feels.
+                    json_schema={
+                        "type": "object",
+                        "properties": {
+                            "keep": {"type": "string", "enum": ["A", "B", "both"]},
+                        },
+                        "required": ["keep"],
+                    },
                     temperature=0.1,
                 )
                 obj = llm.extract_json_object(raw)

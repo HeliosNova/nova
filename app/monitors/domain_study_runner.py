@@ -219,6 +219,26 @@ def _boilerplate_summaries(items: list) -> set[str]:
 _NATIVE_ENRICH_MAX = 8
 _NATIVE_ENRICH_CONCURRENCY = 3
 
+# Per-item source window shown to the enrichment summarizer. 900 was too small:
+# on many pages that is masthead + nav, leaving the model nothing to summarize
+# so it confabulated from parametric memory and the entail gate deleted the
+# result (→ bare link). See _enrich_thin_native_items.
+_ENRICH_BODY_CHARS = 1800
+
+
+def _enrich_num_ctx(prompt: str, max_tokens: int) -> int:
+    """Context size that actually fits this prompt.
+
+    A fixed num_ctx=8192 was safe at 900 chars/item but silently truncates at
+    1800 x up to _NATIVE_ENRICH_MAX items — and a truncated prompt drops whole
+    item bodies, which is precisely what makes the model invent their summaries.
+    Size to the real prompt (~3 chars/token is conservative for English), clamp
+    to sane bounds, and round up to a power of two.
+    """
+    need = len(prompt) // 3 + max_tokens + 512
+    ctx = 1 << max(0, (need - 1)).bit_length()
+    return max(8192, min(32768, ctx))
+
 # Leading boilerplate sentences some sites prepend to extracted text (nature.com's
 # no-CSS banner, cookie walls). If fed to the summarizer, the "summary" describes
 # the banner instead of the article. Sentence end = punctuation followed by
@@ -282,6 +302,74 @@ async def _entail_gate_enrich_summaries(monitor_name: str, cand: list[tuple], mi
             logger.info("[DomainRunner] native enrich entail-drop %s p=%.3f claim=%r",
                         monitor_name, res.get("prob", 0.0), s[:110])
     return kept
+
+
+async def _extractive_retry(monitor_name: str, label: str, redo: list[tuple]) -> list[tuple]:
+    """Re-summarize entail-dropped items under a strict extractive constraint.
+
+    A summary the gate rejected is usually rejected for good reason — the model
+    added something the page does not say. Falling straight back to title+link
+    (the owner's "monitors coming back as hyperlinks") throws away a page we
+    already fetched and already know contains real prose. Instead, ask again
+    with generation freedom removed: every name, number and claim must appear in
+    the source, temperature 0. Returns (it, body, summary) tuples for the
+    caller to re-gate — this function never bypasses the gate.
+    """
+    if not redo:
+        return []
+    from app.core.llm import extract_json_object, invoke_nothink
+
+    blocks = [f"--- Item {i}: {(it.title or '')[:140]} ---\n{body[:_ENRICH_BODY_CHARS]}"
+              for i, (it, body) in enumerate(redo, 1)]
+    schema = {"type": "object",
+              "properties": {"summaries": {"type": "array", "items": {"type": "string"},
+                                           "minItems": len(redo), "maxItems": len(redo)}},
+              "required": ["summaries"]}
+    prompt = (
+        f"For each of the {len(redo)} numbered {label} items below, write ONE "
+        "sentence (max 40 words) that a reader could verify by pointing at the "
+        "item's own text.\n"
+        "HARD CONSTRAINT — this is an extraction task, not a writing task:\n"
+        "- Every name, number, date and claim in your sentence MUST appear in "
+        "that item's text. Compress and rephrase, but invent nothing.\n"
+        "- If you cannot say anything concrete from the text alone, state plainly "
+        "what the page is about using its own wording.\n"
+        "- Do not use knowledge from outside the text. Do not guess founding "
+        "years, locations, affiliations or motives.\n"
+        "- No URLs, no meta-description of the page.\n"
+        f'Return JSON: {{"summaries": ["<item 1>", ...]}} with EXACTLY '
+        f"{len(redo)} strings, in item order.\n\n" + "\n\n".join(blocks)
+    )
+    max_tokens = 70 * len(redo) + 80
+    try:
+        out = await invoke_nothink(
+            [{"role": "user", "content": prompt}],
+            json_mode=True, json_schema=schema,
+            max_tokens=max_tokens, temperature=0.0,
+            num_ctx=_enrich_num_ctx(prompt, max_tokens))
+    except Exception as e:
+        logger.warning("[DomainRunner] extractive retry LLM failed for %s: %r", monitor_name, e)
+        return []
+
+    import json as _json
+    try:
+        data = _json.loads(out)
+    except Exception:
+        data = extract_json_object(out) or {}
+    sums = data.get("summaries") if isinstance(data, dict) else None
+    # Same positional-misalignment guard as the first pass: a miscounted list
+    # would attribute one item's summary to another (fabrication-by-misalignment).
+    if not isinstance(sums, list) or len(sums) != len(redo):
+        logger.warning("[DomainRunner] extractive retry %s: got %s summaries for %d items — skipping",
+                       monitor_name, (len(sums) if isinstance(sums, list) else type(sums).__name__),
+                       len(redo))
+        return []
+    out_pairs: list[tuple] = []
+    for (it, body), s in zip(redo, sums):
+        s = re.sub(r"\s+", " ", str(s or "")).strip()
+        if len(s) >= 40 and "http" not in s[:30]:
+            out_pairs.append((it, body, s))
+    return out_pairs
 
 
 async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) -> None:
@@ -369,6 +457,7 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
     fetched = await asyncio.gather(*(_pull(it) for it in thin))
 
     enrich: list[tuple] = []
+    no_body: list[tuple[str, int]] = []
     for it, body in fetched:
         if is_contracts and body:
             d = _parse_dod_contracts(body)
@@ -378,13 +467,33 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
                 it.meta = meta
         if len(body) >= 300:
             enrich.append((it, body))
+        else:
+            no_body.append((getattr(it, "source_host", "") or
+                            (urlparse(getattr(it, "url", "")).netloc or "?"), len(body)))
+    # An unfetchable body is the OTHER road to a bare link, and it was silent:
+    # a live run read "15 thin, 11 bodies" with no record of which 4 died or
+    # why. On the sampled run fetch misses outnumbered entail-drops 4:2, so the
+    # dominant cause of "monitors coming back as hyperlinks" was invisible.
+    # Name the hosts (with the byte count that failed the >=300 bar).
+    if no_body:
+        logger.info("[DomainRunner] native enrich %s: %d item(s) had no usable body → bare link: %s",
+                    monitor_name, len(no_body),
+                    ", ".join(f"{h}({n}B)" for h, n in no_body[:8]))
     if not enrich:
         logger.info("[DomainRunner] native enrich %s: %d thin item(s), 0 usable bodies",
                     monitor_name, len(thin))
         return
 
     from app.core.llm import invoke_nothink
-    blocks = [f"--- Item {i}: {(it.title or '')[:140]} ---\n{body[:900]}"
+    # 1800 (was 900), 2026-08-29: 900 chars of a page is often masthead + nav,
+    # so the model had no real material and filled the gap from parametric
+    # memory — live repro on the inventati.org manifesto produced "founded in
+    # 2001 by autonomous anticapitalist activists" when NEITHER "2001" nor
+    # "anticapitalist" occurs anywhere in the body. The entail gate then
+    # (correctly) killed it and the item rendered as a bare link. More genuine
+    # source text is the cure; loosening the gate would only publish the
+    # invention.
+    blocks = [f"--- Item {i}: {(it.title or '')[:140]} ---\n{body[:_ENRICH_BODY_CHARS]}"
               for i, (it, body) in enumerate(enrich, 1)]
     # JSON-schema output, not a line format: the 9B ignores "1: <summary>" line
     # instructions and writes flowing prose (verified live 2026-08-19); the
@@ -401,19 +510,30 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
         "Rules:\n"
         "- Lead with the most significant CONCRETE fact: who did what, dollar "
         "amounts, dates, quantities, named entities.\n"
+        # Anti-confabulation (2026-08-29): the two rules above, plus the >=60-char
+        # floor applied to the result, PRESSURE the model to supply concrete facts
+        # even for pages that contain none (a manifesto, a README). It filled the
+        # gap from parametric memory and the entail gate deleted the summary,
+        # rendering a bare link. State the prohibition explicitly.
+        "- Use ONLY facts written in that item's text. Do NOT add founding years, "
+        "dates, locations, affiliations, funding, or political descriptors that "
+        "do not literally appear there — if you are recalling it rather than "
+        "reading it, leave it out.\n"
+        "- If the text states no concrete facts, summarize what it actually says "
+        "in its own terms. A short faithful summary beats an invented detail.\n"
         "- NEVER write meta-descriptions of the page ('contractors are listed', "
         "'details are provided', 'the article discusses') — state the facts themselves.\n"
         "- No URLs.\n"
         f'Return JSON: {{"summaries": ["<item 1 summary>", ...]}} with EXACTLY '
         f"{len(enrich)} strings, in item order.\n\n" + "\n\n".join(blocks)
     )
+    _max_tokens = 90 * len(enrich) + 80
     try:
-        # ~8 bodies x 900 chars + instructions ≈ 2.5k tokens; explicit num_ctx
-        # per the num_ctx discipline (silent prompt truncation otherwise).
         out = await invoke_nothink(
             [{"role": "user", "content": prompt}],
             json_mode=True, json_schema=schema,
-            max_tokens=90 * len(enrich) + 80, temperature=0.2, num_ctx=8192)
+            max_tokens=_max_tokens, temperature=0.2,
+            num_ctx=_enrich_num_ctx(prompt, _max_tokens))
     except Exception as e:
         logger.warning("[DomainRunner] native enrich LLM failed for %s: %s", monitor_name, e)
         return
@@ -444,10 +564,28 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
     # Trust the authoritative source here; keep the entail gate everywhere else,
     # where a compressed article summary can genuinely invent a fact.
     n_dropped = 0
+    n_rescued = 0
     if not is_contracts:
         n_before = len(cand)
-        cand = await _entail_gate_enrich_summaries(
-            monitor_name, cand, min_prob=(0.05 if is_title else None))
+        _floor = 0.05 if is_title else None
+        kept = await _entail_gate_enrich_summaries(monitor_name, cand, min_prob=_floor)
+
+        # Extractive second pass (2026-08-29). A dropped summary previously fell
+        # straight through to a bare link — the owner's "monitors coming back as
+        # hyperlinks". But the drop is usually CORRECT (live repro: the model
+        # invented a founding year absent from the page), so the answer is not to
+        # relax the gate, it is to re-summarize under an extractive constraint and
+        # make the item earn its summary on the second try.
+        _kept_ids = {id(it) for it, _b, _s in kept}
+        redo = [(it, body) for it, body, _s in cand if id(it) not in _kept_ids]
+        if redo:
+            retried = await _extractive_retry(monitor_name, label, redo)
+            if retried:
+                rescued = await _entail_gate_enrich_summaries(
+                    monitor_name, retried, min_prob=_floor)
+                n_rescued = len(rescued)
+                kept = kept + rescued
+        cand = kept
         n_dropped = n_before - len(cand)
         # Dead-man's tripwire: the gate dropping EVERYTHING is the fingerprint of
         # the 2026-08 link-only regression (needle claim vs truncated haystack) —
@@ -457,6 +595,9 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
                            "check MiniCheck doc window / min_prob floor", monitor_name, n_before)
     for it, _body, s in cand:
         it.summary = s
+    if n_rescued:
+        logger.info("[DomainRunner] native enrich %s: extractive retry rescued %d item(s) "
+                    "that would have rendered as bare links", monitor_name, n_rescued)
     logger.info("[DomainRunner] native enrich %s: %d thin, %d bodies, %d summaries written, %d entail-dropped",
                 monitor_name, len(thin), len(enrich), len(cand), n_dropped)
 

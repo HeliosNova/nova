@@ -448,7 +448,10 @@ async def _search_searxng(
                 return []
             data = resp.json()
     except Exception as e:
-        logger.warning("searxng (%s) failed for %r: %s", categories, query[:60], e)
+        # %r, not %s (2026-08-29): httpx timeout exceptions stringify to "", so
+        # this logged "failed for 'query': " naming no fault at all. repr keeps
+        # the class name, which is the entire diagnostic value of the line.
+        logger.warning("searxng (%s) failed for %r: %r", categories, query[:60], e)
         return []
 
     results: list[SearchResult] = []
