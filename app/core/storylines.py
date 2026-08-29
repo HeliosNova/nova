@@ -21,6 +21,7 @@ cluster+name, one per moved thread to update its summary — bounded.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -344,7 +345,10 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
     if not out or out.upper().startswith("NO CHANGE"):
         # Still record events so we don't re-summarize them next cycle.
         if not new_story:
-            _record(db, row, story, fresh, summary=None)
+            # to_thread (2026-08-29): _record does an INSERT-or-UPDATE plus a
+            # loop of development inserts, all sync, called from this async
+            # function — writes on the event-loop thread (54h-freeze class).
+            await asyncio.to_thread(_record, db, row, story, fresh, summary=None)
         return None
 
     summary, changed = out, ""
@@ -382,7 +386,8 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
     except Exception:
         pass
 
-    sid = _record(db, row, story, fresh or story["developments"], summary=summary)
+    sid = await asyncio.to_thread(
+        _record, db, row, story, fresh or story["developments"], summary=summary)
     logger.info("[Storyline] %s thread %r (+%d new)", "NEW" if new_story else "moved",
                 story["title"], len(fresh or story["developments"]))
     narrative = changed or ("new story" if new_story else "updated")

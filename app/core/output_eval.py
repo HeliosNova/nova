@@ -17,6 +17,7 @@ monitor at check_type='output_eval') runs this on a schedule.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
@@ -40,11 +41,26 @@ OUTPUT TO GRADE (truncated):
 Grade each dimension 0-10 (10 = excellent, 0 = useless):
 - relevance:   does the output answer what a Domain Study should answer?
 - facts:       do the named entities and numbers look plausible? (Dates in {year} are CURRENT — do not penalise them.) An article body can legitimately reference earlier-dated events (filings, prior incidents) — those are not factual errors, they are normal news context.
-- freshness:   FRESHNESS RULE — score this dimension by looking ONLY at the
-  "📅 [date]" line under each item header. That is the article's publish date.
-  - If ALL items' published dates are within the past 72 hours of {today_human}, score 10.
-  - If most items are within 72h and a couple are within 7 days, score 7-8.
-  - If most items are older than 7 days, score 2-4.
+- freshness:   FRESHNESS RULE — TWO FORMATS, pick the one this output uses.
+  (A) LIST digests — items with a "📅 [date]" line under each header. Score from
+      those publish dates ONLY:
+      - ALL items within 72 hours of {today_human} → 10.
+      - most within 72h, a couple within 7 days → 7-8.
+      - most older than 7 days → 2-4.
+  (B) PROSE digests — a domain overview with NO "📅" lines anywhere. This is the
+      normal shape for a Domain Study and is NOT a freshness fault. Score from
+      the digest's own header date (the "_read N sources … · <date>_" line) and
+      the recency of the events described:
+      - header date within 72h of {today_human} and events described as current
+        → 9-10.
+      - header date within a week → 7-8.
+      - clearly describing events more than a week old → 4-6.
+      - If NO date signal is present at all, score 7 and say so in the critique.
+      DO NOT score a prose digest low merely because it has no "📅" lines —
+      absence of that markup is a FORMAT difference, not staleness. (Measured
+      2026-08-29: 163 of 184 graded digests carry no 📅 line, so a rule keyed
+      solely on that markup had no evidence to work from and depressed freshness
+      on 89% of output.)
   - DO NOT downgrade because the article BODY references earlier dates ("19th century cables", "since 2024", "filed February 17") — those are normal historical context inside articles and are not freshness penalties.
   - DO NOT downgrade just because an article from a Bloomberg/Reuters/FT URL has a date — the article IS the news, the date IS its publish date, score it on that date alone.
 - format:      VISUAL STRUCTURE ONLY — does each item have a numbered headline, source line, date, URL, and a summary in consistent style? Score 10 if every item follows the same template; 7-8 only if the visual structure varies notably between items. Do NOT downgrade format for content issues like off-topic items, hallucinations, ellipsis truncation in summaries, or irrelevance — those are scored under relevance/facts dimensions, not format. The "📌 N items sourced from X" closing summary IS part of the intended format and should not be penalised.
@@ -193,12 +209,27 @@ async def grade_recent_outputs(db, *, sample_size: int = 20, hours: int = 24) ->
     """Grade up to `sample_size` recent content-monitor results from the
     last `hours` hours. Writes scores to output_quality_log.
     """
-    _ensure_table(db)
+    # to_thread (2026-08-29): _ensure_table runs CREATE TABLE/INDEX DDL and this
+    # is an async function, so the DDL executed on the event-loop thread.
+    await asyncio.to_thread(_ensure_table, db)
     rows = db.fetchall(
         "SELECT mr.id, mr.monitor_id, m.name AS monitor_name, mr.value "
         "FROM monitor_results mr JOIN monitors m ON m.id = mr.monitor_id "
         "WHERE mr.created_at > datetime('now', ?) "
         "  AND m.category = 'content' "
+        # category='content' is not sufficient: feed_health / forecast_resolve /
+        # curiosity monitors carry it too, and they are structurally incapable of
+        # answering "does this answer what a Domain Study should answer?" — the
+        # grader marked Source Health Monitor 6.2 (worst of 20) with the critique
+        # "provides a technical status report rather than a domain study", which
+        # is a correct description of a monitor doing its job. Grading them
+        # depressed the fleet metric and spent GPU to produce a false verdict.
+        # (Exclusion list matches the check_types that actually carry
+        # category='content' today: feed_health, forecast_resolve, curiosity and
+        # kg_consistency are self-diagnostics. 'storyline' is genuine narrative
+        # content and stays in — it grades 8.19, so it is not a false failure.)
+        "  AND m.check_type NOT IN ('feed_health','forecast_resolve',"
+        "                           'curiosity','kg_consistency') "
         "  AND mr.status IN ('ok','changed','alert') "
         "  AND length(mr.value) > 200 "
         "ORDER BY RANDOM() LIMIT ?",
@@ -220,7 +251,10 @@ async def grade_recent_outputs(db, *, sample_size: int = 20, hours: int = 24) ->
             totals[k] += scores[k]
         avg = sum(scores[k] for k in ("relevance", "facts", "freshness", "format")) / 4.0
         try:
-            db.execute(
+            # to_thread (2026-08-29): sync INSERT inside an async grading loop —
+            # every graded sample took the write lock on the event-loop thread.
+            await asyncio.to_thread(
+                db.execute,
                 "INSERT INTO output_quality_log (monitor_id, monitor_name, result_id, "
                 "relevance, facts, freshness, format, avg_score, critique) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
