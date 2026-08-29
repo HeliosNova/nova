@@ -1900,9 +1900,21 @@ async def _run_generation_loop(
                 # Per-tool-name cap
                 _call_counts[tc.tool] = _call_counts.get(tc.tool, 0) + 1
                 if _call_counts[tc.tool] > config.MAX_SAME_TOOL_CALLS:
+                    # Log the QUERY and the skipped ARGS (2026-08-29). This fired
+                    # 17x/48h for web_search and the line named neither, so there
+                    # was no way to tell a runaway loop (cap doing its job) from a
+                    # legitimate multi-part research question being cut off after
+                    # 3 searches (cap costing us evidence). The cap is per-QUERY,
+                    # not per-round, so a decomposable question spends its whole
+                    # search budget early. Do not retune MAX_SAME_TOOL_CALLS until
+                    # these lines show which case dominates — three other
+                    # backstops (MAX_TOOL_ROUNDS=6, MAX_TOOL_CALLS_PER_QUERY=15,
+                    # identical-args dedup=2) already make a runaway impossible.
                     logger.warning(
-                        "Circuit breaker: tool '%s' called %d times (max %d) — skipping",
+                        "Circuit breaker: tool '%s' called %d times (max %d) — skipping. "
+                        "query=%r skipped_args=%r",
                         tc.tool, _call_counts[tc.tool], config.MAX_SAME_TOOL_CALLS,
+                        (query or "")[:120], str(tc.args)[:160],
                     )
                     continue
 

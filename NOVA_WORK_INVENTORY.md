@@ -108,6 +108,27 @@ Ranked by (impact × confidence) / effort.
 
 ---
 
+---
+
+## PASS 2 RESULTS — worked in the recommended order (2026-08-29)
+
+| Item | Outcome | Evidence |
+|---|---|---|
+| **1. Goals / liveness** | **REAL BUG → FIXED** | Capability review marked every gap `reviewed=1` then called `derive_goals()` which selects `reviewed=0` — it consumed its own input. 18 gaps, all reviewed, 9 in 7d, 0 unreviewed. Plus positional cluster keying producing goals named `"gap: does"` / `"…: higher"` / `"…: clock"`. Commit 9b57eb5 |
+| **1b. Other dormant tables** | **not defects** | `verifiable_signals` + `event_queue` GATED OFF (`ENABLE_RLVR_SIGNALS`, `ENABLE_EVENT_TRIGGERS` = false). `active_memories` / `heartbeat_instructions` user-triggered by design. `salience_weights` only learns from manual 👍/👎 — inert because unrated, a design gap not a bug |
+| **2. Cold-Q 42.4%** | **CLOSED — not a defect** | Cold facts are NEWER (20.1d vs 49.7d) and HIGHER confidence (0.949 vs 0.85). Cold rate 90% (0-2d) → **18% (30d+)**. KG ranks by confidence, never usage → no rich-get-richer. **Avoided building a learned controller against a non-problem** |
+| **3. Retrieval audit** | **healthy** | 10/10 cold facts found by subject lookup; **7/7** natural-language queries surfaced them via `get_relevant_facts`. Cold predicates = "nobody asks", not retrieval failure |
+| **4. Security** | **audit overstated; REAL HOLE → FIXED** | `HttpFetchTool` + `BrowserTool` already sanitize; **`_fetch_via_jina` did not** — raw paywalled-page text into KG fact-extraction prompts. Detector verified: attacks 0.6-0.7, prose 0.0, threshold 0.3. Commit 6e29e8e |
+| **5a. `related_to`** | **CLOSED — no action** | Full population (869 facts): 76% real / 69% of retrievals; **0% rejectable by today's gate**. My earlier alarm came from a top-60-by-retrieval sample biased toward residue |
+| **5b. Circuit breaker** | **instrumented, NOT retuned** | Cap is per-QUERY not per-round. Four backstops exist (`MAX_TOOL_ROUNDS=6`, `MAX_TOOL_CALLS_PER_QUERY=15`, same-tool=3, identical-args=2) so runaway is impossible — but no evidence yet whether firings are loops or starved research. Now logs query + skipped args |
+| **5c. Bare links** | **correct behaviour** | HN self-posts / comment permalinks / `hnrss.org` genuinely have NO article (0 bytes). Forcing a summary there is exactly what caused the confabulation |
+| **6. Test coverage** | **triaged + started** | Ranked by LOC × importers × risk: **`llm` (587 LOC, imported by 37)** and **`access_tiers` (321, by 16)** are the load-bearing ones. access_tiers now has a test file locking in escape-blocking, tier monotonicity, protected paths |
+
+**Score: 5 items investigated, 2 real bugs found and fixed, 4 closed by measurement.**
+Two of those closures corrected my *own* earlier recommendations.
+
+---
+
 ## RECOMMENDED ORDER
 
 1. **B2 goals** + **C skills/curiosity liveness** — whole loops dead or churning; biggest blind spot
