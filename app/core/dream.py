@@ -556,7 +556,12 @@ class DreamConsolidator:
                 topic = str(data.get("topic", "")).strip()
                 lesson = str(data.get("lesson", "")).strip()
                 if topic and lesson and len(lesson) > 10:
-                    svc.learning.add_knowledge_lesson(
+                    # to_thread (2026-08-29): add_knowledge_lesson is sync and
+                    # fans out into _find_similar_lesson (SELECT), a dedup-metrics
+                    # INSERT and an UPDATE on lessons — all landing on the
+                    # event-loop thread from this async caller.
+                    await asyncio.to_thread(
+                        svc.learning.add_knowledge_lesson,
                         topic=topic,
                         correct_answer=lesson,
                         lesson_text=f"Promoted from success reflexion (quality={ref['quality_score']})",
@@ -970,7 +975,10 @@ class DreamConsolidator:
             from app.core.trust import TrustManager
             from app.database import get_db
             trust_mgr = TrustManager(get_db())
-            new_score = trust_mgr.decay()
+            # to_thread (2026-08-29): decay() does a sync UPDATE on trust_scores
+            # and report() is async, so this wrote to SQLite from the event-loop
+            # thread — the write-on-the-loop pattern behind the 54h freeze.
+            new_score = await asyncio.to_thread(trust_mgr.decay)
             logger.info("[Dream] Trust decay applied: score now %.0f", new_score)
         except Exception as e:
             logger.warning("[Dream] Trust decay failed: %s", e)

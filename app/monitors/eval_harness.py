@@ -1240,7 +1240,11 @@ class EvalHarness:
 
             # 2. SEED — context marker makes cleanup safe (never deletes real lessons)
             try:
-                learning.add_knowledge_lesson(
+                # to_thread (2026-08-29): sync lesson write (SELECT + dedup
+                # INSERT + UPDATE lessons) from an async caller put all three on
+                # the event-loop thread.
+                await asyncio.to_thread(
+                    learning.add_knowledge_lesson,
                     topic=seed.get("topic", task.id),
                     correct_answer=seed["correct_answer"],
                     lesson_text=seed.get("lesson_text", ""),

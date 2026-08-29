@@ -1417,7 +1417,15 @@ class KnowledgeGraph:
                         garbage_ids.append(low_facts[idx - 1]["id"])
                 if garbage_ids:
                     async with self._write_lock:
-                        deleted_llm = self._retire_facts_batch(garbage_ids)
+                        # to_thread (2026-08-29), matching the heuristic pass ~80
+                        # lines up: this is a sync UPDATE on the event-loop thread,
+                        # and it holds the write lock while doing it — the
+                        # 54h-freeze bug class. It was rare only because the LLM
+                        # pass was itself broken (string "id" aborted every batch);
+                        # now that the schema fix makes curation actually retire
+                        # facts, this write would fire on every run.
+                        deleted_llm = await asyncio.to_thread(
+                            self._retire_facts_batch, garbage_ids)
                     logger.info("KG curation: retired %d garbage facts (LLM)", deleted_llm)
         except Exception as e:
             logger.warning("KG LLM curation failed (heuristic pass still ran): %s", e)

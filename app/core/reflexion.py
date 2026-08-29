@@ -1166,7 +1166,10 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
             )
             return True
 
-        lesson_id = learning_engine.add_knowledge_lesson(
+        # to_thread (2026-08-29): sync lesson write (SELECT + dedup INSERT +
+        # UPDATE lessons) from an async caller put all three on the event loop.
+        lesson_id = await asyncio.to_thread(
+            learning_engine.add_knowledge_lesson,
             topic=topic,
             correct_answer=obj["lesson"],
             lesson_text=f"Auto-lesson: {obj['lesson']}",
