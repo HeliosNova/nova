@@ -80,11 +80,26 @@ class WebSearchTool(BaseTool):
             # Auto-curiosity: a search that finds nothing is a topic Nova
             # doesn't have ambient awareness on yet. Queue it for the
             # Curiosity Research monitor to pursue more thoroughly.
+            #
+            # ...unless the request is EPHEMERAL (eval harness / preview).
+            # This write bypassed think(ephemeral=True)'s "stays out of every
+            # persistent store" promise, and eval queries about FICTIONAL
+            # entities are precisely the ones that return zero results — so
+            # the queue collected "Where is Vorenza based?" and "Skylance X9
+            # aircraft maximum altitude" as real research topics (2026-08-30;
+            # the curiosity judge dismissed them, none reached the KG, but
+            # Nova was one bad judgment away from researching fiction).
             try:
-                from app.database import get_db
-                from app.core.curiosity import CuriosityQueue
-                cq = CuriosityQueue(get_db())
-                cq.add(topic=query[:280], source="search_zero_result", urgency=0.4)
+                from app.tools.base import EPHEMERAL_REQUEST
+                if not EPHEMERAL_REQUEST.get():
+                    from app.database import get_db
+                    from app.core.curiosity import CuriosityQueue
+                    cq = CuriosityQueue(get_db())
+                    cq.add(topic=query[:280], source="search_zero_result", urgency=0.4)
+                else:
+                    logger.debug(
+                        "Skipping auto-curiosity for ephemeral request: %r",
+                        query[:80])
             except Exception as e:
                 logger.debug("Auto-curiosity queue from empty search failed: %s", e)
             return ToolResult(

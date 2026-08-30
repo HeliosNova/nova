@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from abc import ABC, abstractmethod
+from contextvars import ContextVar
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
@@ -19,6 +20,23 @@ logger = logging.getLogger(__name__)
 # Canonical tool failure markers — single source of truth.
 # Import from here in brain.py, critique.py, and anywhere else.
 TOOL_FAILURE_MARKERS = ("failed", "timed out", "error:", "not available", "not found", "exception")
+
+
+# Is the current request ephemeral (eval-harness / preview traffic)?
+#
+# brain.think(ephemeral=True) documents an invariant: "keeps eval traffic out
+# of every persistent store". But tools have SIDE-CHANNEL writes the flag never
+# reached — measured 2026-08-30: web_search's zero-result auto-curiosity mint
+# queued the eval suite's FICTIONAL entities (Vorenza, Skylance X9) as real
+# research topics. The curiosity judge dismissed all three and none reached the
+# KG, but the leak vector was open; Nova was one bad judgment away from
+# researching a fiction into its knowledge graph (and monitor 77 already
+# proved probe-shaped traffic can spawn real work).
+#
+# brain.think() sets this at entry; tools with persistent side effects consult
+# it before writing. Lives here (not brain.py) because brain imports base —
+# the reverse import would be a cycle.
+EPHEMERAL_REQUEST: ContextVar[bool] = ContextVar("ephemeral_request", default=False)
 
 
 # ---------------------------------------------------------------------------

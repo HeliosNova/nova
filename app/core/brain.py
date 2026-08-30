@@ -1452,7 +1452,7 @@ async def _build_messages(
 
 
 from app.tools.base import TOOL_FAILURE_MARKERS as _TOOL_FAILURE_MARKERS
-from app.tools.base import ErrorCategory
+from app.tools.base import EPHEMERAL_REQUEST, ErrorCategory
 
 
 def _round_all_succeeded(results: list[tuple]) -> bool:
@@ -3796,6 +3796,17 @@ async def think(
       _gather_context → _build_messages → _run_generation_loop →
       _refine_response → _run_post_processing
     """
+    # --- Step 0a-pre: publish ephemerality to tools ---
+    # ephemeral=True promises "eval traffic stays out of every persistent
+    # store", but tools have side-channel writes the flag never reached:
+    # web_search's zero-result auto-curiosity mint queued the eval suite's
+    # fictional entities (Vorenza, Skylance X9) as real research topics
+    # (measured 2026-08-30; all were later dismissed, none reached the KG).
+    # Tools run inside this generator's frame in the caller's task, so a
+    # ContextVar set here is visible to them. Set-only, no reset — the
+    # 2026-07 lesson at _refine_response showed cross-context resets raise.
+    EPHEMERAL_REQUEST.set(ephemeral)
+
     # --- Step 0a: GPU-yield latch ---
     # Owner-facing surfaces mark interactive activity so the heartbeat defers
     # background LLM monitors. Audit 2026-07-08: only the HTTP API latched;
