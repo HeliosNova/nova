@@ -64,16 +64,24 @@ _HARNESS_INTERNAL_MODULES: frozenset[str] = frozenset({
 # Shadow-eval ContextVars (no global mutation — safe across async coroutines)
 # ---------------------------------------------------------------------------
 
+# default=None, not {} (2026-08-29): a mutable ContextVar default is ONE object
+# shared by every context that never calls .set() — the opposite of the
+# isolation a ContextVar exists to provide. Nothing mutates it today (both read
+# sites only test membership), so this is a footgun rather than a live bug: a
+# single `_MODULE_OVERRIDES.get()["x"] = y` would leak a shadow-eval override
+# into every unrelated task. Both readers already guard truthiness with
+# `if cv_overrides and ...`, so None is a drop-in replacement.
+
 #: Active module overrides for the current async task (generation path).
-_MODULE_OVERRIDES: ContextVar[dict[str, str]] = ContextVar(
-    "_module_overrides", default={}
+_MODULE_OVERRIDES: ContextVar[dict[str, str] | None] = ContextVar(
+    "_module_overrides", default=None
 )
 
 #: Scoring-path overrides: pins which prompt version is used when brain.think()
 #: calls critique_response() internally, ensuring the harness grades responses
 #: with the baseline critique rather than the candidate being tested.
-_SCORING_OVERRIDES: ContextVar[dict[str, str]] = ContextVar(
-    "_scoring_overrides", default={}
+_SCORING_OVERRIDES: ContextVar[dict[str, str] | None] = ContextVar(
+    "_scoring_overrides", default=None
 )
 
 

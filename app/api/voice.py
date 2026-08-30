@@ -127,8 +127,14 @@ async def voice_chat(
         raise HTTPException(status_code=400, detail="No speech detected in audio")
 
     # Stream the chat response
+    # StreamEvent only — EventType is already imported at module level (line 15).
+    # Re-importing it here rebound it as a LOCAL of voice_chat for the whole
+    # function body, which is precisely the shape that left BrowserTool
+    # unregistered for months ("cannot access free variable ... in enclosing
+    # scope"). It is harmless today only because nothing reads EventType before
+    # this line — a property of the current code, not a guarantee.
     from app.core.brain import think
-    from app.schema import StreamEvent, EventType
+    from app.schema import StreamEvent
 
     async def _stream():
         # First, emit the transcription
