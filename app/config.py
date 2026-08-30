@@ -248,8 +248,14 @@ class Config:
     # Bumped 20s → 35s after eval-suite analysis (2026-05-09): SearXNG hits
     # multiple upstream engines, slow ones flake the whole call. User mandate:
     # optimize for best, not fastest.
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op.
-    WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 35.0))
+    # WAS INERT for ~7 weeks: the 2026-07-08 audit annotated "no runtime reader —
+    # setting this is a no-op" and left it that way; a liveness sweep rediscovered
+    # it 2026-08-30 and WIRED it (native_search.SEARCH_TIMEOUT now reads this).
+    # Default moved 35.0 -> 12.0 to match the constant it replaced, so wiring it
+    # is behaviour-neutral: search still fails fast at 12s so one hung aggregator
+    # engine cannot stall a concurrent gather. Article-body fetches are unaffected
+    # (they keep native_search.DEFAULT_TIMEOUT = 30.0).
+    WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 12.0))
     WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "bing,startpage,ecosia,yandex,yahoo"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
     CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 15))

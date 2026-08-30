@@ -286,12 +286,14 @@ class SkillStore:
             collection = self._get_skill_collection()
             doc_id = f"skill_{skill_id}"
             embed_text = f"{name}: {trigger_pattern}"
-            # Upsert: delete old entry if present, then add
-            try:
-                collection.delete(ids=[doc_id])
-            except Exception:
-                pass
-            collection.add(
+            # Real upsert, not delete-then-add (2026-08-30). Every NEW skill hit
+            # the delete branch for an id that was never indexed, and chroma
+            # records the no-op delete in its log — so those deletes are REPLAYED
+            # on every PersistentClient open, emitting a burst of
+            # "Delete of nonexisting embedding ID: skill_N" for long-dead ids
+            # (observed skill_2..skill_45 on a store whose live ids are 68-99).
+            # _backfill_collection already used upsert; this path was the outlier.
+            collection.upsert(
                 ids=[doc_id],
                 documents=[embed_text],
                 metadatas=[{"skill_id": str(skill_id), "name": name}],

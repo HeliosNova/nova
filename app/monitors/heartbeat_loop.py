@@ -247,88 +247,18 @@ def _strip_deliberation(text: str) -> str:
     return text.strip()
 
 
-_CITATION_RE = re.compile(r"(?i)\bsource\s*[:–]\s*\S")
-_URL_RE = re.compile(r"https?://[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}(?:/[^\s)]*)?")
-_DATE_RE_GATE = re.compile(
-    r"\b("
-    r"(?:January|February|March|April|May|June|July|August|September|October|November|December|"
-    r"Jan|Feb|Mar|Apr|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\.?\s+\d{1,2},\s+\d{4}"
-    r"|"
-    r"\d{4}-\d{2}-\d{2}"
-    r")\b"
-)
-# Hedging patterns that violate the no-hedging rule
-_HEDGE_RE = re.compile(
-    r"(?i)("
-    r"\bapr[/\-]may\b|\bmay[/\-]apr\b|"
-    r"\bapril[–\-]+may\b|\bmay[–\-]+april\b|"
-    r"\b~\s*[a-z]+\b|"
-    r"\b(?:approximately|around|circa|roughly)\s+(?:apr|april|may|jun|june)\b|"
-    r"\b(?:early|mid|late)[\s\-](?:april|may|june)\b|"
-    r"\b\d+[–\-]+\d+\s*days?\s*ago\b|"
-    r"\b\d+\s*days?\s*ago\b"
-    r")"
-)
-
-
-def _domain_study_passes_citation_gate(result: str) -> bool:
-    """A Domain Study output is acceptable if it either:
-      - contains >= 2 'Source:' citations AND >= 2 well-formed dates within the
-        last 48h AND >= 2 well-formed URLs AND no hedging-language matches, OR
-      - is the explicit 'No significant ... in the past 48 hours' fallback,
-      - OR is empty/error (those bypass since we can't fix them by re-rolling).
-    """
-    if not result:
-        return True
-    low = result.lower()
-    if "no significant" in low and "past 48 hours" in low:
-        return True
-    if low.startswith("[query failed") or low.startswith("[query timed out"):
-        return True
-
-    # Hard rejects
-    if _HEDGE_RE.search(result):
-        logger.info("[Heartbeat] citation gate FAIL: hedging language detected")
-        return False
-
-    citations = len(_CITATION_RE.findall(result))
-    if citations < 2:
-        logger.info("[Heartbeat] citation gate FAIL: only %d Source: citations", citations)
-        return False
-
-    urls = [u for u in _URL_RE.findall(result) if "." in u]
-    if len(urls) < 2:
-        logger.info("[Heartbeat] citation gate FAIL: only %d well-formed URLs", len(urls))
-        return False
-
-    # Parse dates and require at least 2 within the last 48h
-    from datetime import datetime as _dt, timedelta as _td
-    cutoff = _dt.utcnow() - _td(hours=48)
-    fresh_count = 0
-    stale_count = 0
-    for m in _DATE_RE_GATE.finditer(result):
-        raw = m.group(1)
-        parsed = None
-        for fmt in ("%B %d, %Y", "%b %d, %Y", "%B %d %Y", "%b %d %Y", "%Y-%m-%d"):
-            try:
-                parsed = _dt.strptime(raw.strip().rstrip("."), fmt)
-                break
-            except ValueError:
-                continue
-        if not parsed:
-            continue
-        if parsed >= cutoff:
-            fresh_count += 1
-        else:
-            stale_count += 1
-    if fresh_count < 2:
-        logger.info(
-            "[Heartbeat] citation gate FAIL: %d fresh dates, %d stale (need ≥2 fresh)",
-            fresh_count, stale_count,
-        )
-        return False
-
-    return True
+# The Domain Study citation gate lived here and was DELETED 2026-08-30.
+# It demanded >=2 'Source:' citations, >=2 URLs and >=2 dates within 48h.
+# git log -S showed exactly one commit ever touched it -- the one that
+# created it in v1.6.0 -- so it was never wired, and measuring it against
+# 120 real digests gave 0% pass, 97.5% failing on the FIRST check because
+# the string 'Source:' appears ZERO times in all 120. Real digests cite via
+# a '_read 20 sources: apnews.com, ...' header. Its _HEDGE_RE also hardcoded
+# apr/may/jun month names, so it could only ever fire in one season.
+# Deleting rather than keeping: a future audit would 'just wire it' and
+# suppress 100% of digests. Same class as the freshness rubric's never-
+# emitted date lines and the format rubric's never-emitted numbered items:
+# output judged against a structure it never had.
 
 
 def _class_floor_order(slow: list, classify, now: datetime) -> list:

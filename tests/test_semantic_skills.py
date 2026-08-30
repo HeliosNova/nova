@@ -182,9 +182,14 @@ class TestEmbedSync:
             steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
         )
 
-        mock_col.add.assert_called_once()
-        call_kwargs = mock_col.add.call_args
+        # upsert, not add (2026-08-30): _embed_skill used to delete-then-add,
+        # which logged a no-op delete for every brand-new skill and left those
+        # deletes in chroma's log to be replayed on each client open. The
+        # INTENT of this test is "creating a skill indexes it" — unchanged.
+        mock_col.upsert.assert_called_once()
+        call_kwargs = mock_col.upsert.call_args
         assert "skill_1" in call_kwargs.kwargs.get("ids", call_kwargs.args[0] if call_kwargs.args else [])
+        mock_col.delete.assert_not_called()
 
     def test_unembed_called_on_delete(self, db, monkeypatch):
         """_unembed_skill is called when a skill is deleted."""
@@ -227,15 +232,15 @@ class TestEmbedSync:
             trigger_pattern=r"original trigger (\w+)",
             steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
         )
-        add_count_after_first = mock_col.add.call_count
+        add_count_after_first = mock_col.upsert.call_count
 
         store.create_skill(
             name="dedup_skill",  # same name → name-dedup path
             trigger_pattern=r"updated trigger (\w+)",
             steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
         )
-        # add should have been called again for the update
-        assert mock_col.add.call_count > add_count_after_first
+        # re-embed should have happened again for the update
+        assert mock_col.upsert.call_count > add_count_after_first
 
 
 # ---------------------------------------------------------------------------
@@ -286,7 +291,7 @@ class TestSyncEmbeddings:
 
         count = store.sync_embeddings()
         assert count == 1
-        mock_col.add.assert_called_once()
+        mock_col.upsert.assert_called_once()
 
     def test_sync_skips_already_embedded(self, db, monkeypatch):
         """sync_embeddings doesn't re-embed skills already in ChromaDB."""
@@ -305,6 +310,7 @@ class TestSyncEmbeddings:
 
         count = store.sync_embeddings()
         assert count == 0
+        mock_col.upsert.assert_not_called()
         mock_col.add.assert_not_called()
 
 

@@ -25,6 +25,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import httpx
 
+from ..config import config
+
 logger = logging.getLogger(__name__)
 
 # Rolling health signal over the last 50 search() calls (True = ≥1 result).
@@ -52,7 +54,14 @@ def search_health() -> float:
 DEFAULT_TIMEOUT = 30.0
 # Search queries fail fast so one hung aggregator engine can't stall a whole
 # concurrent gather; article-body fetches keep DEFAULT_TIMEOUT (slow reads OK).
-SEARCH_TIMEOUT = 12.0
+# Sourced from config (2026-08-30): WEB_SEARCH_TIMEOUT was declared in config.py
+# AND allow-listed as a settable env var, but read NOWHERE — so anyone tuning it
+# in .env got a silent no-op while the real value stayed hardcoded here. Same
+# inert-knob class as ENABLE_AUTO_FINETUNE and the shared ENABLE_MULTI_AGENT
+# flag. The config default was moved 35.0 -> 12.0 to match this constant, so
+# wiring it changes no behaviour: the fail-fast value stays 12s unless the
+# operator deliberately overrides it.
+SEARCH_TIMEOUT = config.WEB_SEARCH_TIMEOUT
 DEFAULT_MAX_RESULTS = 10
 
 # Rotating User-Agents to avoid being fingerprinted as a bot from a fixed UA.
