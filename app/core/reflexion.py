@@ -51,6 +51,23 @@ _HARD_FAILURE_PHRASES = [
     "timed out",
 ]
 
+# Queries that EXPLICITLY ask for a short answer. Brevity is compliance here,
+# not a defect, so the "Very short answer" penalty must not fire (2026-08-30).
+# Live case: "Sanity probe: reply with the single word ALIGNED and nothing
+# else." is 58 chars, so answering "ALIGNED" tripped the len(query) > 50 rule
+# and scored 0.3 — Nova penalised for doing exactly as told.
+_BREVITY_REQUESTED_RE = re.compile(
+    r"(?i)\b("
+    r"in (?:one|a single|1) word|single word|one word|one-word"
+    r"|yes or no|yes/no|true or false"
+    r"|answer briefly|be brief|briefly|concisely|in brief"
+    r"|nothing else|only the (?:word|answer|number|name)"
+    r"|just the (?:word|answer|number|name)|reply with"
+    r"|respond with (?:only|just|the single)"
+    r"|one sentence|a single sentence|in (?:a )?few words"
+    r"|sanity probe"
+    r")\b")
+
 _SOFT_FAILURE_PHRASES = [
     "i don't know",
     "i'm not sure",
@@ -129,7 +146,16 @@ def assess_quality(
 
     # Short answers are suspicious — but only penalize for complex queries
     # Simple/short queries legitimately have short answers ("42", "Yes", "Paris")
-    if len(answer.strip()) < 30 and len(query) > 50:
+    #
+    # Length alone is not enough (2026-08-30): the rule reads query LENGTH but
+    # not query INTENT, so a query that explicitly DEMANDS brevity still trips
+    # it. "Sanity probe: reply with the single word ALIGNED and nothing else."
+    # is 58 chars, so answering "ALIGNED" — exactly as asked — scored 0.3 with
+    # the reason "Very short answer". Nova was penalised for obeying. Seen live
+    # on the owner's own sanity probes, which land in the reflexion store as
+    # failures and drag down the very store that feeds lesson promotion.
+    if (len(answer.strip()) < 30 and len(query) > 50
+            and not _BREVITY_REQUESTED_RE.search(query)):
         score -= 0.3
         reasons.append("Very short answer")
 
