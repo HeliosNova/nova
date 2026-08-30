@@ -123,10 +123,52 @@ _CANARY_NORMAL_MARKERS: dict[str, str] = {
 
 # Lessons whose "answer" is a process instruction, not a gradable fact —
 # the Lesson Quiz skips these (see _execute_quiz).
+#
+# WIDENED 2026-08-30. The v1 pattern (added 08-27) caught 31 of 41 malformed
+# lessons but MISSED 10, and those 10 kept the churn engine running. It failed
+# in two ways, both from being phrase-literal rather than shape-aware:
+#
+#   1. it required verb and preposition to be ADJACENT, so
+#      "verify (with|using|by)" matched "verify with a calculator" but not
+#      "Verify solutions with a calculator" or "verify your answer by checking"
+#      or "Always verify historical claims by cross-referencing" -- the real
+#      stored answers.
+#   2. it enumerated "use", missing every synonym: "Apply a calculator to
+#      solve arithmetic puzzles."
+#
+# Why this matters more than it looks: the quiz treats correct_answer as GROUND
+# TRUTH. When that field holds "Use web_search to answer factual queries", the
+# quiz asks a real art-history question, Nova answers "Leonardo da Vinci"
+# CORRECTLY, and the grader scores it a failure for not matching the
+# instruction. That false failure then (a) writes a 0.2 reflexion, and (b)
+# feeds the 3-strikes recurring-failure path, which mints ANOTHER instruction-
+# shaped lesson. Measured result: 9 near-identical art-history lessons and 4
+# calculator lessons minted June->August, and reflexion quality collapsing from
+# max 1.0 to max 0.4 over two weeks. It is a closed loop that runs on itself.
+#
+# Now shape-aware: an answer is unquizzable if it OPENS in the imperative /
+# conditional-procedural mood, or names a tool anywhere in an instructional
+# frame. Verified against the live store: catches all 41 malformed rows and
+# over-blocks 0 of the 10 genuine fact lessons.
 _UNQUIZZABLE_ANSWER_RE = re.compile(
-    r"(?i)\b(use (a |the |your )?(calculator|web[ _]?search|browser|tool)"
-    r"|search the web|perform a (web )?search|look (it )?up"
-    r"|consult (the|a|current)|verify (with|using|by))\b")
+    r"(?i)("
+    # opens in imperative / procedural mood ("Always verify...", "When solving
+    # word problems...", "Apply a calculator...", "Focus on individual rates")
+    r"^\s*(always|never|when |whenever |if you|before |after |use |using |"
+    r"apply |verify |check |ensure |confirm |consider |remember |avoid |"
+    r"prefer |consult |search |look up|focus on|rely on|make sure|"
+    r"do not|don't|cross-?reference|double-?check)"
+    # ...or a verify/check verb reaching a tool or source across intervening
+    # words ("verify YOUR ANSWER by", "verify HISTORICAL CLAIMS by")
+    r"|\b(verify|confirm|check|validate|cross-?reference)\b[^.]{0,60}?"
+    r"\b(with|using|by|against|via)\b"
+    # ...or an explicit tool name in an instructional frame
+    r"|\b(use|using|apply|applying|invoke|call|run|employ)\b\s+"
+    r"(a |an |the |your )?(calculator|web[ _]?search|browser|tool|search)"
+    r"|\bsearch the web\b|\bperform a (web )?search\b|\blook (it )?up\b"
+    r"|\bconsult (the|a|an|current|authoritative)\b"
+    r"|\bauthoritative sources?\b|\bexternal verification\b"
+    r")")
 
 
 def _canary_should_alert(check_type: str, last_result: str | None,
