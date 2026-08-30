@@ -399,7 +399,14 @@ async def _causal_probe(cluster: ThemeCluster, *, hours: int) -> list[dict]:
         logger.info("[Synthesis] causal probe returned nothing for '%s'", cluster.key)
         return []
     try:
-        data = json.loads(raw) if isinstance(raw, str) else raw
+        # `json` was never imported in this module (2026-08-29) — the only
+        # import is `import json as _json` inside a DIFFERENT function, so this
+        # line raised NameError on every call. The bug was invisible because the
+        # except below caught it and extract_json_object() quietly produced the
+        # same answer: the intended fast path simply never ran, and every causal
+        # probe paid an exception. Delete the fallback and this breaks outright.
+        import json as _json_mod
+        data = _json_mod.loads(raw) if isinstance(raw, str) else raw
     except Exception:
         data = extract_json_object(raw)
     if not isinstance(data, dict):

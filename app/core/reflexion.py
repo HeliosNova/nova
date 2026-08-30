@@ -1154,9 +1154,21 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
             (topic,),
         )
         if recent:
+            # confidence ONLY — do not touch times_helpful (2026-08-29).
+            # This path reinforces an existing lesson instead of minting a
+            # sibling; the lesson was never RETRIEVED here, so counting it as
+            # "helpful" corrupts a retrieval-quality metric with a dedup signal.
+            # Found via a DB invariant check: two lessons had
+            # times_helpful > times_retrieved, which is impossible by definition
+            # — and both were the art-history churn family, i.e. the lessons
+            # that recur most were silently inflating their own rank.
+            # It matters twice over: get_relevant_lessons orders its candidate
+            # pool by `times_helpful DESC`, and mark_lesson_helpful scales its
+            # confidence boost by 1/(1+times_helpful), so a padded count both
+            # promotes the lesson and shrinks its future real boosts.
             learning_engine._db.execute(
-                "UPDATE lessons SET times_helpful = times_helpful + 1, "
-                "confidence = MIN(0.95, confidence + 0.05) WHERE id = ?",
+                "UPDATE lessons SET confidence = MIN(0.95, confidence + 0.05) "
+                "WHERE id = ?",
                 (recent["id"],),
             )
             logger.info(

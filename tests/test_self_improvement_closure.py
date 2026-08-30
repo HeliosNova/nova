@@ -35,6 +35,10 @@ class TestFailureSweepConvergence:
             correct_answer="Always verify historical claims via cross-reference.",
             lesson_text="Auto-lesson: Always verify historical claims.",
         )
+        before_row = db.fetchone(
+            "SELECT confidence, COALESCE(times_helpful,0) AS th, "
+            "COALESCE(times_retrieved,0) AS tr FROM lessons WHERE id = ?",
+            (first_id,))
 
         async def _fake_invoke(messages, **kwargs):
             return ('{"topic": "Art History Fact Verification", '
@@ -53,9 +57,34 @@ class TestFailureSweepConvergence:
         after = db.fetchone("SELECT COUNT(*) AS c FROM lessons")["c"]
 
         assert after == before, "re-promotion must reinforce, not re-mint"
-        row = db.fetchone("SELECT times_helpful FROM lessons WHERE id = ?",
-                          (first_id,))
-        assert row["times_helpful"] >= 1
+        row = db.fetchone(
+            "SELECT confidence, COALESCE(times_helpful,0) AS th, "
+            "COALESCE(times_retrieved,0) AS tr FROM lessons WHERE id = ?",
+            (first_id,))
+
+        # Reinforcement is expressed as CONFIDENCE, not times_helpful.
+        # This test previously asserted times_helpful >= 1, which pinned the
+        # wrong mechanism: the recurring-failure path never RETRIEVES the
+        # lesson, so counting it as "helpful" put a dedup signal into a
+        # retrieval-quality metric. A live DB invariant check caught the result
+        # — two lessons (both this art-history family) had
+        # times_helpful > times_retrieved, which is impossible by definition.
+        # It compounds: get_relevant_lessons orders candidates by
+        # `times_helpful DESC`, and mark_lesson_helpful scales its boost by
+        # 1/(1+times_helpful), so a padded counter promotes the lesson AND
+        # shrinks its future genuine boosts. The INTENT of this test —
+        # reinforce rather than re-mint — is unchanged.
+        assert row["confidence"] > before_row["confidence"], (
+            "re-promotion must reinforce the existing lesson's confidence"
+        )
+        assert row["th"] == before_row["th"], (
+            "reinforcement must NOT touch times_helpful — that counter means "
+            "'was retrieved and helped', and this path retrieves nothing"
+        )
+        assert row["th"] <= row["tr"], (
+            "invariant: a lesson cannot have helped more often than it was "
+            "retrieved"
+        )
 
 
 class TestCuriosityEphemeralGate:
