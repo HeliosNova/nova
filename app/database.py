@@ -320,6 +320,17 @@ class SafeDB:
         # Registry of every per-thread connection so close() can shut them all.
         self._all_conns: list[sqlite3.Connection] = []
         self._all_conns_lock = threading.Lock()
+        # In-flight query counter (2026-08-30). close() closes OTHER THREADS'
+        # connections — legal only because check_same_thread=False, and safe
+        # only while the DB is quiescent. That precondition was documented but
+        # never enforced: if a worker thread sits inside sqlite3_step() when
+        # another thread calls sqlite3_close() on the same connection, SQLite
+        # frees the statement out from under it and the process takes SIGSEGV —
+        # a C-level use-after-free, not a catchable Python error. Observed
+        # 2026-08-30 as pytest exit 139 with the fault at fetchall() on a
+        # concurrent.futures worker. close() now waits for this to drain first.
+        self._inflight = 0
+        self._inflight_cv = threading.Condition()
         # Per-instance schema-ensure memo (audit 2026-08-23): stores ran their
         # idempotent __init__ DDL (CREATE IF NOT EXISTS + ALTER-catch) on EVERY
         # construction, and stores are constructed repeatedly in async contexts
@@ -1335,31 +1346,42 @@ class SafeDB:
         # (and no longer races a concurrent insert on a shared connection).
         self._warn_if_event_loop(sql)
         conn = self._get_conn()
-        with self._acquire_write():
-            try:
-                cursor = conn.execute(sql, params)
-                conn.commit()
-                return cursor
-            except BaseException:
-                # A failed commit leaves the connection mid-transaction; the next
-                # BEGIN on this thread would then raise inside _Transaction.__enter__.
-                # Clear it here so no dangling transaction survives this call.
-                if conn.in_transaction:
-                    conn.rollback()
-                raise
+        # In-flight guard: the writer lock does NOT protect against close(),
+        # which takes no write lock, so a write is just as exposed to having
+        # its connection freed mid-statement as a read is.
+        self._enter_query()
+        try:
+            with self._acquire_write():
+                try:
+                    cursor = conn.execute(sql, params)
+                    conn.commit()
+                    return cursor
+                except BaseException:
+                    # A failed commit leaves the connection mid-transaction; the next
+                    # BEGIN on this thread would then raise inside _Transaction.__enter__.
+                    # Clear it here so no dangling transaction survives this call.
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+        finally:
+            self._exit_query()
 
     def executemany(self, sql: str, params_list: list) -> sqlite3.Cursor:
         self._warn_if_event_loop(sql)
         conn = self._get_conn()
-        with self._acquire_write():
-            try:
-                cursor = conn.executemany(sql, params_list)
-                conn.commit()
-                return cursor
-            except BaseException:
-                if conn.in_transaction:
-                    conn.rollback()
-                raise
+        self._enter_query()
+        try:
+            with self._acquire_write():
+                try:
+                    cursor = conn.executemany(sql, params_list)
+                    conn.commit()
+                    return cursor
+                except BaseException:
+                    if conn.in_transaction:
+                        conn.rollback()
+                    raise
+        finally:
+            self._exit_query()
 
     class _Transaction:
         """Context manager for atomic multi-statement transactions."""
@@ -1410,20 +1432,58 @@ class SafeDB:
         """
         return self._Transaction(self)
 
+    def _enter_query(self) -> None:
+        """Mark a query in flight so close() cannot free the connection under it."""
+        with self._inflight_cv:
+            self._inflight += 1
+
+    def _exit_query(self) -> None:
+        with self._inflight_cv:
+            self._inflight -= 1
+            if self._inflight <= 0:
+                self._inflight_cv.notify_all()
+
     def fetchone(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> sqlite3.Row | None:
         # Lock-free: this thread's own connection, WAL gives a consistent
         # snapshot concurrent with any writer. This is the concurrency win.
+        # The in-flight counter is NOT a lock — readers still run fully
+        # concurrently; it only tells close() when it is safe to proceed.
         self._warn_if_event_loop(sql)
-        return self._get_conn().execute(sql, params).fetchone()
+        self._enter_query()
+        try:
+            return self._get_conn().execute(sql, params).fetchone()
+        finally:
+            self._exit_query()
 
     def fetchall(self, sql: str, params: tuple[Any, ...] | dict[str, Any] = ()) -> list[sqlite3.Row]:
         self._warn_if_event_loop(sql)
-        return self._get_conn().execute(sql, params).fetchall()
+        self._enter_query()
+        try:
+            return self._get_conn().execute(sql, params).fetchall()
+        finally:
+            self._exit_query()
 
     def close(self) -> None:
         # Close every per-thread connection. Called at shutdown / test teardown
         # when the DB is quiescent. check_same_thread=False lets us close
         # other threads' connections from here.
+        #
+        # "When the DB is quiescent" is now ENFORCED, not merely assumed
+        # (2026-08-30). Closing a connection while another thread is inside
+        # sqlite3_step() is a C-level use-after-free -> SIGSEGV, and it was
+        # reachable in practice: pytest teardown calls close_all() while
+        # asyncio.to_thread workers may still be mid-query. Wait (bounded) for
+        # in-flight queries to finish first. The bound matters more than the
+        # wait: a hung query must not block shutdown forever, and proceeding
+        # after the timeout is no worse than the old unconditional behaviour.
+        deadline = 2.0
+        with self._inflight_cv:
+            if self._inflight > 0:
+                self._inflight_cv.wait_for(lambda: self._inflight <= 0, timeout=deadline)
+                if self._inflight > 0:
+                    logger.warning(
+                        "close(): %d query(s) still in flight after %.0fs — closing "
+                        "anyway; a concurrent query may fault", self._inflight, deadline)
         with self._all_conns_lock:
             # Checkpoint the WAL into the main DB on graceful shutdown
             # (2026-08-25): with 3 hard power-losses in 24h, minimizing the

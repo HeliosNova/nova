@@ -13,13 +13,37 @@ chromadb==0.6.3
 # NOTE (audit 2026-08-24): do NOT bump chromadb to 1.x casually — 1.0.0-1.5.8
 # carries CVE-2026-45829 (CVSS 10 pre-auth RCE in the server path); embedded
 # 0.6.3 predates the vulnerable code entirely.
+# NOTE (pip-audit 2026-08-29): 0.6.3 itself now reports three CVEs, and all
+# three are SERVER-path only — they do not apply to this deployment:
+#   CVE-2026-45830  cross-tenant read/write by an authenticated user
+#   CVE-2026-45831  SimpleRBACAuthorizationProvider ignores tenant/db/collection
+#   CVE-2026-45833  code injection via trust_remote_code on the collection
+#                   UPDATE endpoint (/api/v2/tenants/.../collections/{id})
+# Nova uses chromadb.PersistentClient EXCLUSIVELY (kg, learning, reflexion,
+# retriever, skills) with no Chroma server container running, so there is no
+# HTTP API, no tenants and no RBAC provider to attack. Upgrading to reach a
+# "fixed" 1.x would trade three inapplicable findings for a real CVSS-10.
+# Re-verify this reasoning if a Chroma SERVER is ever introduced.
 posthog<6
 
 # Math
 sympy==1.13.3
 
 # Utilities
-python-multipart==0.0.22
+# 0.0.31 (was 0.0.22, 2026-08-29): pip-audit found FIVE CVEs in 0.0.22 and the
+# path is REACHABLE — Nova exposes UploadFile endpoints in api/documents.py,
+# api/system.py (import_all) and api/voice.py, which FastAPI parses through this
+# library. Not merely DoS:
+#   PYSEC-2026-3037  parameter smuggling — ";" acted as a field separator, so
+#                    "role=user&x=;role=admin" reads as role=user to an upstream
+#                    validator but role=admin to the app (last value wins)
+#   PYSEC-2026-3036  O(B^2) urlencoded parsing — a 1MiB "a;a;a;..." body costs
+#                    ~1e11 byte comparisons and blocks a worker for seconds
+#   PYSEC-2026-3039  unbounded part-header count/size -> CPU exhaustion
+#   PYSEC-2026-3038  preamble/epilogue parsing DoS
+#   PYSEC-2026-3040  negative Content-Length -> unbounded read
+# 0.0.31 fixes all five; verified importable against the pinned fastapi 0.135.1.
+python-multipart==0.0.31
 pydantic>=2.11.0,<3.0.0
 PyYAML>=6.0
 
