@@ -195,7 +195,13 @@ class DaemonOrchestrator:
         pending_events = row["c"] if row else 0
 
         # Recent daemon log (last 6h, max 10 entries)
-        cutoff = (now - timedelta(hours=6)).isoformat()
+        # strftime, not isoformat (2026-08-29): created_at is SQLite's
+        # "YYYY-MM-DD HH:MM:SS" while .isoformat() emits a "T". Compared as
+        # STRINGS, ' ' (0x20) sorts before 'T' (0x54) — and with `>` the bug
+        # INVERTS: rows dated on the cutoff day were judged "not newer" and
+        # EXCLUDED, hiding recent entries from the daemon's own situational
+        # awareness. Same root cause as the conversation-prune bug in memory.py.
+        cutoff = (now - timedelta(hours=6)).strftime("%Y-%m-%d %H:%M:%S")
         log_rows = self._db.fetchall(
             "SELECT category, content, created_at FROM daemon_log "
             "WHERE created_at > ? ORDER BY created_at DESC LIMIT 10",
@@ -206,7 +212,9 @@ class DaemonOrchestrator:
         ]
 
         # Monitor health — any recent failures?
-        cutoff_1h = (now - timedelta(hours=1)).isoformat()
+        # Same T-vs-space fix: this one silently under-counted recent errors,
+        # so the daemon's health signal read cleaner than reality.
+        cutoff_1h = (now - timedelta(hours=1)).strftime("%Y-%m-%d %H:%M:%S")
         failure_rows = self._db.fetchall(
             "SELECT COUNT(*) as c FROM monitor_results WHERE status='error' AND created_at > ?",
             (cutoff_1h,),

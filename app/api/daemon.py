@@ -110,7 +110,11 @@ async def get_daemon_log(hours: int = Query(24, ge=1, le=720), category: str | N
         raise HTTPException(503, "Monitor store not initialized")
 
     db = svc.monitor_store.db
-    cutoff = (datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=hours)).isoformat()
+    # strftime, not isoformat (2026-08-29): daemon_log.created_at is SQLite's
+    # "YYYY-MM-DD HH:MM:SS"; .isoformat() emits a "T" and the string comparison
+    # then drops every row dated on the cutoff day from this endpoint's window.
+    cutoff = (datetime.now(timezone.utc).replace(tzinfo=None)
+              - timedelta(hours=hours)).strftime("%Y-%m-%d %H:%M:%S")
 
     if category:
         rows = db.fetchall(

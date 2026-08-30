@@ -237,7 +237,15 @@ class ConversationStore:
         Returns the number of conversations deleted.
         Uses a transaction to ensure messages and conversations are deleted atomically.
         """
-        cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+        # strftime, not isoformat (2026-08-29). updated_at is written by SQLite's
+        # datetime('now') as "YYYY-MM-DD HH:MM:SS" (space), while .isoformat()
+        # emits a "T". These are compared as STRINGS and ' ' (0x20) sorts before
+        # 'T' (0x54), so EVERY row dated on the cutoff day compared as "older"
+        # regardless of its time — this deleted up to a full extra day of
+        # conversations on each prune. Verified live:
+        #   '2026-08-23 10:00:00' < '2026-08-23T04:39:36'  ->  True   (wrong)
+        #   '2026-08-23 10:00:00' < '2026-08-23 04:39:36'  ->  False  (right)
+        cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
         old_convs = self._db.fetchall(
             "SELECT id FROM conversations WHERE updated_at < ?",
             (cutoff,),

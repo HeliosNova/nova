@@ -534,16 +534,13 @@ _TOPIC_FILTERS: dict[str, tuple[str, ...]] = {
         "election", "summit", "crisis", "minister", "president", "war",
         "ceasefire", "natural disaster", "earthquake", "flood",
     ),
-    "middle east": (
-        "israel", "iran", "saudi", "uae", "qatar", "syria", "yemen",
-        "lebanon", "gaza", "hamas", "hezbollah", "kuwait", "bahrain",
-        "egypt", "jordan", "iraq", "opec", "houthi",
-    ),
-    "us policy and regulation": (
-        "trump", "biden", "harris", "congress", "senate", "house",
-        "supreme court", "sec ", "fcc", "fda", "ftc", "doj", "executive order",
-        "regulation", "bill ", "law ", "policy", "election", "governor",
-    ),
+    # NB (2026-08-29): "middle east" and "us policy and regulation" were each
+    # defined TWICE in this dict — once here and again ~100/200 lines below.
+    # Python keeps the LAST definition, so these earlier tuples were discarded
+    # at parse time and never filtered anything. Same silent-collision class as
+    # the duplicate _CHECK_DISPATCH key that killed scheduled Dream
+    # Consolidation (2026-08-17). Both duplicates are removed here and their
+    # unique keywords folded into the surviving definitions below.
     "finance": (
         "stock", "market", "fed ", "powell", "treasury", "bond", "yield",
         "rate", "inflation", "gdp", "earnings", "jobs", "unemployment",
@@ -740,6 +737,12 @@ _TOPIC_FILTERS: dict[str, tuple[str, ...]] = {
         "federal register", "doj", "fda", "ftc", "fcc", "sec ",
         "regulation", "bill ", "act ", "law ", "policy", "lawsuit",
         "antitrust", "tariff", "sanction",
+        # Recovered 2026-08-29 from the duplicate definition that Python was
+        # silently discarding — election coverage was matching nothing here.
+        # Bare "house" is deliberately NOT restored: this list already carries
+        # the precise "house of representatives" and "white house", and the
+        # broad token would pull "housing market" stories into US politics.
+        "election", "governor",
     ),
     "startups and vc": (
         "startup", "raises", "raised", "funding", "series a", "series b",
