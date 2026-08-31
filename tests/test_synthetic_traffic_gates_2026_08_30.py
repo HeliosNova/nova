@@ -120,3 +120,38 @@ class TestGatePresenceAtRemainingSites:
             "brain's no-skill capability-gap writer must check the ephemeral "
             "flag before inserting"
         )
+
+
+class TestTrustRecordingScoped:
+    """Trust is Nova's observational self-awareness metric (can_use never
+    enforces — sovereign-AI design). Eval probes were moving the dial anyway:
+    the ZQX fixture's sandboxed code_exec attempt dinged the global score
+    -15 to 58.0 on 2026-08-30. A self-metric fed by synthetic failures
+    measures the eval suite, not Nova."""
+
+    @pytest.mark.asyncio
+    async def test_ephemeral_tool_outcome_not_recorded(self):
+        from unittest.mock import AsyncMock, MagicMock
+
+        from app.tools.base import BaseTool, ToolRegistry, ToolResult
+
+        class Boom(BaseTool):
+            name = "boom"
+            description = "always fails"
+            async def execute(self, **kwargs):
+                return ToolResult(output="", success=False, error="infra down")
+
+        reg = ToolRegistry()
+        reg.register(Boom())
+        reg.trust_manager = MagicMock()
+        reg.trust_manager.can_use.return_value = True
+
+        EPHEMERAL_REQUEST.set(True)
+        await reg.execute_full("boom", {})
+        reg.trust_manager.record_outcome.assert_not_called()
+
+        EPHEMERAL_REQUEST.set(False)
+        await reg.execute_full("boom", {})
+        assert reg.trust_manager.record_outcome.called, (
+            "real traffic must still move the observational metric"
+        )

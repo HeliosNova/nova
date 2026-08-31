@@ -232,7 +232,13 @@ class ToolRegistry:
             # NOT_FOUND (empty search, hallucinated URL, missing ID) and VALIDATION
             # (bad args) are neutral — they reflect model/query quality, not the tool.
             # Only successes that produced output and infrastructure failures move trust.
-            if trust_mgr is not None:
+            # EPHEMERAL traffic is also excluded (2026-08-30): trust is Nova's
+            # observational self-awareness metric (can_use never enforces), and
+            # eval probes were moving the dial — the ZQX fixture's sandboxed
+            # code_exec attempt dinged the global score -15 to 58.0 tonight.
+            # A self-metric fed by synthetic failures measures the eval suite,
+            # not Nova.
+            if trust_mgr is not None and not EPHEMERAL_REQUEST.get():
                 try:
                     is_neutral = (
                         not result.success
