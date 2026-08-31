@@ -870,6 +870,18 @@ class AgentLoop:
           3. **Curiosity queue**: failed-search topics go into curiosity_queue
              for proactive research on the next maintenance cycle.
         """
+        # Synthetic-traffic gate (2026-08-30): all three collectors below are
+        # PERSISTENT self-improvement inputs (auto_tool_candidates,
+        # capability_gaps, curiosity_queue), and ephemeral eval-harness runs
+        # were feeding them fiction — measured: 22 of 100 candidate rows were
+        # eval-fixture queries ("codename 'ZQX'", the Aurora-7 plant), several
+        # TRIGGERED real LLM tool-writing, and the newest capability_gaps were
+        # quiz questions. think(ephemeral=True) promises "stays out of every
+        # persistent store"; these writers never saw the flag.
+        from app.tools.base import EPHEMERAL_REQUEST
+        if EPHEMERAL_REQUEST.get():
+            return
+
         from app.database import get_db
         db = get_db()
         completed = [s for s in result.plan.steps if s.status == STEP_DONE]

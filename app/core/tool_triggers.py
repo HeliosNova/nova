@@ -73,7 +73,17 @@ class ToolCandidateStore:
         return "|".join(sorted(set(tools)))
 
     def record(self, query: str, tools: list[str]) -> int:
-        """Record a candidate interaction. Returns its row id."""
+        """Record a candidate interaction. Returns its row id.
+
+        Returns 0 without writing for EPHEMERAL requests (2026-08-30):
+        auto_tool_candidates is a persistent self-improvement input, and eval
+        traffic was reaching it — 22 of 100 rows were eval-fixture queries,
+        some of which triggered real LLM tool-writing. think(ephemeral=True)
+        promises "stays out of every persistent store".
+        """
+        from app.tools.base import EPHEMERAL_REQUEST
+        if EPHEMERAL_REQUEST.get():
+            return 0
         seq_key = self._sequence_key(tools)
         cursor = self._db.execute(
             "INSERT INTO auto_tool_candidates (query, tool_sequence, sequence_key) VALUES (?, ?, ?)",

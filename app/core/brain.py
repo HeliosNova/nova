@@ -3381,6 +3381,12 @@ async def _detect_capability_gap(
         return
     if reflexion_quality is None or reflexion_quality >= 0.5:
         return
+    # Synthetic-traffic gate (2026-08-30): capability_gaps is a persistent
+    # self-improvement input; ephemeral eval runs must not seed it (measured:
+    # eval/quiz-family queries in the newest rows, later mined into goals and
+    # auto-tool candidates).
+    if EPHEMERAL_REQUEST.get():
+        return
 
     try:
         from app.database import get_db

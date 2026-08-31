@@ -797,17 +797,31 @@ class ReflexionStore:
         elif failures_only:
             outcome_filter = "failure"
 
+        # Synthetic-traffic scoping (2026-08-30). The store measured 114
+        # is_eval=1 failures against 15 real ones — an 88% synthetic pool — so
+        # REAL chat injecting "you failed this before" warnings was drawing
+        # mostly from eval-harness probes about fictional entities. Real
+        # requests exclude eval rows; EPHEMERAL (eval-harness) requests still
+        # see them, because the memory-learning eval tasks seed failures and
+        # must retrieve them (the reason is_eval rows are kept retrievable at
+        # all — see store()'s docstring).
+        from app.tools.base import EPHEMERAL_REQUEST
+        eval_clause = "" if EPHEMERAL_REQUEST.get() else \
+            " AND (is_eval IS NULL OR is_eval = 0)"
+
         # --- Keyword search ---
         # Successes: sort DESC (best first). Failures: sort ASC (worst first).
         sort_order = "DESC" if successes_only else "ASC"
         if outcome_filter:
             rows = self._db.fetchall(
-                f"SELECT * FROM reflexions WHERE outcome = ? ORDER BY quality_score {sort_order} LIMIT 200",
+                f"SELECT * FROM reflexions WHERE outcome = ?{eval_clause} "
+                f"ORDER BY quality_score {sort_order} LIMIT 200",
                 (outcome_filter,),
             )
         else:
             rows = self._db.fetchall(
-                f"SELECT * FROM reflexions ORDER BY quality_score {sort_order} LIMIT 200"
+                f"SELECT * FROM reflexions WHERE 1=1{eval_clause} "
+                f"ORDER BY quality_score {sort_order} LIMIT 200"
             )
         rows_by_id = {row["id"]: row for row in rows}
 
@@ -863,6 +877,11 @@ class ReflexionStore:
             row = rows_by_id[rid]
             # Apply outcome filter for vector-only results
             if outcome_filter and row["outcome"] != outcome_filter:
+                continue
+            # The vector arm fetches ids the SQL arm never saw ("missing"
+            # above), so the eval scoping must also hold HERE — otherwise a
+            # synthetic probe re-enters through the embedding side door.
+            if eval_clause and (row["is_eval"] or 0):
                 continue
             result_reflexions.append(Reflexion(
                 id=row["id"],
