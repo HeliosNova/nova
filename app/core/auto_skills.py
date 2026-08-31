@@ -341,6 +341,73 @@ def _cluster_covered(key, existing_names: str) -> bool:
     )
 
 
+_DUP_VERDICT_SCHEMA = {
+    "type": "object",
+    "properties": {"verdict": {"type": "string",
+                               "enum": ["duplicate", "distinct"]}},
+    "required": ["verdict"],
+}
+
+
+async def _judge_duplicate_skill(skills: SkillStore, name: str,
+                                 description: str, procedure_text: str) -> str:
+    """Nominate-vs-decide dedup for the AMBIGUOUS similarity band.
+
+    Measured 2026-08-30: true induced duplicates score 0.826 while genuinely
+    distinct skills reach 0.713-0.914 — the bands overlap, so the 0.94 scalar
+    gate structurally cannot catch them, and induction re-minted the same
+    calculator skill hours after a manual merge. Per MemRefine
+    (arXiv:2606.13177): similarity NOMINATES (via nearest_skill), a
+    schema-pinned judge DECIDES, and only inside the band — below the floor is
+    distinct everywhere measured, at/above _SKILL_DUP_SIM the sync gate
+    already rejects. Every failure path returns "distinct" (fail-open to
+    today's behavior), so this can only ADD dedup, never block novel skills —
+    the 2026-08-18 over-collapse cannot recur through this code.
+    """
+    from app.core.skills import _SKILL_DUP_JUDGE_FLOOR, _SKILL_DUP_SIM
+    try:
+        near = skills.nearest_skill(name, description[:200])
+        if near is None:
+            return "distinct"
+        sim = near["similarity"]
+        if sim < _SKILL_DUP_JUDGE_FLOOR:
+            return "distinct"
+        if sim >= _SKILL_DUP_SIM:
+            logger.info("Skill-induction: '%s' is %.3f-similar to #%d '%s' — "
+                        "duplicate (above scalar bar)", name, sim,
+                        near["id"], near["name"])
+            return "duplicate"
+        existing_body = (near["procedure_text"] or near["trigger_pattern"])[:400]
+        result = await asyncio.wait_for(
+            llm.invoke_nothink(
+                [{"role": "user", "content":
+                  "Two skills from the same assistant. Decide if they are the "
+                  "SAME skill (would fire on the same user requests AND "
+                  "prescribe essentially the same procedure) or DISTINCT "
+                  "(different requests, or a materially different procedure).\n\n"
+                  f"SKILL A: {near['name']}\n{existing_body}\n\n"
+                  f"SKILL B: {name} — {description[:200]}\n"
+                  f"{(procedure_text or '')[:400]}\n\n"
+                  'Answer as JSON: {"verdict": "duplicate"} or '
+                  '{"verdict": "distinct"}.'}],
+                json_mode=True,
+                json_schema=_DUP_VERDICT_SCHEMA,
+                max_tokens=24,
+                temperature=0.0,
+                num_ctx=4096,
+            ),
+            timeout=config.INTERNAL_LLM_TIMEOUT,
+        )
+        obj = llm.extract_json_object(result) or {}
+        verdict = obj.get("verdict")
+        logger.info("Skill-induction dup-judge: '%s' vs #%d '%s' sim=%.3f -> %s",
+                    name, near["id"], near["name"], sim, verdict)
+        return verdict if verdict in ("duplicate", "distinct") else "distinct"
+    except Exception as e:
+        logger.debug("Skill dup-judge failed (fail-open to create): %s", e)
+        return "distinct"
+
+
 async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -> int:
     """Scheduled pass: distill procedure skills from proven memory.
 
@@ -458,10 +525,22 @@ async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -
             if not obj or obj.get("skip") or not obj.get("name"):
                 logger.info("Skill-induction: LLM declined for cluster %s", set(key))
                 continue
+            # Nominate-vs-decide dedup (2026-08-30): the 0.94 scalar gate inside
+            # create_procedure_skill cannot see the ambiguous band where real
+            # induced duplicates live (measured 0.826) — ask the judge first.
+            cand_name = str(obj.get("name") or "")[:80]
+            cand_desc = str(obj.get("description") or "")[:200]
+            cand_proc = str(obj.get("procedure_text") or "")
+            if await _judge_duplicate_skill(
+                    skills, cand_name, cand_desc, cand_proc) == "duplicate":
+                logger.info("Skill-induction: '%s' judged duplicate of an "
+                            "existing skill — skipped", cand_name)
+                consumed.update(idxs)  # evidence is spent either way
+                continue
             sid = skills.create_procedure_skill(
-                name=str(obj.get("name") or "")[:80],
-                description=str(obj.get("description") or "")[:200],
-                procedure_text=str(obj.get("procedure_text") or ""),
+                name=cand_name,
+                description=cand_desc,
+                procedure_text=cand_proc,
                 source="induced",
                 initial_success_rate=0.6,
             )

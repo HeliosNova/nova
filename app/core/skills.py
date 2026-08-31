@@ -159,6 +159,22 @@ def _negated_query_tokens(query: str) -> frozenset[str]:
 # "price of X" skills at 0.914) while a true reworded duplicate scores 0.968.
 _SKILL_DUP_SIM = 0.94
 
+# The AMBIGUOUS band, and why a second bar exists (2026-08-30): re-measured on
+# the LIVE induced store, a true duplicate pair (calculator_math vs
+# calculator_usage, induced a day apart) scored 0.826 — INSIDE the 08-18
+# "distinct sibling" range of 0.836–0.914, while tonight's genuinely distinct
+# pairs topped out at 0.713. The bands OVERLAP across datasets, so no scalar
+# threshold can separate duplicate from distinct in [~0.70, 0.94). The gate let
+# the calculator pair through, and induction re-minted the same skill AGAIN
+# hours after the first merge (skill #110, 2026-08-30 18:30).
+# Remedy is nominate-vs-decide (MemRefine, arXiv:2606.13177): similarity only
+# NOMINATES candidates in this band; a schema-pinned LLM judge DECIDES. Below
+# the floor: distinct everywhere measured, never ask. At/above _SKILL_DUP_SIM:
+# duplicate, never ask. The judge is consulted only in between, and any judge
+# failure fails OPEN to creation — so the 2026-08-18 over-collapse disaster
+# (6 seeded skills -> 1 survivor) structurally cannot recur.
+_SKILL_DUP_JUDGE_FLOOR = 0.70
+
 
 def _query_skill_topically_related(query: str, skill_name: str, trigger_pattern: str,
                                    similarity: float = 0.0) -> bool:
@@ -372,6 +388,46 @@ class SkillStore:
             return existing_id
         except Exception as e:
             logger.debug("Semantic dedup check failed (non-critical): %s", e)
+            return None
+
+    def nearest_skill(self, name: str, text: str) -> dict | None:
+        """Nearest existing skill to a candidate, with NO thresholding.
+
+        Read-only nomination step for the dup-judge band (2026-08-30): callers
+        that can afford an LLM verdict (async induction) use the similarity to
+        decide whether to consult the judge. Returns
+        {id, name, similarity, trigger_pattern, procedure_text} or None.
+        Ghost vectors (SQLite row gone) return None rather than a phantom.
+        """
+        if not config.ENABLE_SEMANTIC_SKILL_MATCHING:
+            return None
+        try:
+            collection = self._get_skill_collection()
+            if collection is None or collection.count() == 0:
+                return None
+            results = collection.query(
+                query_texts=[f"{name}: {text}"],
+                n_results=1,
+                include=["distances", "metadatas"],
+            )
+            if not results["ids"] or not results["ids"][0]:
+                return None
+            similarity = 1.0 - (results["distances"][0][0] / 2.0)
+            existing_id = int(results["metadatas"][0][0]["skill_id"])
+            row = self._db.fetchone(
+                "SELECT name, trigger_pattern, procedure_text FROM skills "
+                "WHERE id = ?", (existing_id,))
+            if row is None:
+                return None
+            return {
+                "id": existing_id,
+                "name": row["name"],
+                "similarity": similarity,
+                "trigger_pattern": row["trigger_pattern"] or "",
+                "procedure_text": row["procedure_text"] or "",
+            }
+        except Exception as e:
+            logger.debug("nearest_skill lookup failed (non-critical): %s", e)
             return None
 
     def _unembed_skill(self, skill_id: int) -> None:
