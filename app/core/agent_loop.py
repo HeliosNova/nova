@@ -663,7 +663,21 @@ def sanitize_synthesis(text: str) -> tuple[str, int]:
     out = _re_sanitize.sub(r"\s+([.,!?])", r"\1", out)
     # Trailing/leading whitespace per line
     out = "\n".join(line.rstrip() for line in out.splitlines())
-    return out.strip(), changes
+    out = out.strip()
+    # Leading-stub repair (2026-08-31): when a phrase redaction fires at the
+    # very START of the answer, the remainder can open on a dangling
+    # conjunction — live: "From the search results and my standing knowledge
+    # dossiers, here are…" redacted to "and my standing knowledge dossiers,
+    # here are…", a garbled user-facing opening (messages rowid 250). Only
+    # repair when a redaction actually happened, only at position 0, and
+    # re-capitalize the surviving first word.
+    if changes:
+        repaired = _re_sanitize.sub(r"^(?:(?:and|but|or|so|yet)\b[,\s]+|[,;\s]+)", "", out, count=1)
+        if repaired != out:
+            out = repaired
+        if out and out[0].islower():
+            out = out[0].upper() + out[1:]
+    return out, changes
 
 
 
@@ -880,6 +894,17 @@ class AgentLoop:
         # persistent store"; these writers never saw the flag.
         from app.tools.base import EPHEMERAL_REQUEST
         if EPHEMERAL_REQUEST.get():
+            return
+
+        # Internal-scaffold gate (2026-08-31): the will-module and the
+        # auto-monitor detector invoke the loop with their FULL orchestration
+        # prompt as `query` ("=== WILL-MODULE TASK ===…", "=== System Context
+        # ===…"), and those prompts were being recorded verbatim as
+        # auto_tool_candidates "user demand" (live rows 21/22/89) — the
+        # process-instructions-as-content defect class. "=== " is the in-band
+        # marker every internal scaffold header uses; real user queries never
+        # open with it.
+        if (result.query or "").lstrip().startswith("==="):
             return
 
         from app.database import get_db

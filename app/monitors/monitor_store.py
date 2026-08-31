@@ -226,6 +226,7 @@ class MonitorStore:
         now = datetime.now(timezone.utc).replace(tzinfo=None)
         monitors = self.list_all()
         due = []
+        anchored_due_ids: set[int] = set()
         for m in monitors:
             if not m.enabled:
                 continue
@@ -239,6 +240,7 @@ class MonitorStore:
                 if not self._anchored_due(m, int(anchor)):
                     continue
                 due.append(m)
+                anchored_due_ids.add(m.id)
                 continue
             if m.last_check_at:
                 last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
@@ -246,11 +248,26 @@ class MonitorStore:
                     continue
             due.append(m)
 
+        # Anchored-due ranking floor (2026-08-31): an anchored daily that IS
+        # due (its local date has turned) still computed a raw ratio from
+        # last_check_at — ~0.55 at midday — and sorted BEHIND every backlogged
+        # digest at ratio ≥2. Under a chronic deep queue it never reached the
+        # front: Morning Check-in ran at 23:43 local on Aug 28 and then missed
+        # Aug 29 AND Aug 30 entirely while 31 monitors sat ≥2× overdue. A due
+        # anchored monitor has a hard once-per-day contract, so it starts at
+        # ratio 1.0 the moment it's due and gains 1.0 per 6h past the anchor —
+        # competitive with a 2× backlog by mid-morning, ahead of a 3× backlog
+        # by evening, never able to miss a whole day again while ticks run.
         def _overdue_ratio(m: Monitor) -> float:
             if not m.last_check_at:
                 return float("inf")
             last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
-            return (now - last).total_seconds() / max(m.schedule_seconds, 1)
+            raw = (now - last).total_seconds() / max(m.schedule_seconds, 1)
+            if m.id in anchored_due_ids:
+                anchor = int((m.check_config or {}).get("anchor_hour", 0))
+                past_h = max(0.0, self._local_now().hour - anchor)
+                return max(raw, 1.0 + past_h / 6.0)
+            return raw
 
         due.sort(key=_overdue_ratio, reverse=True)
         return due

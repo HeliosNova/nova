@@ -464,15 +464,9 @@ async def run_eval_categories(categories: str = Query("memory-learning,kg-retrie
 # Internal QA/meta annotations that get appended to storyline_events but are
 # NOT narrative events — hide them from the user-facing timeline (2026-08-20
 # visual pass; screenshots showed a "Fresh-check could NOT be confirmed" note
-# rendered as a story beat). `\_%` needs ESCAPE (LIKE `_` is a wildcard).
-_EVENT_META_EXCL = (
-    "AND summary NOT LIKE '⚠%' "
-    "AND summary NOT LIKE '\\_%' ESCAPE '\\' "
-    "AND summary NOT LIKE '%Fresh-check%' "
-    "AND summary NOT LIKE '%Sourcing note%' "
-    "AND summary NOT LIKE '%could NOT be confirmed%' "
-    "AND summary NOT LIKE 'read %sources%'"
-)
+# rendered as a story beat). Definition moved to core/storylines.py
+# 2026-08-31 so dossier consolidation applies the same exclusion.
+from app.core.storylines import EVENT_META_EXCL_SQL as _EVENT_META_EXCL
 
 
 @router.get("/storylines")

@@ -3698,7 +3698,13 @@ async def _run_post_processing(
             logger.warning("Reflexion-to-action setup failed: %s", e)
 
     # --- Topic tracking for auto-monitor creation ---
-    if config.ENABLE_CURIOSITY and svc.topic_tracker and intent == "general":
+    # `not ephemeral` (2026-08-31): the ONE writer in this post-processing
+    # block that never got the gate its neighbors have. Eval queries were
+    # recorded as recurring topics — topic_frequency row 35 held the
+    # Prometheus-9 probe text verbatim — and topic_frequency is what the
+    # auto-monitor detector mines, so synthetic traffic could seed real
+    # monitor creation (the monitor-77 incident channel).
+    if config.ENABLE_CURIOSITY and svc.topic_tracker and intent == "general" and not ephemeral:
         try:
             await asyncio.to_thread(svc.topic_tracker.record_topic, query)
         except Exception as e:

@@ -152,6 +152,16 @@ class ActiveMemoryTool(BaseTool):
         if not content:
             return ToolResult(output="", success=False, error="No content provided",
                               error_category=ErrorCategory.VALIDATION)
+        # Ephemeral gate (2026-08-31): this was the LAST ungated persistent
+        # writer reachable from eval traffic. An eval probe that says
+        # "remember this: …" passes the explicit-intent gate below by
+        # construction — that is exactly how the Prometheus-9 fiction reached
+        # active_memories + its chroma vectors (purged 2026-08-31; data fixed,
+        # writer wasn't). Success-shaped response so probe behavior stays
+        # natural; nothing persists.
+        if self._ephemeral():
+            return ToolResult(output="Memory noted (ephemeral session — not persisted).",
+                              success=True)
 
         # Gate: owner must have explicitly authorized storage. The fine-tuned model
         # eagerly calls add() on any self-referential statement (poisoning memory
@@ -256,9 +266,17 @@ class ActiveMemoryTool(BaseTool):
 
         return ToolResult(output="\n".join(lines), success=True)
 
+    @staticmethod
+    def _ephemeral() -> bool:
+        from app.tools.base import EPHEMERAL_REQUEST
+        return bool(EPHEMERAL_REQUEST.get())
+
     def _update(self, kwargs: dict) -> ToolResult:
         mem_id = kwargs.get("id")
         content = kwargs.get("content", "").strip()
+        if self._ephemeral():
+            return ToolResult(output="Memory update noted (ephemeral session — not persisted).",
+                              success=True)
         if not mem_id:
             return ToolResult(output="", success=False, error="No memory ID provided",
                               error_category=ErrorCategory.VALIDATION)
@@ -287,6 +305,9 @@ class ActiveMemoryTool(BaseTool):
 
     def _delete(self, kwargs: dict) -> ToolResult:
         mem_id = kwargs.get("id")
+        if self._ephemeral():
+            return ToolResult(output="Memory delete noted (ephemeral session — not persisted).",
+                              success=True)
         if not mem_id:
             return ToolResult(output="", success=False, error="No memory ID provided",
                               error_category=ErrorCategory.VALIDATION)

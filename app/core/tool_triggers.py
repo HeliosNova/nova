@@ -84,6 +84,12 @@ class ToolCandidateStore:
         from app.tools.base import EPHEMERAL_REQUEST
         if EPHEMERAL_REQUEST.get():
             return 0
+        # Internal-scaffold gate (2026-08-31) — same guard as
+        # agent_loop._learn_from_run: orchestration prompts ("=== … ===")
+        # must not be recorded as user tool demand (live rows 21/22/89 held
+        # the will-module and auto-monitor-detector prompts verbatim).
+        if (query or "").lstrip().startswith("==="):
+            return 0
         seq_key = self._sequence_key(tools)
         cursor = self._db.execute(
             "INSERT INTO auto_tool_candidates (query, tool_sequence, sequence_key) VALUES (?, ?, ?)",

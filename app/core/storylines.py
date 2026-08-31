@@ -342,7 +342,16 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
         logger.warning("[Storyline] update LLM failed for %r: %s", story["title"], e)
         return None
     out = (out or "").strip()
-    if not out or out.upper().startswith("NO CHANGE"):
+    # No-change detection (2026-08-31): the guard only caught a "NO CHANGE"
+    # PREFIX. When the model rambled its rationale first and ended with the
+    # verdict ("The provided new developments contain no information
+    # regarding X…\n\nNO CHANGE"), the whole rationale was stored as the
+    # thread's summary, overwriting the real one (live: storyline 31).
+    # A STANDALONE "NO CHANGE" line anywhere is the verdict; content that
+    # merely mentions "no change" mid-sentence (e.g. "Fed made no change to
+    # rates") never matches a standalone line.
+    _no_change = bool(re.search(r"(?im)^\s*NO CHANGE[.!]?\s*$", out))
+    if not out or out.upper().startswith("NO CHANGE") or _no_change:
         # Still record events so we don't re-summarize them next cycle.
         if not new_story:
             # to_thread (2026-08-29): _record does an INSERT-or-UPDATE plus a
@@ -425,9 +434,41 @@ def _record(db, row, story, developments, *, summary):
         db.execute(
             "INSERT INTO storyline_events (storyline_id, summary, source_monitor, is_new) "
             "VALUES (?, ?, ?, 1)",
-            (sid, dev[:300], story["monitors"][0] if story["monitors"] else ""),
+            (sid, _event_summary(dev), story["monitors"][0] if story["monitors"] else ""),
         )
     return sid
+
+
+# Internal QA/meta annotations appended to storyline_events that are NOT
+# narrative events (fresh-check notes, sourcing notes, read-sources headers).
+# Moved here from api/monitors.py 2026-08-31: only the DISPLAY side filtered
+# them — dossier consolidation (_storyline_sources) was reading QA notes as
+# story beats. `\_%` needs ESCAPE (LIKE `_` is a wildcard).
+EVENT_META_EXCL_SQL = (
+    "AND summary NOT LIKE '⚠%' "
+    "AND summary NOT LIKE '\\_%' ESCAPE '\\' "
+    "AND summary NOT LIKE '%Fresh-check%' "
+    "AND summary NOT LIKE '%Sourcing note%' "
+    "AND summary NOT LIKE '%could NOT be confirmed%' "
+    "AND summary NOT LIKE 'read %sources%'"
+)
+
+
+def _event_summary(dev: str, cap: int = 300) -> str:
+    """Whole-word bound for stored event summaries (2026-08-31). The old
+    `dev[:300]` hard cut left 948 of 1,761 storyline_events at exactly 300
+    chars ending mid-word — the timeline the frontend, dossier consolidation
+    and next-cycle dedup all read. Prefer the last sentence boundary in the
+    tail; fall back to the last whole word + ellipsis."""
+    d = (dev or "").strip()
+    if len(d) <= cap:
+        return d
+    cut = d[:cap]
+    tail = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if tail >= int(cap * 0.7):
+        return cut[:tail + 1]
+    ws = cut.rfind(" ")
+    return (cut[:ws].rstrip(" ,;:—-") + "…") if ws > 0 else cut
 
 
 def close_stale(db, days: int = 21) -> int:

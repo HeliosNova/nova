@@ -60,7 +60,11 @@ playwright==1.49.1
 
 # Desktop automation (optional — only used when ENABLE_DESKTOP_AUTOMATION=true)
 pyautogui==0.9.54
-Pillow>=10.0.0
+# Floor raised 10.0.0 -> 12.3.0 (2026-08-31, pip-audit): 10.0.0 satisfies the
+# old range but carries ~20 advisories (worst: CVE-2026-59197 heap OOB write,
+# fixed 12.3.0). Live container already resolves 12.3.0 — zero-delta floor
+# that stops a stale layer replay from landing inside the vulnerable window.
+Pillow>=12.3.0
 
 # Voice (optional — only used when ENABLE_VOICE=true)
 openai-whisper==20250625
@@ -70,7 +74,13 @@ piper-tts==1.7.0
 # rebuild 2026-08-12) removed the 1.x Server decorator API (`Server.list_tools`)
 # that app/mcp_server.py targets, silently breaking the MCP feature + its tests.
 # Lift the pin only together with a port of mcp_server.py to the 2.x API.
-mcp>=1.23.0,<2
+# Floor raised 1.23.0 -> 1.28.1 (2026-08-31, pip-audit): 1.23.0–1.28.0 carry
+# CVE-2026-52869/-52870 (session hijack / cross-session task access, fixed
+# 1.27.2) and CVE-2026-59950 (WS transport Origin bypass, fixed 1.28.1). All
+# are in the SSE/HTTP/WS server transports — Nova's MCP server is stdio-only,
+# so exposure was theoretical — but the safe floor costs nothing: the live
+# container already resolves 1.29.1.
+mcp>=1.28.1,<2
 
 # Testing
 pytest==8.3.5

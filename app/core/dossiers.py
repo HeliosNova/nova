@@ -230,6 +230,28 @@ _TENSION_GENERIC = frozenset({
 })
 
 
+def _wtrim(s: str, cap: int) -> str:
+    """Whole-word cap (2026-08-31). Tension excerpts and the curiosity topic
+    were hard-sliced ([:80]/[:180]) mid-word — 33 stored dossier_tension
+    topics at exactly len 203 opened and closed on word fragments ('enue was
+    **$22.8 billion**…'), and those topics become live search queries."""
+    s = (s or "").strip()
+    if len(s) <= cap:
+        return s
+    cut = s[:cap]
+    ws = cut.rfind(" ")
+    return (cut[:ws].rstrip(" ,;:—-") + "…") if ws > 0 else cut
+
+
+def _fmt_qty(val: float, unit: str) -> str:
+    """'2billion' → '2 billion' (2026-08-31): symbol units (%, bp, x) attach
+    directly; word units get a space. The old f'{val:g}{unit}' mangled every
+    word-unit tension string."""
+    u = unit or ""
+    sep = "" if u in ("%", "bp", "x", "") else " "
+    return f"{val:g}{sep}{u}"
+
+
 def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
     """Thinking rung, brick one (2026-08-14): notice when two CURRENT dossiers
     assert materially different values for what reads as the SAME quantity
@@ -269,7 +291,7 @@ def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
                 # years and bare small ints are noise, not metrics
                 if not unit and (val > 1900 or val == int(val) and val < 32):
                     continue
-                facts.append((r["title"], toks, val, unit, s.lstrip("*- ")[:80]))
+                facts.append((r["title"], toks, val, unit, _wtrim(s.lstrip("*- "), 80)))
     tensions: list[str] = []
     seen_pairs: set[frozenset] = set()
     for i in range(len(facts)):
@@ -305,7 +327,7 @@ def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
                 continue
             seen_pairs.add(pair)
             tensions.append(
-                f"{a[0]} says {a[2]:g}{a[3]} but {b[0]} says {b[2]:g}{b[3]} — "
+                f"{a[0]} says {_fmt_qty(a[2], a[3])} but {b[0]} says {_fmt_qty(b[2], b[3])} — "
                 f"\"{a[4]}\" vs \"{b[4]}\"")
             if len(tensions) >= max_report:
                 return tensions
@@ -581,17 +603,24 @@ def _entity_sources(db, subject: str, since: str | None) -> str:
 def _storyline_sources(db, storyline_id: int, since: str | None) -> str:
     """Storyline's current summary + its events since the last consolidation."""
     try:
+        # Meta-annotation exclusion (2026-08-31): QA notes appended to
+        # storyline_events ("Fresh-check could NOT be confirmed", sourcing
+        # notes) were filtered on the API timeline but flowed into dossier
+        # consolidation prompts here as if they were narrative events.
+        from app.core.storylines import EVENT_META_EXCL_SQL
         s = db.fetchone("SELECT title, summary FROM storylines WHERE id = ?", (storyline_id,))
         if since:
             evs = db.fetchall(
                 "SELECT summary, created_at FROM storyline_events "
-                "WHERE storyline_id = ? AND created_at > ? ORDER BY created_at LIMIT 40",
+                f"WHERE storyline_id = ? AND created_at > ? {EVENT_META_EXCL_SQL} "
+                "ORDER BY created_at LIMIT 40",
                 (storyline_id, since),
             )
         else:
             evs = db.fetchall(
                 "SELECT summary, created_at FROM storyline_events "
-                "WHERE storyline_id = ? ORDER BY created_at LIMIT 60",
+                f"WHERE storyline_id = ? {EVENT_META_EXCL_SQL} "
+                "ORDER BY created_at LIMIT 60",
                 (storyline_id,),
             )
     except Exception:
@@ -855,7 +884,7 @@ async def consolidate_dossiers(db) -> str:
             # MAX_CURIOSITY_ATTEMPTS, but never pins critical_curiosity>0.
             await asyncio.to_thread(
                 CuriosityQueue(db).add,
-                f"Resolve contradiction: {tensions[0][:180]}",
+                f"Resolve contradiction: {_wtrim(tensions[0], 180)}",
                 "dossier_tension", 0.5)
     except Exception as e:
         logger.debug("[Knowing] tension scan failed: %s", e)

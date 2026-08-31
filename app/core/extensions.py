@@ -37,6 +37,10 @@ EXTENSIONS_PACKAGE = "app.extensions"
 
 
 _loaded_modules: dict[str, object] = {}
+# Strong refs for fire-and-forget async register() tasks (2026-08-31) — see
+# the create_task site: asyncio holds only weak refs, so unreferenced tasks
+# can be garbage-collected mid-flight.
+_bg_register_tasks: set = set()
 _load_errors: dict[str, str] = {}
 
 
@@ -88,10 +92,22 @@ def _import_one(path: Path, services) -> tuple[str, bool, str]:
             import asyncio
             if asyncio.iscoroutine(result):
                 # Best effort: schedule but don't block. Most register fns
-                # should be sync.
+                # should be sync. Hold a strong reference + log-on-failure
+                # (2026-08-31): asyncio keeps only a WEAK ref to tasks, so
+                # the bare create_task could be GC'd mid-flight, and an
+                # exception inside an extension's async register() died as
+                # an unretrieved-task error at GC time — invisibly.
                 try:
                     loop = asyncio.get_event_loop()
-                    loop.create_task(result)
+                    task = loop.create_task(result)
+                    _bg_register_tasks.add(task)
+
+                    def _done(t: asyncio.Task, _name=name) -> None:
+                        _bg_register_tasks.discard(t)
+                        if not t.cancelled() and t.exception() is not None:
+                            logger.warning("extension %r async register() failed: %s",
+                                           _name, t.exception())
+                    task.add_done_callback(_done)
                 except Exception:
                     pass
         except Exception as e:

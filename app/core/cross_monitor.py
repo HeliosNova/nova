@@ -468,10 +468,15 @@ async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
     # cut — while the fix for exactly that bug sat ONE FUNCTION below
     # (_preview, built 2026-08-15 after a cross-monitor preview shipped
     # "…Leinweber Foundat…") and was never applied here. max_tokens=320 above
-    # generates ~1200-1500 chars, so the cap bit MOST outputs: 299 stored
-    # digest inserts measured ending mid-word at exactly length 1200. Prefer
-    # the last sentence boundary in the tail; fall back to the last whole
-    # word + ellipsis.
+    # generates ~1200-1500 chars, so the cap bit MOST outputs.
+    # ATTRIBUTION CORRECTION (later the same night): the "299 stored inserts
+    # at exactly length 1200" cluster first blamed on this cap was shape-
+    # tested at 515/515 skeletal-heading lines — those rows belong to
+    # heartbeat_loop._skeletal_digest (demoted retention), which had the SAME
+    # hard cut and is now fixed identically. This site's own cut victims
+    # never persisted (synthesis text goes to the KG, truncated in-flight).
+    # Prefer the last sentence boundary in the tail; fall back to the last
+    # whole word + ellipsis.
     if len(text) <= 1200:
         return text
     cut = text[:1200]

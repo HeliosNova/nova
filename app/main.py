@@ -758,6 +758,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
 app.add_middleware(RateLimitMiddleware, max_requests=config.RATE_LIMIT_RPM, window_seconds=60)
 
 
+_activity_write_tasks: set = set()  # strong refs — see UserActivityMiddleware
+
+
 class UserActivityMiddleware(BaseHTTPMiddleware):
     """Track last user activity for idle detection (dream mode trigger)."""
 
@@ -771,11 +774,23 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
                 if svc.monitor_store:
                     ts = datetime.now(timezone.utc).isoformat()
                     db = svc.monitor_store._db
-                    asyncio.create_task(asyncio.to_thread(
+                    # Strong ref + log-on-failure (2026-08-31): the bare
+                    # create_task on EVERY chat/voice/actions request held no
+                    # reference (GC could collect the task mid-write) and a
+                    # failed INSERT died silently — idle detection would
+                    # quietly stop seeing user activity.
+                    _t = asyncio.create_task(asyncio.to_thread(
                         db.execute,
                         "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, datetime('now'))",
                         ("last_user_activity", ts),
                     ))
+                    _activity_write_tasks.add(_t)
+
+                    def _done(t: asyncio.Task) -> None:
+                        _activity_write_tasks.discard(t)
+                        if not t.cancelled() and t.exception() is not None:
+                            logger.warning("User activity write failed: %s", t.exception())
+                    _t.add_done_callback(_done)
             except Exception as e:
                 logger.warning("User activity tracking failed: %s", e)
         return await call_next(request)

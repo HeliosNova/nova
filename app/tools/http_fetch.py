@@ -475,9 +475,32 @@ class HttpFetchTool(BaseTool):
                     error_category=_cat,
                 )
 
-            # Extract readable text from HTML (strip scripts, styles, tags)
+            # Binary guard (2026-08-31): PDFs and other binary bodies decoded
+            # via resp.text are mojibake, not content — 38 action_log rows
+            # show raw '%PDF-1.4' byte soup returned as tool output and fed
+            # to the model (SkyLance spec-sheet fetches, Aug 1–26). Refuse
+            # cleanly so the model tries another source instead of "reading"
+            # garbage.
             content_type = resp.headers.get("content-type", "")
-            if "html" in content_type.lower():
+            _ct = content_type.lower()
+            _is_binary = (
+                any(b in _ct for b in ("application/pdf", "application/octet-stream",
+                                        "application/zip", "image/", "audio/", "video/",
+                                        "application/msword", "officedocument"))
+                or text.lstrip()[:5] in ("%PDF-",)
+            )
+            if _is_binary:
+                return ToolResult(
+                    output="",
+                    success=False,
+                    error=(f"Binary content ({content_type or 'unknown type'}, "
+                           f"{len(text)} chars) — cannot render as text. "
+                           "Try an HTML source for this document."),
+                    error_category=ErrorCategory.VALIDATION,
+                )
+
+            # Extract readable text from HTML (strip scripts, styles, tags)
+            if "html" in _ct:
                 text = _extract_readable_text(text)
 
             if config.ENABLE_INJECTION_DETECTION:

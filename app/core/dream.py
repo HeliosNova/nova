@@ -401,6 +401,24 @@ class DreamConsolidator:
                 f"DELETE FROM reflexions WHERE id IN ({placeholders})", tuple(ids)
             )
             result.reflexions_pruned = len(ids)
+            # Vector cleanup (2026-08-31): this was the ONE reflexion delete
+            # path that skipped ChromaDB — ReflexionStore.prune (line ~1139)
+            # calls _remove_from_vector, this daily NREM prune did not, so
+            # every cycle minted ghost vectors (measured: 192 vectors for 138
+            # rows — 54 ghosts crowding semantic retrieval's top-k).
+            try:
+                from app.core.reflexion import ReflexionStore
+                store = None
+                try:
+                    from app.core.brain import get_services
+                    store = get_services().reflexions
+                except Exception:
+                    pass
+                if store is None:
+                    store = ReflexionStore(self._db)
+                await asyncio.to_thread(store._remove_from_vector, ids)
+            except Exception as e:
+                logger.warning("[Dream] Reflexion prune vector cleanup failed: %s", e)
         except Exception as e:
             result.errors.append(f"reflexion prune: {e}")
             logger.warning("[Dream] Reflexion prune failed: %s", e)

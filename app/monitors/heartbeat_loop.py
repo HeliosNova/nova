@@ -259,14 +259,29 @@ def _curate_inverted_leads(db) -> int:
 def _skeletal_digest(text: str, cap: int = 1200) -> str:
     """Deterministic skeleton of a digest for demoted retention: headings and
     bolded lead lines only — the structure and headline claims survive, the
-    prose body (already consolidated into dossiers by now) is released."""
+    prose body (already consolidated into dossiers by now) is released.
+
+    Whole-word bound (2026-08-31): the cap was a hard `out[:cap]` mid-word cut.
+    All 515 stored length==1200 monitor_results rows (Jul 14-24 cohort) are
+    THIS function's output — shape-tested 515/515 skeletal-heading lines, i.e.
+    the cluster earlier attributed to cross_monitor's text[:1200] actually
+    came from here, and every future demotion pass would have kept re-biting.
+    Prefer the last sentence boundary in the tail; fall back to the last
+    whole word + ellipsis (same policy as cross_monitor._synthesize)."""
     keep = []
     for ln in (text or "").split("\n"):
         s = ln.strip()
         if s.startswith("#") or s.startswith(("* **", "- **", "**")):
             keep.append(s)
-    out = "\n".join(keep) or (text or "")[:cap]
-    return out[:cap]
+    out = "\n".join(keep) or (text or "")
+    if len(out) <= cap:
+        return out
+    cut = out[:cap]
+    tail = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if tail >= int(cap * 0.83):
+        return cut[:tail + 1]
+    ws = cut.rfind(" ")
+    return (cut[:ws].rstrip() + "…") if ws > 0 else cut
 
 # ---------------------------------------------------------------------------
 # Deliberation scrubber — strip untagged model deliberation from monitor output
