@@ -800,6 +800,38 @@ class EvalHarness:
             except Exception as e:
                 logger.warning("[EvalHarness] Skill seed failed for %r: %s", seed["name"], e)
 
+    def _cleanup_seeded_documents(self) -> None:
+        """Delete every seeded eval-seed-* document from the live store.
+
+        The 2026-08-12 stable-id fix stopped the seeds ACCUMULATING (46 dup
+        docs at its worst) but nothing ever removed them, so the persistent
+        document store's ONLY content was eval fixtures — real-chat document
+        retrieval searched over nothing but test material (measured
+        2026-08-31: 3 of 3 documents were source='eval-seed'). Mirrors
+        _cleanup_seeded_skills: retriever.delete_document() removes the row,
+        its chunks_fts entries AND its chroma vectors — a raw row delete
+        leaves orphan chunks that knowledge_search still serves (one such
+        orphan was observed injecting a CONTENT-WARNING banner into live
+        search results). The eval-seed- id prefix is the seeding convention,
+        so the sweep also collects leftovers from interrupted runs.
+        """
+        try:
+            from app.core.retriever import Retriever
+            retriever = Retriever()
+            rows = retriever._db.fetchall(
+                "SELECT id FROM documents WHERE id LIKE 'eval-seed-%' "
+                "OR source IN ('eval-seed', 'eval')"
+            )
+            for row in rows:
+                retriever.delete_document(str(row["id"]))
+            if rows:
+                logger.info(
+                    "[EvalHarness] cleaned up %d seeded eval document(s)",
+                    len(rows),
+                )
+        except Exception as e:
+            logger.warning("[EvalHarness] eval document cleanup skipped: %s", e)
+
     def _cleanup_seeded_skills(self) -> None:
         """Delete every seeded "Eval: *" skill from the live store.
 
@@ -1553,6 +1585,7 @@ class EvalHarness:
             # normal completion AND cancellation (client disconnect cancels
             # the /api/eval/run task).
             self._cleanup_seeded_skills()
+            self._cleanup_seeded_documents()
 
         duration = time.monotonic() - start_ts
         passed = sum(1 for r in task_results if r.passed)

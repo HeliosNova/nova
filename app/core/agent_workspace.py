@@ -173,6 +173,14 @@ def save_workspace(
     sig = query_signature(query)
     if not sig:
         return None
+    # Synthetic-traffic gate (2026-08-31): workspaces persist across restarts
+    # and prime future runs of "the same" query — and eval fixtures were
+    # accumulating scratchpads (measured live: workspaces for the fictional
+    # Aurora-7 plant and a "codename prometheus-9" probe).
+    # think(ephemeral=True) promises "stays out of every persistent store".
+    from app.tools.base import EPHEMERAL_REQUEST
+    if EPHEMERAL_REQUEST.get():
+        return None
 
     _ensure_failed_approaches_column(db)
     findings_json = json.dumps({k: str(v)[:600] for k, v in (findings or {}).items()})
