@@ -464,7 +464,22 @@ async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
         if "no underlying" in low:
             return text
         return ""
-    return text[:1200]
+    # Whole-word bound (2026-08-31). This was `text[:1200]` — a hard mid-word
+    # cut — while the fix for exactly that bug sat ONE FUNCTION below
+    # (_preview, built 2026-08-15 after a cross-monitor preview shipped
+    # "…Leinweber Foundat…") and was never applied here. max_tokens=320 above
+    # generates ~1200-1500 chars, so the cap bit MOST outputs: 299 stored
+    # digest inserts measured ending mid-word at exactly length 1200. Prefer
+    # the last sentence boundary in the tail; fall back to the last whole
+    # word + ellipsis.
+    if len(text) <= 1200:
+        return text
+    cut = text[:1200]
+    tail = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if tail >= 1000:
+        return cut[:tail + 1]
+    ws = cut.rfind(" ")
+    return (cut[:ws].rstrip() + "…") if ws > 0 else cut
 
 
 def _preview(text: str, cap: int = 280) -> str:
