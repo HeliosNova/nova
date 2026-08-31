@@ -651,6 +651,14 @@ class ReflexionStore:
             ("times_injected", "INTEGER DEFAULT 0"),
             ("quality_when_used_sum", "REAL DEFAULT 0.0"),
             ("quality_when_used_count", "INTEGER DEFAULT 0"),
+            # Consumed-mark for REM promotion (2026-08-31). dream's gather
+            # query was COMMENTED "reflexions never promoted to lessons" but
+            # enforced it nowhere — the same top reflexions re-promoted every
+            # cycle whenever lesson-dedup missed. Reflexion #7 ("who painted
+            # the Mona Lisa?", 2026-06-20, q=0.95) seeded the art-history
+            # lesson family on June 20 and was STILL re-minting it on
+            # August 31 — the taproot of the 17-member churn family.
+            ("promoted_at", "TEXT"),
         ]:
             try:
                 self._db.execute(f"ALTER TABLE reflexions ADD COLUMN {col} {typedef}")

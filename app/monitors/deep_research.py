@@ -1361,6 +1361,51 @@ _NO_CONTENT_RE = re.compile(
     re.IGNORECASE)
 
 
+# A line that ends cleanly: sentence punctuation, optionally followed by a
+# closing quote/bracket/citation paren, OR a self-contained short label line.
+_CLEAN_TAIL_RE = re.compile(r"""[.!?…][)"'”’\]]*\s*$""")
+
+
+def _trim_dangling_tail(text: str) -> str:
+    """Drop a final line that was cut mid-sentence by the max_tokens cap.
+
+    Only the LAST line is ever considered (bullet lists keep every complete
+    bullet), and only when it plainly lacks a sentence boundary. If trimming
+    would gut the text, the original is returned — downstream gates decide."""
+    if not text:
+        return text
+    lines = text.rstrip().split("\n")
+    last = lines[-1].strip()
+    if not last or _CLEAN_TAIL_RE.search(last):
+        return text
+    # numeric/label endings like "…up 34%" or "…$1.2B" are complete thoughts
+    # magnitude suffixes count: "$1.2B)" / "40M" are complete numeric tails
+    if re.search(r'[%\d][KMBTkmbt]?[)"”’\]]*\s*$', last):
+        return text
+    trimmed = "\n".join(lines[:-1]).rstrip()
+    if len(trimmed) >= 40:
+        return trimmed
+    # Single-line (or nearly) text cut mid-word: dropping the whole line would
+    # gut it, but the line may still contain complete sentences — keep those.
+    # "TSMC confirmed the expansion. Construction begins in Octo" ->
+    # "TSMC confirmed the expansion."
+    # a sentence ender must precede whitespace/end — "." inside "$1.2" is a
+    # decimal point, not a boundary (it mangled "$1.2B)" to "$1." before)
+    m = list(re.finditer(r"""[.!?…][)"'”’\]]*(?=\s|$)""", last))
+    if m:
+        intra = last[:m[-1].end()].rstrip()
+        rebuilt = "\n".join(lines[:-1] + [intra]).strip()
+        # Floor is LOWER here than the caller's 40-char gate on purpose:
+        # the trimmer's job is to return clean sentences; the caller's gate
+        # then decides whether what remains is substantial enough to keep.
+        # A repaired-but-thin result gets dropped THERE — which is the right
+        # outcome for a finding reduced to six words — whereas returning the
+        # raw fragment would put a mid-sentence tail into the evidence pool.
+        if len(rebuilt) >= 20:
+            return rebuilt
+    return text
+
+
 async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
     async def _one(title, url, body):
         try:
@@ -1380,6 +1425,15 @@ async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
                 # 08-14 defect from the prompt side.
                 max_tokens=512, temperature=0.2, num_ctx=8192)
             f = (f or "").strip()
+            # Dangling-fragment repair (2026-08-31). The cap history here is
+            # 240 -> 320 -> 512 and the tripwire STILL catches an occasional
+            # cut (eval == max_tokens, mid-generation) — raising the cap
+            # shrinks the tail but never kills it, and a mid-sentence fragment
+            # lands in the EVIDENCE POOL where synthesis may quote it. Repair
+            # deterministically instead of raising again: if the last line
+            # does not end at a sentence/citation boundary, drop that line.
+            # Same philosophy as the digest-side _bound_and_clean repair.
+            f = _trim_dangling_tail(f)
             # Drop empties, relevance-rejects, and "the page has no real content"
             # outputs (nav/boilerplate pages that slipped the body gate) — these
             # otherwise pollute the evidence with non-findings.

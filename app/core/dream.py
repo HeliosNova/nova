@@ -184,6 +184,15 @@ class DreamConsolidator:
             "SELECT id, task_summary, outcome, reflection, quality_score "
             "FROM reflexions WHERE quality_score >= 0.9 AND outcome = 'success' "
             "AND COALESCE(is_eval, 0) = 0 "
+            # "never promoted" is now ENFORCED, not just described
+            # (2026-08-31). The comment above promised it; the query never
+            # filtered for it, so the same top reflexions re-promoted every
+            # cycle whenever lesson-dedup missed. Reflexion #7 ("who painted
+            # the Mona Lisa?", 2026-06-20, q=0.95) seeded the art-history
+            # lesson family on June 20 and was STILL re-minting it on
+            # August 31, hours after a manual family merge — the taproot of
+            # the 17-member churn family.
+            "AND promoted_at IS NULL "
             "ORDER BY quality_score DESC LIMIT 20"
         )
         signals.high_quality_unpromoted = [dict(r) for r in rows]
@@ -560,15 +569,35 @@ class DreamConsolidator:
                     # fans out into _find_similar_lesson (SELECT), a dedup-metrics
                     # INSERT and an UPDATE on lessons — all landing on the
                     # event-loop thread from this async caller.
+                    #
+                    # lesson_text carries the LESSON, not provenance
+                    # (2026-08-31). It used to say "Promoted from success
+                    # reflexion (quality=X)" — the provenance-as-content
+                    # defect class (same as the 08-26 quiz-side fix), which
+                    # ALSO blinded lesson dedup: every promoted lesson's text
+                    # was near-identical boilerplate, so family duplicates
+                    # scored jaccard ~0 against the real members and sailed
+                    # through (dedup_decisions logged 0.0 for tonight's
+                    # re-mints). Provenance lives in `context`.
                     await asyncio.to_thread(
                         svc.learning.add_knowledge_lesson,
                         topic=topic,
                         correct_answer=lesson,
-                        lesson_text=f"Promoted from success reflexion (quality={ref['quality_score']})",
+                        lesson_text=(
+                            f"{lesson} (learned from a successful approach "
+                            f"to: {task_summary[:140]})"),
                         context="dream_consolidation",
                         confidence=0.7,
                     )
                     result.reflexions_promoted += 1
+                # Mark the source CONSUMED whether or not the lesson survived
+                # dedup — a dedup-merge still means this experience is
+                # represented, and an unmarked source re-promotes forever
+                # (reflexion #7 did exactly that, June 20 -> August 31).
+                # LLM failures above skip this and retry next cycle.
+                await self._db.execute(
+                    "UPDATE reflexions SET promoted_at = datetime('now') "
+                    "WHERE id = ?", (ref["id"],))
             except Exception as e:
                 result.errors.append(f"promote reflexion: {e}")
                 logger.warning("[Dream] Reflexion promotion failed: %s", e)
