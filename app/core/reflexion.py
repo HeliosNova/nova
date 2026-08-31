@@ -949,7 +949,7 @@ class ReflexionStore:
                 (float(quality_score), *injected_ids),
             )
         except Exception as e:
-            logger.debug("record_post_quality_for_injected failed: %s", e)
+            logger.warning("record_post_quality_for_injected failed — the credit-assignment counter (quality_when_used_*) silently stops accruing and useless-pattern detection starves: %s", e)
 
     def get_useless_success_patterns(self, min_uses: int = 5,
                                        max_avg_quality: float = 0.5) -> list[int]:

@@ -690,8 +690,20 @@ class Config:
             # Only load overrides for mutable fields (security: prevent persisted security bypasses)
             filtered = {k: v for k, v in overrides.items() if k in _MUTABLE_FIELDS}
             self.update(**filtered)
-        except (json.JSONDecodeError, OSError):
-            pass
+        except (json.JSONDecodeError, OSError) as e:
+            # LOUD, not silent (2026-08-30 silent-error sweep). A corrupt
+            # overrides file used to be swallowed entirely, which means Nova
+            # boots on DEFAULTS: MONITOR_SYNTHESIS_MODEL silently falls back
+            # 27B -> 9B and ENABLE_MINICHECK reverts — the documented
+            # override-gotcha class (a stale LLM_MODEL once 404'd every
+            # generation for days), in its invisible variant. Still boots —
+            # a broken file must not brick startup — but says so at ERROR.
+            import logging
+            logging.getLogger(__name__).error(
+                "config_overrides.json UNREADABLE (%s: %s) — RUNNING ON "
+                "DEFAULTS. Live overrides (synthesis model, minicheck, "
+                "thinking) are NOT applied. Fix or delete %s.",
+                type(e).__name__, e, path)
 
     def validate(self) -> list[str]:
         """Validate config values. Returns list of warning messages (empty = valid)."""

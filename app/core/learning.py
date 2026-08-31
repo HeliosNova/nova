@@ -565,7 +565,7 @@ class LearningEngine:
             from app.monitors.event_trigger import emit_event
             emit_event("internal:lesson_saved", {"lesson_id": lesson_id, "topic": topic})
         except Exception as e:
-            logger.debug("emit_event(lesson_saved) failed: %s", e)
+            logger.warning("emit_event(lesson_saved) failed — event-triggered monitors will not see this lesson: %s", e)
 
         return lesson_id
 

@@ -1025,7 +1025,7 @@ async def _gather_context(
                     )
                     logger.info("[kg-communities] injected %d theme summaries for global query", len(_comms))
         except Exception as e:
-            logger.debug("[kg-communities] global-query route failed: %s", e)
+            logger.warning("[kg-communities] global-query route failed — context arm LOST for this chat: %s", e)
 
     # --- Storyline state (interrogable worldmodel) ---
     # Make tracked monitor THREADS queryable in chat: "where does the Iran
@@ -1049,7 +1049,7 @@ async def _gather_context(
                 )
                 logger.info("[storylines] injected %d tracked thread(s) into context", len(_stories))
         except Exception as e:
-            logger.debug("[storylines] chat retrieval failed: %s", e)
+            logger.warning("[storylines] chat retrieval failed — context arm LOST for this chat: %s", e)
 
     # --- Standing dossiers (the knowing tier, 2026-08-12) ---
     # Questions get answered FROM Nova's accumulated understanding: the matched
@@ -1074,7 +1074,7 @@ async def _gather_context(
                 )
                 logger.info("[dossiers] injected %d dossier(s) into context", len(_dossiers))
         except Exception as e:
-            logger.debug("[dossiers] chat retrieval failed: %s", e)
+            logger.warning("[dossiers] chat retrieval failed — context arm LOST for this chat: %s", e)
 
     # --- Self-state snapshot (2026-08-19) ---
     # Chat denied having active forecasts while 210 sat open with a 15-2
@@ -1100,7 +1100,7 @@ async def _gather_context(
                 )
                 logger.info("[self-state] injected system snapshot into context")
         except Exception as e:
-            logger.debug("[self-state] snapshot failed: %s", e)
+            logger.warning("[self-state] snapshot failed — context arm LOST for this chat: %s", e)
 
     # --- Reflexions (past failure warnings) ---
     if svc.reflexions:

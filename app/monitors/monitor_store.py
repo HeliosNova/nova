@@ -355,7 +355,15 @@ class MonitorStore:
         for row in rows:
             try:
                 patterns = json.loads(row["trigger_events"]) if row["trigger_events"] else []
-            except (json.JSONDecodeError, TypeError):
+            except (json.JSONDecodeError, TypeError) as e:
+                # Loud, not silent (2026-08-30 silent-error sweep): a corrupt
+                # trigger_events blob means this event-triggered monitor NEVER
+                # fires — the "monitor quietly dead" class. Name it so it is
+                # fixable; keep matching the others.
+                logger.warning(
+                    "Monitor #%s (%s): trigger_events unparseable (%s) — "
+                    "its event triggers are DEAD until the JSON is fixed",
+                    row["id"], row["name"], e)
                 continue
             if any(self._event_matches(event_type, p) for p in patterns):
                 matched.append(self._row_to_monitor(row))
