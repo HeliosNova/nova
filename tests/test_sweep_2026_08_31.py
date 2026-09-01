@@ -317,33 +317,45 @@ class TestScaffoldQueryGuard:
 # ── F8: anchored-due ranking floor in get_due ───────────────────────────────
 
 class TestAnchoredDueFloor:
-    def _seed(self, db):
+    FMT = "%Y-%m-%d %H:%M:%S"
+
+    def _fix_local(self, monkeypatch, hour):
+        """Pin MonitorStore's local clock and return the pinned datetime.
+
+        All anchored-monitor seeds must be derived FROM this pin: a
+        real-clock '30h ago' seed straddles one extra calendar date once the
+        suite runs past UTC midnight (flaked live 2026-08-31 -> 09-01)."""
+        from app.monitors.monitor_store import MonitorStore
+        fixed = datetime.now(timezone.utc).replace(
+            hour=hour, minute=0, second=0, microsecond=0)
+        monkeypatch.setattr(MonitorStore, "_local_now", staticmethod(lambda: fixed))
+        return fixed
+
+    def _seed(self, db, fixed, *, anchored_days_behind=1):
         from app.monitors.monitor_store import MonitorStore
         store = MonitorStore(db)
         a_id = store.create("Morning Check-in", "query", {"anchor_hour": 7},
                             schedule_seconds=86400)
         r_id = store.create("Hourly Digest", "search", {"query": "news"},
                             schedule_seconds=3600)
-        now = datetime.now(timezone.utc)
-        fmt = "%Y-%m-%d %H:%M:%S"
+        # Anchored: last ran N local days before the PINNED date (deterministic
+        # date diff regardless of when the suite runs).
+        a_last = (fixed - timedelta(days=anchored_days_behind)).replace(hour=14)
         db.execute("UPDATE monitors SET last_check_at = ? WHERE id = ?",
-                   ((now - timedelta(hours=30)).strftime(fmt), a_id))
+                   (a_last.strftime(self.FMT), a_id))
+        # Rival: genuinely backlogged at ratio 2.5 against the REAL clock
+        # (raw ratios use datetime.now, not the pinned local clock).
+        r_last = datetime.now(timezone.utc) - timedelta(hours=2, minutes=30)
         db.execute("UPDATE monitors SET last_check_at = ? WHERE id = ?",
-                   ((now - timedelta(hours=2, minutes=30)).strftime(fmt), r_id))
+                   (r_last.strftime(self.FMT), r_id))
         return store, a_id, r_id
-
-    def _fix_local(self, monkeypatch, hour):
-        from app.monitors.monitor_store import MonitorStore
-        fixed = datetime.now(timezone.utc).replace(
-            hour=hour, minute=0, second=0, microsecond=0)
-        monkeypatch.setattr(MonitorStore, "_local_now", staticmethod(lambda: fixed))
 
     def test_late_day_anchored_outranks_backlog(self, db, monkeypatch):
         """Aug 29/30 defect: due anchored daily at raw ratio ~0.55 sat behind
         31 monitors at ratio ≥2 and never ran. By evening the floor
         (1 + hours-past-anchor/6) must beat a ratio-2.5 digest."""
-        store, a_id, r_id = self._seed(db)
-        self._fix_local(monkeypatch, 19)  # 12h past anchor → floor 3.0
+        fixed = self._fix_local(monkeypatch, 19)  # 12h past anchor → floor 3.0
+        store, a_id, r_id = self._seed(db, fixed)
         due = store.get_due()
         ids = [m.id for m in due]
         assert ids.index(a_id) < ids.index(r_id)
@@ -351,12 +363,24 @@ class TestAnchoredDueFloor:
     def test_early_day_anchored_does_not_jump_queue(self, db, monkeypatch):
         """Both directions: shortly after the anchor the floor is small — a
         genuinely backlogged monitor still goes first."""
-        store, a_id, r_id = self._seed(db)
-        self._fix_local(monkeypatch, 9)  # 2h past anchor → floor ~1.33
+        fixed = self._fix_local(monkeypatch, 9)  # 2h past anchor → floor ~1.33
+        store, a_id, r_id = self._seed(db, fixed)
         due = store.get_due()
         ids = [m.id for m in due]
         assert a_id in ids, "anchored monitor must still be due"
         assert ids.index(r_id) < ids.index(a_id)
+
+    def test_missed_full_day_jumps_queue_even_at_dawn(self, db, monkeypatch):
+        """Live-observed 2026-08-31 16:58: on the post-outage day the /6
+        floor (2.66) still lost to a 3-8x backlog — a THIRD consecutive
+        missed day. An anchored daily ≥2 local days behind sorts with the
+        never-run tier: max one missed day, ever."""
+        fixed = self._fix_local(monkeypatch, 8)  # just past anchor, floor ~1.17
+        store, a_id, r_id = self._seed(db, fixed, anchored_days_behind=2)
+        due = store.get_due()
+        ids = [m.id for m in due]
+        assert ids.index(a_id) < ids.index(r_id), \
+            "a day-missed anchored daily must outrank any backlogged digest"
 
 
 # ── F10: NREM reflexion prune cleans chroma ─────────────────────────────────

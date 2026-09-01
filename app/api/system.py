@@ -568,7 +568,9 @@ async def delete_custom_tool(name: str):
     svc = get_services()
     if not svc.custom_tools:
         raise HTTPException(404, "Custom tools not enabled")
-    deleted = svc.custom_tools.delete_tool(name)
+    # to_thread (2026-08-31): sync DELETE on the loop (custom_tools.py:463
+    # tripwire).
+    deleted = await asyncio.to_thread(svc.custom_tools.delete_tool, name)
     if not deleted:
         raise HTTPException(404, f"Tool '{name}' not found")
     # Unregister from live registry

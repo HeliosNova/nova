@@ -860,7 +860,10 @@ class AgentLoop:
                 if not k.startswith("prior:")
             }
             if save_findings or answer:
-                save_workspace(
+                # to_thread (2026-08-31): sync SELECT+UPSERT on the loop
+                # (agent_workspace.py:224 tripwire).
+                await asyncio.to_thread(
+                    save_workspace,
                     get_db(),
                     query=query,
                     findings=save_findings,
@@ -907,6 +910,13 @@ class AgentLoop:
         if (result.query or "").lstrip().startswith("==="):
             return
 
+        # Off-loop (2026-08-31): the three collectors below are sync DB writes
+        # and this coroutine runs on the event loop — each INSERT serialized on
+        # the writer lock from the loop thread (the 2026-06-11 lock-convoy
+        # class; _warn_if_event_loop flagged agent_loop.py:900/920/926 live).
+        await asyncio.to_thread(self._learn_from_run_sync, result)
+
+    def _learn_from_run_sync(self, result: AgentResult) -> None:
         from app.database import get_db
         db = get_db()
         completed = [s for s in result.plan.steps if s.status == STEP_DONE]

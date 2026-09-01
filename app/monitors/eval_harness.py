@@ -1084,7 +1084,9 @@ class EvalHarness:
             except Exception as e:
                 logger.warning("[EvalHarness] dossier cleanup failed for %s: %s", task.id, e)
 
-        _clean()  # defensive pre-clean
+        # to_thread (2026-08-31): _clean's DELETE is sync and this coroutine
+        # runs on the loop (eval_harness dossier tripwires).
+        await asyncio.to_thread(_clean)  # defensive pre-clean
 
         try:
             # 1. BEFORE — dossier absent
@@ -1094,7 +1096,8 @@ class EvalHarness:
 
             # 2. SEED the dossier
             try:
-                db.execute(
+                await asyncio.to_thread(
+                    db.execute,
                     "INSERT INTO dossiers (kind, dkey, title, body, changed_note, update_count) "
                     "VALUES ('domain', ?, ?, ?, 'eval seed', 1)",
                     (dkey, title, body),
@@ -1107,7 +1110,7 @@ class EvalHarness:
             after_failed = self._evaluate_assertions(task.assertions, after)
             after_correct = bool(after.response_text) and not after_failed
         finally:
-            _clean()
+            await asyncio.to_thread(_clean)
 
         latency = time.monotonic() - start
 
@@ -1200,14 +1203,18 @@ class EvalHarness:
                     # (reads don't filter it), but excluded from dream's
                     # lesson promotion and the training-signal export — this
                     # write was the last unmarked eval-traffic side door.
-                    svc.reflexions.store(
-                        task_summary=task.query[:500],
-                        outcome="failure",
-                        reflection=f"[eval-harness:{task.id}] {reason}",
-                        quality_score=inv.reflexion_score if inv.reflexion_score is not None else 0.3,
-                        tools_used=inv.tools_invoked,
-                        revision_count=0,
-                        is_eval=True,
+                    # to_thread (2026-08-31): sync INSERT + vector upsert on
+                    # the loop (reflexion.py store tripwire).
+                    await asyncio.to_thread(
+                        lambda: svc.reflexions.store(
+                            task_summary=task.query[:500],
+                            outcome="failure",
+                            reflection=f"[eval-harness:{task.id}] {reason}",
+                            quality_score=inv.reflexion_score if inv.reflexion_score is not None else 0.3,
+                            tools_used=inv.tools_invoked,
+                            revision_count=0,
+                            is_eval=True,
+                        )
                     )
             except Exception as _e:
                 logger.debug("[EvalHarness] failure-reflexion write skipped: %s", _e)
@@ -1261,8 +1268,9 @@ class EvalHarness:
                 error="setup_error",
             )
 
-        # Defensive: clear any leftover eval lesson for this task id
-        self._purge_eval_lessons(learning, marker)
+        # Defensive: clear any leftover eval lesson for this task id.
+        # to_thread (2026-08-31): sync DELETE + vector cleanup on the loop.
+        await asyncio.to_thread(self._purge_eval_lessons, learning, marker)
 
         try:
             # 1. BEFORE — lesson absent
@@ -1294,7 +1302,7 @@ class EvalHarness:
             # 4. CLEANUP — in finally so a cancelled run (client disconnect
             # cancels the /api/eval/run task) can't leave the seeded lesson
             # live in the store.
-            self._purge_eval_lessons(learning, marker)
+            await asyncio.to_thread(self._purge_eval_lessons, learning, marker)
 
         latency = time.monotonic() - start
 
@@ -1551,8 +1559,10 @@ class EvalHarness:
 
         logger.info("[EvalHarness] Starting eval run %s — %d tasks", run_id, len(tasks))
 
-        # Seed eval skills and documents into live stores before testing
-        self._seed_skills(tasks)
+        # Seed eval skills and documents into live stores before testing.
+        # to_thread (2026-08-31): _seed_skills does create_skill INSERTs +
+        # vector upserts, sync, from this async runner (skills tripwire).
+        await asyncio.to_thread(self._seed_skills, tasks)
         await self._seed_documents(tasks)
 
         # Run tasks sequentially to avoid confounding latency metrics
@@ -1584,7 +1594,7 @@ class EvalHarness:
             # 2026-07-07 with "Eval: Crypto Price Probe"). finally covers both
             # normal completion AND cancellation (client disconnect cancels
             # the /api/eval/run task).
-            self._cleanup_seeded_skills()
+            await asyncio.to_thread(self._cleanup_seeded_skills)
             self._cleanup_seeded_documents()
 
         duration = time.monotonic() - start_ts

@@ -1164,7 +1164,9 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
     if not store:
         return False
 
-    similar = store.find_recurring_failures(task_summary)
+    # to_thread (2026-08-31): sync cluster scan (DB + vector reads) called
+    # from this async path ran on the event loop (reflexion tripwire class).
+    similar = await asyncio.to_thread(store.find_recurring_failures, task_summary)
     if not similar:
         return False
 
@@ -1201,7 +1203,8 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
         # paraphrase). A recent same-topic lesson means the cluster is
         # already taught; REINFORCE it (retrieval rank + confidence) instead
         # of minting a sibling that competes with it.
-        recent = learning_engine._db.fetchone(
+        recent = await asyncio.to_thread(
+            learning_engine._db.fetchone,
             "SELECT id FROM lessons WHERE topic = ? COLLATE NOCASE "
             "AND created_at >= datetime('now', '-7 days') LIMIT 1",
             (topic,),
@@ -1219,7 +1222,10 @@ async def check_recurring_failures(task_summary: str, learning_engine, store=Non
             # pool by `times_helpful DESC`, and mark_lesson_helpful scales its
             # confidence boost by 1/(1+times_helpful), so a padded count both
             # promotes the lesson and shrinks its future real boosts.
-            learning_engine._db.execute(
+            # to_thread (2026-08-31): sync UPDATE on the loop (reflexion
+            # confidence-reinforce tripwire).
+            await asyncio.to_thread(
+                learning_engine._db.execute,
                 "UPDATE lessons SET confidence = MIN(0.95, confidence + 0.05) "
                 "WHERE id = ?",
                 (recent["id"],),

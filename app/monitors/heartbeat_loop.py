@@ -1674,11 +1674,15 @@ class HeartbeatLoop:
 
         if svc.reflexions:
             try:
-                svc.reflexions.store(
-                    task_summary=f"Quiz on '{lesson.topic}': {question[:100]}",
-                    outcome="failure",
-                    reflection=f"Answered incorrectly. Expected: {lesson.correct_answer[:200]}. Got: {answer[:200]}. Reason: {fail_reason}",
-                    quality_score=0.2,
+                # to_thread (2026-08-31): sync INSERT + vector upsert on the
+                # loop (reflexion.py store tripwire).
+                await asyncio.to_thread(
+                    lambda: svc.reflexions.store(
+                        task_summary=f"Quiz on '{lesson.topic}': {question[:100]}",
+                        outcome="failure",
+                        reflection=f"Answered incorrectly. Expected: {lesson.correct_answer[:200]}. Got: {answer[:200]}. Reason: {fail_reason}",
+                        quality_score=0.2,
+                    )
                 )
             except Exception as e:
                 logger.warning("[Heartbeat] Quiz reflexion failed: %s", e)

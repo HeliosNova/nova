@@ -129,7 +129,9 @@ async def delete_lesson(lesson_id: int):
     svc = get_services()
     if not svc.learning:
         raise HTTPException(status_code=503, detail="Learning engine not initialized")
-    deleted = svc.learning.delete_lesson(lesson_id)
+    # to_thread (2026-08-31): sync DELETE + vector cleanup on the loop
+    # (learning.py delete tripwire).
+    deleted = await asyncio.to_thread(svc.learning.delete_lesson, lesson_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Lesson not found")
     return {"status": "deleted", "lesson_id": lesson_id}
@@ -208,7 +210,9 @@ async def delete_skill(skill_id: int):
     svc = get_services()
     if not svc.skills:
         raise HTTPException(status_code=503, detail="Skills not initialized")
-    deleted = svc.skills.delete_skill(skill_id)
+    # to_thread (2026-08-31): sync DELETE + vector cleanup on the loop
+    # (skills.py delete tripwire).
+    deleted = await asyncio.to_thread(svc.skills.delete_skill, skill_id)
     if not deleted:
         raise HTTPException(status_code=404, detail="Skill not found")
     return {"status": "deleted", "skill_id": skill_id}

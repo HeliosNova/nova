@@ -195,12 +195,12 @@ async def maybe_extract_skill(
             re.compile(pattern)
         except re.error:
             logger.info("Auto-skill: invalid regex %r — rejected", pattern[:80])
-            _procedure_fallback("invalid regex")
+            await asyncio.to_thread(_procedure_fallback, "invalid regex")
             return
 
         if _is_too_broad(pattern):
             logger.info("Auto-skill: pattern too broad %r — rejected", pattern[:80])
-            _procedure_fallback("pattern too broad")
+            await asyncio.to_thread(_procedure_fallback, "pattern too broad")
             return
 
         steps = obj.get("steps", [])
@@ -249,11 +249,14 @@ async def maybe_extract_skill(
                 pass
             if not (repaired and not _has_capture_group_mismatch(pattern, steps, answer_template)):
                 logger.info("Auto-skill: capture group mismatch — rejected (pattern=%r)", pattern[:80])
-                _procedure_fallback("capture group mismatch")
+                await asyncio.to_thread(_procedure_fallback, "capture group mismatch")
                 return
             logger.info("Auto-skill: repaired invented placeholder alias → {query}")
 
-        skill_id = skills.create_skill(
+        # to_thread (2026-08-31): sync INSERT + vector upsert on the loop
+        # (skills.py create tripwire); same for the fallback call sites above.
+        skill_id = await asyncio.to_thread(
+            skills.create_skill,
             name=obj["name"],
             trigger_pattern=pattern,
             steps=steps,
@@ -537,7 +540,8 @@ async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -
                             "existing skill — skipped", cand_name)
                 consumed.update(idxs)  # evidence is spent either way
                 continue
-            sid = skills.create_procedure_skill(
+            sid = await asyncio.to_thread(
+                skills.create_procedure_skill,
                 name=cand_name,
                 description=cand_desc,
                 procedure_text=cand_proc,

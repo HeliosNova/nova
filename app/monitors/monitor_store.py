@@ -264,8 +264,25 @@ class MonitorStore:
             last = datetime.fromisoformat(m.last_check_at).replace(tzinfo=None)
             raw = (now - last).total_seconds() / max(m.schedule_seconds, 1)
             if m.id in anchored_due_ids:
+                # Missed-day escalation (2026-08-31 evening): the /6 floor is
+                # calibrated for a NORMAL-day backlog (ratio 2-3 by evening).
+                # On the post-outage day it was live-observed still losing at
+                # 16:58 local (floor 2.66 vs 29 monitors at 3-8x) — a third
+                # consecutive missed day for Morning Check-in. Once an
+                # anchored daily has already missed one FULL local day it
+                # sorts with the never-run tier: max-one-missed-day is the
+                # contract's real floor. A merely same-day-due monitor still
+                # queues on the gentle floor so it can't starve hot digests.
+                now_local = self._local_now()
+                last_local = (
+                    datetime.fromisoformat(m.last_check_at)
+                    .replace(tzinfo=timezone.utc)
+                    .astimezone(now_local.tzinfo)
+                )
+                if (now_local.date() - last_local.date()).days >= 2:
+                    return float("inf")
                 anchor = int((m.check_config or {}).get("anchor_hour", 0))
-                past_h = max(0.0, self._local_now().hour - anchor)
+                past_h = max(0.0, now_local.hour - anchor)
                 return max(raw, 1.0 + past_h / 6.0)
             return raw
 

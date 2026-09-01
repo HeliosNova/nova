@@ -267,19 +267,23 @@ async def maybe_trigger_tool_creation(
         except Exception:
             pass  # If skill check fails, continue
 
-    # Use shared DB — ToolCandidateStore initialises its own schema
+    # Use shared DB — ToolCandidateStore initialises its own schema.
+    # to_thread (2026-08-31): the store's ctor (DDL), record (INSERT + prune)
+    # and counts are all sync and ran on the event loop from this background
+    # coroutine (tool_triggers.py:67-107 tripwires).
     from app.database import get_db
-    candidate_store = _candidate_store or ToolCandidateStore(get_db())
+    candidate_store = _candidate_store or await asyncio.to_thread(
+        ToolCandidateStore, get_db())
 
     # Guard: skip if already triggered for this sequence
-    if candidate_store.is_already_triggered(tools_used):
+    if await asyncio.to_thread(candidate_store.is_already_triggered, tools_used):
         return
 
     # Record this occurrence
-    candidate_store.record(query, tools_used)
+    await asyncio.to_thread(candidate_store.record, query, tools_used)
 
     # Count recurrences
-    count = candidate_store.count_untriggered(tools_used)
+    count = await asyncio.to_thread(candidate_store.count_untriggered, tools_used)
     threshold = config.AUTO_TOOL_CREATION_THRESHOLD
     if count < threshold:
         logger.debug(
@@ -289,8 +293,9 @@ async def maybe_trigger_tool_creation(
         return
 
     # Threshold reached — mark and fire generation
-    candidate_store.mark_triggered(tools_used)
-    example_queries = candidate_store.get_example_queries(tools_used)
+    await asyncio.to_thread(candidate_store.mark_triggered, tools_used)
+    example_queries = await asyncio.to_thread(
+        candidate_store.get_example_queries, tools_used)
 
     logger.info(
         "Auto-tool threshold reached (%d occurrences) — generating tool for sequence: %s",

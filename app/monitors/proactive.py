@@ -105,7 +105,9 @@ class DailyDigest:
                     if now_local.hour == config.DIGEST_HOUR and self._last_digest != today:
                         await self.send_digest()
                         self._last_digest = today
-                        self._save_last_digest(today)
+                        # to_thread (2026-08-31): sync UPSERT on the loop
+                        # (proactive.py:68 tripwire).
+                        await asyncio.to_thread(self._save_last_digest, today)
                 except Exception as e:
                     logger.error("[Digest] Loop failed: %s", e)
 

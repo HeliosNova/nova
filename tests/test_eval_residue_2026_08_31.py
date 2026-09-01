@@ -47,7 +47,10 @@ class TestHarnessCleansSeededDocuments:
         assert "eval-seed-" in body
 
     def test_cleanup_runs_in_the_finally_block(self):
-        i = HARNESS.index("self._cleanup_seeded_skills()")
+        # 2026-08-31: the skills cleanup moved off the event loop
+        # (asyncio.to_thread(self._cleanup_seeded_skills)) — match without
+        # the call parens so the wrapper doesn't break the invariant check.
+        i = HARNESS.index("self._cleanup_seeded_skills")
         after = HARNESS[i:i + 200]
         assert "self._cleanup_seeded_documents()" in after, (
             "document cleanup must sit beside the skills cleanup in `finally` "
