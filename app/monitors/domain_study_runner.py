@@ -1720,7 +1720,12 @@ async def _fetch_form4_txn(url: str, client) -> dict | None:
 async def _enrich_sec_form4(items: list) -> list:
     """Attach parsed Form 4 transaction detail to each SEC item's `.meta['form4']`,
     concurrently but rate-limited (SEC fair-access ~10 req/s). Best-effort — a filing
-    that won't parse just keeps its title+link."""
+    that won't parse keeps its title+link — but no longer SILENTLY best-effort:
+    2026-09-01, owner-reported "bare links": the 00:29 post-outage digest shipped
+    8/15 unannotated items, every one of which parsed fine on replay — transient
+    sec.gov throttling during the catch-up burst, zero retries, zero log evidence
+    (`except: pass`). One paced retry recovers the transient class; a coverage
+    line makes the next silent degradation visible."""
     import httpx
     from app.monitors.rss_feeds import _SEC_USER_AGENT
     sem = asyncio.Semaphore(4)
@@ -1728,15 +1733,26 @@ async def _enrich_sec_form4(items: list) -> list:
                                  headers={"User-Agent": _SEC_USER_AGENT}) as client:
         async def _one(it):
             async with sem:
-                try:
-                    txn = await _fetch_form4_txn(getattr(it, "url", "") or "", client)
-                    if txn:
-                        meta = getattr(it, "meta", None) or {}
-                        meta["form4"] = txn
-                        it.meta = meta
-                except Exception:
-                    pass
+                for attempt in (0, 1):
+                    try:
+                        txn = await _fetch_form4_txn(getattr(it, "url", "") or "", client)
+                        if txn:
+                            meta = getattr(it, "meta", None) or {}
+                            meta["form4"] = txn
+                            it.meta = meta
+                            return
+                    except Exception as e:
+                        logger.debug("[SEC] form4 fetch failed (attempt %d): %s", attempt, e)
+                    if attempt == 0:
+                        # sec.gov throttling breather before the one retry
+                        await asyncio.sleep(1.5)
         await asyncio.gather(*[_one(it) for it in items])
+    parsed = sum(1 for it in items if (getattr(it, "meta", None) or {}).get("form4"))
+    if items:
+        logger.info("[SEC] form4 enrichment: %d/%d filings parsed", parsed, len(items))
+        if parsed < len(items) * 0.6:
+            logger.warning("[SEC] form4 coverage LOW (%d/%d) — sec.gov throttling "
+                           "likely; digest items will read as bare links", parsed, len(items))
     return items
 
 

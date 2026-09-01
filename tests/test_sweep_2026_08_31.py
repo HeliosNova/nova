@@ -547,3 +547,68 @@ class TestStorylineSourceMetaExclusion:
         assert "from app.core.storylines import EVENT_META_EXCL_SQL" in src or \
                "EVENT_META_EXCL_SQL" in src, \
             "display-side filter no longer shares the canonical exclusion SQL"
+
+
+# ── SEC Form-4 enrichment retry + coverage observability (2026-09-01) ───────
+
+class TestForm4EnrichRetry:
+    """Owner-reported "bare links" (2026-09-01): the 00:29 post-outage SEC
+    digest shipped 8/15 items with no trade annotation. Replay parsed ALL 15
+    — transient sec.gov throttling during the catch-up burst, and the
+    enricher's `except: pass` had zero retries and zero log evidence."""
+
+    def _items(self, n=4):
+        from types import SimpleNamespace
+        return [SimpleNamespace(url=f"https://www.sec.gov/Archives/edgar/data/"
+                                    f"{100+i}/{'0'*12}{100000+i}/x-index.htm",
+                                meta={}) for i in range(n)]
+
+    @pytest.mark.asyncio
+    async def test_transient_failure_recovered_by_retry(self, monkeypatch):
+        import app.monitors.domain_study_runner as dsr
+        calls = {}
+
+        async def flaky(url, client):
+            calls[url] = calls.get(url, 0) + 1
+            if calls[url] == 1:
+                raise RuntimeError("HTTP 403 (sec.gov throttle)")
+            return {"direction": "buy", "buy_shares": 10, "buy_value": 500.0,
+                    "sell_shares": 0, "sell_value": 0, "codes": ["P"]}
+
+        monkeypatch.setattr(dsr, "_fetch_form4_txn", flaky)
+        monkeypatch.setattr(dsr.asyncio, "sleep", AsyncMock())
+        items = self._items()
+        out = await dsr._enrich_sec_form4(items)
+        assert all(it.meta.get("form4") for it in out), \
+            "one paced retry must recover the transient sec.gov throttle class"
+        assert all(c == 2 for c in calls.values())
+
+    @pytest.mark.asyncio
+    async def test_permanent_failure_logs_low_coverage(self, monkeypatch, caplog):
+        import logging
+
+        import app.monitors.domain_study_runner as dsr
+
+        async def dead(url, client):
+            raise RuntimeError("HTTP 403")
+
+        monkeypatch.setattr(dsr, "_fetch_form4_txn", dead)
+        monkeypatch.setattr(dsr.asyncio, "sleep", AsyncMock())
+        with caplog.at_level(logging.INFO):
+            await dsr._enrich_sec_form4(self._items())
+        assert any("form4 coverage LOW" in r.message for r in caplog.records), \
+            "silent enrichment degradation must be loud"
+
+    @pytest.mark.asyncio
+    async def test_parsed_first_try_does_not_retry(self, monkeypatch):
+        import app.monitors.domain_study_runner as dsr
+        calls = {}
+
+        async def good(url, client):
+            calls[url] = calls.get(url, 0) + 1
+            return {"direction": "sell", "buy_shares": 0, "buy_value": 0,
+                    "sell_shares": 5, "sell_value": 100.0, "codes": ["S"]}
+
+        monkeypatch.setattr(dsr, "_fetch_form4_txn", good)
+        await dsr._enrich_sec_form4(self._items())
+        assert all(c == 1 for c in calls.values()), "no wasteful double-fetch"
