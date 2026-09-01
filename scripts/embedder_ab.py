@@ -81,6 +81,15 @@ CONFIGS = [
     ("qwen3-emb symmetric", "qwen3-embedding:0.6b", "", ""),
     ("qwen3-emb instructed", "qwen3-embedding:0.6b",
      "Instruct: Given a question, retrieve the stored fact that answers it\nQuery: ", ""),
+    # harrier-oss-v1-0.6b (2026-09-01, owner-approved pull): Microsoft's
+    # multilingual decoder-embedding family (last-token pooling, 1024-dim —
+    # same dim as bge-m3), the one research-surfaced candidate that survived
+    # the 2026-08-30 measurement gate. Asymmetric family → also test the
+    # instructed-query config so it isn't under-measured (the "half-wired
+    # embedder" mistake class).
+    ("harrier-0.6b symmetric", "hf.co/mradermacher/harrier-oss-v1-0.6b-GGUF:Q8_0", "", ""),
+    ("harrier-0.6b instructed", "hf.co/mradermacher/harrier-oss-v1-0.6b-GGUF:Q8_0",
+     "Instruct: Given a question, retrieve the stored fact that answers it\nQuery: ", ""),
 ]
 
 

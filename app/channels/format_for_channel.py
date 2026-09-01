@@ -32,6 +32,18 @@ _HEADING_HASH = re.compile(r"^(#{1,3})\s+(.+)$", re.MULTILINE)
 # Telegram (HTML mode — caller must pass parse_mode="HTML")
 # ---------------------------------------------------------------------------
 
+def _compact_anchor(url: str) -> str:
+    """Telegram <a> with the DOMAIN as visible text, full URL as target."""
+    from urllib.parse import urlparse
+    try:
+        host = (urlparse(url).hostname or "").removeprefix("www.")
+    except Exception:
+        host = ""
+    label = host or "link"
+    return (f'<a href="{html_escape(url, quote=True)}">'
+            f'{html_escape(label)} ↗</a>')
+
+
 def to_telegram_html(text: str) -> str:
     """Convert Discord-flavored markdown to Telegram HTML.
 
@@ -68,17 +80,19 @@ def to_telegram_html(text: str) -> str:
 
     # 2. URLs — pull them out BEFORE html_escape so the angle/square brackets
     # around them are removed instead of escaped to &lt;/&gt;.
+    # Compact anchors (2026-09-01, owner-reported "bare links" on Telegram):
+    # the anchor TEXT used to be the full URL, so every digest item carried a
+    # 2-3-line wrapped blue link on a phone and 15 of them visually drowned
+    # the item bodies — a rich digest read as a list of links. The visible
+    # text is now just the domain + ↗; the full URL stays in the tap target.
     text = _DISCORD_URL_BRACKETED.sub(
-        lambda m: _stash(f'<a href="{html_escape(m.group(1), quote=True)}">{html_escape(m.group(1))}</a>', "URL"),
-        text,
+        lambda m: _stash(_compact_anchor(m.group(1)), "URL"), text,
     )
     text = _DISCORD_URL_SQ_BRACKETED.sub(
-        lambda m: _stash(f'<a href="{html_escape(m.group(1), quote=True)}">{html_escape(m.group(1))}</a>', "URL"),
-        text,
+        lambda m: _stash(_compact_anchor(m.group(1)), "URL"), text,
     )
     text = _DISCORD_BARE_URL.sub(
-        lambda m: _stash(f'<a href="{html_escape(m.group(1), quote=True)}">{html_escape(m.group(1))}</a>', "URL"),
-        text,
+        lambda m: _stash(_compact_anchor(m.group(1)), "URL"), text,
     )
 
     # 3. Escape the rest. Placeholders are pure ASCII so they pass through
@@ -88,6 +102,11 @@ def to_telegram_html(text: str) -> str:
     # 4. Inline tags + dividers + headings
     text = _DISCORD_BOLD.sub(r"<b>\1</b>", text)
     text = _DISCORD_ITALIC.sub(r"<i>\1</i>", text)
+    # Full-line _underscore italics_ (digest sub-headers like "_read 28
+    # sources…_" / "💡 _summary_") rendered as literal underscores on
+    # Telegram. Line-anchored so snake_case inside prose is never touched.
+    text = re.sub(r"^(\W*)_([^_\n](?:[^\n]*[^_\n])?)_\s*$",
+                  r"\1<i>\2</i>", text, flags=re.MULTILINE)
     text = _DISCORD_DIVIDER.sub("━━━━━━━━━━━━━━━━━━━━━━━━━━", text)
     text = _HEADING_HASH.sub(lambda m: f"<b>{m.group(2)}</b>", text)
 

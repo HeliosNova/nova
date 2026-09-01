@@ -48,3 +48,50 @@ class TestBalanceHtmlChunks:
     def test_plain_text_untouched(self):
         chunks = ["plain text", "1 < 2 but not a tag"]
         assert _balance(chunks) == chunks
+
+
+class TestCompactAnchors:
+    """Owner-reported 'bare links' on Telegram (2026-09-01): rich digests
+    (GitHub advisories 15/15 substantive) still READ as link lists because
+    every anchor's visible text was the full URL — 2-3 wrapped blue lines per
+    item on a phone. Visible text is now the domain; the URL stays in href."""
+
+    def test_bracketed_url_shows_domain_only(self):
+        from app.channels.format_for_channel import to_telegram_html
+        line = ("↳ **github.com**  ·  📅 August 31, 2026  ·  "
+                "<https://github.com/advisories/GHSA-fm3f-ch8h-qw8q>")
+        out = to_telegram_html(line)
+        assert '<a href="https://github.com/advisories/GHSA-fm3f-ch8h-qw8q">' in out
+        assert ">github.com ↗</a>" in out
+        # the long path must not be user-visible outside the href attribute
+        assert out.count("GHSA-fm3f-ch8h-qw8q") == 1
+
+    def test_bare_url_in_prose_compacted(self):
+        from app.channels.format_for_channel import to_telegram_html
+        out = to_telegram_html(
+            "Filed at https://www.sec.gov/Archives/edgar/data/760498/000076049826000055/x-index.htm today")
+        assert ">sec.gov ↗</a>" in out  # www. stripped
+        assert out.count("edgar/data") == 1  # only inside href
+
+    def test_unparseable_url_falls_back_to_link_label(self):
+        from app.channels.format_for_channel import _compact_anchor
+        a = _compact_anchor("https://")
+        assert ">link ↗</a>" in a
+
+    def test_fullline_underscore_italics_converted(self):
+        from app.channels.format_for_channel import to_telegram_html
+        out = to_telegram_html(
+            "_read 28 sources: abc.net.au, apnews.com · 0 facts learned_")
+        assert out.startswith("<i>read 28 sources")
+        assert out.endswith("</i>")
+
+    def test_emoji_prefixed_summary_line_converted(self):
+        from app.channels.format_for_channel import to_telegram_html
+        out = to_telegram_html("💡 _Multiple MariaDB connectors leak credentials_")
+        assert "<i>Multiple MariaDB connectors leak credentials</i>" in out
+
+    def test_inline_snake_case_never_italicized(self):
+        from app.channels.format_for_channel import to_telegram_html
+        out = to_telegram_html("set check_config and anchor_hour before quiz_engine runs")
+        assert "<i>" not in out
+        assert "check_config" in out
