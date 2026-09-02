@@ -91,9 +91,16 @@ def _digest_health_verdict(lengths: list[int], linkish: int,
 
     error  — pipeline broken: no digests in 7d, thin output (avg < 2000
              chars — healthy live average is ~8k), or >10% link-only.
-    warning — degradation: avg < 4000 chars, or entail drop-rate > 55%
-             (the pre-fix live rate was ~51%; digit-aware windows should
-             push it DOWN, so exceeding 55% means a new regression).
+    warning — degradation: avg < 4000 chars, or entail drop-rate > 75%.
+
+    Drop-rate threshold recalibrated 2026-09-02 (was 55%). The metric's
+    DENOMINATOR changed when the gate went from 24 to 48 sentences per
+    digest: it now also checks the marginal tail that used to go unchecked,
+    so a higher share is dropped for the same output. Measured over the 8
+    hours after the change: 11 digests, 326 checked, 193 dropped (59%),
+    while the digests themselves got RICHER (avg 7,230 -> 7,678 chars, the
+    shortest 475 -> 2,812). Substance is what this canary really guards —
+    avg chars and link-only share are unchanged; only this rate moved.
     """
     if not lengths:
         return "error", "no content digests stored in 7 days — pipeline dead?"
@@ -104,7 +111,7 @@ def _digest_health_verdict(lengths: list[int], linkish: int,
              f"{link_share:.0%} link-only, entail drop {drop_rate:.0%}")
     if avg < 2000 or link_share > 0.10:
         return "error", f"digest substance degraded — {stats}"
-    if avg < 4000 or drop_rate > 0.55:
+    if avg < 4000 or drop_rate > 0.75:
         return "warning", f"digest quality drifting — {stats}"
     return "info", stats
 

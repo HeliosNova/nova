@@ -118,6 +118,16 @@ class TestDigestHealthCanary:
             [8000] * 50, linkish=0, checked=1400, dropped=600)
         assert status == "info"
 
+    def test_live_drop_rate_after_the_wider_gate_is_still_healthy(self):
+        """Measured 2026-09-02 over the 8h after the gate widened to 48
+        sentences: 326 checked, 193 dropped (59%) with digests averaging
+        7,678 chars. That is the new normal, not a regression."""
+        from app.monitors.heartbeat_loop import _digest_health_verdict
+
+        status, _ = _digest_health_verdict(
+            [7678] * 24, linkish=1, checked=326, dropped=193)
+        assert status == "info"
+
     def test_no_digests_is_error(self):
         from app.monitors.heartbeat_loop import _digest_health_verdict
 
@@ -135,7 +145,7 @@ class TestDigestHealthCanary:
         from app.monitors.heartbeat_loop import _digest_health_verdict
 
         status, _ = _digest_health_verdict(
-            [8000] * 50, linkish=0, checked=1000, dropped=700)
+            [8000] * 50, linkish=0, checked=1000, dropped=800)
         assert status == "warning"
 
     def test_gate_line_regex_parses_live_format(self):
