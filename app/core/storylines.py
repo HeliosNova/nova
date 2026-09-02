@@ -231,15 +231,32 @@ async def _cluster_into_stories(items: list[dict], existing_titles: list[str] | 
     return stories
 
 
+# A thread that stopped moving for three weeks is CLOSED (close_stale), but a
+# story does not stop existing because it went quiet: the Strait of Hormuz
+# thread closed in August and September's developments started a SECOND thread
+# beside it (live 2026-09-02: two Hormuz threads, two "global instability"
+# threads). close_stale always promised "the next development flips status
+# back to active", but only the exact-key path could find a closed row — the
+# fuzzy path searched active threads only, so a re-titled continuation
+# fragmented instead of reattaching. Closed threads are candidates again for
+# this long, after which a recurrence is fairly called a new story.
+_REATTACH_DAYS = 60
+
+
 def _find_matching_storyline(db, story: dict):
-    """Match a story to an existing active thread — exact key first, then a
+    """Match a story to an existing thread — exact key first, then a
     deterministic fuzzy fallback on shared SPECIFIC entities, so the same story
     named slightly differently across cycles doesn't fragment into two threads.
 
-    Entities appearing across MANY active threads (e.g. 'trump', 'us') can't
+    Entities appearing across MANY threads (e.g. 'trump', 'us') can't
     discriminate one story from another, so they're down-weighted by document
     frequency — only rare, specific shared entities (hormuz, nvidia) signal a
     merge. This is what stops over-merging distinct stories about a common actor.
+
+    Recently-closed threads are candidates too (see _REATTACH_DAYS): matching
+    one REVIVES it — _record's UPDATE sets status back to 'active' — so a
+    story that goes quiet and returns keeps its history instead of forking.
+    Ties go to an active thread.
     """
     row = db.fetchone("SELECT * FROM storylines WHERE story_key = ?", (story["key"],))
     if row:
@@ -248,18 +265,24 @@ def _find_matching_storyline(db, story: dict):
     active = db.fetchall(
         "SELECT * FROM storylines WHERE status = 'active' ORDER BY last_updated DESC LIMIT 80"
     )
-    if not active:
+    closed = db.fetchall(
+        "SELECT * FROM storylines WHERE status != 'active' "
+        "AND last_updated > datetime('now', ?) ORDER BY last_updated DESC LIMIT 40",
+        (f"-{_REATTACH_DAYS} days",),
+    )
+    candidates = list(active) + list(closed)   # active first: ties favour a live thread
+    if not candidates:
         return None
 
-    # Document frequency: how many active threads each entity appears in.
+    # Document frequency: how many candidate threads each entity appears in.
     df: dict[str, int] = {}
     cand_tok_map: dict[int, set[str]] = {}
-    for r in active:
+    for r in candidates:
         toks = _sig_tokens(r["title"]) | _sig_tokens(r["summary"])
         cand_tok_map[r["id"]] = toks
         for t in toks:
             df[t] = df.get(t, 0) + 1
-    # An entity in >=3 distinct active threads is too common to discriminate.
+    # An entity in >=3 distinct threads is too common to discriminate.
     common = {t for t, c in df.items() if c >= 3}
 
     story_toks = _sig_tokens(story["title"])
@@ -270,12 +293,15 @@ def _find_matching_storyline(db, story: dict):
         return None
 
     best, best_ov = None, 0
-    for r in active:
+    for r in candidates:
         # Overlap on RARE shared entities only.
         ov = len(story_specific & (cand_tok_map[r["id"]] - common))
         title_ov = len((_sig_tokens(story["title"]) - common) & (_sig_tokens(r["title"]) - common))
         if ov >= 2 and title_ov >= 1 and ov > best_ov:
             best, best_ov = r, ov
+    if best is not None and best["status"] != "active":
+        logger.info("[Storyline] reattaching to closed thread %r (idle since %s)",
+                    best["title"], best["last_updated"])
     return best
 
 
