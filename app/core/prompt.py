@@ -6,6 +6,7 @@ Block 1 (Identity + Reasoning) is the most critical text in the entire project.
 
 from __future__ import annotations
 
+import re
 import logging
 from datetime import datetime
 
@@ -692,6 +693,9 @@ def _confidence_label(confidence: float) -> str:
     return "[LOW]"
 
 
+_PROVENANCE_LESSON_RE = re.compile(r"^\s*(?:Promoted from|Procedural-consolidation:|Merged from|Consolidated from)")
+
+
 def format_lessons_for_prompt(lessons: list) -> str:
     """Format lessons as a prompt block with confidence indicators.
 
@@ -715,6 +719,11 @@ def format_lessons_for_prompt(lessons: list) -> str:
         lesson_text = (lesson.lesson_text if hasattr(lesson, "lesson_text") else lesson.get("lesson_text", "")) or ""
         correct = (lesson.correct_answer if hasattr(lesson, "correct_answer") else lesson.get("correct_answer", "")) or ""
         wrong = (lesson.wrong_answer if hasattr(lesson, "wrong_answer") else lesson.get("wrong_answer", "")) or ""
+        # Provenance strings are not lessons (2026-09-01): five legacy rows
+        # carried "Promoted from success reflexion (quality=0.95)" as their
+        # text and were injected 177 times. Use the answer instead.
+        if _PROVENANCE_LESSON_RE.match(lesson_text):
+            lesson_text = correct or ""
         confidence = (lesson.confidence if hasattr(lesson, "confidence") else lesson.get("confidence", 0.8)) or 0.8
         if confidence < _MIN_LESSON_CONFIDENCE:
             skipped_low_conf += 1
@@ -750,6 +759,9 @@ def format_lessons_for_prompt(lessons: list) -> str:
         return ""
     return (
         "## Lessons From Past Corrections\n\n"
+        "**Facts the owner taught you are authoritative.** When a lesson states a fact "
+        "(a name, a place, a value, a codename, a preference), answer from it directly — "
+        "do not web-search, memory-search or second-guess it.\n\n"
         "Apply these — your owner taught you these.\n\n"
         "**Lessons are summaries, not depth ceilings.** Each lesson below is a "
         "compressed takeaway from a longer prior conversation. They are PRINCIPLES "

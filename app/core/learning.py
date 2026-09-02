@@ -642,8 +642,12 @@ class LearningEngine:
         # silently drops candidates once lessons exceed it, so the vector/keyword
         # arms can never surface a relevant lesson outside the top-500-by-helpful.
         _cand = int(getattr(config, "MAX_LESSON_CANDIDATES", 5000))
+        # Demoted lessons (confidence < 0.40, the prompt floor) used to take
+        # top-5 slots and earn times_retrieved while the formatter dropped
+        # them silently (2026-09-01).
         all_lessons = self._db.fetchall(
-            "SELECT * FROM lessons ORDER BY times_helpful DESC, confidence DESC LIMIT ?",
+            "SELECT * FROM lessons WHERE COALESCE(confidence, 0.8) >= 0.40 "
+            "ORDER BY times_helpful DESC, confidence DESC LIMIT ?",
             (_cand,),
         )
 
@@ -860,6 +864,10 @@ class LearningEngine:
         channel: str = "api",
         confidence: float = 1.0,
     ) -> None:
+        # Retired 2026-09-01: the trainer lives in archive/, nothing consumes
+        # /data/training_data.jsonl (0 bytes since July) — no write.
+        logger.debug("save_training_pair skipped (training writers retired)")
+        return
         """Append a DPO-ready training pair to JSONL.
 
         Format: {"query": ..., "chosen": ..., "rejected": ..., "timestamp": ...}
@@ -1109,6 +1117,30 @@ class LearningEngine:
                 logger.warning("Failed to delete %d lessons from ChromaDB: %s", len(deleted_ids), e)
         return deleted_ids, not_found_ids
 
+    def _vector_duplicate(self, topic: str, correct_answer: str):
+        """Existing lesson whose embedding sits within _LESSON_DUP_VECTOR_DISTANCE
+        of the new one (and whose answer does not conflict), else None."""
+        try:
+            collection = self._get_lessons_collection()
+            if collection is None or collection.count() == 0:
+                return None
+            res = collection.query(query_texts=[f"{topic}. {correct_answer}"],
+                                   n_results=3, include=["distances"])
+            ids = (res.get("ids") or [[]])[0]
+            dists = (res.get("distances") or [[]])[0]
+            for id_str, dist in zip(ids, dists):
+                if dist is None or dist > _LESSON_DUP_VECTOR_DISTANCE:
+                    continue
+                row = self._db.fetchone(
+                    "SELECT id, confidence, topic, correct_answer FROM lessons WHERE id = ?",
+                    (int(id_str),))
+                if not row or _answers_conflict(row["correct_answer"] or "", correct_answer):
+                    continue
+                return row
+        except Exception as e:
+            logger.debug("lesson vector dedup unavailable: %s", e)
+        return None
+
     def _find_similar_lesson(self, topic: str, correct_answer: str) -> dict | None:
         """Find an existing lesson similar enough to be a duplicate.
 
@@ -1138,6 +1170,14 @@ class LearningEngine:
         if exact:
             _dm.record_decision("lesson", 1.0, 1.0, "merged")
             return exact
+
+        # Vector duplicate (2026-09-01): paraphrase siblings score answer
+        # Jaccard 0.07-0.41 (the five rate-limiter lessons), invisible to the
+        # token passes below; bge-m3 puts true duplicates well under 0.2.
+        vec = self._vector_duplicate(topic, correct_answer)
+        if vec is not None:
+            _dm.record_decision("lesson", 1.0, _LESSON_DUP_VECTOR_DISTANCE, "merged_vector")
+            return vec
 
         max_jaccard = 0.0  # track best near-miss across both fuzzy passes
 
@@ -1393,6 +1433,8 @@ def _normalize_words(text: str) -> set[str]:
     return _base_normalize_words(text, stem=True)
 
 
+_LESSON_DUP_VECTOR_DISTANCE = 0.18  # bge-m3 cosine distance for "same lesson" (2026-09-01)
+
 _NEGATION_RE = re.compile(
     r"(?i)\b(?:not|no|never|none|isn'?t|aren'?t|wasn'?t|weren'?t|don'?t|doesn'?t|"
     r"didn'?t|can'?t|won'?t|cannot|false|incorrect|untrue)\b"
@@ -1413,7 +1455,14 @@ def _answers_conflict(a: str, b: str) -> bool:
     b = b or ""
     # Polarity flip — one negates, the other doesn't.
     if bool(_NEGATION_RE.search(a)) != bool(_NEGATION_RE.search(b)):
-        return True
+        # Polarity only contradicts when the texts are otherwise the same
+        # claim ("Pluto is a planet" / "Pluto is NOT a planet"). A rhetorical
+        # "not" in a differently-worded answer is not a contradiction
+        # (2026-09-01: the two CPU-clock lessons were kept apart by this).
+        wa, wb = _base_normalize_words(a), _base_normalize_words(b)
+        union = wa | wb
+        if union and len(wa & wb) / len(union) >= 0.5:
+            return True
     # Disjoint numeric content — different figures = different claims.
     nums_a = set(_NUMERIC_RE.findall(a))
     nums_b = set(_NUMERIC_RE.findall(b))

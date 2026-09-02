@@ -33,7 +33,7 @@ services:
       # (measured 2026-07-06) — zero headroom for the owner's side processes.
       # 16384 halves the worst-case stray load; the monitor synthesis chain pins
       # num_ctx=12288 per call and chat never needs 32K. (owner: more headroom)
-      OLLAMA_NUM_CTX: "16384"
+      OLLAMA_NUM_CTX: "24576"  # 16384 -> 24576 (2026-09-02): match the runner floor so no request restarts a runner
       # Hard VRAM reserve for the owner's side processes (owner 2026-07-06: "a bit
       # more headroom"). Ollama plans model loads as if this much VRAM doesn't
       # exist, auto-offloading a few 27B layers to CPU when needed — the ctx cap
@@ -144,12 +144,11 @@ services:
       ENABLE_DESKTOP_AUTOMATION: "true"
       ENABLE_PLANNING: "true"
       ENABLE_CRITIQUE: "true"
-      # MCP: expose Nova as MCP server (for Claude Code/Cursor) and consume
-      # external MCP tools. (Auto-finetune text removed 2026-08-25: the
-      # training stack was archived 2026-06-12 — no runtime pathway exists;
-      # manual fine-tuning runs from the host via archive/training/.)
+      # MCP: consume external MCP tools. (The MCP *server* runs out of process
+      # via scripts/mcp_server_runner.py; its ENABLE_MCP_SERVER flag had no
+      # reader and was dropped 2026-09-02. Auto-finetune text removed
+      # 2026-08-25: the training stack was archived 2026-06-12.)
       ENABLE_MCP: "true"
-      ENABLE_MCP_SERVER: "true"
       # Voice: Whisper STT + Piper TTS (both already installed in image).
       ENABLE_VOICE: "true"
       ENABLE_TTS: "true"
@@ -161,14 +160,9 @@ services:
     volumes:
       - nova_data:/data
       - ./mcp:/data/mcp:ro
-      # Off-volume backup target: daily verified snapshots are copied here
-      # so they survive loss/corruption of the nova_data volume itself.
-      # Lives on the host filesystem next to the compose tree (gitignored).
-      - ./backups:/backups
-      # True OFFSITE leg on a different physical drive (2026-08-14): the E:
-      # mirror was fed by a one-shot manual robocopy — the daily leg silently
-      # didn't exist. Maintenance now copies+verifies snapshots here directly.
-      - "E:/nova-offsite:/offsite"
+      # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
+      # container that runs LLM-authored `sh -c` must not hold both DR legs
+      # read-write. Maintenance still writes verified snapshots to /data/backups.
       # Job hand-off to the network-isolated exec sidecar (audit 2026-07-08).
       # Presence of this mount routes code_exec through nova-exec.
       - exec_queue:/exec_queue
@@ -314,29 +308,57 @@ services:
   # whitelists ONLY what the watchdog needs — container list/inspect and
   # restart; exec/build/images/volumes/networks are denied by default.
   # Isolated on its own network so nova-app can never reach it.
+  backup:
+    # Disaster-recovery sidecar (2026-09-01): owns the off-volume (F:) and offsite
+    # (E:) legs so nova-app — which executes LLM-authored shell — holds neither.
+    # Copies the newest verified snapshot from /data/backups hourly, verifies
+    # each copy, prunes each leg to 7.
+    image: nova-app:latest
+    container_name: nova-backup
+    restart: unless-stopped
+    network_mode: none
+    entrypoint: ["python", "/app/scripts/backup_sidecar.py"]
+    volumes:
+      - nova_data:/data:ro
+      # The image ships only scripts/__init__.py (Dockerfile keeps app/ lean),
+      # so the sidecar reads its script from the checkout. Directory mount on
+      # purpose — single-file binds become stale placeholders after an unclean
+      # Windows shutdown (runbook 2026-08-17).
+      - ./scripts:/app/scripts:ro
+      - ./backups:/backups
+      - "E:/nova-offsite:/offsite"
+    tmpfs:
+      - /tmp
+    read_only: true
+    mem_limit: 256m
+    cpus: 0.5
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+
   socket-proxy:
-    # Pinned by digest 2026-08-25 (was :latest — silent-drift risk on a
-    # security-boundary container). Bump deliberately, with a changelog read.
-    image: tecnativa/docker-socket-proxy@sha256:1f5038b54f06c3e18422902cf00ba21803d1c97805aae032e5e6673d532d3459
+    # Explicit allowlist (2026-09-01): nginx in front of the socket admits only
+    # GET /containers/{nova-app,nova-ollama,nova-embed}/json and POST .../restart
+    # (see socket-proxy/default.conf). The tecnativa proxy's POST=1 master
+    # switch also admitted container delete/prune/create/exec-create.
+    # Pinned by digest; bump deliberately.
+    image: nginx@sha256:65645c7bb6a0661892a8b03b89d0743208a18dd2f3f17a54ef4b76fb8e2f2a10
     container_name: nova-socket-proxy
-    environment:
-      CONTAINERS: 1       # GET /containers/* (list + inspect/health)
-      # POST=1 is the tecnativa proxy's MASTER switch for every POST endpoint —
-      # LIVE-TESTED 2026-08-20: with POST=0 the watchdog's restart returns 403
-      # (ALLOW_RESTARTS alone is insufficient), so POST=1 is mandatory for the
-      # watchdog to recover nova-app. The cost is that POST /containers/create
-      # is also reachable (returns 201) — a host-escape *primitive*, but blunted
-      # because ALLOW_START is unset (default 0): a created container cannot be
-      # started, so no code executes. Residual risk requires the watchdog itself
-      # (static shell script, cap_drop ALL, internal-only net) to be compromised.
-      POST: 1
-      ALLOW_RESTARTS: 1   # /containers/{id}/restart|stop|kill
+    # The mounted docker.sock is root:root 660; nginx's default worker user
+    # (nginx, uid 101) got EACCES → 502 and a blind watchdog (live 2026-09-02).
+    # Run the workers as root like the haproxy it replaced — the allowlist,
+    # not the uid, is the boundary here.
+    command: ["sh", "-c", "sed -i 's/^user .*;/user root;/' /etc/nginx/nginx.conf && exec nginx -g 'daemon off;'"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./socket-proxy:/etc/nginx/conf.d:ro
     networks:
       - watchdog_net
     security_opt:
       - no-new-privileges:true
+    restart: unless-stopped
+
     mem_limit: 64m
     cpus: 0.25
     logging:
@@ -344,8 +366,6 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
-    restart: unless-stopped
-
   watchdog:
     build:
       context: .

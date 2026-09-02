@@ -123,10 +123,10 @@ def score_text(db, text: str, *, owner: dict | None = None,
     corrob = min(1.0, (int(m.group(1)) / 8.0)) if m else 0.0
 
     # 3) Learned weight: best matching topic weight, squashed to 0..1 (0.5 neutral).
+    # Learned weights disabled 2026-09-01: the table held 12 junk tokens from
+    # one June test rating and no rating surface exists yet; neutral until
+    # ratings arrive from the digest reader / channels.
     lw = 0.5
-    if learned:
-        best = max((learned.get(t, 0.0) for t in toks), default=0.0)
-        lw = max(0.0, min(1.0, 0.5 + best / 4.0))
 
     # 4) Knowing: overlap with dossier titles/Open-questions (~3 weighted hits
     #    saturate — an open-question hit counts double), plus the contradiction
@@ -137,7 +137,7 @@ def score_text(db, text: str, *, owner: dict | None = None,
 
     # COLD START (no owner queries AND no learned weights): don't gut the
     # digest — corroboration and standing knowledge only, floored mid-range.
-    if not owner and not learned:
+    if not owner:
         return round(min(1.0, 0.4 + 0.3 * corrob + 0.3 * know + contra), 3)
 
     # Informed: convex blend in [0,1]; low items CAN fall below the drop floor.

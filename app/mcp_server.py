@@ -155,6 +155,60 @@ _TOOLS = [
             "required": [],
         },
     ),
+    # Knowing tier (2026-09-02): the durable understanding, not just the facts.
+    Tool(
+        name="nova_dossiers",
+        description=(
+            "Search Nova's living dossiers — its standing, revisable understanding of a "
+            "domain, entity or story thread, distilled from verified intelligence digests. "
+            "Returns the best-matching dossiers with their 'Current understanding' and "
+            "'Open questions' excerpts. Use for: what does Nova currently understand about X, "
+            "what does it still not know. Prefer nova_knowledge_graph for single facts. "
+            "Limit default: 2, max: 5."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Topic, entity or question"},
+                "limit": {"type": "integer", "description": "Max dossiers", "default": 2},
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
+        name="nova_storylines",
+        description=(
+            "Active story threads Nova is tracking that match a query: title, current "
+            "state, how many times the thread moved, last update. Use for: what is the "
+            "current state of an ongoing situation. Limit default: 3, max: 10."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Story topic or entity"},
+                "limit": {"type": "integer", "description": "Max threads", "default": 3},
+            },
+            "required": ["query"],
+        },
+    ),
+    Tool(
+        name="nova_forecasts",
+        description=(
+            "Nova's falsifiable forecasts and its self-graded track record. Filter by "
+            "status (open, hit, miss, unresolvable, restated) and an optional claim "
+            "substring. Returns the forecasts plus accuracy and calibration. "
+            "Limit default: 10, max: 50."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "enum": ["open", "hit", "miss", "unresolvable", "restated"]},
+                "query": {"type": "string", "description": "Substring the claim must contain"},
+                "limit": {"type": "integer", "description": "Max forecasts", "default": 10},
+            },
+            "required": [],
+        },
+    ),
 ]
 
 
@@ -216,6 +270,63 @@ def create_mcp_server(
     # list_tools handler
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Knowing-tier handlers (2026-09-02)
+    # ------------------------------------------------------------------
+
+    def _clip(rows: list[dict], cap: int = 2500) -> list[dict]:
+        return [{k: (v[:cap] if isinstance(v, str) else v) for k, v in dict(r).items()} for r in rows]
+
+    async def _handle_dossiers(arguments: dict[str, Any]):
+        import asyncio as _aio
+        query = str(arguments.get("query", "") or "").strip()
+        if not query:
+            return _mcp_error("query is required", "invalid_argument", False)
+        limit = max(1, min(int(arguments.get("limit", 2) or 2), 5))
+        from app.core.dossiers import get_relevant_dossiers
+        rows = await _aio.to_thread(get_relevant_dossiers, db, query, limit=limit, open_questions=True)
+        return [TextContent(type="text", text=json.dumps(
+            {"query": query, "dossiers": _clip(rows)}, default=str))]
+
+    async def _handle_storylines(arguments: dict[str, Any]):
+        import asyncio as _aio
+        query = str(arguments.get("query", "") or "").strip()
+        if not query:
+            return _mcp_error("query is required", "invalid_argument", False)
+        limit = max(1, min(int(arguments.get("limit", 3) or 3), 10))
+        from app.core.storylines import get_relevant_storylines
+        rows = await _aio.to_thread(get_relevant_storylines, db, query, limit=limit)
+        return [TextContent(type="text", text=json.dumps(
+            {"query": query, "storylines": _clip(rows, 1500)}, default=str))]
+
+    async def _handle_forecasts(arguments: dict[str, Any]):
+        import asyncio as _aio
+        status = str(arguments.get("status", "") or "").strip().lower() or None
+        if status is not None and status not in ("open", "hit", "miss", "unresolvable", "restated"):
+            return _mcp_error("status must be open|hit|miss|unresolvable|restated", "invalid_argument", False)
+        needle = str(arguments.get("query", "") or "").strip()
+        limit = max(1, min(int(arguments.get("limit", 10) or 10), 50))
+
+        def _rows():
+            clauses, params = [], []
+            if status:
+                clauses.append("status = ?")
+                params.append(status)
+            if needle:
+                clauses.append("claim LIKE ?")
+                params.append(f"%{needle}%")
+            where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+            out = db.fetchall(
+                f"SELECT id, claim, confidence, status, resolves_at, resolved_at, resolution, "
+                f"source_monitor, created_at FROM forecasts {where} "
+                f"ORDER BY created_at DESC LIMIT ?", (*params, limit))
+            from app.core.forecasts import accuracy, calibration
+            return [dict(r) for r in out], accuracy(db), calibration(db, min_n=5)
+
+        rows, acc, cal = await _aio.to_thread(_rows)
+        return [TextContent(type="text", text=json.dumps(
+            {"forecasts": rows, "track_record": acc, "calibration": cal}, default=str))]
+
     @server.list_tools()
     async def list_tools() -> list[Tool]:
         return _TOOLS
@@ -237,6 +348,12 @@ def create_mcp_server(
                 content = await _handle_document_search(arguments)
             elif name == "nova_facts_about":
                 content = await _handle_facts_about(arguments)
+            elif name == "nova_dossiers":
+                content = await _handle_dossiers(arguments)
+            elif name == "nova_storylines":
+                content = await _handle_storylines(arguments)
+            elif name == "nova_forecasts":
+                content = await _handle_forecasts(arguments)
             else:
                 return _mcp_error(f"Unknown tool: {name}", "not_found", False)
             # Wrap list[TextContent] in CallToolResult for consistent return type

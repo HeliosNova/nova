@@ -276,6 +276,16 @@ CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_facts(subject);
 CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_facts(object);
 CREATE INDEX IF NOT EXISTS idx_kg_valid_from ON kg_facts(valid_from);
 CREATE INDEX IF NOT EXISTS idx_kg_created ON kg_facts(created_at);
+-- Channel user -> conversation mapping (2026-09-01: moved into the base schema; it
+-- was created lazily by ChannelConversationStore and did not exist in the live DB)
+CREATE TABLE IF NOT EXISTS channel_conversations (
+    channel TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    conversation_id TEXT NOT NULL,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (channel, user_id)
+);
+
 CREATE INDEX IF NOT EXISTS idx_monitors_enabled ON monitors(enabled);
 CREATE INDEX IF NOT EXISTS idx_monitor_results_monitor ON monitor_results(monitor_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_action_log_type ON action_log(action_type, created_at);
@@ -1257,6 +1267,58 @@ class SafeDB:
                     "AND schedule_seconds = 86400"
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (32,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # Migration 33 (2026-09-02): the open-questions ledger + belief revisions.
+        # A dossier's "## Open questions" section is Nova's epistemic frontier,
+        # but it lived only as prose: consolidation rewrote it every cycle and
+        # nothing recorded whether a question was researched, answered or
+        # dropped. dossier_questions tracks each question's disposition;
+        # belief_revisions keeps every REVISED: line (Nova changing its mind).
+        if 33 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS dossier_questions ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  dossier_id INTEGER NOT NULL,"
+                    "  dkey TEXT NOT NULL,"
+                    "  question TEXT NOT NULL,"
+                    "  qkey TEXT NOT NULL,"                     # normalized dedup key
+                    "  status TEXT NOT NULL DEFAULT 'open',"   # open|queued|researched|retired
+                    "  curiosity_id INTEGER,"
+                    "  resolution TEXT,"
+                    "  first_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  last_seen_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  resolved_at TIMESTAMP,"
+                    "  UNIQUE(dkey, qkey)"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dossier_questions_status "
+                    "ON dossier_questions (status, last_seen_at)"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_dossier_questions_curiosity "
+                    "ON dossier_questions (curiosity_id)"
+                )
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS belief_revisions ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  dossier_id INTEGER NOT NULL,"
+                    "  dkey TEXT NOT NULL,"
+                    "  revised TEXT NOT NULL,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_belief_revisions_dkey "
+                    "ON belief_revisions (dkey, created_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (33,))
                 conn.commit()
             except Exception:
                 conn.rollback()

@@ -180,3 +180,8 @@ class StatusResponse(BaseModel):
     kg_facts: int = 0
     reflexions: int = 0
     custom_tools: int = 0
+    # One entry per background pathway (app/monitors/pathways.py):
+    # name, verdict (alive/dead/idle/off/warming), last_at, age_hours, window_hours.
+    pathways: list[dict] = Field(default_factory=list)
+    # Quiet window (2026-09-02): end of an operator-declared LLM-lane pause, else None.
+    quiet_until: str | None = None

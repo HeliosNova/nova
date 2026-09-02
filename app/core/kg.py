@@ -228,7 +228,7 @@ def normalize_predicate(pred: str) -> str:
 # Stop words and normalization — shared via text_utils
 # ---------------------------------------------------------------------------
 
-from app.core.text_utils import normalize_words as _base_normalize  # noqa: E402
+from app.core.text_utils import normalize_words as _base_normalize, _IRREGULAR_STEMS  # noqa: E402
 
 
 def _normalize_words(text: str) -> set[str]:
@@ -653,6 +653,7 @@ class KnowledgeGraph:
             ("provenance", "TEXT DEFAULT ''"),
             ("superseded_by", "INTEGER"),
             ("times_retrieved", "INTEGER DEFAULT 0"),
+            ("last_retrieved_at", "TEXT"),
             # Bitemporal: transaction time of supersession (added 2026-05-16, task #29).
             # Distinct from valid_to: valid_to = when the fact stopped being true in
             # the world; superseded_at = when WE recorded the supersession. For
@@ -702,6 +703,7 @@ class KnowledgeGraph:
             "WHERE superseded_at IS NULL AND valid_to IS NOT NULL"
         )
         getattr(db, "mark_schema_ensured", lambda _t: None)("kg")
+        self._ensure_fts()
         self._finish_init()
 
     def _finish_init(self) -> None:
@@ -712,6 +714,9 @@ class KnowledgeGraph:
         self._write_lock = asyncio.Lock()
         # ChromaDB collection for semantic search (lazy init)
         self._collection = None
+        # FTS5 keyword index state: True/False once probed, None = unknown
+        if not hasattr(self, "_fts_ok"):
+            self._fts_ok = None
 
     # --- ChromaDB vector collection for semantic KG search ---
 
@@ -1658,6 +1663,138 @@ class KnowledgeGraph:
             for r in rows
         ]
 
+    # --- FTS5 keyword candidates (2026-09-01) ---
+    # The keyword arm used to scan EVERY live fact in Python, which was the only
+    # reason MAX_KG_FACTS existed — and the cap turned the KG into a ring buffer
+    # that evicted the newest facts first. Candidates now come from an
+    # external-content FTS5 index kept in sync by triggers; the exact stemmed
+    # overlap scoring runs on that subset. The full scan survives as a fallback.
+    _FTS_DDL = (
+        "CREATE VIRTUAL TABLE IF NOT EXISTS kg_facts_fts USING fts5("
+        "subject, predicate, object, content='kg_facts', content_rowid='id', "
+        "tokenize='unicode61')"
+    )
+    _FTS_TRIGGERS = (
+        "CREATE TRIGGER IF NOT EXISTS kg_facts_fts_ai AFTER INSERT ON kg_facts BEGIN "
+        "INSERT INTO kg_facts_fts(rowid, subject, predicate, object) "
+        "VALUES (new.id, new.subject, new.predicate, new.object); END",
+        "CREATE TRIGGER IF NOT EXISTS kg_facts_fts_ad AFTER DELETE ON kg_facts BEGIN "
+        "INSERT INTO kg_facts_fts(kg_facts_fts, rowid, subject, predicate, object) "
+        "VALUES ('delete', old.id, old.subject, old.predicate, old.object); END",
+        "CREATE TRIGGER IF NOT EXISTS kg_facts_fts_au AFTER UPDATE OF subject, predicate, object "
+        "ON kg_facts BEGIN "
+        "INSERT INTO kg_facts_fts(kg_facts_fts, rowid, subject, predicate, object) "
+        "VALUES ('delete', old.id, old.subject, old.predicate, old.object); "
+        "INSERT INTO kg_facts_fts(rowid, subject, predicate, object) "
+        "VALUES (new.id, new.subject, new.predicate, new.object); END",
+    )
+
+    def _ensure_fts(self) -> None:
+        """Create the FTS5 index + sync triggers; rebuild when out of step."""
+        try:
+            self._db.execute(self._FTS_DDL)
+            for stmt in self._FTS_TRIGGERS:
+                self._db.execute(stmt)
+            try:
+                self._db.execute("INSERT INTO kg_facts_fts(kg_facts_fts) VALUES ('integrity-check')")
+            except Exception:
+                self._db.execute("INSERT INTO kg_facts_fts(kg_facts_fts) VALUES ('rebuild')")
+                n = self._db.fetchone("SELECT COUNT(*) AS c FROM kg_facts")
+                logger.info("kg_facts_fts rebuilt for %d facts", n["c"] if n else -1)
+            self._fts_ok = True
+        except Exception as e:
+            logger.warning("kg_facts_fts unavailable — keyword arm uses the full scan: %s", e)
+            self._fts_ok = False
+
+    def _fts_candidates(self, query: str, query_words: set[str], *, max_rows: int = 3000):
+        """Live, non-quarantined rows whose text matches any query word — raw
+        form, stem prefix, or irregular-stem form (French<->France). Returns
+        None when the index is unavailable so the caller can fall back."""
+        if self._fts_ok is False:
+            return None
+        raw = {w for w in _base_normalize(query, min_length=2, stem=False)}
+        terms: list[str] = []
+        for w in sorted(raw | set(query_words)):
+            w = re.sub(r"[^\w]", "", w)
+            if len(w) < 2:
+                continue
+            terms.append(f'"{w}"')
+            if w in query_words and len(w) >= 3:
+                terms.append(f'"{w}"*')
+        for stem in query_words:
+            for k, v in _IRREGULAR_STEMS.items():
+                if v == stem and k not in raw:
+                    terms.append(f'"{k}"')
+        if not terms:
+            return []
+        match = " OR ".join(dict.fromkeys(terms))
+        try:
+            rows = self._db.fetchall(
+                "SELECT f.* FROM kg_facts_fts s JOIN kg_facts f ON f.id = s.rowid "
+                "WHERE kg_facts_fts MATCH ? AND f.valid_to IS NULL "
+                "AND COALESCE(f.quarantined, 0) = 0 "
+                "ORDER BY bm25(kg_facts_fts) LIMIT ?",
+                (match, max_rows),
+            )
+        except Exception as e:
+            msg = str(e).lower()
+            if "no such table" in msg or "no such module" in msg:
+                self._fts_ok = False
+            logger.warning("kg_facts_fts query failed — falling back to full scan: %s", e)
+            return None
+        self._fts_ok = True
+        return list(rows)
+
+    def _load_live_facts(self, limit: int) -> list:
+        return list(self._db.fetchall(
+            "SELECT * FROM kg_facts WHERE valid_to IS NULL "
+            "AND COALESCE(quarantined, 0) = 0 "
+            "ORDER BY confidence DESC LIMIT ?",
+            (limit,),
+        ))
+
+    def _rows_by_ids(self, ids: list[int]) -> dict[int, object]:
+        """Resolve ids to LIVE, non-quarantined rows (chunked IN lists)."""
+        out: dict[int, object] = {}
+        ids = [int(i) for i in ids]
+        for i in range(0, len(ids), 400):
+            chunk = ids[i:i + 400]
+            ph = ",".join("?" for _ in chunk)
+            for row in self._db.fetchall(
+                f"SELECT * FROM kg_facts WHERE id IN ({ph}) AND valid_to IS NULL "
+                f"AND COALESCE(quarantined, 0) = 0",
+                tuple(chunk),
+            ):
+                out[row["id"]] = row
+        return out
+
+    def _ppr_rank_from_db(self, ppr_mod, seeds: list[str], *, top_k: int,
+                          rows_by_id: dict[int, object]) -> list[tuple[int, float]]:
+        """PPR scoring over the seeds' neighbourhood fetched from the DB instead
+        of a full live-fact scan (same score = max(ppr[subj], ppr[obj]))."""
+        ppr = ppr_mod.compute_ppr(seeds, top_k=300)
+        if not ppr:
+            return []
+        ents = list(ppr.keys())
+        scored: list[tuple[int, float]] = []
+        for i in range(0, len(ents), 300):
+            chunk = ents[i:i + 300]
+            ph = ",".join("?" for _ in chunk)
+            rows = self._db.fetchall(
+                f"SELECT * FROM kg_facts WHERE valid_to IS NULL AND COALESCE(quarantined, 0) = 0 "
+                f"AND (LOWER(subject) IN ({ph}) OR LOWER(object) IN ({ph})) LIMIT 4000",
+                tuple(chunk) + tuple(chunk),
+            )
+            for row in rows:
+                s_ = (row["subject"] or "").strip().lower()
+                o_ = (row["object"] or "").strip().lower()
+                score = max(ppr.get(s_, 0.0), ppr.get(o_, 0.0))
+                if score > 0:
+                    rows_by_id[row["id"]] = row
+                    scored.append((row["id"], score))
+        scored.sort(key=lambda x: -x[1])
+        return scored[:top_k]
+
     def get_relevant_facts(self, query: str, limit: int = 8) -> list[Fact]:
         """Get facts relevant to a query by hybrid keyword + semantic search.
 
@@ -1676,23 +1813,24 @@ class KnowledgeGraph:
         # from untrusted web content stay OUT of prompt injection until
         # independently corroborated — this retrieval path feeds the system
         # prompt, so it is exactly the surface a poisoned fact targets.
-        all_facts = self._db.fetchall(
-            "SELECT * FROM kg_facts WHERE valid_to IS NULL "
-            "AND COALESCE(quarantined, 0) = 0 "
-            "ORDER BY confidence DESC LIMIT ?",
-            (_cand_limit,),
-        )
-        if not all_facts:
-            return []
+        # Candidate generation (2026-09-01): FTS5 candidates (see
+        # _fts_candidates) instead of a confidence-ordered window over every
+        # live fact; rows are resolved lazily per arm so the cap no longer
+        # bounds what is retrievable.
+        rows_by_id: dict[int, object] = {}
+        all_facts = None
 
-        rows_by_id = {row["id"]: row for row in all_facts}
-
-        # --- Keyword search (existing approach) ---
+        # --- Keyword search (exact stemmed overlap on FTS candidates) ---
         query_words = _normalize_words(query)
         keyword_ids: list[int] = []
         if query_words:
+            cand_rows = self._fts_candidates(query, query_words)
+            if cand_rows is None:
+                all_facts = self._load_live_facts(_cand_limit)
+                cand_rows = all_facts
             scored: list[tuple[int, int]] = []
-            for row in all_facts:
+            for row in cand_rows:
+                rows_by_id[row["id"]] = row
                 fact_words = (
                     _normalize_words(row["subject"])
                     | _normalize_words(row["predicate"].replace("_", " "))
@@ -1750,9 +1888,15 @@ class KnowledgeGraph:
                     # cosine 0.08-0.42, so 0.5 admits genuine paraphrases only.
                     _STRONG_DISTANCE = min(_MAX_DISTANCE, 0.5)
                     distances = results.get("distances", [[]])[0]
-                    for rid_str, dist in zip(results["ids"][0], distances):
-                        rid = int(rid_str)
-                        if rid in rows_by_id and dist < _MAX_DISTANCE:
+                    cand = [(int(r), d) for r, d in zip(results["ids"][0], distances)
+                            if d < _MAX_DISTANCE]
+                    # Resolve hits to LIVE, non-quarantined rows (the index may
+                    # lag a retirement or quarantine by one maintenance cycle).
+                    missing = [rid for rid, _ in cand if rid not in rows_by_id]
+                    if missing:
+                        rows_by_id.update(self._rows_by_ids(missing))
+                    for rid, dist in cand:
+                        if rid in rows_by_id:
                             vector_ids.append(rid)
                             if dist <= _STRONG_DISTANCE:
                                 vector_strong.add(rid)
@@ -1771,7 +1915,11 @@ class KnowledgeGraph:
                 from app.core import ppr as ppr_mod
                 seeds = ppr_mod.extract_entities(query, max_seeds=6)
                 if seeds:
-                    ranked = ppr_mod.rank_facts_by_ppr(all_facts, seeds, top_k=limit * 3)
+                    if all_facts is not None:
+                        ranked = ppr_mod.rank_facts_by_ppr(all_facts, seeds, top_k=limit * 3)
+                    else:
+                        ranked = self._ppr_rank_from_db(
+                            ppr_mod, seeds, top_k=limit * 3, rows_by_id=rows_by_id)
                     ppr_ids = [rid for rid, _ in ranked]
                     if ppr_ids:
                         logger.debug(
@@ -1824,14 +1972,16 @@ class KnowledgeGraph:
             if entities and neighbor_budget > 0:
                 placeholders = ",".join("?" for _ in entities)
                 neighbors = self._db.fetchall(
-                    f"SELECT id FROM kg_facts WHERE valid_to IS NULL "
+                    f"SELECT id FROM kg_facts WHERE valid_to IS NULL AND COALESCE(quarantined, 0) = 0 "
                     f"AND (LOWER(subject) IN ({placeholders}) OR LOWER(object) IN ({placeholders})) "
                     f"ORDER BY confidence DESC LIMIT ?",
                     tuple(entities) + tuple(entities) + (neighbor_budget * 3,),
                 )
-                for nrow in neighbors:
-                    nid = nrow["id"]
-                    if nid not in seen_ids and nid in rows_by_id:
+                neighbor_ids = [nrow["id"] for nrow in neighbors if nrow["id"] not in seen_ids]
+                rows_by_id.update(self._rows_by_ids(
+                    [n for n in neighbor_ids if n not in rows_by_id]))
+                for nid in neighbor_ids:
+                    if nid in rows_by_id:
                         seen_ids.add(nid)
                         top_ids.append(nid)
                         if len(top_ids) >= limit:
@@ -2158,29 +2308,49 @@ class KnowledgeGraph:
             "unique_predicates": predicates,
         }
 
-    def _prune(self) -> None:
-        """If current kg_facts exceed _config.MAX_KG_FACTS, delete oldest low-confidence ones.
+    _PROTECTED_SOURCES = ("principle", "cross_synthesis", "storyline")
 
-        Only prunes current facts. Superseded facts are historical and not counted.
+    def _prune(self) -> None:
+        """Keep the live KG at or under MAX_KG_FACTS WITHOUT discarding new
+        knowledge (2026-09-01).
+
+        The old order (`times_retrieved ASC, confidence ASC, created_at ASC`)
+        retired the newest, never-yet-retrieved facts first — measured live:
+        2,036 facts learned in 7 days, 513 still live; 5,514 retired at age
+        < 1 day; cross_synthesis 83 minted / 1 live. Now: facts younger than
+        14 days and distilled provenance classes are never cap-evicted; among
+        the rest, never-retrieved go first, then the least recently retrieved,
+        then the lowest confidence. If the excess is all young or protected,
+        nothing is evicted — the daily staleness prunes handle the long tail.
+        Only prunes current facts; superseded facts are history and not counted.
         """
         count_row = self._db.fetchone(
             "SELECT COUNT(*) AS c FROM kg_facts WHERE valid_to IS NULL"
         )
         count = count_row["c"] if count_row else 0
-        if count <= _config.MAX_KG_FACTS:
+        cap = int(_config.MAX_KG_FACTS)
+        if count <= cap:
             return
-        excess = count - _config.MAX_KG_FACTS
-        # Retire (set valid_to) instead of hard-deleting to preserve temporal history
+        excess = count - cap
+        ph = ",".join("?" for _ in self._PROTECTED_SOURCES)
         prune_rows = self._db.fetchall(
-            "SELECT id FROM kg_facts "
-            "WHERE valid_to IS NULL "
-            "ORDER BY times_retrieved ASC, confidence ASC, created_at ASC "
-            "LIMIT ?",
-            (excess,),
+            f"SELECT id FROM kg_facts WHERE valid_to IS NULL "
+            f"AND created_at < datetime('now', '-14 days') "
+            f"AND COALESCE(source, '') NOT IN ({ph}) "
+            f"AND COALESCE(provenance, '') NOT LIKE 'curiosity%' "
+            f"ORDER BY (COALESCE(times_retrieved, 0) = 0) DESC, "
+            f"COALESCE(last_retrieved_at, created_at) ASC, confidence ASC "
+            f"LIMIT ?",
+            tuple(self._PROTECTED_SOURCES) + (excess,),
         )
         prune_ids = [r["id"] for r in prune_rows]
-        retired = self._retire_facts_batch(prune_ids)
-        logger.info("Pruned (retired) %d KG facts (over %d limit)", retired, _config.MAX_KG_FACTS)
+        retired = self._retire_facts_batch(prune_ids) if prune_ids else 0
+        if retired < excess:
+            logger.info(
+                "KG over cap by %d but only %d fact(s) eligible for eviction "
+                "(older than 14d, unprotected) — young knowledge kept", excess, retired)
+        if retired:
+            logger.info("Pruned (retired) %d KG facts (over %d limit)", retired, cap)
 
     async def decay_stale(self, days: int = 60, decay_amount: float = 0.05) -> int:
         """Lower confidence on old current facts. Returns count affected."""

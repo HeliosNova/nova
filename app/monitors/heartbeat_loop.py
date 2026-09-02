@@ -118,6 +118,9 @@ def _digest_health_verdict(lengths: list[int], linkish: int,
 _CANARY_NORMAL_MARKERS: dict[str, str] = {
     "kg_growth": "kg growth normal",
     "ollama_latency": "ollama healthy",
+    # Pathway liveness (2026-09-02): healthy readouts carry no drifting
+    # numbers, so only the first dead verdict and the recovery edge deliver.
+    "pathway_liveness": "all pathways alive",
 }
 
 
@@ -187,14 +190,35 @@ def _canary_should_alert(check_type: str, last_result: str | None,
     return not (was_normal and is_normal)
 
 
+_STATUS_STRING_RE = re.compile(
+    r"(?i)^\s*\[?\s*(?:provisional\]\s*)?(?:no change|nothing new|no new|unchanged|status:)\b"
+    r"|\|\s*last:\s*20\d\d")
+_DATE_SIGNAL_RE = re.compile(
+    r"(?i)\b20\d\d\b"
+    r"|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|\b\d{1,2}\s+(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*\b"
+    r"|\b(?:today|yesterday|this week|last week|this month)\b")
+_SOURCE_SIGNAL_RE = re.compile(
+    r"(?i)\b[a-z0-9-]+\.(?:com|org|net|gov|edu|io|co|uk|eu|ai|news|info|int|mil)\b"
+    r"|\baccording to\b|\breported\b|\bannounced\b|\bpublished\b|\bconfirmed\b"
+    r"|\banalysts?\b|\bestimates?\b|\bdata shows?\b|\bsurvey\b|\bstudy\b|\bfilings?\b"
+    r"|\bofficials?\b|\bspokes(?:person|man|woman)\b|\bstatement\b")
+
+
 def _provisional_acceptable(topic: str, result: str) -> bool:
     """Is `result` an acceptable PROVISIONAL answer for `topic`?
 
-    Two cheap screens (the closure judge was already bypassed for
-    analytical topics): reject session-summary-shaped text, and require at
-    least one substantive topic token to appear in the answer.
+    Screens (the closure judge was already bypassed for analytical topics):
+    reject session-summary-shaped text and monitor-status strings ('no change
+    | last: …' was banked as an answer 8 times in 14 days), require at least
+    one dated AND one sourced signal (knowledge, not a hedge), and require a
+    substantive topic token to appear in the answer.
     """
     if not result or _SESSION_SUMMARY_RE.search(result):
+        return False
+    if _STATUS_STRING_RE.search(result[:200]):
+        return False
+    if not (_DATE_SIGNAL_RE.search(result) and _SOURCE_SIGNAL_RE.search(result)):
         return False
     topic_tokens = {t for t in re.findall(r"[a-z0-9]{4,}", (topic or "").lower())
                     if t not in ("what", "will", "could", "might", "would",
@@ -316,6 +340,35 @@ def _strip_deliberation(text: str) -> str:
 # suppress 100% of digests. Same class as the freshness rubric's never-
 # emitted date lines and the format rubric's never-emitted numbered items:
 # output judged against a structure it never had.
+
+
+# Check types that drive the 27B synthesis model (MONITOR_SYNTHESIS_MODEL)
+# outside the query/deep-research route: consolidation rewrites dossiers on
+# it, cross-monitor synthesis writes themes with it. They share the digest
+# residency class so a tick never swaps 27B→9B→27B around them (2026-09-02).
+_SYNTHESIS_MODEL_TYPES = frozenset({"consolidation", "synthesis"})
+
+
+def _batch_by_class(order: list, classify) -> list:
+    """Group a batch by residency class in order of first appearance,
+    keeping each class's relative order (2026-09-02, scheduler v2).
+
+    The 24GB card holds ONE of the 27B / 9B / judge models; every class
+    alternation in a batch is a full unload+load (~80s cold). Overdue-ratio
+    order interleaves classes freely, so a 12-monitor tick could swap ten
+    times. Grouping bounds swaps to (number of classes − 1) per tick while
+    keeping the starvation floor (_class_floor_order runs first, so a
+    starved daily still leads its class, and its class still leads the tick).
+    """
+    seen: list[str] = []
+    groups: dict[str, list] = {}
+    for m in order:
+        c = classify(m)
+        if c not in groups:
+            seen.append(c)
+            groups[c] = []
+        groups[c].append(m)
+    return [m for c in seen for m in groups[c]]
 
 
 def _class_floor_order(slow: list, classify, now: datetime) -> list:
@@ -477,7 +530,7 @@ class HeartbeatLoop:
                     if due:
                         logger.info("[Heartbeat] %d monitor(s) due", len(due))
 
-                        _FAST_TYPES = {"system_health", "maintenance"}
+                        _FAST_TYPES = {"system_health", "maintenance", "pathway_liveness"}
                         fast = [m for m in due if m.check_type in _FAST_TYPES]
                         slow = [m for m in due if m.check_type not in _FAST_TYPES]
 
@@ -497,6 +550,23 @@ class HeartbeatLoop:
                         # no-LLM monitors above still ran. Due monitors aren't lost
                         # — last_check_at isn't advanced, so they're picked up on
                         # the next tick once chat goes quiet.
+                        # Quiet window (2026-09-02): an operator-declared pause for
+                        # A/B replays / model work. The LLM lane sleeps, the fast
+                        # lane keeps running, nothing is marked checked — so every
+                        # skipped monitor catches up the moment the window ends.
+                        if slow:
+                            try:
+                                from app.database import get_db as _qdb
+                                from app.monitors.quiet import quiet_status as _qs
+                                _q = await asyncio.to_thread(_qs, _qdb())
+                            except Exception:
+                                _q = {"active": False}
+                            if _q.get("active"):
+                                logger.info(
+                                    "[Heartbeat] quiet window (%s) — deferring %d LLM monitor(s), %.0f min left",
+                                    _q.get("reason") or "no reason given", len(slow),
+                                    _q.get("remaining_minutes", 0) or 0)
+                                slow = []
                         from app.core import llm as _llm
                         if slow and _llm.interactive_active():
                             # Escape hatch against indefinite starvation: a
@@ -540,6 +610,12 @@ class HeartbeatLoop:
                         slow = _class_floor_order(
                             slow, self._monitor_class,
                             datetime.now(timezone.utc).replace(tzinfo=None))
+                        slow = _batch_by_class(slow, self._monitor_class)
+                        if len(slow) > 1:
+                            _classes = [self._monitor_class(m) for m in slow]
+                            _swaps = sum(1 for a, b in zip(_classes, _classes[1:]) if a != b)
+                            logger.info("[Heartbeat] batch of %d: %s (%d model swap(s))",
+                                        len(slow), ",".join(_classes), _swaps)
                         if slow:
                             gate = _ClassGate({"digest": _MAX_CONCURRENT_DIGEST_MONITORS},
                                               default=_MAX_CONCURRENT_LLM_MONITORS)
@@ -622,6 +698,10 @@ class HeartbeatLoop:
         Domain Study:*/Auto:*/feed-backed query monitors run the 27B
         deep-research chain ("digest"); every other slow monitor (brain.think
         9B queries, quiz, consolidation, eval) stays exclusive ("other")."""
+        if monitor.check_type in _SYNTHESIS_MODEL_TYPES:
+            return "digest"          # 27B via MONITOR_SYNTHESIS_MODEL
+        if monitor.check_type == "output_eval":
+            return "judge"           # JUDGE_MODEL (gemma) — a third residency
         if monitor.check_type != "query":
             return "other"
         try:
@@ -956,6 +1036,7 @@ class HeartbeatLoop:
         "forecast_resolve": lambda self, m, cfg: self._execute_forecast_resolve(),
         "auto_tool": lambda self, m, cfg: self._execute_auto_tool_synthesis(),
         "output_eval": lambda self, m, cfg: self._execute_output_eval(),
+        "pathway_liveness": lambda self, m, cfg: self._execute_pathway_liveness(),
     }
 
     async def _execute_check(self, monitor: Monitor) -> str:
@@ -1345,7 +1426,11 @@ class HeartbeatLoop:
         tokens = []
         try:
             async with asyncio.timeout(config.GENERATION_TIMEOUT):
-                async for event in think(query=enriched_query, ephemeral=True, channel="monitor"):
+                # Research whitelist (2026-09-01): monitor-channel generations
+                # never get side-effect tools, whatever the access tier.
+                from app.core.access_tiers import research_scope
+                with research_scope():
+                  async for event in think(query=enriched_query, ephemeral=True, channel="monitor"):
                     if event.type == EventType.TOKEN:
                         text = event.data.get("text", "")
                         if text:
@@ -1605,27 +1690,11 @@ class HeartbeatLoop:
         except Exception as e:
             logger.warning("[Heartbeat] Quiz tracking update failed: %s", e)
 
-        # RLVR — record quiz outcome as a verifiable signal regardless of pass/fail.
-        try:
-            from app.config import config as _cfg
-            if getattr(_cfg, "ENABLE_RLVR_SIGNALS", False):
-                from app.core import rlvr as _rlvr
-                _rlvr.record_signal(
-                    "quiz_correct",
-                    1.0 if passed else 0.0,
-                    query=str(question)[:500],
-                    response=str(answer)[:500],
-                    evidence=f"lesson_id={lesson.id} topic={(lesson.topic or '')[:80]}",
-                )
-        except Exception:
-            pass
-
         if passed:
-            # Reinforce the lesson
-            try:
-                await asyncio.to_thread(svc.learning.mark_lesson_helpful, lesson.id)
-            except Exception as e:
-                logger.warning("[Heartbeat] mark_lesson_helpful failed: %s", e)
+            # No self-credit (2026-09-01): a quiz graded against the lesson's own
+            # answer must not raise times_helpful / retrieval_score — those
+            # counters order retrieval and qualify skill induction and principle
+            # promotion, and with chat unused they were quiz-driven entirely.
             # CLOSURE: clear the quiz_failures counter — the lesson has been
             # re-validated. This is the closure signal for the
             # quiz-fail → curiosity-research → re-quiz feedback loop.
@@ -1895,6 +1964,13 @@ class HeartbeatLoop:
                         await asyncio.to_thread(
                             svc.curiosity.resolve, item.id,
                             "[provisional] " + result[:1985])
+                        try:
+                            from app.core.questions import mark_researched
+                            from app.database import get_db as _gdb
+                            await asyncio.to_thread(mark_researched, _gdb(), item.id,
+                                                    "[provisional] " + result[:580])
+                        except Exception:
+                            pass
                         logger.info("[Curiosity] analytical question resolved as provisional: %s",
                                     item.topic[:80])
                         return (f"CURIOSITY PROVISIONAL | topic={item.topic[:80]} | "
@@ -1915,6 +1991,11 @@ class HeartbeatLoop:
                     logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
                     return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
 
+                # A monitor-status string is not knowledge (2026-09-01).
+                if _STATUS_STRING_RE.search(result[:200]):
+                    await asyncio.to_thread(svc.curiosity.fail, item.id)
+                    return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=status_string"
+
                 # Store findings in KG if possible
                 if svc.kg and len(result) > 50:
                     from app.core.brain import _extract_kg_triples
@@ -1925,6 +2006,12 @@ class HeartbeatLoop:
                         pass
 
                 await asyncio.to_thread(svc.curiosity.resolve, item.id, result[:2000])
+                try:  # open-questions ledger (2026-09-02): a dossier question got its answer
+                    from app.core.questions import mark_researched
+                    from app.database import get_db as _gdb
+                    await asyncio.to_thread(mark_researched, _gdb(), item.id, result[:600])
+                except Exception:
+                    pass
 
                 # --- Convert research findings into a lesson ---
                 # Gate: only create a lesson when the research result LOOKS LIKE actual
@@ -3271,9 +3358,40 @@ class HeartbeatLoop:
                     sent = sent or bool(ok)
                     if not ok:
                         logger.error("[Heartbeat] %s alert NOT delivered", ch)
+                    elif ch == "telegram":
+                        # Talk-back anchor (2026-09-01): a delivered digest becomes
+                        # an assistant turn in the owner's channel conversation, so
+                        # "that's wrong, X is Y" typed after it has an answer to
+                        # correct and "what did you send me about X" has history.
+                        await asyncio.to_thread(
+                            self._record_channel_turn, "telegram",
+                            getattr(bots[ch], "default_chat_id", None), text)
                 except Exception as e:
                     logger.error("[Heartbeat] %s alert failed: %s", ch, e)
         return sent
+
+    def _record_channel_turn(self, channel: str, user_id, text: str) -> None:
+        """Append a delivered digest (bounded) as an assistant message in the
+        channel user's persistent conversation, creating the mapping if needed."""
+        if not user_id or not text:
+            return
+        try:
+            from app.core.brain import get_services
+            from app.database import ChannelConversationStore, get_db
+            svc = get_services()
+            if not svc or not getattr(svc, "conversations", None):
+                return
+            store = ChannelConversationStore(get_db())
+            conv_id = store.get(channel, str(user_id))
+            if not conv_id:
+                conv_id = svc.conversations.create_conversation()
+                store.set(channel, str(user_id), conv_id)
+            body = text.strip()
+            if len(body) > 1200:
+                body = body[:1200].rstrip() + " […]"
+            svc.conversations.add_message(conv_id, "assistant", body)
+        except Exception as e:
+            logger.debug("[Heartbeat] channel turn not recorded: %s", e)
 
     def _format_digest(self, items: list[tuple[str, str]], categories: dict | None = None) -> str:
         """One message from a cycle's alerts. Single item keeps its plain form;
@@ -3856,6 +3974,20 @@ class HeartbeatLoop:
             "entail_dropped": dropped,
         }
         return format_monitor_result("Digest Health Canary", status, summary, fields)
+
+    async def _execute_pathway_liveness(self) -> str:
+        """Fast-lane liveness verdict over every optional background writer
+        (app/monitors/pathways.py). Deterministic — DB reads and one file
+        mtime; no LLM, no network. A pathway whose table stopped growing
+        past its window is DEAD; the summary names it and the fields carry
+        the silence, so the failure mode that hid storylines for five weeks
+        (2026-08-11) surfaces within one cycle.
+        """
+        from app.database import get_db
+        from app.monitors.pathways import liveness_report
+
+        status, summary, fields = await asyncio.to_thread(liveness_report, get_db())
+        return format_monitor_result("Pathway Liveness", status, summary, fields)
 
     async def _execute_kg_health_check(self) -> str:
         """Check Knowledge Graph health: node count, edge count, fragmentation."""

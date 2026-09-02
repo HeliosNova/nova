@@ -85,6 +85,18 @@ _SIDE_EFFECT_TOOLS = frozenset({
     "desktop", "background_task", "tool_create", "monitor",
 })
 
+# Taint tracking (2026-09-01). Once a turn has ingested web-derived text the
+# model may be reading an injected instruction; side-effect tools leave its
+# tool list for the rest of that turn (sandboxed code_exec and the benign
+# owner-facing tools stay). The injection detector only prefixes a banner.
+_WEB_INGEST_TOOLS = frozenset({
+    "web_search", "http_fetch", "browser", "deep_research", "knowledge_search",
+})
+_TAINT_STRIPPED_TOOLS = frozenset({
+    "shell_exec", "file_ops", "desktop", "tool_create", "email_send", "webhook",
+    "integration", "background_task", "delegate",
+})
+
 # Per-query pivot tracking — one backtrack pivot allowed per conversation per query.
 # Keyed by conversation_id; auto-cleared after the tool loop finishes (in _run_generation_loop).
 _pivot_attempted_this_query: dict[str, bool] = {}
@@ -1062,12 +1074,16 @@ async def _gather_context(
             from app.database import get_db
             _dossiers = await _run_context_io(
                 "dossiers",
-                asyncio.to_thread(get_relevant_dossiers, get_db(), query, limit=1),
+                asyncio.to_thread(get_relevant_dossiers, get_db(), query, limit=2),
                 default=None,
             )
             if _dossiers:
-                _dtext = "Standing knowledge dossier (Nova's accumulated understanding):\n" + "\n".join(
-                    f"### {d['title']}\n{d['excerpt']}" for d in _dossiers
+                _dtext = (
+                    "Standing knowledge dossiers (Nova's accumulated understanding). Answer "
+                    "from them when they cover the question and cite them as (dossier: <title>); "
+                    "when their Open questions bear on the query, say plainly what Nova does not "
+                    "yet know instead of searching:\n"
+                    + "\n".join(f"### {d['title']}\n{d['excerpt']}" for d in _dossiers)
                 )
                 ctx.kg_facts_text = (
                     (_dtext + "\n\n" + ctx.kg_facts_text) if ctx.kg_facts_text else _dtext
@@ -1627,6 +1643,55 @@ def _kg_answers_query(query: str, kg_facts_text: str) -> bool:
     return False
 
 
+_KNOWING_TOOL_VERB_RE = re.compile(
+    r"(?i)\b(?:search|look ?up|google|browse|fetch|download|scrape|crawl|run|execute|"
+    r"calculate|compute|check (?:the )?(?:web|internet|online)|go online|find online)\b")
+_KNOWING_ASK_RE = re.compile(
+    r"(?i)\b(?:what (?:do|did|have) (?:you|your monitors|the monitors)|"
+    r"according to (?:your|the) (?:dossiers?|monitors?|knowledge|notes|understanding)|"
+    r"your (?:dossiers?|monitors?|understanding|standing knowledge|digests?)|"
+    r"what (?:are you|is nova) tracking|what did nova learn|"
+    r"from (?:your|nova'?s) (?:dossiers?|digests?|monitors?)|"
+    r"(?:per|according to) my notes|in my notes)\b")
+
+
+def _knowing_answers_query(query: str, kg_facts_text: str, lessons_text: str) -> bool:
+    """Knowing-first gate (2026-09-01): the answer is already in the prompt as a
+    standing dossier or an owner-taught lesson — generate WITHOUT tools so the
+    model reads what it knows instead of hunting the web past it. Measured
+    before: a 'what did your monitors learn' question took 131 s and five tool
+    rounds with the dossier in context; two memory evals web-searched past a
+    rank-1 lesson. Narrow: a knowledge-interrogation phrasing with a dossier
+    present, a dossier title fully named in the query, or a lesson whose topic
+    the query names — and never for tool-implying queries."""
+    # Only explicit tool verbs opt out — "latest"/"current" are exactly what a
+    # standing dossier answers (the KG gate's broader _TOOL_ACTION_RE would
+    # send every "what's the latest on X" back to the web).
+    if _KNOWING_TOOL_VERB_RE.search(query):
+        return False
+    q_tokens = {t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", query)}
+    has_dossier = "Standing knowledge dossier" in (kg_facts_text or "")
+    if has_dossier and _KNOWING_ASK_RE.search(query):
+        return True
+    if has_dossier:
+        for line in kg_facts_text.split("\n"):
+            if not line.startswith("### "):
+                continue
+            title_tokens = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9'-]{3,}", line[4:])]
+            distinctive = [t for t in title_tokens if t not in ("and", "the", "for", "with")]
+            if distinctive and all(t in q_tokens for t in distinctive[:3]):
+                return True
+    for line in (lessons_text or "").split("\n"):
+        m = re.match(r"\s*-\s*\[(?:HIGH|MED|LOW)\]\s*([^:]{4,80}):", line)
+        if not m:
+            continue
+        topic_tokens = [t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9'-]{3,}", m.group(1))]
+        distinctive = [t for t in topic_tokens if len(t) >= 4 and t not in ("nova's", "user's", "users")]
+        if len(distinctive) >= 2 and sum(1 for t in distinctive[:4] if t in q_tokens) >= 2:
+            return True
+    return False
+
+
 def _auto_think_eligible(*, query: str, intent: str, image: str | None,
                          selected_model: str, channel: str) -> bool:
     """Should the hard-reasoning heuristic auto-enable extended thinking?
@@ -1669,6 +1734,7 @@ async def _run_generation_loop(
     This is Step 9 of the original think() pipeline.
     """
     # query is now passed explicitly to avoid messages[-1] assumption breaking after planning
+    _tainted = False
 
     # Model selection
     selected_model = _select_model(query, intent, was_planned)
@@ -2052,6 +2118,11 @@ async def _run_generation_loop(
                 break
 
             tool_calls = _filtered_calls
+            if _tainted:
+                _blocked = [tc.tool for tc in tool_calls if tc.tool in _TAINT_STRIPPED_TOOLS]
+                if _blocked:
+                    logger.warning("[taint] side-effect tool call(s) %s refused after web ingestion", _blocked)
+                    tool_calls = [tc for tc in tool_calls if tc.tool not in _TAINT_STRIPPED_TOOLS]
 
             if _circuit_broken:
                 # Force this to be the final round
@@ -2128,6 +2199,14 @@ async def _run_generation_loop(
                 _deduped_results.append((tc, tool_output, tool_result_obj))
             results = _deduped_results
 
+            if not _tainted and any(tc.tool in _WEB_INGEST_TOOLS for tc, _o, _r in results):
+                _tainted = True
+                _before = len(tools)
+                tools = [t for t in tools if t.get("name") not in _TAINT_STRIPPED_TOOLS]
+                if len(tools) != _before:
+                    logger.info("[taint] web-derived content ingested — %d side-effect tool(s) "
+                                "withdrawn for the rest of this turn", _before - len(tools))
+
             # Use empty content when the LLM emits tool calls without narrative.
             # Prior code used "[Calling tool: X]" as a placeholder, which leaked
             # into assistant-role history and caused the model to imitate the
@@ -2150,23 +2229,6 @@ async def _run_generation_loop(
                     "args": tc.args,
                     "output": trimmed,
                 })
-                # RLVR — record verifiable tool-call signal (success/failure).
-                # Fire-and-forget; failures log at debug only.
-                try:
-                    if getattr(config, "ENABLE_RLVR_SIGNALS", False):
-                        from app.core import rlvr as _rlvr
-                        _ok = bool(tool_result_obj and getattr(tool_result_obj, "success", True))
-                        await asyncio.to_thread(
-                            _rlvr.record_signal,
-                            "tool_correct",
-                            1.0 if _ok else 0.0,
-                            query=query[:500],
-                            response=trimmed[:500],
-                            evidence=f"tool={tc.tool} args_keys={list((tc.args or {}).keys())}",
-                            conversation_id=conversation_id,
-                        )
-                except Exception:
-                    pass
                 yield StreamEvent(
                     type=EventType.TOOL_USE,
                     data={"tool": tc.tool, "result": tool_output[:500], "status": "complete",
@@ -4053,6 +4115,10 @@ async def think(
         if intent == "general" and _kg_answers_query(query, ctx.kg_facts_text or ""):
             logger.info("[facts-first] KG subject matches query — tool-less generation")
             _gen_tools = []
+        elif intent == "general" and _knowing_answers_query(
+                query, ctx.kg_facts_text or "", ctx.lessons_text or ""):
+            logger.info("[knowing-first] dossier/lesson covers the query — tool-less generation")
+            _gen_tools = []
 
         gen = _GenerationResult()
         async for event in _run_generation_loop(
@@ -4171,27 +4237,6 @@ async def think(
                 if stripped_reasons:
                     for r in stripped_reasons:
                         logger.warning("[claim-validator-ephemeral] %s", r)
-                # RLVR — only record when claim candidates exist in the
-                # pre-validate content. See multi-agent merge path comment.
-                try:
-                    if getattr(config, "ENABLE_RLVR_SIGNALS", False):
-                        _candidates = count_claim_candidates(_pre_validate_content_ephemeral)
-                        if _candidates > 0:
-                            from app.core import rlvr as _rlvr
-                            _val = 1.0 if not stripped_reasons else max(
-                                0.0, 1.0 - min(1.0, len(stripped_reasons) / 5.0)
-                            )
-                            await asyncio.to_thread(
-                                _rlvr.record_signal,
-                                "claim_grounded",
-                                _val,
-                                query=query[:500],
-                                response=final_content[:500],
-                                evidence=f"stripped={len(stripped_reasons)} checked={_candidates} ephemeral=true",
-                                conversation_id=conversation_id,
-                            )
-                except Exception:
-                    pass
                 # Skill scoring for EPHEMERAL traffic (2026-08-25): nearly all
                 # skill matches happen on monitor/eval runs, which exit here —
                 # before the non-ephemeral scoring block — so times_used /
@@ -4299,27 +4344,6 @@ async def think(
             if stripped_reasons:
                 for r in stripped_reasons:
                     logger.warning("[claim-validator] %s", r)
-            # RLVR — only record when claim candidates exist in the
-            # pre-validate content. See multi-agent merge path comment.
-            try:
-                if getattr(config, "ENABLE_RLVR_SIGNALS", False):
-                    _candidates = count_claim_candidates(_pre_validate_content_main)
-                    if _candidates > 0:
-                        from app.core import rlvr as _rlvr
-                        _val = 1.0 if not stripped_reasons else max(
-                            0.0, 1.0 - min(1.0, len(stripped_reasons) / 5.0)
-                        )
-                        await asyncio.to_thread(
-                            _rlvr.record_signal,
-                            "claim_grounded",
-                            _val,
-                            query=query[:500],
-                            response=final_content[:500],
-                            evidence=f"stripped={len(stripped_reasons)} checked={_candidates}",
-                            conversation_id=conversation_id,
-                        )
-            except Exception:
-                pass
         # Refine catastrophically emptied the answer → keep the validated draft
         # the user already saw (never blank a shown message).
         if not final_content and draft:

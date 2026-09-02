@@ -80,6 +80,7 @@ _SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
     "Auto-Tool Synthesis",
     "Output Quality Eval",
     "Digest Health Canary",
+    "Pathway Liveness",
 })
 
 _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
@@ -90,6 +91,7 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "chromadb_integrity",
     "kg_health",
     "digest_health",
+    "pathway_liveness",
     "maintenance",
     "finetune",
     "consolidation",
@@ -536,7 +538,7 @@ class MonitorStore:
         "Knowledge Consolidation",
         "Forecast Resolution",
         "Dream Consolidation",
-        "Capability Review",
+        # "Capability Review" retired 2026-09-01 (self-certifying / no inputs) — stays in the catalog, disabled
         "Quality Eval Harness",
         # Content (Discord + others)
         "Morning Check-in",
@@ -552,7 +554,7 @@ class MonitorStore:
         # See _migrate_existing_monitors V4 for the one-shot re-enable on
         # existing DBs where these were previously culled.
         "Lesson Quiz",
-        "Skill Validation",
+        # "Skill Validation" retired 2026-09-01 (self-certifying / no inputs) — stays in the catalog, disabled
         "Auto-Monitor Detector",
         # ("Fine-Tune Check" removed from core 2026-08-25 — the trainer is
         # archived; the seed stays in the catalog, disabled.)
@@ -561,10 +563,14 @@ class MonitorStore:
         # "link-only digests" failure recurred twice with no coverage.
         "Digest Health Canary",
         # Self-improvement loop closers (added 2026-04-25)
-        "Goal Derivation",
+        # "Goal Derivation" retired 2026-09-01 (self-certifying / no inputs) — stays in the catalog, disabled
         "Cross-Monitor Synthesis",
-        "Auto-Tool Synthesis",
+        # "Auto-Tool Synthesis" retired 2026-09-01 (self-certifying / no inputs) — stays in the catalog, disabled
         "Output Quality Eval",
+        # Liveness registry (2026-09-02): the dead-man's switch for every
+        # optional background writer — core, because silence is the one
+        # failure nothing else can see.
+        "Pathway Liveness",
     })
 
     def seed_defaults(self) -> int:
@@ -823,6 +829,11 @@ class MonitorStore:
             # digests" bug recurred twice with zero automated coverage, and
             # entail-gate attrition was log-archaeology-only.
             {"name": "Digest Health Canary", "check_type": "digest_health", "schedule_seconds": 604800, "cooldown_minutes": 1440, "notify_condition": "on_change",
+             "check_config": {}},
+            # Pathway liveness (2026-09-02): every optional background writer
+            # (storylines, dossiers, forecasts, curiosity, KG banking, eval...)
+            # checked against the silence it is allowed. Fast lane, no LLM.
+            {"name": "Pathway Liveness", "check_type": "pathway_liveness", "schedule_seconds": 21600, "cooldown_minutes": 300, "notify_condition": "on_change",
              "check_config": {}},
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
@@ -1094,7 +1105,7 @@ class MonitorStore:
         if current_version < 4:
             _phase_0_restore = (
                 "Lesson Quiz",
-                "Skill Validation",
+                # "Skill Validation" retired 2026-09-01 (self-certifying test)
                 "Auto-Monitor Detector",
                 "Fine-Tune Check",
                 "Hacker News Top Stories",

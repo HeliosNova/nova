@@ -30,6 +30,15 @@ from app.core.source_authority import authority as _sa_authority
 logger = logging.getLogger(__name__)
 
 
+def _syn_model() -> str | None:
+    """The configured synthesis model, or None for the provider default.
+    Every digest-chain stage uses it (2026-09-01): running angles, findings,
+    gap follow-up and the fresh-check on the 9B forced 3-4 weight reloads per
+    digest on a card that cannot hold both models."""
+    from app.config import config as _cfg_
+    return (getattr(_cfg_, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
+
+
 async def _invoke_bg(*args, **kwargs):
     """llm.invoke_nothink with a GPU-yield checkpoint.
 
@@ -129,7 +138,9 @@ _STRING_ARRAY_SCHEMA = {"type": "array", "items": {"type": "string"}}
 
 
 # --- Source-quality tiers -------------------------------------------------
-_TIER1_SUFFIX = (".gov", ".edu", ".int", ".mil")
+# ".edu" dropped 2026-09-01: academia.edu, alumni pages and course notes ranked
+# with the wires; papers still score via _PRIMARY_URL_RE.
+_TIER1_SUFFIX = (".gov", ".int", ".mil")
 _TIER1_HOSTS = {
     "reuters.com", "apnews.com", "bloomberg.com", "ft.com", "wsj.com",
     "economist.com", "nature.com", "science.org", "arxiv.org",
@@ -312,10 +323,69 @@ _PRIMARY_URL_RE = re.compile(
     r")")
 
 
+# Reference/explainer sites: fine as background, never a "development" and
+# never a lead anchor (2026-09-01: wikipedia 0.834 / investopedia 0.926 in the
+# authority dataset made them "quality" reads that produced evergreen bullets).
+_REFERENCE_HOSTS = frozenset({
+    "wikipedia.org", "wikimedia.org", "britannica.com", "investopedia.com",
+    "howtogeek.com", "wikihow.com", "wikiwand.com", "encyclopedia.com",
+    "dictionary.com", "merriam-webster.com", "techtarget.com", "geeksforgeeks.org",
+    "w3schools.com", "tutorialspoint.com", "simple.wikipedia.org", "wiktionary.org",
+})
+
+
+def _is_reference_host(host: str) -> bool:
+    h = (host or "").lower().replace("www.", "")
+    return any(h == r or h.endswith("." + r) for r in _REFERENCE_HOSTS)
+
+
+# Publish dates for read articles (URL path or engine-supplied), keyed by URL.
+_PUB_DATES: dict[str, str] = {}
+_URL_DATE_RE = re.compile(r"/(20\d{2})[/-](\d{1,2})[/-](\d{1,2})(?:[/-]|$|\b)")
+
+
+def _url_date(url: str) -> str | None:
+    m = _URL_DATE_RE.search(url or "")
+    if not m:
+        return None
+    y, mo, d = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    if not (1 <= mo <= 12 and 1 <= d <= 31):
+        return None
+    return f"{y:04d}-{mo:02d}-{d:02d}"
+
+
+def _record_pub_date(r) -> None:
+    """Remember the best known publish date for a read result."""
+    url = getattr(r, "url", "") or ""
+    if not url:
+        return
+    if len(_PUB_DATES) > 5000:
+        _PUB_DATES.clear()
+    date = (getattr(r, "published_date", "") or "").strip() or _url_date(url) or ""
+    if date:
+        _PUB_DATES[url] = date
+
+
+def _pub_dt(value: str):
+    for fmt in _DT_FMTS:
+        try:
+            d = datetime.strptime(value.strip(), fmt)
+            return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+        except ValueError:
+            continue
+    try:
+        d = datetime.strptime(value.strip()[:10], "%Y-%m-%d")
+        return d.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
 def _source_quality(url: str) -> float:
     if _blocked(url):
         return 0.0
     h = _host(url)
+    if _is_reference_host(h):
+        return 1.0
     if any(h.endswith(s) for s in _TIER1_SUFFIX) or h in _TIER1_HOSTS:
         return 3.0
     if h in _TIER2_HOSTS:
@@ -1031,6 +1101,7 @@ async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) ->
     good, misses = [], []
     for r, body in await asyncio.gather(*[_http(r) for r in picks]):
         if body and not _stale_body(body):
+            _record_pub_date(r)
             good.append((r.title, r.url, body))
         else:
             misses.append(r)
@@ -1046,7 +1117,10 @@ async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) ->
 
         async def _esc(r):
             body = await _fetch_body(r.url, browser_budget=budget)
-            return (r.title, r.url, body) if (body and not _stale_body(body)) else None
+            if body and not _stale_body(body):
+                _record_pub_date(r)
+                return (r.title, r.url, body)
+            return None
 
         good += [a for a in await asyncio.gather(*[_esc(r) for r in (pay + js)]) if a]
     return good[:read_target]
@@ -1082,7 +1156,7 @@ async def _gather_sources(subject: str, *, read_target: int, browser_budget: int
     return await _read_bodies(picks, read_target=read_target, browser_budget=browser_budget)
 
 
-async def _overview_angles(subjects: list[str]) -> list[str]:
+async def _overview_angles(subjects: list[str], *, model: str | None = None) -> list[str]:
     """Facet-expand the stories into article-finding queries. The bare subject
     phrase tends to surface landing/SEO pages; a 'what happened / numbers' facet
     surfaces actual articles. ONE LLM call, and the angle count is capped — we get
@@ -1112,7 +1186,8 @@ async def _overview_angles(subjects: list[str]) -> list[str]:
             f"OTHER story, ONE 'what happened' query.\n" +
             "\n".join(f"- {s}" for s in subjects) +
             "\nReturn one flat JSON array of all the query strings."}],
-            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=360, temperature=0.2)
+            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=360, temperature=0.2,
+            model=model if model is not None else _syn_model())
         angles += [a for a in _json_array(raw) if isinstance(a, str) and len(a) > 8]
     except Exception:
         pass
@@ -1334,7 +1409,8 @@ async def _gap_followup(findings: list, label: str, *, model: str | None = None)
             f"gaps — missing corroboration, the 'so what' details (exact numbers, named players, "
             f"outcomes), or a consequential angle not yet covered. Return a JSON array of query "
             f"strings, most important first; NO commentary."}],
-            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=220, temperature=0.3, model=model)
+            json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=220, temperature=0.3,
+            model=model if model is not None else _syn_model())
         return [str(q).strip() for q in _json_array(raw)
                 if isinstance(q, str) and 8 < len(str(q).strip()) < 120][:5]
     except Exception as e:
@@ -1406,7 +1482,7 @@ def _trim_dangling_tail(text: str) -> str:
     return text
 
 
-async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
+async def _findings(articles: list, subject: str, *, model: str | None = None) -> list[tuple[str, str, str]]:
     async def _one(title, url, body):
         try:
             f = await _invoke_bg([{"role": "user", "content":
@@ -1423,7 +1499,10 @@ async def _findings(articles: list, subject: str) -> list[tuple[str, str, str]]:
                 # model default — prompt_eval+eval hit exactly 4096 and
                 # findings truncated mid-sentence ~95×/day, re-opening the
                 # 08-14 defect from the prompt side.
-                max_tokens=512, temperature=0.2, num_ctx=8192)
+                # 800 (was 512), 2026-09-01: on the 27B the extraction is worth
+                # the room — 5 of 6 truncation warnings in a day came from here.
+                max_tokens=800, temperature=0.2, num_ctx=8192,
+                model=model if model is not None else _syn_model())
             f = (f or "").strip()
             # Dangling-fragment repair (2026-08-31). The cap history here is
             # 240 -> 320 -> 512 and the tripwire STILL catches an occasional
@@ -2919,13 +2998,21 @@ _COPULA_TAIL_RE = re.compile(
 
 
 _ANALYTICAL_RE = re.compile(
-    r"(?i)\b(?:second-order implication|the implication is|this (?:consolidation|move|"
-    r"shift|strategy|finding|trend|divergence|tension|approach) (?:mirrors|suggests|"
-    r"reflects|attempts|crystallizes|positions|forces|signals|underscores|implies|"
-    r"marks|serves)|mirrors similar|crystallizes the|reflects? a broader|"
-    r"suggesting (?:a|an|sector)|is moving from|marks a (?:shift|critical)|"
-    r"represents a (?:broader|fundamental|critical)|serves as a critical|"
-    r"potentially (?:preempting|shifting|fragment))")
+    r"(?i)\b(?:second-order implication|the (?:broader|deeper|real|second-order) "
+    r"(?:implication|question|risk|significance|lesson)|the implication is|"
+    r"this (?:consolidation|move|shift|strategy|finding|trend|divergence|tension|"
+    r"approach|incident|development|rupture|split|decision|deal|ruling|breach|episode|"
+    r"pattern|escalation|dynamic|outcome|fracture|pivot|reversal) "
+    r"(?:mirrors|suggests|reflects|attempts|crystallizes|positions|forces|signals|"
+    r"underscores|implies|marks|serves|reveals|highlights|threatens|raises|exposes|"
+    r"confirms|creates|sets|tests|erodes|accelerates|cements|complicates)|"
+    r"mirrors similar|crystallizes the|reflects? a broader|suggesting (?:a|an|sector)|"
+    r"is moving from|marks a (?:shift|critical|turning)|represents a (?:broader|"
+    r"fundamental|critical)|serves as a critical|potentially (?:preempting|shifting|"
+    r"fragment)|is not merely|not merely a|stress test|reassessment|"
+    r"raises? the (?:question|prospect|risk|stakes)|sets? the stage|points? to a|"
+    r"what to watch|signals? that|underscores? (?:the|a|how)|highlights? (?:the|a|how)|"
+    r"the (?:throughline|takeaway) )")
 
 
 def _is_analytical(claim: str) -> bool:
@@ -2936,7 +3023,11 @@ def _is_analytical(claim: str) -> bool:
     itself is the product: gate v4 DE-CITES them instead of deleting them.
     Number-bearing sentences never qualify — an unsupported figure must
     still drop."""
-    if re.search(r"\d", re.sub(r"\b(?:19|20)\d\d\b", "", claim)):
+    # Figures are facts; years (2026) and alphanumeric names (G20, H100, 5G)
+    # are not figures.
+    scrub = re.sub(r"\b(?:19|20)\d\d\b", "", claim)
+    scrub = re.sub(r"\b[A-Za-z]+\d+\w*\b|\b\d+[A-Za-z]+\b", "", scrub)
+    if re.search(r"\d", scrub):
         return False
     return bool(_ANALYTICAL_RE.search(claim))
 
@@ -3020,7 +3111,7 @@ def _claim_tokens(claim: str) -> set[str]:
     return toks
 
 
-async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24,
+async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
                            label: str = "") -> tuple[str, int]:
     """MiniCheck entailment gate (#48, gated by ENABLE_MINICHECK, fail-open).
 
@@ -3302,6 +3393,96 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 24,
     return out, n_changed
 
 
+_PSEUDO_CITE_RE = re.compile(r"\s*\((?:deep )?analysis:[^)]*\)")
+
+
+def _strip_pseudo_citations(text: str) -> tuple[str, int]:
+    """Remove '(deep analysis: …)' markers (2026-09-01): they carry no domain
+    token, so _PAREN_CITE_RE never saw them and the sentences they decorated
+    shipped unchecked (8 of 36 factual sentences in one Middle East digest)."""
+    if not text:
+        return text, 0
+    out, n = _PSEUDO_CITE_RE.subn("", text)
+    return out, n
+
+
+def _decite_analysis(text: str) -> tuple[str, int]:
+    """Strip outlet citations from the digest's OWN analysis sentences before
+    the gate runs (2026-09-01): an analysis sentence with a citation is a
+    fabricated attribution the entail gate can only drop — 52% of live drops
+    were exactly this shape. The sentence is the product; the citation is not."""
+    if not text:
+        return text, 0
+    n = 0
+    out_lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip("*-• ").strip()
+        if (not stripped or stripped.startswith(("#", "_"))
+                or (stripped.startswith("**") and stripped.endswith("**"))):
+            out_lines.append(line)
+            continue
+        segs = []
+        for seg in _SENT_SPLIT_RE.split(line):
+            st = seg.strip()
+            if st and _PAREN_CITE_RE.search(st) and _is_analytical(_PAREN_CITE_RE.sub("", st)):
+                cleaned = _PAREN_CITE_RE.sub("", seg)
+                cleaned = re.sub(r"\s{2,}", " ", cleaned).replace(" .", ".").replace(" ,", ",")
+                segs.append(cleaned)
+                n += 1
+            else:
+                segs.append(seg)
+        out_lines.append(" ".join(segs))
+    return "\n".join(out_lines), n
+
+
+_ARTIFACT_RES = (
+    re.compile(r"(?i)\bthe (?:launched|announced|reported|is attempting|has announced|are attempting)\b"),
+    re.compile(r"(?:^|\s)'s\s"),
+    re.compile(r"(?i)\bthe (?:is|are|was|were) attempting\b"),
+    re.compile(r"(?i)\b(?:a|an|the) the\b"),
+    re.compile(r"\bof the \*\*\s*$"),
+    re.compile(r"\bthe \*\*\s*$"),
+)
+_EMPTY_PAREN_RE = re.compile(r"\s*\((?:deep analysis:|analysis:)?\s*\)")
+
+
+def _drop_artifact_sentences(text: str) -> tuple[str, int]:
+    """Final canary (2026-09-01): a sentence the regex excision passes left
+    mangled ('the launched a $10 million…', "solidifying 's position",
+    'a debate the is attempting to mediate') is dropped whole rather than
+    shipped; headlines lose the dangling tail; empty '(deep analysis:)'
+    parentheses vanish. Returns (text, number of repairs)."""
+    if not text:
+        return text, 0
+    n = 0
+    text, k = _EMPTY_PAREN_RE.subn("", text)
+    n += k
+    out_lines = []
+    for line in text.split("\n"):
+        stripped = line.lstrip("*-• #").strip()
+        is_head = stripped.startswith("**") or line.lstrip().startswith("#")
+        if is_head:
+            new = line
+            for rx in _ARTIFACT_RES[-2:]:
+                if rx.search(new):
+                    new = rx.sub("**" if "**" in rx.pattern else "", new).rstrip()
+                    n += 1
+            out_lines.append(new)
+            continue
+        segs = []
+        for seg in _SENT_SPLIT_RE.split(line):
+            if seg.strip() and any(rx.search(seg) for rx in _ARTIFACT_RES[:4]):
+                n += 1
+                continue
+            segs.append(seg)
+        joined = " ".join(s_ for s_ in segs if s_ is not None).strip()
+        if joined or not line.strip():
+            out_lines.append(joined if line.strip() else line)
+    if n:
+        logger.info("[DeepResearch] artifact canary: %d mangled fragment(s) removed", n)
+    return "\n".join(out_lines), n
+
+
 def _cite_uncited_sentences(text: str, arts: list, *, max_added: int = 12) -> tuple[str, int]:
     """Append '(host)' to factual sentences that lack a citation, when EXACTLY ONE
     read source strongly contains the sentence's distinctive tokens (≥2 token hits,
@@ -3328,7 +3509,8 @@ def _cite_uncited_sentences(text: str, arts: list, *, max_added: int = 12) -> tu
         for seg in segs:
             st = seg.strip()
             factual = (len(st) > 40 and (any(c.isdigit() for c in st)
-                       or re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+", st)))
+                       or re.search(r"\b[A-Z][a-z]+\s+[A-Z][a-z]+", st))
+                       and not _is_analytical(st))
             if added >= max_added or not factual or _PAREN_CITE_RE.search(st):
                 new_segs.append(seg)
                 continue
@@ -3454,7 +3636,8 @@ async def _verify_lead_claims(text: str, label: str, *, corroborated=frozenset()
                 "{\"verdict\": \"supported\"|\"contradicted\"|\"unaddressed\", "
                 "\"note\": \"<one short sentence giving the value the evidence states, ONLY if "
                 "contradicted>\"}."}],
-                json_mode=True, json_prefix="{", max_tokens=160, temperature=0.0)
+                json_mode=True, json_prefix="{", max_tokens=160, temperature=0.0,
+                model=_syn_model())
             data = llm.extract_json_object(raw) if raw else {}
         except Exception as e:
             logger.debug("[DeepResearch] fresh-check judge failed: %s", e)
@@ -3492,7 +3675,8 @@ async def _verify_lead_claims(text: str, label: str, *, corroborated=frozenset()
 _LEAD_CITE_RE = re.compile(r"\(([a-z0-9][a-z0-9.\-]*\.[a-z]{2,})\)")
 
 
-def _gate_lead_credibility(text: str, host_clusters: dict | None = None) -> tuple[str, bool]:
+def _gate_lead_credibility(text: str, host_clusters: dict | None = None,
+                           articles: list | None = None) -> tuple[str, bool]:
     """CORROBORATION-GATED LEAD: a headline that rests on a SINGLE lower-credibility
     source with no independent corroboration gets an inline sourcing caveat.
 
@@ -3516,12 +3700,49 @@ def _gate_lead_credibility(text: str, host_clusters: dict | None = None) -> tupl
     # longer manufacture the corroboration that waves a lead through.
     hc = host_clusters or {}
     n_indep = len({hc.get(h, h) for h in hosts})
-    if max(_source_quality("http://" + h) for h in hosts) >= 2.0 or n_indep >= 2:
-        return text, False                      # credible anchor OR ≥2 INDEPENDENT sources
+    anchors = [h for h in hosts if not _is_reference_host(h)]
+    credible = bool(anchors) and max(_source_quality("http://" + h) for h in anchors) >= 2.0
+    if credible or n_indep >= 2:
+        return _freshness_note(text, m, hosts, articles), False   # credible anchor OR ≥2 INDEPENDENT sources
     caveat = ("\n⚠️ _Sourcing note: this lead rests on a single lower-credibility source "
               "and is not independently corroborated — treat as unconfirmed._")
     cut = m.end(1)
     return text[:cut].rstrip() + "\n" + caveat + "\n" + text[cut:], True
+
+
+def _freshness_note(text: str, m, hosts: set[str], articles: list | None) -> str:
+    """Append a freshness caveat when every cited source behind the lead has a
+    KNOWN publish date older than 7 days (2026-09-01: September digests led
+    with July events; no read article carried a date before this)."""
+    if not articles or not hosts:
+        return text
+    newest = None
+    known = 0
+    rds = {_reg_domain(h) for h in hosts}
+    for _t, u, _b in articles:
+        hu = _host(u)
+        if hu not in hosts and _reg_domain(hu) not in rds:
+            continue
+        raw = _PUB_DATES.get(u)
+        if not raw:
+            continue
+        d = _pub_dt(raw)
+        if d is None:
+            continue
+        known += 1
+        if newest is None or d > newest:
+            newest = d
+    if newest is None:
+        return text
+    age_days = (_NOW() - newest).total_seconds() / 86400.0
+    logger.info("[DeepResearch] lead freshness: newest cited source dated %s (%.1f d, %d dated)",
+                newest.date().isoformat(), age_days, known)
+    if age_days <= 7:
+        return text
+    note = ("\n⚠️ _Freshness note: the sources behind this lead are more than a week old "
+            f"(newest {newest.date().isoformat()}) — this may be background, not today's development._")
+    cut = m.end(1)
+    return text[:cut].rstrip() + "\n" + note + "\n" + text[cut:]
 
 
 def _count_content_sentences(text: str) -> int:
@@ -3670,6 +3891,8 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
+    final, _ = _strip_pseudo_citations(final)   # "(deep analysis: …)" is not a source (2026-09-01)
+    final, _ = _decite_analysis(final)   # the digest's own reasoning carries no citation (2026-09-01)
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
     final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
     final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
@@ -3679,6 +3902,7 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final = _drop_orphan_headers(final)   # remove any section header left empty by the strip passes
     final = _repair_dangling_fragments(final)  # recover sentences broken by an excised entity (prep/possessive)
     final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
+    final, _ = _drop_artifact_sentences(final)   # never ship "the launched a …" (2026-09-01)
     learned = await _learn_facts(subject, final, findings, kg, articles=articles, model=syn_model)
     logger.info("[DeepResearch] %s: read %d sources (%s), learned %d facts",
                 label, len(findings), ", ".join(hosts[:6]), learned)
@@ -3693,7 +3917,7 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
 
     # Corroboration-gated lead: caveat a headline resting on a single low-credibility
     # source (robust to unknown farms the blocklist misses). Deterministic, always on.
-    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters)
+    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters, articles=articles)
     if _gated:
         logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
 
@@ -3894,7 +4118,48 @@ async def _gather_evidence(label: str, n_stories: int, feed_key: str | None):
     return subjects, findings, articles
 
 
-async def _synthesize_from_evidence(label: str, findings: list, articles: list, today: str, *, kg=None, syn_model: str | None = None) -> str:
+_KVN_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "new": {"type": "integer"},
+        "updates": {"type": "integer"},
+        "contradictions": {"type": "integer"},
+    },
+    "required": ["new", "updates", "contradictions"],
+}
+
+
+async def _count_known_vs_new(prior_block: str, final: str, *, model: str | None, label: str) -> dict | None:
+    """Knowing instrumentation v2 (2026-08-12): ONE tiny gated call counting the
+    finished digest against the prior dossier. 2026-09-01: max_tokens 80 -> 200
+    and a JSON schema — the 80-token budget truncated the reply on the 27B and
+    logged 'None new | None updates' (the only two primed runs in the window)."""
+    try:
+        raw = await _invoke_bg([{"role": "user", "content":
+            prior_block +
+            "TODAY'S BRIEFING:\n" + final[:9000] +
+            "\n\nCount today's developments in the briefing against the PRIOR "
+            "UNDERSTANDING above: how many are genuinely NEW (absent from prior), "
+            "how many UPDATE something already known, and how many CONTRADICT it. "
+            'Return JSON only: {"new": <int>, "updates": <int>, "contradictions": <int>}'}],
+            json_mode=True, json_schema=_KVN_SCHEMA, max_tokens=200, temperature=0.0,
+            model=model, num_ctx=8192)
+        data = llm.extract_json_object(raw) if isinstance(raw, str) else (raw or {})
+        if not isinstance(data, dict):
+            return None
+        out = {}
+        for k in ("new", "updates", "contradictions"):
+            try:
+                out[k] = int(data.get(k))
+            except (TypeError, ValueError):
+                out[k] = None
+        return out
+    except Exception as e:
+        logger.debug("[Knowing] KNOWN-VS-NEW measurement failed (%s): %s", label, e)
+        return None
+
+
+async def _synthesize_from_evidence(label: str, findings: list, articles: list, today: str, *, kg=None, syn_model: str | None = None, dossier_key: str | None = None) -> str:
     """Deep analysis -> best-of-N synthesis -> grounding stack -> fact-banking -> bound.
     Split out of domain_overview (2026-07-10) so the ceiling harness replays the EXACT
     production synthesis on captured evidence with any (model, config). syn_model=None
@@ -3939,18 +4204,27 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     prior_block = ""
     if getattr(_cfg, "ENABLE_DOSSIERS", True):
         try:
-            from app.core.dossiers import get_domain_dossier
+            from app.core.dossiers import get_domain_dossier, priming_excerpt
             from app.database import get_db
             # Off the event loop — a sync DB read here was the one steady-state
             # [Sync DB call on event-loop] violation (audit 2026-08-23).
-            _d = await asyncio.to_thread(get_domain_dossier, get_db(), label)
+            # Keyed by MONITOR NAME (2026-09-01): the short profile label only
+            # matched the dossier key for 13/39 domains — the rest ran unprimed.
+            _d = await asyncio.to_thread(get_domain_dossier, get_db(), label, dossier_key)
             if _d and _d["body"]:
                 prior_block = (
                     "PRIOR UNDERSTANDING — what Nova already knew about this domain "
                     "BEFORE today (its standing dossier). Use it to judge what is "
                     "genuinely NEW vs already known. It is context, NOT today's "
-                    "evidence — never cite it as the source for a new claim:\n"
-                    + _d["body"][:2500] + "\n\n")
+                    "evidence — never cite it as the source for a new claim. If "
+                    "today's evidence answers, advances or contradicts one of its "
+                    "OPEN QUESTIONS, say so explicitly in the briefing and name "
+                    "the question:\n"
+                    + priming_excerpt(_d["body"]) + "\n\n")
+                logger.info("[Knowing] %s primed by dossier %r", label, _d["dkey"])
+            else:
+                logger.info("[Knowing] %s has no domain dossier yet (key=%r) — unprimed",
+                            label, dossier_key or label)
         except Exception as e:
             logger.debug("[Knowing] dossier priming unavailable: %s", e)
 
@@ -4009,8 +4283,11 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "single MOST CONSEQUENTIAL thing to watch next — a real open question with stakes, NOT a "
         "routine scheduling detail (e.g. a minor earnings date). Draw ONLY on facts already stated "
         "above; introduce NO new number, figure, or named entity in this section.\n"
-        "EVERY sentence and bullet MUST cite its outlet inline like (cnbc.com). If you cannot cite "
-        "a claim from the findings, OMIT it. Use ONLY information present in the analyses/findings "
+        "Every FACTUAL sentence — an event, figure, quote, or named action — MUST cite its outlet "
+        "inline like (cnbc.com). Your own ANALYSIS (implications, connections, what to watch) "
+        "carries NO citation: never attach an outlet to your own reasoning and never write "
+        "'(deep analysis: …)'. If you cannot cite a factual claim from the findings, OMIT it. "
+        "Use ONLY information present in the analyses/findings "
         "above — never invent a company, number, person, or event.")
     if prior_block:
         # Knowing tier: novelty + contradiction discipline against the dossier.
@@ -4046,26 +4323,12 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     # strictly from the sources (verification + grounding guards below re-check every claim).
     draft = await _enrich_overview(draft, analysis_block, common, label, model=syn_model)
 
-    # VERIFICATION PASS — ground every claim AND require a citation on each (RARR
-    # mode: revise partial-support claims to their supported core instead of deleting).
-    from app.config import config as _cfg_v
-    _rarr = bool(getattr(_cfg_v, "ENABLE_RARR", False))
-    try:
-        final = await _invoke_bg([{"role": "user", "content":
-            _verify_prompt(evidence, draft, overview=True, rarr=_rarr, common=common)}],
-            # 3600 (was 2800) + num_ctx 16384 (was 12288): 2800 tokens = ~7168
-            # chars truncated full digests MID-SENTENCE ("$47 billion revenue"
-            # then stop), silently — the recall levers made digests longer and
-            # pushed them over. num_ctx raised so prompt+output both fit (2026-07-08).
-            # 16384→20480 (2026-08-11): common ~10k tokens post-ANALYSIS_CAP raise
-            # + draft + 5000 gen ≈ 18k.
-            max_tokens=5000, temperature=0.1, num_ctx=20480, model=syn_model)
-        final = (final or "").strip() or draft
-    except Exception:
-        final = draft
-    logger.info("[DeepResearch] verify pass (%s): %d→%d content sentences%s",
-                label, _count_content_sentences(draft), _count_content_sentences(final),
-                " [RARR]" if _rarr else "")
+    # Verify pass retired 2026-09-01: the 27B "delete mode" pass changed 0
+    # sentences in 17 of 20 live runs while costing a 5,000-token generation;
+    # the MiniCheck gate below now covers every cited fact sentence instead.
+    final = draft
+    logger.info("[DeepResearch] verify pass retired — entail gate covers %d content sentences (%s)",
+                _count_content_sentences(final), label)
 
     final = _strip_prompt_leak(final)   # drop any synthesis-prompt instructions the model echoed
     final = _KNOWN_VS_NEW_RE.sub("", final).strip()   # belt-and-braces: knowing marker must never post
@@ -4075,6 +4338,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
+    final, _ = _strip_pseudo_citations(final)   # "(deep analysis: …)" is not a source (2026-09-01)
+    final, _ = _decite_analysis(final)   # the digest's own reasoning carries no citation (2026-09-01)
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
     final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
     final = _correct_currency_mislabels(final, articles)   # re-stamp $-figures the sources state in CNY/HKD/EUR/...
@@ -4084,28 +4349,16 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     final = _drop_orphan_headers(final)   # remove any section header left empty by the strip passes
     final = _repair_dangling_fragments(final)  # recover sentences broken by an excised entity (prep/possessive)
     final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
+    final, _ = _drop_artifact_sentences(final)   # never ship "the launched a …" (2026-09-01)
     # Knowing instrumentation v2 (2026-08-12): measured OUT-OF-BAND — one tiny
     # gated call counting the finished digest against the prior dossier. The
     # v1 in-band marker asked the synthesis to append a count line, but the
     # aggregation merge rewrites candidates and dropped it (probe-verified).
     if prior_block:
-        try:
-            _kvn_raw = await _invoke_bg([{"role": "user", "content":
-                prior_block +
-                "TODAY'S BRIEFING:\n" + final[:9000] +
-                "\n\nCount today's developments in the briefing against the PRIOR "
-                "UNDERSTANDING above: how many are genuinely NEW (absent from prior), "
-                "how many UPDATE something already known, and how many CONTRADICT it. "
-                'Return JSON only: {"new": <int>, "updates": <int>, "contradictions": <int>}'}],
-                json_mode=True, json_prefix="{", max_tokens=80, temperature=0.0,
-                model=syn_model, num_ctx=8192)
-            # Balanced-brace salvage (not bare json.loads) so a stray prose prefix
-            # from the 27B doesn't drop the KNOWN-VS-NEW instrumentation line (2026-08-18).
-            _kvn = llm.extract_json_object(_kvn_raw) if isinstance(_kvn_raw, str) else (_kvn_raw or {})
+        _kvn = await _count_known_vs_new(prior_block, final, model=syn_model, label=label)
+        if _kvn:
             logger.info("[Knowing] %s KNOWN-VS-NEW: %s new | %s updates | %s contradictions",
                         label, _kvn.get("new"), _kvn.get("updates"), _kvn.get("contradictions"))
-        except Exception as e:
-            logger.debug("[Knowing] KNOWN-VS-NEW measurement failed: %s", e)
 
     learned = await _learn_facts(label, final, findings, kg, articles=articles, model=syn_model)
     logger.info("[DeepResearch] %s overview: read %d sources (%s), learned %d facts",
@@ -4134,7 +4387,7 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
 
     # Corroboration-gated lead: caveat a headline resting on a single low-credibility
     # source (robust to unknown farms the blocklist misses). Deterministic, always on.
-    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters)
+    final, _gated = _gate_lead_credibility(final, host_clusters=_host_clusters, articles=articles)
     if _gated:
         logger.info("[DeepResearch] %s: lead flagged — single low-credibility source", label)
 
@@ -4182,5 +4435,5 @@ async def domain_overview(label: str, kg=None, n_stories: int = 5, feed_key: str
         return (f"## 🌐 {label} — domain overview\n_no readable credible sources today · {today}_\n\n"
                 f"No readable credible sources were found across the top {label} stories today; "
                 f"nothing reported rather than speculation.")
-    return await _synthesize_from_evidence(label, findings, articles, today, kg=kg)
+    return await _synthesize_from_evidence(label, findings, articles, today, kg=kg, dossier_key=feed_key)
 

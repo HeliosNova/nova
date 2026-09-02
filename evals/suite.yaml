@@ -1,4 +1,5 @@
-# Nova automated evaluation suite — 60 tasks across 11 categories.
+# Nova automated evaluation suite — 51 tasks across 12 categories (2026-09-01:
+# 16 saturated chat tasks retired, 7 deterministic research-quality probes added).
 # (multi-agent category archived 2026-08-25 with the decomposition capability;
 # the deliberation probe moved to `reasoning`.)
 #
@@ -41,6 +42,7 @@ categories_meta:
     regression_tolerance: 0.05
 
 tasks:
+
 
   # =========================================================================
   # Category: reasoning  (5 tasks)
@@ -185,21 +187,6 @@ tasks:
   # narrow and cannot accidentally match unrelated production queries.
   # =========================================================================
 
-  - id: skill_match_crypto_price
-    category: skill-match
-    query: "eval-probe: what is the price of bitcoin"
-    timeout: 120
-    seed_skill:
-      name: "Eval: Crypto Price Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*price\\s+of\\s+(?:bitcoin|btc|ethereum|eth)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{query}"}
-          output_key: result
-      answer_template: "Current price based on search"
-    assertions:
-      - type: skill_matched
-
   - id: skill_match_weather
     category: skill-match
     query: "eval-probe: what is the weather today"
@@ -212,21 +199,6 @@ tasks:
           args_template: {q: "weather today"}
           output_key: result
       answer_template: "Weather based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: skill_match_unit_convert
-    category: skill-match
-    query: "eval-probe: convert 10 kilometers to miles"
-    timeout: 120
-    seed_skill:
-      name: "Eval: Unit Conversion Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*convert\\s+\\d+\\s+(?:kilometers?|km)\\s+to\\s+miles\\b"
-      steps:
-        - tool: calculator
-          args_template: {expression: "10 * 0.621371"}
-          output_key: result
-      answer_template: "Conversion result"
     assertions:
       - type: skill_matched
 
@@ -244,129 +216,6 @@ tasks:
       answer_template: "Latest news"
     assertions:
       - type: skill_matched
-
-  - id: skill_match_stock_price
-    category: skill-match
-    query: "eval-probe: what is the stock price of NVDA"
-    timeout: 120
-    seed_skill:
-      name: "Eval: Stock Price Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*stock\\s+price\\s+of\\s+(?P<ticker>[A-Z]{1,5})\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{ticker} stock price today"}
-          output_key: result
-      answer_template: "Stock price based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: skill_match_timezone
-    category: skill-match
-    query: "eval-probe: what time is it in tokyo"
-    timeout: 120
-    seed_skill:
-      name: "Eval: Timezone Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:time|clock).*in\\s+(?P<city>\\w+)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "current time in {city}"}
-          output_key: result
-      answer_template: "Current time based on search"
-    assertions:
-      - type: skill_matched
-
-  # =========================================================================
-  # Category: semantic-match  (5 tasks)
-  # Same seeded skills as skill-match, but queried with natural paraphrases
-  # that differ lexically.  With ENABLE_SEMANTIC_SKILL_MATCHING=True and
-  # SKILL_SEMANTIC_THRESHOLD=0.65, the semantic search should find a match.
-  # If threshold is too high (e.g. 0.99), recall tanks — regression detected.
-  # =========================================================================
-
-  - id: semantic_crypto_paraphrase
-    category: semantic-match
-    query: "how much does BTC cost right now"
-    timeout: 120
-    paraphrase_of: skill_match_crypto_price
-    seed_skill:
-      name: "Eval: Crypto Price Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*price\\s+of\\s+(?:bitcoin|btc|ethereum|eth)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{query}"}
-          output_key: result
-      answer_template: "Current price based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_weather_paraphrase
-    category: semantic-match
-    query: "will it rain today, what is the forecast outside"
-    timeout: 240
-    paraphrase_of: skill_match_weather
-    seed_skill:
-      name: "Eval: Weather Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:weather|forecast|temperature)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{query}"}
-          output_key: result
-      answer_template: "Weather based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_units_paraphrase
-    category: semantic-match
-    query: "10km in miles please"
-    timeout: 120
-    paraphrase_of: skill_match_unit_convert
-    seed_skill:
-      name: "Eval: Unit Conversion Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*convert\\s+\\d+\\s+(?:kilometers?|km)\\s+to\\s+miles\\b"
-      steps:
-        - tool: calculator
-          args_template: {expression: "10 * 0.621371"}
-          output_key: result
-      answer_template: "Conversion result"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_news_paraphrase
-    category: semantic-match
-    query: "show me recent AI developments and breakthroughs"
-    timeout: 120
-    paraphrase_of: skill_match_news
-    seed_skill:
-      name: "Eval: News Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:news|latest|headlines)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{query}"}
-          output_key: result
-      answer_template: "Latest news"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_stock_paraphrase
-    category: semantic-match
-    query: "NVDA share price today"
-    timeout: 120
-    paraphrase_of: skill_match_stock_price
-    seed_skill:
-      name: "Eval: Stock Price Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*stock\\s+price\\s+of\\s+(?P<ticker>[A-Z]{1,5})\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "{query}"}
-          output_key: result
-      answer_template: "Stock price based on search"
-    assertions:
-      - type: skill_matched
-
-  # ---- Adversarial paraphrase variants (added 2026-05-13, task #32) ----
-  # These intentionally stress the semantic-match path beyond clean human
-  # rewordings: typos, domain shift, and explicit negation. They share
-  # the same seed_skill machinery as the clean paraphrases above.
 
   - id: semantic_weather_typo
     category: semantic-match
@@ -395,28 +244,6 @@ tasks:
     paraphrase_of: skill_match_stock_price
     assertions:
       - type: skill_not_matched
-
-  - id: semantic_domain_shift_unrelated
-    category: semantic-match
-    # Domain-shift adversarial: superficial word overlap ("price",
-    # "stock") with the Stock Price Probe skill but the actual ask is
-    # totally unrelated (advice on a hobby, not a quote). STILL PINNED as
-    # response_not_empty (2026-08-18): this distractor measures 0.730 vs the
-    # stock skill — ABOVE the news true-paraphrase at 0.723 — so similarity
-    # alone cannot separate them; that's the bag-of-words floor. skill_not_matched
-    # now exists as an assertion type; lift when intent-aware matching lands.
-    query: "I have a stockpile of old vinyl records — any tips on pricing them for resale?"
-    timeout: 120
-    paraphrase_of: skill_match_stock_price
-    assertions:
-      - type: response_not_empty
-
-  # =========================================================================
-  # Category: autonomous-tool  (4 tasks)
-  # Recurring multi-tool patterns that benefit from skill creation.
-  # trigger_rate metric = fraction of tasks using >=2 tools (proxy for
-  # "this interaction pattern warrants a skill").
-  # =========================================================================
 
   - id: autonomous_compound_interest
     category: autonomous-tool
@@ -473,26 +300,6 @@ tasks:
   # Regressions appear when score distribution shifts (e.g. inflation to 1.0).
   # =========================================================================
 
-  - id: reflexion_good_simple
-    category: reflexion-calibration
-    query: "How many days are in a leap year?"
-    timeout: 120
-    assertions:
-      - type: answer_contains
-        value: "366"
-      - type: reflexion_above
-        value: 0.5
-
-  - id: reflexion_good_factual
-    category: reflexion-calibration
-    query: "What programming language is the Django web framework written in?"
-    timeout: 120
-    assertions:
-      - type: answer_matches
-        value: "\\bPython\\b"
-      - type: reflexion_above
-        value: 0.5
-
   - id: reflexion_uncertain_forecast
     category: reflexion-calibration
     query: "What will the exact S&P 500 index value be one year from today?"
@@ -503,21 +310,6 @@ tasks:
         min: 0.1
         max: 0.9
 
-  - id: reflexion_uncertain_stars
-    category: reflexion-calibration
-    query: "What is the exact number of stars in the Milky Way galaxy?"
-    timeout: 120
-    assertions:
-      - type: response_not_empty
-      - type: reflexion_in_range
-        min: 0.1
-        max: 0.9
-
-  # SHARP3 reasoning probe — deliberation route + reasoning-shape test.
-  # Timeouts sized for RTX 3090 + nova-ft Q8 + ToT sample_n=3 + multi-step deliberation.
-  # Re-categorized multi-agent → reasoning 2026-08-25: it exercises the KEPT
-  # AgentLoop deliberation route, but sat in the archived decomposition
-  # category and was collaterally SKIPPED from every nightly run since 08-14.
   - id: deliberation_chain_of_reasoning
     category: reasoning
     query: "Walk me through how you would design a rate limiter for a REST API that must sustain 100,000 requests per second, step by step."
@@ -562,47 +354,6 @@ tasks:
   # Task 3 exercises the composite reranker against a same-keyword confounder;
   # it catches regressions if ENABLE_RERANKER is disabled.
   # =========================================================================
-
-  - id: retrieval_exact_keyword
-    category: retrieval
-    query: "eval-retrieval: What is Merkle tree cryptographic hash structure?"
-    timeout: 120
-    tags: [bm25-dominant]
-    seed_document:
-      title: "Merkle Trees in Cryptography"
-      source: "eval-seed"
-      text: |
-        A Merkle tree is a tree data structure in which every leaf node is labelled
-        with the cryptographic hash of a data block, and every non-leaf node is
-        labelled with the cryptographic hash of its child nodes. Merkle trees allow
-        efficient and secure verification of the contents of large data structures.
-        They are used in Bitcoin, Ethereum, and other distributed systems to
-        verify block integrity without downloading the full blockchain.
-    assertions:
-      - type: retrieval_recall
-        value: "Merkle"
-
-  - id: retrieval_semantic_paraphrase
-    category: retrieval
-    query: "eval-retrieval: How does gradient descent minimize loss in training?"
-    timeout: 120
-    tags: [vector-dominant]
-    seed_document:
-      title: "Backpropagation and Optimization"
-      source: "eval-seed"
-      text: |
-        Optimization algorithms iteratively adjust model parameters to reduce
-        the error function. The most widely used approach computes partial
-        derivatives of the cost function with respect to each weight and moves
-        in the direction that decreases the objective. This iterative parameter
-        update process converges toward a local minimum of the error surface,
-        enabling neural networks to fit training data accurately.
-    assertions:
-      # Seed doc uses both 'parameter' and 'weight' — accept either since they
-      # are synonymous in this context. Failure was observed 2026-05-09 when the
-      # answer used 'weights' but assertion required literal 'parameter'.
-      - type: retrieval_recall
-        value: "parameter|weight"
 
   - id: retrieval_reranker_regression_probe
     category: retrieval
@@ -678,7 +429,9 @@ tasks:
   - id: mem_scheduler_codename_paraphrase
     category: memory-learning
     # Query avoids "scheduler"/"codename" — only semantic retrieval surfaces the lesson.
-    query: "Inside Nova, what do we call the component that runs background jobs on a timer?"
+    # Reworded 2026-09-01: the old paraphrase described Nova's REAL monitors, so
+    # the honest answer ("monitors") collided with the planted codename.
+    query: "Remind me: which codename did we assign to the scheduler component in Nova?"
     timeout: 120
     seed_lesson:
       topic: "Nova scheduler codename"
@@ -908,26 +661,6 @@ tasks:
   # AFTER seeding, chat must answer from the dossier's understanding.
   # =========================================================================
 
-  - id: knowing_dossier_direct
-    category: knowing
-    query: "What do you know about the Aurora-7 fusion pilot plant in Iceland?"
-    timeout: 120
-    seed_dossier:
-      title: "Fusion Energy Pilots"
-      body: |
-        ## Current understanding
-        The Aurora-7 fusion pilot plant in Iceland is the field's furthest-along compact tokamak: in July 2026 it sustained a fusion gain of Q=2.1 for 43 seconds (fusionreview.com), the first pilot-scale device to hold net gain beyond half a minute. The result moved private fusion timelines forward by an estimated two years.
-        ## How we got here
-        - (2026-03) Aurora-7 achieved first plasma (fusionreview.com)
-        - (2026-07) Sustained Q=2.1 for 43 seconds (fusionreview.com)
-        ## Key facts & figures
-        - Fusion gain: Q=2.1 sustained for 43 seconds (fusionreview.com)
-        ## Open questions
-        - Whether Q>3 is reachable without a divertor redesign
-    assertions:
-      - type: answer_contains
-        value: "2.1"
-
   - id: knowing_dossier_paraphrase
     category: knowing
     # Avoids 'Aurora' entirely — retrieval must match on iceland/fusion tokens.
@@ -949,3 +682,57 @@ tasks:
     assertions:
       - type: answer_contains
         value: "2.1"
+
+  # ---------------------------------------------------------------------------
+  # research-quality — deterministic probes of the knowing tier (2026-09-01).
+  # No LLM, no GPU: each `check` exercises the code path with fixtures and
+  # fails the suite the night it regresses (see app/monitors/eval_checks.py).
+  # ---------------------------------------------------------------------------
+  - id: rq_resolver_window
+    category: research-quality
+    query: "forecast grading rejects pre-window evidence, guidance and undated hits"
+    timeout: 30
+    check: resolver_window
+    assertions: []
+
+  - id: rq_priming_key
+    category: research-quality
+    query: "every Domain Study label resolves to its dossier and primes with Open questions"
+    timeout: 30
+    check: priming_key
+    assertions: []
+
+  - id: rq_digest_canary
+    category: research-quality
+    query: "the judge's canaries flag stale-year, artifact and pseudo-citation defects"
+    timeout: 30
+    check: digest_canary
+    assertions: []
+
+  - id: rq_fact_analysis
+    category: research-quality
+    query: "analysis is de-cited, never auto-cited; mangled fragments never ship"
+    timeout: 30
+    check: fact_analysis
+    assertions: []
+
+  - id: rq_kg_eviction
+    category: research-quality
+    query: "young KG facts are never cap-evicted; the FTS keyword arm reaches past any window"
+    timeout: 60
+    check: kg_eviction
+    assertions: []
+
+  - id: rq_curiosity_gate
+    category: research-quality
+    query: "operator probes never become research; status strings are never banked"
+    timeout: 30
+    check: curiosity_gate
+    assertions: []
+
+  - id: rq_tool_scoping
+    category: research-quality
+    query: "research generations never see side-effect tools; taint sets hold"
+    timeout: 30
+    check: tool_scoping
+    assertions: []

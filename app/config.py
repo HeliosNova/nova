@@ -48,7 +48,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
     "ENABLE_VOICE", "ENABLE_TTS", "TTS_MODEL_PATH", "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
-    "ENABLE_SHELL_EXEC", "ENABLE_MCP", "ENABLE_MCP_SERVER",
+    "ENABLE_SHELL_EXEC", "ENABLE_MCP",
     "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
     "AUTO_TOOL_CREATION_THRESHOLD", "ENABLE_INJECTION_DETECTION",
     "ENABLE_DESKTOP_AUTOMATION", "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
@@ -82,8 +82,6 @@ _MUTABLE_FIELDS = {
     "RETRIEVAL_HARD_FLOOR",
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
     "ENABLE_PPR_RETRIEVAL", "ENABLE_CONFORMAL_ABSTENTION", "ENABLE_GSW_EPISODIC",
-    "ENABLE_LORA_CONTINUAL_MERGE", "LORA_MERGE_ALPHA", "ENABLE_SFT_BOOTSTRAP",
-    "ENABLE_RLVR_SIGNALS",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
@@ -117,8 +115,9 @@ class Config:
     ENABLE_MCP: bool = field(default_factory=lambda: _env("ENABLE_MCP", "true").lower() == "true")
     MCP_CONFIG_DIR: str = field(default_factory=lambda: _env("MCP_CONFIG_DIR", "/data/mcp"))
 
-    # MCP Server (expose Nova as MCP server)
-    ENABLE_MCP_SERVER: bool = field(default_factory=lambda: _env("ENABLE_MCP_SERVER", "true").lower() == "true")
+    # MCP Server (expose Nova as MCP server). Runs OUT of process via
+    # scripts/mcp_server_runner.py; the old ENABLE_MCP_SERVER flag had no
+    # reader anywhere and was dropped 2026-09-02 (invariant: every flag is read).
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
     # External skills (AgentSkills format)
@@ -162,20 +161,14 @@ class Config:
     ENABLE_CONFORMAL_ABSTENTION: bool = field(default_factory=lambda: _env("ENABLE_CONFORMAL_ABSTENTION", "true").lower() == "true")
     # GSW (Generative Semantic Workspace) — episodic memory layer
     ENABLE_GSW_EPISODIC: bool = field(default_factory=lambda: _env("ENABLE_GSW_EPISODIC", "true").lower() == "true")
-    # Continual LoRA merging (TIES) — preserve prior adapter knowledge across fine-tunes
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
-    ENABLE_LORA_CONTINUAL_MERGE: bool = field(default_factory=lambda: _env("ENABLE_LORA_CONTINUAL_MERGE", "false").lower() == "true")
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
-    LORA_MERGE_ALPHA: float = field(default_factory=lambda: _env_float("LORA_MERGE_ALPHA", 0.5))
-    # open-rs SFT pre-DPO bootstrap — short SFT epoch on reasoning traces before DPO
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Archived training stack only.
-    ENABLE_SFT_BOOTSTRAP: bool = field(default_factory=lambda: _env("ENABLE_SFT_BOOTSTRAP", "false").lower() == "true")
+    # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
+    # dropped 2026-09-02: inert since the training stack was archived — no
+    # runtime reader. The archive keeps its own settings.)
     # RLVR — recorded verifiable signals (tool/JSON/math/claim/quiz/code outcomes)
     # ONLY to feed the GRPO/RLVR weight trainer, which was archived 2026-06-12
     # (archive/training/). With no consumer left, collection is pure write
     # overhead on the chat path, so it now defaults OFF. Re-enable only if weight
     # training is revived.
-    ENABLE_RLVR_SIGNALS: bool = field(default_factory=lambda: _env("ENABLE_RLVR_SIGNALS", "false").lower() == "true")
     # SCM/SleepGate-style two-phase dream consolidation: split the current
     # kitchen-sink Phase 3 into NREM (structural ops: prune/compact/disable —
     # fast, deterministic) and REM (integrative ops: promote/resolve/distill —
@@ -423,7 +416,7 @@ class Config:
     # _CHAT_NUM_CTX, and only after re-measuring the estimate:real ratio.
     MAX_SYSTEM_TOKENS: int = field(default_factory=lambda: _env_int("MAX_SYSTEM_TOKENS", 13500))
     MAX_USER_FACTS: int = field(default_factory=lambda: _env_int("MAX_USER_FACTS", 30))
-    MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 5000))
+    MAX_KG_FACTS: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS", 50000))  # 5000 -> 50000 (2026-09-01): FTS5 candidates removed the scan-cost reason; eviction protects young facts
     MAX_LESSON_CANDIDATES: int = field(default_factory=lambda: _env_int("MAX_LESSON_CANDIDATES", 5000))
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
     MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
@@ -476,7 +469,7 @@ class Config:
     # hardcoded 0.7 to 0.9 so paraphrased queries (low keyword overlap) still
     # surface the relevant lesson — the WS2A "semantic-first" change. The RRF
     # fusion, MIN_RRF_SCORE floor, and 0.40 confidence floor remain as backstops.
-    LESSON_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_MAX_DISTANCE", 0.9))
+    LESSON_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_MAX_DISTANCE", 0.6))  # 0.9 -> 0.6 (2026-09-01): 0.9 admitted every lesson; true matches sit at 0.22-0.39, noise at 0.62-0.75
     KG_VECTOR_MAX_DISTANCE: float = field(default_factory=lambda: _env_float("KG_VECTOR_MAX_DISTANCE", 0.8))
     # Strong-match bound: a vector hit at or under this distance is a clear
     # semantic match (e.g. a paraphrase of the lesson's original query) and

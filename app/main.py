@@ -666,6 +666,8 @@ async def lifespan(app: FastAPI):
 
 _docs_url = None if config.API_KEY else "/docs"
 _redoc_url = None if config.API_KEY else "/redoc"
+# The schema document is the attack-surface map; gate it like the docs.
+_openapi_url = None if config.API_KEY else "/openapi.json"
 
 app = FastAPI(
     title="Nova",
@@ -674,6 +676,7 @@ app = FastAPI(
     lifespan=lifespan,
     docs_url=_docs_url,
     redoc_url=_redoc_url,
+    openapi_url=_openapi_url,
 )
 
 # Rate limiting — simple in-memory per-IP limiter

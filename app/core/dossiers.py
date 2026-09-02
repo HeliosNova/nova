@@ -118,14 +118,20 @@ _UPDATE_PROMPT = (
     "## Key facts & figures\n"
     "(bullets, each with its citation)\n"
     "## Open questions\n"
-    "(3-6 things genuinely not yet known)\n"
+    "(3-6 questions answerable TODAY by research, in the present tense — what is "
+    "X's current…, who holds…, how much…; NOT future events)\n"
+    "- Then one line 'Watch for: <expected future events, comma-separated>' "
+    "(or 'Watch for: none') — futures live there, not among the questions.\n"
     "- End with exactly one line 'CHANGED: <what moved in this consolidation>' "
     "(or 'CHANGED: initial dossier' for a first version).\n"
     "- End with one FINAL line, always present: "
-    "'FORECAST: <specific testable claim> | <N> days | <0.x confidence>' when the "
-    "material supports a clear falsifiable near-term expectation, else exactly "
-    "'FORECAST: none'. A dated event, a priced probability, or a scheduled "
-    "decision in the material usually supports one.\n"
+    "'FORECAST: <specific testable claim> | resolves YYYY-MM-DD | <0.x confidence>' "
+    "when the material supports a clear falsifiable expectation, else exactly "
+    "'FORECAST: none'. The date is when the outcome becomes knowable (up to a "
+    "year out); put any deadline inside the claim too, make the claim settleable "
+    "by a news search on that date, and never forecast a target, guidance figure "
+    "or plan — only a realized outcome. A dated event or a scheduled decision in "
+    "the material usually supports one.\n"
     "Write the COMPLETE dossier and finish cleanly — no preamble, no meta-commentary.\n\n"
     "PRIOR DOSSIER:\n{prior}\n\n"
     "NEW MATERIAL:\n{sources}"
@@ -153,13 +159,19 @@ _WORLD_PROMPT = (
     "## Key facts & figures\n"
     "(only the cross-cutting ones, each with its citation)\n"
     "## Open questions\n"
-    "(3-6 macro unknowns with real stakes)\n"
+    "(3-6 macro unknowns with real stakes, phrased as questions answerable TODAY by "
+    "research — present tense, NOT future events)\n"
+    "- Then one line 'Watch for: <expected future events, comma-separated>' "
+    "(or 'Watch for: none').\n"
     "- End with exactly one line 'CHANGED: <what moved at the macro level>'.\n"
     "- End with one FINAL line, always present: "
-    "'FORECAST: <specific testable claim> | <N> days | <0.x confidence>' when the "
-    "material supports a clear falsifiable near-term expectation, else exactly "
-    "'FORECAST: none'. A dated event, a priced probability, or a scheduled "
-    "decision in the material usually supports one.\n"
+    "'FORECAST: <specific testable claim> | resolves YYYY-MM-DD | <0.x confidence>' "
+    "when the material supports a clear falsifiable expectation, else exactly "
+    "'FORECAST: none'. The date is when the outcome becomes knowable (up to a "
+    "year out); put any deadline inside the claim too, make the claim settleable "
+    "by a news search on that date, and never forecast a target, guidance figure "
+    "or plan — only a realized outcome. A dated event or a scheduled decision in "
+    "the material usually supports one.\n"
     "Write the COMPLETE dossier and finish cleanly — no preamble, no meta-commentary.\n\n"
     "PRIOR DOSSIER:\n{prior}\n\n"
     "NEW MATERIAL:\n{sources}"
@@ -373,16 +385,77 @@ def get_dossier(db, kind: str, dkey: str):
         return None
 
 
-def get_domain_dossier(db, label: str):
-    """Domain dossier for a deep_research feed label (e.g. 'finance').
+def resolve_domain_dkey(label: str, monitor_name: str | None = None) -> str:
+    """Dossier key for a deep_research feed label or a monitor name.
 
-    Domain dossiers are keyed by slug of the monitor name minus the
-    'Domain Study: ' prefix, which equals slug(label) for domain studies.
+    Consolidation keys domain dossiers by slug(monitor name minus
+    'Domain Study: '). deep_research only knows the SHORT profile label
+    ('AI/ML', 'open source', 'Europe + EU'), whose slug matches the key for
+    just 13 of 39 domains (live check 2026-09-01) — the other 26 digests ran
+    unprimed. A monitor name resolves directly; a bare label is mapped back
+    through the profile table, falling back to its own slug.
     """
-    return get_dossier(db, "domain", _slug(label))
+    if monitor_name:
+        base = monitor_name.strip()
+        if base.startswith(_DOMAIN_PREFIX):
+            base = base[len(_DOMAIN_PREFIX):]
+        return _slug(base)
+    direct = _slug(label)
+    try:
+        from app.monitors.domain_study_runner import _DOMAIN_PROFILES
+    except Exception:
+        return direct
+    lab = (label or "").strip().lower()
+    for key, prof in _DOMAIN_PROFILES.items():
+        if str(prof[1]).strip().lower() == lab:
+            return _slug(key)
+    return direct
 
 
-def get_relevant_dossiers(db, query: str, *, limit: int = 1) -> list[dict]:
+def get_domain_dossier(db, label: str, monitor_name: str | None = None):
+    """Domain dossier for a deep_research feed label (e.g. 'finance') or,
+    preferably, the monitor name it runs under. Tries the monitor-name key,
+    then the label's own slug, then the profile alias (see resolve_domain_dkey).
+    """
+    keys: list[str] = []
+    if monitor_name:
+        keys.append(resolve_domain_dkey(label, monitor_name))
+    for k in (_slug(label), resolve_domain_dkey(label)):
+        if k and k not in keys:
+            keys.append(k)
+    for k in keys:
+        row = get_dossier(db, "domain", k)
+        if row:
+            return row
+    return None
+
+
+_CU_SECTION_RE = re.compile(r"(?is)## Current understanding\s*(.+?)(?=\n## |\Z)")
+
+
+def priming_excerpt(body: str, *, cu_cap: int = 2500, oq_cap: int = 1200) -> str:
+    """The part of a dossier worth priming a digest with: the current
+    understanding (what is already known) plus the open questions (what the
+    digest should try to answer). The old body[:2500] slice stopped before
+    '## Open questions' in every one of the 39 domain dossiers (offsets
+    5,387-8,907), so digests never saw the frontier they were meant to push."""
+    body = body or ""
+    m = _CU_SECTION_RE.search(body)
+    cu = m.group(1).strip() if m else body.strip()
+    out = "## Current understanding\n" + _bound(cu, cu_cap)
+    m2 = _OPEN_Q_SECTION_RE.search(body)
+    if m2 and m2.group(1).strip():
+        out += "\n\n## Open questions\n" + _bound(m2.group(1).strip(), oq_cap)
+    return out
+
+
+_ASKS_GAPS_RE = re.compile(
+    r"(?i)\b(?:what (?:do|don'?t|dont) you know|what (?:are you|is nova) (?:unsure|uncertain)|"
+    r"unsure|uncertain|open questions?|don'?t (?:you )?know|not (?:yet )?know|unknowns?|gaps?|"
+    r"what (?:is|are) (?:still )?(?:missing|unclear|unresolved))\b")
+
+
+def get_relevant_dossiers(db, query: str, *, limit: int = 1, open_questions: bool | None = None) -> list[dict]:
     """Cheap keyword match of a chat query to dossiers (no LLM, no embedder).
 
     Mirrors storylines.get_relevant_storylines: overlap >= 2 significant tokens;
@@ -400,9 +473,11 @@ def get_relevant_dossiers(db, query: str, *, limit: int = 1) -> list[dict]:
     if not q_toks:
         return []
     try:
+        # Every dossier (2026-09-01): the old LIMIT 60 made the 29 oldest —
+        # entity dossiers like Anthropic and Microsoft — unreachable by
+        # construction. 89 rows is trivial to scan.
         rows = db.fetchall(
-            "SELECT title, body FROM dossiers WHERE body != '' "
-            "ORDER BY updated_at DESC LIMIT 60"
+            "SELECT title, body FROM dossiers WHERE body != '' ORDER BY updated_at DESC"
         )
     except Exception:
         return []
@@ -421,10 +496,16 @@ def get_relevant_dossiers(db, query: str, *, limit: int = 1) -> list[dict]:
             scored.append((overlap + 2 * len(q_toks & title_toks), r))
     scored.sort(key=lambda x: x[0], reverse=True)
     out = []
+    want_gaps = _ASKS_GAPS_RE.search(query or "") is not None if open_questions is None else open_questions
     for _, r in scored[:limit]:
         body = r["body"]
         m = re.search(r"(?is)## Current understanding\s*(.+?)(?=\n## |\Z)", body)
-        excerpt = _bound((m.group(1) if m else body).strip(), 900)
+        # 2,000 chars (was 900: ~71% of a median 3,141-char section was cut).
+        excerpt = _bound((m.group(1) if m else body).strip(), 2000)
+        if want_gaps:
+            m2 = _OPEN_Q_SECTION_RE.search(body)
+            if m2 and m2.group(1).strip():
+                excerpt += "\n\nOpen questions (what Nova does not yet know):\n" + _bound(m2.group(1).strip(), 600)
         out.append({"title": r["title"], "excerpt": excerpt})
     return out
 
@@ -655,6 +736,16 @@ async def _update_dossier(db, cand: dict, sources: str, syn_model: str | None,
                        f"FORECAST confidence accordingly.")
     except Exception:
         pass
+    # Global calibration record (2026-09-01): the per-family note above only
+    # reached 4 of 29 families; every mint now sees how stated confidence has
+    # actually delivered across all of Nova's forecasts.
+    try:
+        from app.core.forecasts import global_calibration_note
+        _gnote = await asyncio.to_thread(global_calibration_note, db)
+        if _gnote:
+            sources = sources + "\n\n" + _gnote
+    except Exception:
+        pass
 
     prompt = prompt_template.format(title=cand["title"], prior=prior, sources=sources)
     try:
@@ -825,6 +916,13 @@ async def consolidate_dossiers(db) -> str:
             continue
         if res:
             updated.append(res)
+            # Open-questions ledger (2026-09-02): reconcile what the new body
+            # asks against what it asked before; record REVISED: lines.
+            try:
+                from app.core.questions import sync_after_consolidation
+                await asyncio.to_thread(sync_after_consolidation, db, cand["kind"], cand["dkey"])
+            except Exception as e:
+                logger.debug("[Knowing] question ledger sync failed for %r: %s", cand["title"], e)
             if cand["kind"] == "domain":
                 domain_updates += 1
             # Curiosity <- Open questions (rung 2): the dossier's own stated
@@ -840,20 +938,37 @@ async def consolidate_dossiers(db) -> str:
                 try:
                     row = await asyncio.to_thread(get_dossier, db, cand["kind"], cand["dkey"])
                     qs = _extract_open_questions(row["body"] if row else "", limit=3)
-                    qs = [q for q in qs if not _is_future_question(q)][:1]
+                    qs = [q for q in qs if not _is_future_question(q)
+                          and not q.lower().startswith("watch for")][:1]
                     if qs:
                         from app.core.curiosity import CuriosityQueue
-                        await asyncio.to_thread(
+                        _cid = await asyncio.to_thread(
                             CuriosityQueue(db).add,
                             f"{cand['title']}: {qs[0]}",
                             "dossier_open_question", 0.6)
                         res["questions_fed"] = True
+                        try:
+                            from app.core.questions import mark_queued
+                            await asyncio.to_thread(mark_queued, db, cand["dkey"], qs[0], _cid)
+                        except Exception as e:
+                            logger.debug("[Knowing] ledger mark_queued failed: %s", e)
                         logger.info("[Knowing] curiosity fed from %r: %s", cand["title"], qs[0][:90])
                 except Exception as e:
                     logger.debug("[Knowing] curiosity feed failed for %r: %s", cand["title"], e)
 
     # Capstone (rung 4): re-consolidate the state of the world when the domain
     # picture moved. Does not count against the per-cycle cap.
+    # Ledger hygiene (2026-09-02): questions of closed storyline threads are
+    # no longer the frontier — retire them so the counts stay honest.
+    try:
+        from app.core.questions import retire_orphaned
+        _n_retired = await asyncio.to_thread(retire_orphaned, db)
+        if _n_retired:
+            logger.info("[Knowing] question ledger: %d question(s) retired with their closed storylines",
+                        _n_retired)
+    except Exception as e:
+        logger.debug("[Knowing] ledger orphan sweep failed: %s", e)
+
     world_note = ""
     if domain_updates >= 2:
         try:

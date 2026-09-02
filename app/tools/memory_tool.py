@@ -30,9 +30,10 @@ class MemorySearchTool(BaseTool):
         "required": ["query"],
     }
 
-    def __init__(self, conversations=None, user_facts=None):
+    def __init__(self, conversations=None, user_facts=None, learning=None):
         self._conversations = conversations
         self._user_facts = user_facts
+        self._learning = learning
 
     async def execute(self, *, query: str = "", **kwargs) -> ToolResult:
         if not query:
@@ -68,6 +69,28 @@ class MemorySearchTool(BaseTool):
                     results.append(f"- {f.key}: {f.value}")
 
         # Search conversation messages by content
+        # Owner-taught lessons ARE memory (2026-09-01): the prompt sends "my
+        # notes" questions here, and this tool could not see lessons — so a
+        # taught fact lost to a web page about a homonym.
+        learning = self._learning
+        if learning is None:
+            try:
+                from app.core.brain import get_services
+                learning = getattr(get_services(), "learning", None)
+            except Exception:
+                learning = None
+        if learning is not None:
+            try:
+                lessons = learning.get_relevant_lessons(query, limit=5)
+            except Exception:
+                lessons = []
+            if lessons:
+                results.append("\n## Matching Lessons (owner-taught — authoritative)")
+                for les in lessons:
+                    text = (getattr(les, "correct_answer", "") or getattr(les, "lesson_text", "") or "").strip()
+                    if text:
+                        results.append(f"- {getattr(les, 'topic', '')}: {text[:400]}")
+
         if self._conversations:
             matches = self._conversations.search_messages(query, limit=10)
             if matches:

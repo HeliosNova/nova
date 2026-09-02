@@ -21,6 +21,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(tags=["dossiers"], dependencies=[Depends(require_auth)])
 
 _KINDS = {"domain", "entity", "storyline", "meta"}
+_Q_STATUSES = {"open", "queued", "researched", "retired"}
 
 
 @router.get("/dossiers")
@@ -41,6 +42,37 @@ async def list_dossiers(kind: str | None = Query(None, max_length=20)):
     return {"dossiers": [dict(r) for r in rows]}
 
 
+@router.get("/dossiers/questions")
+async def list_open_questions(
+    status: str | None = Query(None, max_length=12),
+    dkey: str | None = Query(None, max_length=80),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """The open-questions ledger (2026-09-02): every question a dossier has
+    asked, with its disposition (open / queued / researched / retired) and
+    the frontier counts. Registered BEFORE /dossiers/{dossier_id}."""
+    if status is not None and status not in _Q_STATUSES:
+        raise HTTPException(status_code=422, detail=f"status must be one of {sorted(_Q_STATUSES)}")
+    import asyncio
+    from app.core.questions import frontier, list_questions
+    db = get_db()
+    fr = await asyncio.to_thread(frontier, db, dkey)
+    rows = await asyncio.to_thread(list_questions, db, status=status, dkey=dkey, limit=limit)
+    return {"frontier": fr, "questions": rows}
+
+
+@router.get("/dossiers/beliefs")
+async def list_belief_revisions(
+    dkey: str | None = Query(None, max_length=80),
+    limit: int = Query(50, ge=1, le=500),
+):
+    """Every REVISED: line a consolidation emitted — Nova changing its mind."""
+    import asyncio
+    from app.core.questions import list_revisions
+    rows = await asyncio.to_thread(list_revisions, get_db(), dkey=dkey, limit=limit)
+    return {"revisions": rows}
+
+
 @router.get("/dossiers/{dossier_id}")
 async def get_dossier_detail(dossier_id: int):
     """One dossier with its full body + how many prior revisions exist."""
@@ -54,6 +86,20 @@ async def get_dossier_detail(dossier_id: int):
     out = dict(row)
     out["revision_count"] = n_rev
     return out
+
+
+@router.get("/dossiers/{dossier_id}/questions")
+async def dossier_questions(dossier_id: int):
+    """This dossier's questions + frontier counts."""
+    import asyncio
+    from app.core.questions import frontier, list_questions
+    db = get_db()
+    row = db.fetchone("SELECT dkey FROM dossiers WHERE id = ?", (dossier_id,))
+    if row is None:
+        raise HTTPException(status_code=404, detail="Dossier not found")
+    fr = await asyncio.to_thread(frontier, db, row["dkey"])
+    rows = await asyncio.to_thread(list_questions, db, dkey=row["dkey"], limit=200)
+    return {"dossier_id": dossier_id, "dkey": row["dkey"], "frontier": fr, "questions": rows}
 
 
 @router.get("/dossiers/{dossier_id}/revisions")

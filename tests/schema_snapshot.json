@@ -1,0 +1,403 @@
+{
+ "action_log": [
+  "id",
+  "action_type",
+  "params",
+  "result",
+  "success",
+  "created_at"
+ ],
+ "agent_workspace": [
+  "id",
+  "query_signature",
+  "last_query",
+  "findings_json",
+  "last_answer",
+  "run_count",
+  "success_count",
+  "fail_count",
+  "created_at",
+  "updated_at"
+ ],
+ "auth_lockouts": [
+  "ip",
+  "failures",
+  "locked_until",
+  "updated_at"
+ ],
+ "belief_revisions": [
+  "id",
+  "dossier_id",
+  "dkey",
+  "revised",
+  "created_at"
+ ],
+ "capability_gaps": [
+  "id",
+  "query",
+  "reason",
+  "tools_tried",
+  "quality_score",
+  "reviewed",
+  "created_at"
+ ],
+ "channel_conversations": [
+  "channel",
+  "user_id",
+  "conversation_id",
+  "updated_at"
+ ],
+ "chunks_fts": [
+  "chunk_id",
+  "document_id",
+  "content"
+ ],
+ "chunks_fts_config": [
+  "k",
+  "v"
+ ],
+ "chunks_fts_content": [
+  "id",
+  "c0",
+  "c1",
+  "c2"
+ ],
+ "chunks_fts_data": [
+  "id",
+  "block"
+ ],
+ "chunks_fts_docsize": [
+  "id",
+  "sz"
+ ],
+ "chunks_fts_idx": [
+  "segid",
+  "term",
+  "pgno"
+ ],
+ "conversation_summaries": [
+  "id",
+  "conversation_id",
+  "summary",
+  "narrative",
+  "key_entities",
+  "message_count",
+  "last_message_id",
+  "valid_from",
+  "valid_to",
+  "created_at",
+  "updated_at"
+ ],
+ "conversations": [
+  "id",
+  "title",
+  "created_at",
+  "updated_at"
+ ],
+ "custom_tools": [
+  "id",
+  "name",
+  "description",
+  "parameters",
+  "code",
+  "times_used",
+  "success_rate",
+  "enabled",
+  "created_at"
+ ],
+ "daemon_log": [
+  "id",
+  "category",
+  "content",
+  "source",
+  "created_at"
+ ],
+ "dedup_decisions": [
+  "id",
+  "entity_type",
+  "jaccard_score",
+  "threshold",
+  "decision",
+  "created_at"
+ ],
+ "documents": [
+  "id",
+  "title",
+  "source",
+  "chunk_count",
+  "created_at"
+ ],
+ "dossier_questions": [
+  "id",
+  "dossier_id",
+  "dkey",
+  "question",
+  "qkey",
+  "status",
+  "curiosity_id",
+  "resolution",
+  "first_seen_at",
+  "last_seen_at",
+  "resolved_at"
+ ],
+ "dossier_revisions": [
+  "id",
+  "dossier_id",
+  "body",
+  "valid_from",
+  "valid_to"
+ ],
+ "dossiers": [
+  "id",
+  "kind",
+  "dkey",
+  "title",
+  "body",
+  "changed_note",
+  "update_count",
+  "created_at",
+  "updated_at"
+ ],
+ "event_queue": [
+  "id",
+  "event_type",
+  "payload",
+  "priority",
+  "status",
+  "created_at",
+  "processed_at"
+ ],
+ "forecasts": [
+  "id",
+  "claim",
+  "storyline_key",
+  "confidence",
+  "created_at",
+  "resolves_at",
+  "status",
+  "resolution",
+  "resolved_at",
+  "source_monitor",
+  "attempts"
+ ],
+ "goals": [
+  "id",
+  "goal",
+  "priority",
+  "status",
+  "source",
+  "context",
+  "created_at",
+  "updated_at",
+  "completed_at"
+ ],
+ "heartbeat_instructions": [
+  "id",
+  "instruction",
+  "schedule_seconds",
+  "enabled",
+  "last_run_at",
+  "notify_channels",
+  "created_at"
+ ],
+ "host_cooccurrence": [
+  "host_a",
+  "host_b",
+  "n_cooccur",
+  "first_seen",
+  "last_seen"
+ ],
+ "host_digest_counts": [
+  "host",
+  "n_digests",
+  "last_seen"
+ ],
+ "kg_facts": [
+  "id",
+  "subject",
+  "predicate",
+  "object",
+  "confidence",
+  "source",
+  "created_at",
+  "valid_from",
+  "valid_to",
+  "provenance",
+  "superseded_by",
+  "times_retrieved",
+  "last_retrieved_at"
+ ],
+ "lessons": [
+  "id",
+  "topic",
+  "wrong_answer",
+  "correct_answer",
+  "lesson_text",
+  "context",
+  "confidence",
+  "times_retrieved",
+  "times_helpful",
+  "created_at",
+  "last_retrieved_at",
+  "last_quizzed_at",
+  "quiz_failures",
+  "retrieval_score"
+ ],
+ "messages": [
+  "id",
+  "conversation_id",
+  "role",
+  "content",
+  "tool_calls",
+  "tool_name",
+  "sources",
+  "created_at"
+ ],
+ "monitor_results": [
+  "id",
+  "monitor_id",
+  "status",
+  "value",
+  "message",
+  "created_at",
+  "user_rating"
+ ],
+ "monitors": [
+  "id",
+  "name",
+  "check_type",
+  "check_config",
+  "schedule_seconds",
+  "enabled",
+  "cooldown_minutes",
+  "notify_condition",
+  "last_check_at",
+  "last_alert_at",
+  "last_result",
+  "created_at",
+  "category",
+  "trigger_events",
+  "trigger_mode",
+  "channels"
+ ],
+ "pending_deliveries": [
+  "id",
+  "targets",
+  "monitor_name",
+  "message",
+  "category",
+  "created_at"
+ ],
+ "procedural_clusters": [
+  "id",
+  "cluster_key",
+  "member_lesson_ids",
+  "canonical_lesson_id",
+  "member_count",
+  "last_consolidated_at",
+  "created_at"
+ ],
+ "prompt_modules": [
+  "id",
+  "module_name",
+  "version",
+  "content",
+  "is_baseline",
+  "status",
+  "parent_version",
+  "delta_description",
+  "promoted_at",
+  "promoted_eval_run_id",
+  "rolled_back_at",
+  "quarantined_until",
+  "shadow_eval_metrics",
+  "created_at"
+ ],
+ "reflexions": [
+  "id",
+  "task_summary",
+  "outcome",
+  "reflection",
+  "quality_score",
+  "tools_used",
+  "revision_count",
+  "created_at",
+  "is_eval"
+ ],
+ "salience_weights": [
+  "topic",
+  "weight",
+  "updated_at"
+ ],
+ "schema_version": [
+  "version",
+  "applied_at"
+ ],
+ "skills": [
+  "id",
+  "name",
+  "trigger_pattern",
+  "steps",
+  "answer_template",
+  "learned_from",
+  "times_used",
+  "success_rate",
+  "enabled",
+  "created_at",
+  "last_used_at",
+  "consecutive_failures",
+  "source",
+  "composed_of",
+  "kind",
+  "procedure_text"
+ ],
+ "storyline_events": [
+  "id",
+  "storyline_id",
+  "summary",
+  "source_monitor",
+  "item_url",
+  "published",
+  "is_new",
+  "created_at"
+ ],
+ "storylines": [
+  "id",
+  "story_key",
+  "title",
+  "status",
+  "summary",
+  "monitors_csv",
+  "first_seen",
+  "last_updated",
+  "update_count",
+  "last_digest_at"
+ ],
+ "system_state": [
+  "key",
+  "value",
+  "updated_at"
+ ],
+ "user_facts": [
+  "id",
+  "key",
+  "value",
+  "source",
+  "confidence",
+  "category",
+  "updated_at",
+  "last_accessed_at",
+  "access_count"
+ ],
+ "verifiable_signals": [
+  "id",
+  "conversation_id",
+  "query",
+  "response",
+  "signal_type",
+  "signal_value",
+  "evidence",
+  "consumed_for_training",
+  "created_at"
+ ]
+}

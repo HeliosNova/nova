@@ -109,6 +109,9 @@ class TrustManager:
 
     def get_score(self) -> float:
         """Get current trust score (0-100)."""
+        mem = getattr(self, "_score", None)
+        if mem is not None:
+            return float(mem)
         row = self._db.fetchone("SELECT current_score FROM trust_scores WHERE id = 1")
         return row["current_score"] if row else DEFAULT_STARTING_SCORE
 
@@ -122,69 +125,31 @@ class TrustManager:
         return True  # All tools always allowed — trust is tracked, not enforced
 
     def record_outcome(self, tool_name: str, success: bool, action: str = "") -> float:
-        """Record a tool execution outcome. Returns new trust score.
+        """Record a tool execution outcome in memory. Returns the new score.
 
-        Audit log policy: log all FAILURES (always actionable), but only sample
-        ~1 in 50 successes (so the audit table doesn't grow unboundedly while
-        still preserving anomaly detection signal).
+        Retired from the database 2026-09-01: one UPDATE per tool call plus an
+        audit row gated nothing (can_use is always True) and fed only a
+        dashboard number. The score is still tracked for self-awareness.
         """
         delta = self._success_delta if success else self._failure_delta
-        result = "success" if success else "failure"
-
-        current = self.get_score()
+        current = float(getattr(self, "_score", None) or DEFAULT_STARTING_SCORE)
         new_score = max(TRUST_FLOOR, min(100.0, current + delta))
-
-        now = datetime.now(timezone.utc).isoformat()
-
-        # Update score
+        self._score = new_score
         if success:
-            self._db.execute(
-                "UPDATE trust_scores SET current_score = ?, total_successes = total_successes + 1, "
-                "updated_at = ? WHERE id = 1",
-                (new_score, now),
-            )
+            self._successes = getattr(self, "_successes", 0) + 1
         else:
-            self._db.execute(
-                "UPDATE trust_scores SET current_score = ?, total_failures = total_failures + 1, "
-                "updated_at = ? WHERE id = 1",
-                (new_score, now),
-            )
-
-        # Audit log: failures always, successes sampled (1 in 50) to bound growth.
-        # Use proof_hash as cheap PRNG: hash includes timestamp so naturally varies.
-        proof_data = f"{tool_name}|{action}|{result}|{delta}|{new_score}|{now}"
-        proof_hash = hashlib.sha256(proof_data.encode()).hexdigest()[:16]
-        should_log = (not success) or (int(proof_hash, 16) % 50 == 0)
-
-        if should_log:
-            self._db.execute(
-                "INSERT INTO trust_audit_log (tool_name, action, result, score_delta, new_score, proof_hash, timestamp) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (tool_name, action, result, delta, new_score, proof_hash, now),
-            )
-
-        if not success:
-            logger.warning(
+            self._failures = getattr(self, "_failures", 0) + 1
+            logger.info(
                 "Trust: %s FAILED (score %.0f -> %.0f, threshold %d)",
                 tool_name, current, new_score, _TOOL_TIERS.get(tool_name, 0),
             )
-
         return new_score
 
     def decay(self, amount: float = DEFAULT_DECAY_AMOUNT) -> float:
-        """Daily decay — trust must be maintained through use, not just accumulated.
-
-        Called during dream consolidation so trust erodes during idle periods.
-        """
-        current = self.get_score()
+        """Idle decay, in memory only (see record_outcome)."""
+        current = float(getattr(self, "_score", None) or DEFAULT_STARTING_SCORE)
         new_score = max(TRUST_FLOOR, current - amount)
-        if new_score != current:
-            now = datetime.now(timezone.utc).isoformat()
-            self._db.execute(
-                "UPDATE trust_scores SET current_score = ?, updated_at = ? WHERE id = 1",
-                (new_score, now),
-            )
-            logger.info("Trust: daily decay %.0f -> %.0f", current, new_score)
+        self._score = new_score
         return new_score
 
     def get_stats(self) -> dict:

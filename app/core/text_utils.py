@@ -168,4 +168,4 @@ def estimate_tokens(text: str) -> int:
         if '\u4e00' <= c <= '\u9fff' or '\u3040' <= c <= '\u30ff' or '\uac00' <= c <= '\ud7af'
     )
     non_cjk = len(text) - cjk_count
-    return non_cjk // 4 + int(cjk_count / 1.5)
+    return int(non_cjk / 3.25)  # 4 -> 3.25 (2026-09-01): Ollama counted 16.6k tokens where the estimate said 13.5k + int(cjk_count / 1.5)

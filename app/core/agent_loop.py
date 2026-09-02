@@ -33,6 +33,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from app.core import llm
+from app.core.curiosity import CuriosityQueue
 from app.core.llm import extract_json_object
 
 logger = logging.getLogger(__name__)
@@ -963,19 +964,13 @@ class AgentLoop:
             if s.action and s.action.get("tool") in {"web_search", "knowledge_search", "browser"}:
                 topic = s.description[:200]
                 try:
-                    # Avoid duplicates by checking existing pending items
-                    existing = db.fetchone(
-                        "SELECT id FROM curiosity_queue "
-                        "WHERE topic = ? AND status = 'pending' LIMIT 1",
-                        (topic,),
-                    )
-                    if not existing:
-                        db.execute(
-                            "INSERT INTO curiosity_queue "
-                            "(topic, source, urgency, status, attempts, created_at) "
-                            "VALUES (?, 'agent_failure', 0.7, 'pending', 0, CURRENT_TIMESTAMP)",
-                            (topic,),
-                        )
+                    # Through the queue's own gate (2026-09-01): the raw INSERT
+                    # bypassed Jaccard dedup, cooldown, probe rejection and the
+                    # ephemeral suppression — it is how the five duplicate
+                    # rate-limiter lessons were born. Urgency 0.6 keeps agent
+                    # failures below the daemon's 0.7 critical-research line.
+                    rid = CuriosityQueue(db).add(topic, source="agent_failure", urgency=0.6)
+                    if rid and rid > 0:
                         logger.info("agent_loop: queued curiosity research: %s", topic[:80])
                 except Exception as e:
                     logger.warning("curiosity_queue insert failed: %s", e)

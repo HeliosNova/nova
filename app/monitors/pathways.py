@@ -1,0 +1,302 @@
+"""Pathway liveness registry (2026-09-02).
+
+Every optional pathway in Nova — storylines, dossiers, forecasts, curiosity,
+KG banking, output eval, the delivery ledger — is a background WRITER whose
+failure mode is silence, not an error: the code path stops being reached and
+its table simply stops growing. Storylines were dead for five weeks
+(2026-08-11) and KG extraction for three days (2026-08-18) before log
+archaeology noticed; nothing in the system could say "this table used to grow
+and no longer does".
+
+This module is the ONE place that lists those writers, the table (or file)
+each one writes, the config flag and heartbeat monitor that gate it, and how
+long it may go quiet before that silence is a fault. Two consumers:
+
+  * the "Pathway Liveness" monitor (fast lane: no LLM, no network) turns the
+    list into a deterministic verdict every 6h and alerts on the first dead
+    pathway — and again on recovery;
+  * /api/system/status exposes the same snapshot so the frontend can show
+    "last written" per pathway.
+
+Verdicts: alive (wrote inside its window), dead (silent past the window),
+idle (usage-gated — only writes when the owner talks to Nova — so silence is
+not a fault), off (flag false or driving monitor disabled), warming (the
+install is younger than the window), unknown (probe failed — missing table,
+treated as dead).
+"""
+from __future__ import annotations
+
+import logging
+import os
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+
+logger = logging.getLogger(__name__)
+
+_TS = "%Y-%m-%d %H:%M:%S"
+
+
+@dataclass(frozen=True)
+class Pathway:
+    """One background writer and the silence it is allowed."""
+
+    name: str
+    cadence_hours: float            # silence longer than this is a fault
+    table: str = ""                 # writer table (or "" for a file probe)
+    time_col: str = ""              # timestamp column proving a write
+    where: str = ""                 # extra SQL filter (e.g. source = 'storyline')
+    flag: str | None = None         # config.ENABLE_* that gates the pathway
+    monitor: str | None = None      # heartbeat monitor that drives the writer
+    usage_gated: bool = False       # only writes when the owner uses Nova
+    min_rows: int = 1               # rows expected inside the window
+    path: str | None = None         # file probe by mtime instead of a table
+    describe: str = ""
+
+
+# The effective window is max(cadence, 2 × driving monitor schedule + 1h), so
+# a monitor that legitimately runs every 12h is never flagged for a 25h gap.
+PATHWAYS: tuple[Pathway, ...] = (
+    Pathway("heartbeat_results", 3, "monitor_results", "created_at",
+            describe="any monitor stored a result"),
+    Pathway("alert_delivery", 12, "monitors", "last_alert_at",
+            describe="an alert reached a channel"),
+    Pathway("kg_digest_facts", 12, "kg_facts", "created_at", where="source = 'researched'",
+            describe="deep research banked facts from a digest"),
+    Pathway("kg_extracted_facts", 12, "kg_facts", "created_at", where="source = 'extracted'",
+            describe="post-digest / chat triple extraction"),
+    Pathway("digest_independence", 24, "host_cooccurrence", "last_seen",
+            describe="source-network (laundering) layer updated"),
+    Pathway("storylines", 36, "storyline_events", "created_at",
+            flag="ENABLE_STORYLINES", monitor="Storyline Tracker",
+            describe="story threads moved"),
+    Pathway("dossiers", 36, "dossiers", "updated_at",
+            flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
+            describe="a dossier was (re)consolidated"),
+    # valid_from on a revision row is the SUPERSEDED body's updated_at (days
+    # old by construction), so the window is a week: quiet domains revise
+    # rarely, but across 90 dossiers some prior version from the last week is
+    # always being retired while the trail is alive.
+    Pathway("dossier_history", 168, "dossier_revisions", "valid_from",
+            flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
+            describe="bitemporal revision trail appended"),
+    Pathway("question_ledger", 48, "dossier_questions", "last_seen_at",
+            flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
+            describe="the open-questions frontier was reconciled"),
+    Pathway("forecast_minting", 48, "forecasts", "created_at",
+            flag="ENABLE_FORECASTS", describe="a falsifiable forecast was minted"),
+    Pathway("forecast_resolution", 48, "forecasts", "resolved_at",
+            flag="ENABLE_FORECASTS", monitor="Forecast Resolution",
+            describe="a due forecast was graded"),
+    Pathway("curiosity_intake", 48, "curiosity_queue", "created_at",
+            flag="ENABLE_CURIOSITY", describe="an open question entered the queue"),
+    Pathway("curiosity_research", 48, "curiosity_queue", "resolved_at",
+            flag="ENABLE_CURIOSITY", monitor="Curiosity Research",
+            describe="a queued question was researched"),
+    Pathway("output_eval", 48, "output_quality_log", "created_at",
+            monitor="Output Quality Eval", describe="a digest was graded"),
+    Pathway("cross_synthesis", 168, "kg_facts", "created_at", where="source = 'cross_synthesis'",
+            monitor="Cross-Monitor Synthesis", describe="a cross-monitor theme was written"),
+    Pathway("kg_communities", 48, "kg_communities", "created_at",
+            monitor="Dream Consolidation", describe="KG community summaries rebuilt"),
+    Pathway("dream_consolidation", 48, "daemon_log", "created_at",
+            monitor="Dream Consolidation", describe="the dream/daemon cycle logged"),
+    Pathway("maintenance_ran", 48, "monitor_results", "created_at",
+            where="status IN ('ok','changed','alert') AND monitor_id IN "
+                  "(SELECT id FROM monitors WHERE name = 'System Maintenance')",
+            monitor="System Maintenance", describe="daily maintenance completed"),
+    Pathway("trust_ledger", 48, "trust_scores", "updated_at",
+            describe="tool trust score refreshed"),
+    Pathway("dedup_metrics", 48, "dedup_decisions", "created_at",
+            describe="a dedup decision was recorded"),
+    Pathway("kg_retrieval", 48, "kg_facts", "last_retrieved_at",
+            describe="KG facts were read into a prompt"),
+    Pathway("eval_harness", 48, path="{EVAL_REPORT_PATH}/eval_history.jsonl",
+            flag="ENABLE_EVAL_HARNESS", monitor="Quality Eval Harness",
+            describe="the nightly eval appended its history"),
+    # Usage-gated: these only write when the owner talks to Nova. Silence is
+    # reported as idle, never dead.
+    Pathway("chat_messages", 168, "messages", "created_at", usage_gated=True,
+            describe="a chat turn was stored"),
+    Pathway("lessons", 168, "lessons", "created_at", usage_gated=True,
+            describe="a correction became a lesson"),
+    Pathway("reflexions", 168, "reflexions", "created_at", usage_gated=True,
+            describe="a response was critiqued"),
+    Pathway("skills", 168, "skills", "created_at", usage_gated=True,
+            describe="a skill was induced"),
+    Pathway("tool_actions", 168, "action_log", "created_at", usage_gated=True,
+            describe="a tool call was logged"),
+)
+
+_BY_NAME: dict[str, Pathway] = {p.name: p for p in PATHWAYS}
+
+HEALTHY_MARKER = "all pathways alive"
+
+
+def get_pathway(name: str) -> Pathway | None:
+    return _BY_NAME.get(name)
+
+
+def _parse_ts(value) -> datetime | None:
+    """Tolerant parser for the three timestamp spellings in the DB
+    (SQLite datetime('now'), ISO with 'T', ISO with offset/microseconds)."""
+    if not value:
+        return None
+    s = str(value).strip().replace("T", " ")
+    for sep in ("+", "Z"):
+        s = s.split(sep)[0]
+    if "." in s:
+        s = s.split(".")[0]
+    try:
+        return datetime.strptime(s[:19], _TS)
+    except ValueError:
+        return None
+
+
+def _monitor_index(db) -> dict[str, dict]:
+    try:
+        rows = db.fetchall("SELECT name, enabled, schedule_seconds FROM monitors")
+    except Exception:
+        return {}
+    return {
+        r["name"]: {"enabled": bool(r["enabled"]),
+                    "schedule_seconds": int(r["schedule_seconds"] or 0)}
+        for r in rows
+    }
+
+
+def _install_age_hours(db, now: datetime) -> float | None:
+    try:
+        row = db.fetchone("SELECT MIN(applied_at) AS t FROM schema_version")
+    except Exception:
+        return None
+    t = _parse_ts(row["t"] if row else None)
+    return (now - t).total_seconds() / 3600 if t else None
+
+
+def _probe_table(db, p: Pathway, cutoff: str) -> tuple[str | None, int]:
+    sql = (f"SELECT MAX({p.time_col}) AS last_at, "
+           f"SUM(CASE WHEN {p.time_col} > ? THEN 1 ELSE 0 END) AS recent "
+           f"FROM {p.table} WHERE {p.time_col} IS NOT NULL")
+    if p.where:
+        sql += f" AND ({p.where})"
+    try:
+        row = db.fetchone(sql, (cutoff,))
+    except Exception as e:
+        # Several writers create their table lazily on first use (curiosity,
+        # output eval, trust, communities): no table = the writer never ran,
+        # which is warm-up on a fresh install and DEAD on an old one — the
+        # ordinary verdict rule, not a probe error.
+        if "no such table" in str(e).lower():
+            return None, 0
+        raise
+    if not row:
+        return None, 0
+    return row["last_at"], int(row["recent"] or 0)
+
+
+def _probe_file(p: Pathway, cfg, cutoff: str) -> tuple[str | None, int]:
+    path = (p.path or "").format(
+        EVAL_REPORT_PATH=getattr(cfg, "EVAL_REPORT_PATH", "/data/eval_reports"))
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return None, 0
+    last = datetime.fromtimestamp(mtime, tz=timezone.utc).replace(tzinfo=None).strftime(_TS)
+    return last, (1 if last > cutoff else 0)
+
+
+def effective_window_hours(p: Pathway, monitors: dict[str, dict]) -> float:
+    window = float(p.cadence_hours)
+    drv = monitors.get(p.monitor) if p.monitor else None
+    if drv and drv["schedule_seconds"]:
+        window = max(window, 2 * drv["schedule_seconds"] / 3600 + 1)
+    return window
+
+
+def snapshot(db, *, cfg=None, now: datetime | None = None) -> list[dict]:
+    """One dict per pathway: name, verdict, last_at, age_hours, window_hours,
+    recent_rows, flag, monitor, describe. Pure DB reads — safe on the API path."""
+    if cfg is None:
+        from app.config import config as cfg  # noqa: N813 — late import keeps this module import-light
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    monitors = _monitor_index(db)
+    install_age = _install_age_hours(db, now)
+    out: list[dict] = []
+    for p in PATHWAYS:
+        window = effective_window_hours(p, monitors)
+        entry: dict = {
+            "name": p.name, "describe": p.describe, "flag": p.flag, "monitor": p.monitor,
+            "window_hours": round(window, 1), "last_at": None, "age_hours": None,
+            "recent_rows": 0, "verdict": "alive",
+        }
+        if p.flag and not getattr(cfg, p.flag, True):
+            entry["verdict"] = "off"
+            out.append(entry)
+            continue
+        if p.monitor:
+            drv = monitors.get(p.monitor)
+            if drv is None or not drv["enabled"]:
+                entry["verdict"] = "off"
+                out.append(entry)
+                continue
+        cutoff = (now - timedelta(hours=window)).strftime(_TS)
+        try:
+            if p.path:
+                last_at, recent = _probe_file(p, cfg, cutoff)
+            else:
+                last_at, recent = _probe_table(db, p, cutoff)
+        except Exception as e:
+            logger.warning("[Pathways] probe failed for %s: %s", p.name, e)
+            entry["verdict"] = "unknown"
+            entry["error"] = str(e)[:120]
+            out.append(entry)
+            continue
+        last_dt = _parse_ts(last_at)
+        entry["last_at"] = last_dt.strftime(_TS) if last_dt else None
+        entry["age_hours"] = (round((now - last_dt).total_seconds() / 3600, 1)
+                              if last_dt else None)
+        entry["recent_rows"] = recent
+        if recent >= p.min_rows:
+            verdict = "alive"
+        elif p.usage_gated:
+            verdict = "idle"
+        elif install_age is not None and install_age < window:
+            verdict = "warming"
+        else:
+            verdict = "dead"
+        entry["verdict"] = verdict
+        out.append(entry)
+    return out
+
+
+def liveness_report(db, *, cfg=None, now: datetime | None = None
+                    ) -> tuple[str, str, dict[str, str | int | float]]:
+    """(status, summary, fields) for the Pathway Liveness monitor.
+
+    The healthy summary always carries HEALTHY_MARKER and no drifting numbers,
+    so the canary gate can suppress healthy→healthy repeats and deliver only
+    the first dead verdict and the recovery edge.
+    """
+    rows = snapshot(db, cfg=cfg, now=now)
+    dead = [r for r in rows if r["verdict"] in ("dead", "unknown")]
+    alive = [r for r in rows if r["verdict"] == "alive"]
+    idle = [r for r in rows if r["verdict"] == "idle"]
+    off = [r for r in rows if r["verdict"] == "off"]
+    warming = [r for r in rows if r["verdict"] == "warming"]
+    fields: dict[str, str | int | float] = {"alive": len(alive), "idle": len(idle), "off": len(off)}
+    if warming:
+        fields["warming"] = len(warming)
+    if dead:
+        for r in dead:
+            if r["verdict"] == "unknown":
+                fields[r["name"]] = f"probe error: {r.get('error', '')}"
+            elif r["age_hours"] is None:
+                fields[r["name"]] = f"never wrote (window {r['window_hours']:.0f}h)"
+            else:
+                fields[r["name"]] = f"{r['age_hours']:.0f}h silent (window {r['window_hours']:.0f}h)"
+        names = ", ".join(r["name"] for r in dead)
+        return "error", f"{len(dead)} pathway(s) DEAD: {names}", fields
+    tail = f"{len(alive)} writing, {len(idle)} idle, {len(off)} off"
+    if warming:
+        tail += f", {len(warming)} warming up"
+    return "info", f"{HEALTHY_MARKER} ({tail})", fields

@@ -66,8 +66,8 @@ def _parse_response(content_list) -> dict:
 
 
 class TestListTools:
-    def test_list_tools_returns_five(self):
-        assert len(_TOOLS) == 5
+    def test_list_tools_returns_eight(self):
+        assert len(_TOOLS) == 8
 
     def test_tool_names(self):
         names = {t.name for t in _TOOLS}
@@ -77,6 +77,10 @@ class TestListTools:
             "nova_lessons",
             "nova_document_search",
             "nova_facts_about",
+            # knowing tier (2026-09-02)
+            "nova_dossiers",
+            "nova_storylines",
+            "nova_forecasts",
         }
         assert names == expected
 
@@ -284,7 +288,7 @@ class TestMCPServerCallTool:
         result = await handler(ListToolsRequest(method="tools/list"))
         # ServerResult wraps the actual result in .root
         tools = result.root.tools
-        assert len(tools) == 5
+        assert len(tools) == 8  # 5 memory tools + 3 knowing-tier tools (2026-09-02)
 
     async def test_facts_about_via_service(self, services):
         """Test the facts_about logic end-to-end using the services directly."""

@@ -15,6 +15,8 @@ from app import __version__
 from app.auth import require_auth
 from app.config import config, _MUTABLE_FIELDS
 from app.database import get_db
+from app.monitors.pathways import snapshot as pathway_snapshot
+from app.monitors.quiet import quiet_until as _quiet_until
 from app.schema import HealthResponse, StatusResponse
 
 logger = logging.getLogger(__name__)
@@ -92,6 +94,11 @@ async def providers_health():
     return {"active": active_name, "providers": results}
 
 
+def _quiet_until_str(db) -> str | None:
+    until = _quiet_until(db)
+    return until.strftime("%Y-%m-%d %H:%M:%S") if until else None
+
+
 _ALLOWED_TABLES = frozenset({
     "conversations", "messages", "user_facts", "lessons", "skills", "documents",
     "kg_facts", "reflexions", "custom_tools",
@@ -132,6 +139,9 @@ async def status() -> StatusResponse:
             kg_facts=count("kg_facts"),
             reflexions=count("reflexions"),
             custom_tools=count("custom_tools"),
+            # Liveness registry (2026-09-02): last write per background pathway.
+            pathways=pathway_snapshot(db),
+            quiet_until=_quiet_until_str(db),
         )
 
     counts = await asyncio.to_thread(_sync_status)
@@ -289,7 +299,6 @@ class ConfigUpdateRequest(BaseModel):
     ENABLE_PROACTIVE: bool | None = None
     ENABLE_SHELL_EXEC: bool | None = None
     ENABLE_MCP: bool | None = None
-    ENABLE_MCP_SERVER: bool | None = None
     ENABLE_AUTO_SKILL_CREATION: bool | None = None
     ENABLE_INJECTION_DETECTION: bool | None = None
     ENABLE_DESKTOP_AUTOMATION: bool | None = None

@@ -72,6 +72,7 @@ class EvalTask:
     # forced math routing correctly made pure-math tasks single-tool
     # (2026-08-24), flagging an improvement as a regression.
     expect_tools: list[str] = field(default_factory=list)
+    check: str | None = None  # deterministic research-quality probe (eval_checks.CHECKS)
 
 
 @dataclass
@@ -740,6 +741,7 @@ class EvalHarness:
                 tags=raw.get("tags", []),
                 turns=raw.get("turns", []),
                 expect_tools=raw.get("expect_tools", []),
+                check=raw.get("check"),
             ))
         # Opt-in category skip (empty by default → load_suite() stays pure for
         # tests that exercise every category directly). The nightly monitor sets
@@ -1164,8 +1166,33 @@ class EvalHarness:
             memory_caused_fix=caused_fix,
         )
 
+    async def _run_check_task(self, task: EvalTask) -> TaskResult:
+        """Deterministic research-quality probe (2026-09-01): no LLM, no GPU —
+        exercises the code paths that make Nova knowing (see eval_checks)."""
+        from app.monitors.eval_checks import CHECKS
+        import time as _time
+        t0 = _time.monotonic()
+        fn = CHECKS.get(task.check or "")
+        if fn is None:
+            return TaskResult(task_id=task.id, category=task.category, query=task.query, passed=False,
+                              response_text=f"unknown check {task.check!r}", tools_invoked=[],
+                              skill_used=None, reflexion_score=None, latency_seconds=0.0,
+                              failed_assertions=[f"unknown check {task.check!r}"],
+                              error=f"unknown check {task.check!r}")
+        try:
+            passed, detail = await asyncio.to_thread(fn)
+            err = None
+        except Exception as e:  # a crashing probe is a failing probe
+            passed, detail, err = False, f"{type(e).__name__}: {e}", f"{type(e).__name__}: {e}"
+        return TaskResult(task_id=task.id, category=task.category, query=task.query, passed=passed,
+                          response_text=str(detail)[:2000], tools_invoked=[], skill_used=None,
+                          reflexion_score=None, latency_seconds=round(_time.monotonic() - t0, 3),
+                          failed_assertions=[] if passed else [str(detail)[:400]], error=err)
+
     async def run_task(self, task: EvalTask) -> TaskResult:
         """Run one eval task through the real brain pipeline."""
+        if task.check:
+            return await self._run_check_task(task)
         # memory-learning / kg-retrieval / knowing tasks use dedicated
         # before/seed/after paths
         if task.category == "kg-retrieval" and task.seed_fact:

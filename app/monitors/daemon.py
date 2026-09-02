@@ -89,7 +89,14 @@ class DaemonOrchestrator:
         # every 5-minute tick (observed live 2026-08-26: 3 full GPU research
         # runs in 20 min, all discarded). The hourly Curiosity Research monitor
         # remains the steady cadence; the daemon only supplements.
-        self._last_curiosity_research: float = 0.0
+        # None = never ran. The old 0.0 sentinel compared against
+        # time.monotonic() suppressed research for the first 30 minutes of
+        # every process — every CI runner and every post-boot half hour.
+        self._last_curiosity_research: float | None = None
+
+    def _curiosity_cooldown_elapsed(self) -> bool:
+        last = getattr(self, "_last_curiosity_research", None)
+        return last is None or time.monotonic() - last >= 1800
 
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
@@ -294,16 +301,16 @@ class DaemonOrchestrator:
         # cooldown between daemon-initiated runs (see __init__ note).
         if (budget in (BUDGET_LIGHT, BUDGET_FULL)
                 and context["critical_curiosity"] > 0
-                and time.monotonic() - self._last_curiosity_research >= 1800):
+                and self._curiosity_cooldown_elapsed()):
             return {"action": "research_curiosity"}
 
         # Process pending events
         if context["pending_events"] > 0 and budget != BUDGET_BRIEF:
             return {"action": "process_events"}
 
-        # Pursue next goal — only when idle with budget for it (avoid competing with user).
-        if budget == BUDGET_FULL and context.get("pending_goals", 0) > 0:
-            return {"action": "pursue_goal"}
+        # Goal pursuit retired 2026-09-01 (capability-gap chain had no inputs;
+        # 7 of 8 goals failed with garbage titles). _pursue_goal is kept for
+        # explicit API use only.
 
         # Monitor degradation — log observation
         if context["recent_failures"] >= 3:

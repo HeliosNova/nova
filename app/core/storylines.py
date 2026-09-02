@@ -126,9 +126,12 @@ _UPDATE_PROMPT = (
     "Use the SAME main-entity wording each cycle so the status can be tracked. Omit "
     "the line entirely if there is no clear trackable status.\n"
     "Then end with one final line, always present: 'FORECAST: <specific testable "
-    "claim> | <N> days | <0.x confidence>' when there is a clear falsifiable "
-    "near-term expectation (a dated event or scheduled decision usually supports "
-    "one), else exactly 'FORECAST: none'.\n"
+    "claim> | resolves YYYY-MM-DD | <0.x confidence>' when there is a clear "
+    "falsifiable expectation (a dated event or scheduled decision usually supports "
+    "one), else exactly 'FORECAST: none'. The date is when the outcome becomes "
+    "knowable (up to a year out); put any deadline inside the claim, make it "
+    "settleable by a news search on that date, and never forecast a target, "
+    "guidance figure or plan — only a realized outcome.\n"
     "If the new developments add nothing substantive, reply exactly 'NO CHANGE'."
 )
 
@@ -149,7 +152,12 @@ def _collect_items(db) -> list[dict]:
                 # Drop pure formatting/scaffold lines; keep lines with real signal.
                 if len(line) < 40 or not _extract_signals(line):
                     continue
-                clean = re.sub(r"^[`*#>\d\.\-\s]+", "", line)[:300]
+                # Word-safe cap (2026-09-01): this [:300] was the ACTUAL
+                # mid-word cutter behind the len-300 storyline_events — items
+                # arrive at _record already ≤300, so the 08-31 _event_summary
+                # bound at the INSERT never fired (6 fresh mid-word rows from
+                # the first post-fix Morning Check-in proved it).
+                clean = _event_summary(re.sub(r"^[`*#>\d\.\-\s]+", "", line), cap=300)
                 if clean:
                     items.append({"text": clean, "monitor": monitor_name})
                 if len(items) >= 120:  # hard cap on prompt size
@@ -324,6 +332,15 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
         return None  # known thread, nothing new — skip
 
     dev_text = "\n".join(f"- {d}" for d in (fresh or story["developments"])[:10])
+    # Global calibration record for the FORECAST tail (2026-09-01): storyline
+    # mints never saw any calibration feedback before.
+    try:
+        from app.core.forecasts import global_calibration_note
+        _gnote = await asyncio.to_thread(global_calibration_note, db)
+        if _gnote:
+            dev_text += "\n\n" + _gnote
+    except Exception:
+        pass
     new_story = row is None
 
     # One LLM pass to update the narrative state + name what changed.

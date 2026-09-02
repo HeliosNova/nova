@@ -121,6 +121,28 @@ class TestEventSummary:
         from app.core.storylines import _event_summary
         assert _event_summary("Fed held rates.", cap=300) == "Fed held rates."
 
+    def test_collect_items_extraction_is_word_safe(self, db, monkeypatch):
+        """2026-09-01: the first post-fix Morning Check-in still minted 6
+        len-300 mid-word events — the ACTUAL cutter was _collect_items'
+        extraction [:300], which delivered pre-truncated text that
+        _event_summary passed through untouched."""
+        import app.core.storylines as sl
+        long_line = ("**US tariffs on Southeast Asian imports intensified as "
+                     "Michigan, Ohio, and Kentucky manufacturers that rely on "
+                     "imported components reported sharply higher input costs "
+                     "while several state commissions opened formal reviews of "
+                     "the resulting consumer price increases across household "
+                     "categories including appliances electronics and repair " * 2)
+        monkeypatch.setattr(sl, "_gather_recent_outputs",
+                            lambda db_, hours, max_per_monitor: {"Test Monitor": [long_line]})
+        items = sl._collect_items(db)
+        assert items, "extraction dropped the line entirely"
+        for it in items:
+            t = it["text"]
+            assert len(t) <= 301
+            if len(t) >= 300:
+                assert not t[-1].isalnum(), f"mid-word extraction cut: …{t[-30:]!r}"
+
 
 # ── F3: NO-CHANGE verdict as standalone line anywhere ───────────────────────
 

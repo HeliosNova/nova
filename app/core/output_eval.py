@@ -114,8 +114,70 @@ def _ensure_table(db) -> None:
             "CREATE INDEX IF NOT EXISTS idx_output_quality_created "
             "ON output_quality_log(created_at)"
         )
+        try:
+            db.execute("ALTER TABLE output_quality_log ADD COLUMN novelty REAL")
+        except sqlite3.Error:
+            pass  # column exists
     except sqlite3.Error as e:
         logger.warning("[OutputEval] table create failed: %s", e)
+
+
+_YEAR_RE = re.compile(r"\b(?:19|20)\d\d\b")
+_PSEUDO_CITE_RE = re.compile(r"\((?:deep )?analysis:")
+_BARE_URL_CITE_RE = re.compile(r"\(https?://[^)]+\)|\bhttps?://\S+")
+_ARTIFACT_RE = re.compile(r"(?i)\bthe (?:launched|announced|reported|is attempting|are attempting)\b"
+                          r"|(?:^|\s)'s\s|\b(?:a|an|the) the\b|\(deep analysis:\)")
+
+
+def _canaries(output: str, *, year: int) -> list[str]:
+    """Deterministic defect detectors the judge cannot talk its way past:
+    stale-year (a bullet/sentence whose only dates are in prior years),
+    artifact (mangled prose left by excision), pseudo-citation, bare-url."""
+    flags: list[str] = []
+    text = output or ""
+    stale = False
+    for line in text.split("\n"):
+        st = line.strip()
+        if not st or st.startswith(("#", "_")):
+            continue
+        for seg in re.split(r"(?<=[.!?])\s+(?=[A-Z*])", st):
+            years = [int(y) for y in _YEAR_RE.findall(seg)]
+            if years and max(years) < year and len(seg) > 40:
+                stale = True
+    if stale:
+        flags.append("stale-year")
+    if _ARTIFACT_RE.search(text):
+        flags.append("artifact")
+    if _PSEUDO_CITE_RE.search(text):
+        flags.append("pseudo-citation")
+    if _BARE_URL_CITE_RE.search(text):
+        flags.append("bare-url")
+    return flags
+
+
+def _novelty(output: str, dossier_body: str) -> float | None:
+    """1 - share of the digest's entity anchors already present in the domain
+    dossier. None when there is no dossier or no anchors to compare."""
+    if not dossier_body or not output:
+        return None
+    try:
+        from app.monitors.report_grader import _anchors
+        a = _anchors(output)
+        if not a:
+            return None
+        d = _anchors(dossier_body)
+        return round(1.0 - len(a & d) / len(a), 3)
+    except Exception:
+        return None
+
+
+def _dossier_body_for(db, monitor_name: str) -> str:
+    try:
+        from app.core.dossiers import get_domain_dossier
+        row = get_domain_dossier(db, monitor_name, monitor_name=monitor_name)
+        return row["body"] if row else ""
+    except Exception:
+        return ""
 
 
 async def _grade_one(monitor_name: str, output: str) -> dict | None:
@@ -123,7 +185,9 @@ async def _grade_one(monitor_name: str, output: str) -> dict | None:
     from datetime import datetime as _dt, timezone as _tz, timedelta as _td
     if not output or len(output) < 50:
         return None
-    body = output[:3000]
+    # Whole digest (2026-09-01): output[:3000] graded ~35% of an 8k digest and
+    # never saw the evergreen/off-topic/mangled bullets that sit past it.
+    body = output[:12000]
     now = _dt.now(_tz.utc)
     cutoff = now - _td(hours=72)
     prompt = _GRADE_PROMPT.format(
@@ -144,7 +208,7 @@ async def _grade_one(monitor_name: str, output: str) -> dict | None:
             json_mode=True, json_prefix="{",
             max_tokens=300, temperature=0.0,
             model=_judge,
-            num_ctx=8192 if _judge else None,
+            num_ctx=12288,
         )
     except Exception as e:
         logger.warning("[OutputEval] grade LLM failed: %s", e)
@@ -209,19 +273,31 @@ async def _grade_one(monitor_name: str, output: str) -> dict | None:
                 if len(missing) >= max(2, len(nouns) * 2 // 3):
                     bogus = True
         if bogus:
-            logger.info("[OutputEval] grader hallucinated critique (evidence not in body) — flooring scores")
-            rel = max(rel, 8.0)
-            fac = max(fac, 8.0)
-            fre = max(fre, 8.0)
-            fmt = max(fmt, 8.0)
-            crit = "none (hallucinated critique rejected)"
+            # 2026-09-01: flooring to 8 turned every unverifiable critique
+            # into a good grade (stdev 0.20). A grade whose evidence cannot
+            # be found in the text is not a grade — skip the row.
+            logger.info("[OutputEval] grader critique not found in the digest — row skipped")
+            return None
 
+    # Deterministic canaries (2026-09-01): a stale-year bullet, a mangled
+    # fragment, a pseudo-citation or a bare-URL citation caps the score no
+    # matter what the judge said — the judge is a plausibility reader.
+    flags = _canaries(output, year=now.year)
+    if flags:
+        if {"stale-year", "pseudo-citation", "artifact"} & set(flags):
+            fac = min(fac, 6.0)
+        if {"artifact", "bare-url"} & set(flags):
+            fmt = min(fmt, 6.0)
+        if "stale-year" in flags:
+            fre = min(fre, 6.0)
+        crit = f"[canary: {', '.join(flags)}] " + (crit or "")
     return {
         "relevance": max(0.0, min(10.0, rel)),
         "facts": max(0.0, min(10.0, fac)),
         "freshness": max(0.0, min(10.0, fre)),
         "format": max(0.0, min(10.0, fmt)),
-        "critique": crit,
+        "critique": crit[:300],
+        "canaries": flags,
     }
 
 
@@ -276,12 +352,13 @@ async def grade_recent_outputs(db, *, sample_size: int = 20, hours: int = 24) ->
             await asyncio.to_thread(
                 db.execute,
                 "INSERT INTO output_quality_log (monitor_id, monitor_name, result_id, "
-                "relevance, facts, freshness, format, avg_score, critique) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "relevance, facts, freshness, format, avg_score, critique, novelty) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     r["monitor_id"], r["monitor_name"], r["id"],
                     scores["relevance"], scores["facts"], scores["freshness"], scores["format"],
                     avg, scores["critique"],
+                    _novelty(r["value"], await asyncio.to_thread(_dossier_body_for, db, r["monitor_name"])),
                 ),
             )
         except sqlite3.Error as e:

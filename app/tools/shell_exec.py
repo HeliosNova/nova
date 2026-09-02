@@ -37,6 +37,10 @@ _BLOCKED_PATTERNS = [
     r"<\(",                              # process substitution <(...)
     r">\(",                              # process substitution >(...)
     r"<<['\"]?\w",                       # heredoc injection (<<EOF, <<'EOF', <<"EOF")
+    # 2026-09-01: persistence + disaster-recovery boundaries
+    r"/data/extensions",                 # auto-imported at boot — never writable from a shell
+    r"(?:^|[\s;|&>])/offsite(?:/|\s|$)",  # offsite DR leg (now owned by the backup sidecar)
+    r"(?:^|[\s;|&>])/backups(?:/|\s|$)",  # off-volume DR leg (idem)
 ]
 
 # Prefixes to skip when extracting the base command

@@ -196,6 +196,27 @@ class CuriosityItem:
     resolved_at: str | None
 
 
+# Sources whose topics come from Nova's own dossiers/quizzes — never screened
+# as operator probes (they legitimately mention monitors, dossiers, forecasts).
+_DOSSIER_SOURCES = frozenset({"dossier_open_question", "dossier_tension", "quiz_failure",
+                              "dossier", "storyline"})
+_PROBE_RE = re.compile(
+    r"(?i)\b(?:in one word|one word|reply with exactly|answer in one|answer with one|"
+    r"yes or no|one sentence|are you (?:operational|online|alive|working|there)|"
+    r"your (?:monitors?|dossiers?|digests?|forecasts?|lessons?|memory|skills?)|"
+    r"what did you learn|what have you learned|what do you know about yourself|"
+    r"nova'?s? (?:own|internal|monitors?))\b")
+
+
+def _looks_like_operator_probe(topic: str) -> bool:
+    """A chat-side topic that is a sanity probe, a brevity request or a question
+    about Nova itself — none of which web research can answer."""
+    t = (topic or "").strip()
+    if len(t.split()) < 4:
+        return True
+    return bool(_PROBE_RE.search(t))
+
+
 class CuriosityQueue:
     """Priority queue for self-directed research topics."""
 
@@ -305,6 +326,13 @@ class CuriosityQueue:
         topic = topic.strip()[:500]
         if not topic:
             return -1
+        # Operator probes and Nova self-references are not knowledge gaps
+        # (2026-09-01): 'in one word, are you operational' and 'what did your
+        # monitors learn…' were researched six times with web searches.
+        if source not in _DOSSIER_SOURCES and _looks_like_operator_probe(topic):
+            logger.info("Curiosity add rejected (operator probe / self-reference): %r [%s]",
+                        topic[:80], source)
+            return -1
         # Strip WILL-MODULE framing if it leaked in. The KAIROS goal-pursuit
         # path wraps goal text with a multi-line system-style prompt prefix
         # ("=== WILL-MODULE TASK ===\n... =\n=== END TASK ===\nGOAL: ..."), and
@@ -412,13 +440,26 @@ class CuriosityQueue:
         return cursor.lastrowid
 
     def get_next(self) -> CuriosityItem | None:
-        """Get the highest-urgency pending item."""
-        row = self._db.fetchone(
-            "SELECT * FROM curiosity_queue "
-            "WHERE status = 'pending' AND attempts < ? "
-            "ORDER BY urgency DESC, created_at ASC LIMIT 1",
-            (int(MAX_ATTEMPTS),),
-        )
+        """Highest-urgency pending item; every third pick prefers a pending
+        dossier_tension — contradictions between Nova's own monitors are the
+        most valuable signal it produces and they starved behind 0.6-0.7 open
+        questions (32 minted, 0 resolved before 2026-09-01)."""
+        self._pick_count = getattr(self, "_pick_count", 0) + 1
+        row = None
+        if self._pick_count % 3 == 0:
+            row = self._db.fetchone(
+                "SELECT * FROM curiosity_queue "
+                "WHERE status = 'pending' AND attempts < ? AND source = 'dossier_tension' "
+                "ORDER BY urgency DESC, created_at ASC LIMIT 1",
+                (int(MAX_ATTEMPTS),),
+            )
+        if row is None:
+            row = self._db.fetchone(
+                "SELECT * FROM curiosity_queue "
+                "WHERE status = 'pending' AND attempts < ? "
+                "ORDER BY urgency DESC, created_at ASC LIMIT 1",
+                (int(MAX_ATTEMPTS),),
+            )
         return self._row_to_item(row) if row else None
 
     def resolve(self, item_id: int, resolution: str) -> None:

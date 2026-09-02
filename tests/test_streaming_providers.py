@@ -208,7 +208,16 @@ class TestInvokeNothinkJsonHandling:
         assert json.loads(out)["score"] == 0.7
 
     @pytest.mark.asyncio
-    async def test_num_ctx_flows_into_request_options(self):
+    async def test_num_ctx_is_pinned_at_or_above_the_runner_floor(self):
+        """Contract changed 2026-09-02 (see providers/ollama._RUNNER_CTX_FLOOR).
+
+        Ollama restarts a model's runner whenever a request asks for a context
+        size the resident runner was not started with, so a request BELOW the
+        floor (and a request that omits num_ctx entirely, which used to fall to
+        the 4096 model default) is raised to the floor instead. A larger
+        explicit request still wins.
+        """
+        from app.core.providers.ollama import _RUNNER_CTX_FLOOR
         provider = self._provider()
         mock_resp = MagicMock()
         mock_resp.json.return_value = {"message": {"content": '{"ok": true}'}}
@@ -222,7 +231,15 @@ class TestInvokeNothinkJsonHandling:
                 model="gemma3:4b", num_ctx=8192,
             )
             payload = mock_rot.call_args.kwargs["json"]
-            assert payload["options"]["num_ctx"] == 8192
+            assert payload["options"]["num_ctx"] == _RUNNER_CTX_FLOOR
+
+            mock_rot.reset_mock()
+            await provider.invoke_nothink(
+                [{"role": "user", "content": "x"}],
+                model="gemma3:4b", num_ctx=_RUNNER_CTX_FLOOR * 2,
+            )
+            payload = mock_rot.call_args.kwargs["json"]
+            assert payload["options"]["num_ctx"] == _RUNNER_CTX_FLOOR * 2
 
             mock_rot.reset_mock()
             await provider.invoke_nothink(
@@ -230,6 +247,6 @@ class TestInvokeNothinkJsonHandling:
                 model="gemma3:4b",
             )
             payload = mock_rot.call_args.kwargs["json"]
-            assert "num_ctx" not in payload["options"]
+            assert payload["options"]["num_ctx"] == _RUNNER_CTX_FLOOR
 
 

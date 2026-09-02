@@ -141,15 +141,10 @@ class TestLearningEngine:
                 good_answer="Guido van Rossum created the Python programming language in 1991.",
             )
 
-        # Read the JSONL file
+        # Retired 2026-09-01: the DPO trainer is archived and nothing consumes
+        # the JSONL, so the writer is a no-op — the file must NOT appear.
         path = tmp_path / "training.jsonl"
-        assert path.exists()
-        with open(path) as f:
-            entry = json.loads(f.readline())
-        assert entry["query"] == "Who created the Python programming language?"
-        assert entry["chosen"] == "Guido van Rossum created the Python programming language in 1991."
-        assert entry["rejected"] == "James Gosling created the Python programming language in the early 1990s."
-        assert "timestamp" in entry
+        assert not path.exists()
 
     def test_get_all_lessons(self, engine):
         for i in range(3):
@@ -890,12 +885,9 @@ class TestCorrectionToLessonLoop:
                 good_answer="Antonio Meucci invented the telephone.",
             )
 
-        with open(training_path) as f:
-            entry = json.loads(f.readline())
-
-        assert entry["query"] == "Who invented the telephone?"
-        assert entry["chosen"] == "Antonio Meucci invented the telephone."
-        assert entry["rejected"] == "Alexander Graham Bell invented the telephone."
+        # Retired 2026-09-01 (see test_save_training_pair): no file is written.
+        import os as _os
+        assert not _os.path.exists(training_path)
 
 
 # ===========================================================================

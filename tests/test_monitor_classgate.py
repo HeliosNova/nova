@@ -87,7 +87,11 @@ def test_monitor_class_routing():
     # including Morning Check-in, which has curated feeds in _FEEDS
     assert lp._monitor_class(mk("World Awareness")) == "digest"
     assert lp._monitor_class(mk("Morning Check-in")) == "digest"
-    # feedless brain.think query monitors and non-query monitors stay exclusive
+    # feedless brain.think query monitors and 9B non-query monitors stay exclusive
     assert lp._monitor_class(mk("[Reminder]: call the dentist")) == "other"
     assert lp._monitor_class(mk("Lesson Quiz", ct="quiz")) == "other"
-    assert lp._monitor_class(mk("Knowledge Consolidation", ct="consolidation")) == "other"
+    # residency classes (2026-09-02): consolidation + cross-synthesis drive the
+    # 27B synthesis model, the output judge drives a third model
+    assert lp._monitor_class(mk("Knowledge Consolidation", ct="consolidation")) == "digest"
+    assert lp._monitor_class(mk("Cross-Monitor Synthesis", ct="synthesis")) == "digest"
+    assert lp._monitor_class(mk("Output Quality Eval", ct="output_eval")) == "judge"

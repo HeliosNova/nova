@@ -186,7 +186,10 @@ class FileOpsTool(BaseTool):
 
     _PROTECTED_EXTENSIONS = {".db", ".sqlite", ".sqlite3", ".pem", ".key", ".pk8", ".p12", ".env", ".secret", ".pfx", ".crt"}
     _PROTECTED_FILES = {"nova.db", "training_data.jsonl", "config_overrides.json", ".env", ".env.local", ".env.production", "id_rsa", "id_ed25519"}
-    _PROTECTED_DIRS = {"mcp", ".ssh", ".gnupg"}  # Prevent LLM from writing MCP server configs / accessing sensitive dirs
+    # extensions + chromadb added 2026-09-01: /data/extensions/*.py is imported
+    # into the uvicorn process at boot (persistent code exec with the real
+    # secrets); chromadb is the vector store the retrieval arms depend on.
+    _PROTECTED_DIRS = {"mcp", ".ssh", ".gnupg", "extensions", "chromadb"}
 
     async def _delete(self, path_str: str) -> ToolResult:
         safe = _safe_path(path_str, write=True)

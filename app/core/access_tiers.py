@@ -76,6 +76,28 @@ MAINTENANCE_TOOLS = frozenset({
 CURIOSITY_TOOLS = MAINTENANCE_TOOLS | frozenset({
     "web_search", "http_fetch", "browser",
 })
+# Everything an unattended research generation (curiosity research, monitor
+# queries) legitimately needs — and nothing with side effects. 2026-09-01:
+# curiosity research ran think() with the whole registry (shell_exec,
+# file_ops, desktop, tool_create) on web-derived topics, 44 times a week.
+RESEARCH_TOOLS = CURIOSITY_TOOLS | frozenset({
+    "deep_research", "active_memory", "code_understand", "screenshot",
+})
+
+
+class research_scope:
+    """Context manager: run the block under RESEARCH_TOOLS, intersected with
+    any whitelist already in force, and restore the previous whitelist."""
+
+    def __enter__(self):
+        self._prev = get_tool_whitelist()
+        scope = RESEARCH_TOOLS if self._prev is None else (self._prev & RESEARCH_TOOLS)
+        set_tool_whitelist(scope)
+        return scope
+
+    def __exit__(self, *exc):
+        set_tool_whitelist(self._prev)
+        return False
 
 
 def _tier() -> str:

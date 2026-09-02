@@ -1,7 +1,7 @@
 # Nova
 
 [![License: AGPL-3.0](https://img.shields.io/badge/License-AGPL%20v3-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-3%2C000%2B-brightgreen)](tests/)
+[![Tests](https://github.com/HeliosNova/nova/actions/workflows/test.yml/badge.svg)](https://github.com/HeliosNova/nova/actions/workflows/test.yml)
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://python.org)
 [![Release](https://img.shields.io/github/v/release/HeliosNova/nova)](https://github.com/HeliosNova/nova/releases)
 
@@ -211,12 +211,15 @@ Nova is both an MCP **client** and **server** — unique in the landscape:
 
 **As client:** Drop MCP tool configs in `/data/mcp/` and Nova discovers and uses them.
 
-**As server:** Exposes 5 tools for any MCP client (Cursor, VS Code, and others):
+**As server:** Exposes 8 tools for any MCP client (Cursor, VS Code, and others):
 - `nova_memory_query` — search user facts and conversations
 - `nova_knowledge_graph` — query the KG
 - `nova_lessons` — retrieve learned lessons
 - `nova_document_search` — search indexed documents
 - `nova_facts_about` — get user profile facts
+- `nova_dossiers` — Nova's standing understanding of a topic, with its open questions
+- `nova_storylines` — the story threads it is tracking and their current state
+- `nova_forecasts` — its falsifiable forecasts with the self-graded track record
 
 ## LLM Provider
 

@@ -123,8 +123,22 @@ class TelegramBot:
         answer = await self._handle_query(query, user_id)
 
         async with self._send_lock:
-            for chunk in self._split_message(answer):
-                await update.message.reply_text(chunk)
+            for chunk in self._reply_chunks(answer):
+                try:
+                    await update.message.reply_text(
+                        chunk, parse_mode="HTML", disable_web_page_preview=True)
+                except Exception as html_err:  # tag imbalance etc. — never lose the reply
+                    logger.warning("[Telegram] HTML reply failed (%s) — sending plain", html_err)
+                    await update.message.reply_text(chunk)
+
+    @classmethod
+    def _reply_chunks(cls, answer: str) -> list[str]:
+        """Chat replies render like alerts (2026-09-01): markdown -> Telegram
+        HTML, split at 4096, tags balanced across chunks. Before this, replies
+        went out with no parse_mode and showed raw asterisks."""
+        from app.channels.format_for_channel import to_telegram_html
+        html = to_telegram_html(answer or "")
+        return cls._balance_html_chunks(cls._split_message(html))
 
     async def _handle_query(self, query: str, user_id: int) -> str:
         """Run query through think() and collect the response."""

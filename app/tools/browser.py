@@ -177,6 +177,21 @@ _INTERACTIVE_ELEMENTS_JS = """
 """
 
 
+_BROWSER_ENV_KEEP = (
+    "PATH", "HOME", "LANG", "LC_ALL", "DISPLAY", "TMPDIR", "TMP", "TEMP",
+    "PLAYWRIGHT_BROWSERS_PATH", "XDG_RUNTIME_DIR", "XDG_CACHE_HOME", "FONTCONFIG_PATH",
+)
+
+
+def _browser_env() -> dict[str, str]:
+    """Environment for the headless browser: what Chromium needs, nothing else."""
+    import os as _os
+    env = {k: v for k, v in _os.environ.items() if k in _BROWSER_ENV_KEEP}
+    env.setdefault("HOME", "/home/nova")
+    env.setdefault("PATH", "/usr/local/bin:/usr/bin:/bin")
+    return env
+
+
 class BrowserTool(BaseTool):
     name = "browser"
     description = (
@@ -343,6 +358,10 @@ class BrowserTool(BaseTool):
                 headless=True,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
                       "--disable-blink-features=AutomationControlled"],
+                # Minimal env (2026-09-01): the renderer used to inherit the whole
+                # process environment — API and bot tokens included — while
+                # rendering attacker-controlled pages.
+                env=_browser_env(),
             )
             logger.info("[Browser] Launched headless browser")
 

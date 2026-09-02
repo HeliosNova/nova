@@ -27,6 +27,14 @@ TOPICS = [
     "Domain Study: Cybersecurity", "Domain Study: China Tech and Economy",
     "Domain Study: Economics and Markets", "Domain Study: Energy and Climate",
     "Domain Study: Biotech and Genetics",
+    # n=16 expansion (2026-09-01): the 08-13 dossier-priming A/B won every
+    # mean at n=8 but p≈0.14 — doubled for proof-grade. Additions keep the
+    # diversity axes: +2 regions, +2 hard-tech, medical, crypto-numeric,
+    # space-science, defense.
+    "Domain Study: Space and Astronomy", "Domain Study: Health and Medicine",
+    "Domain Study: Semiconductors", "Domain Study: Middle East",
+    "Domain Study: Crypto and Web3", "Domain Study: Supply Chain and Trade",
+    "Domain Study: Latin America", "Domain Study: Defense and Military Tech",
 ]
 
 
@@ -86,7 +94,8 @@ async def replay(model, tag, sets, only, judge):
         articles = [tuple(x) for x in d["articles"]]
         try:
             digest = await _synthesize_from_evidence(label, findings, articles, today,
-                                                     kg=None, syn_model=model)
+                                                     kg=None, syn_model=model,
+                                                     dossier_key=d.get("monitor"))
         except Exception as e:
             print(f"[{tag}] {label}: SYNTH FAILED {type(e).__name__}: {e}", flush=True)
             continue
@@ -105,6 +114,14 @@ async def replay(model, tag, sets, only, judge):
             "support": round(m(lambda r: r[1]["fact"]["support"]), 3),
             "fabricated": round(m(lambda r: r[1]["fact"]["fabricated_rate"]), 3),
             "core_cov": round(m(lambda r: r[2]["core_coverage"]), 3),
+            # Per-topic rows (2026-09-01): the 08-13 priming A/B persisted only
+            # means, so the paired per-topic comparison the p-value needs had
+            # to be scraped from stdout. A/B evidence must outlive the session.
+            "rows": [{"label": r[0], "overall": r[1]["overall"],
+                      "race": r[1]["race_avg"], "support": r[1]["fact"]["support"],
+                      "fabricated": r[1]["fact"]["fabricated_rate"],
+                      "core_cov": r[2]["core_coverage"], "chars": r[3]}
+                     for r in rows],
         }
         print(f"\n[{tag}] MEANS n={summary['n']}: overall={summary['overall']} race={summary['race']} "
               f"support={summary['support']} fab={summary['fabricated']} core_cov={summary['core_cov']}", flush=True)
@@ -126,4 +143,13 @@ if __name__ == "__main__":
     if a.capture:
         asyncio.run(capture(only))
     if a.replay:
-        asyncio.run(replay(a.model, a.tag, a.set, only, a.judge))
+        # Quiet window (2026-09-02): the replay owns the GPU for its run —
+        # the heartbeat skips its LLM lane instead of the operator hand-
+        # disabling 39 monitors and a guardian re-enabling them.
+        from app.database import get_db
+        from app.monitors.quiet import clear_quiet, set_quiet
+        set_quiet(get_db(), 6, f"ceiling A/B replay {a.tag}")
+        try:
+            asyncio.run(replay(a.model, a.tag, a.set, only, a.judge))
+        finally:
+            clear_quiet(get_db())

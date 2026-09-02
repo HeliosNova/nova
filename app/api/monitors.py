@@ -215,6 +215,42 @@ async def create_monitor(body: MonitorCreate):
     return _monitor_to_dict(monitor)
 
 
+class QuietRequest(BaseModel):
+    hours: float = Field(2.0, ge=0.05, le=24.0)
+    reason: str = Field("", max_length=200)
+
+
+# Quiet window (2026-09-02) — literal paths, registered before /monitors/{monitor_id}.
+@router.get("/monitors/quiet")
+async def get_quiet_window():
+    from app.database import get_db
+    from app.monitors.quiet import quiet_status
+    return await asyncio.to_thread(quiet_status, get_db())
+
+
+@router.post("/monitors/quiet")
+async def open_quiet_window(body: QuietRequest):
+    """Pause every LLM-driven monitor for `hours` (max 24). The fast lane keeps
+    running; skipped monitors are not marked checked, so they catch up when the
+    window ends. Re-posting moves the end time."""
+    from app.database import get_db
+    from app.monitors.quiet import quiet_status, set_quiet
+    db = get_db()
+    await asyncio.to_thread(set_quiet, db, body.hours, body.reason)
+    return await asyncio.to_thread(quiet_status, db)
+
+
+@router.delete("/monitors/quiet")
+async def close_quiet_window():
+    from app.database import get_db
+    from app.monitors.quiet import clear_quiet, quiet_status
+    db = get_db()
+    cleared = await asyncio.to_thread(clear_quiet, db)
+    out = await asyncio.to_thread(quiet_status, db)
+    out["cleared"] = cleared
+    return out
+
+
 # IMPORTANT: literal path /monitors/results/recent must be registered BEFORE
 # the parameterized /monitors/{monitor_id} to avoid FastAPI matching "results" as an ID.
 @router.get("/monitors/results/recent")

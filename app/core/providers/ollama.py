@@ -37,6 +37,26 @@ logger = logging.getLogger(__name__)
 # the 9B Q8 with q8 KV + flash attention; Ollama clamps to VRAM if needed.
 _CHAT_NUM_CTX = 24576
 
+# Runner context floor (2026-09-02). Ollama restarts a model's runner whenever
+# a request asks for a context size the resident runner was not started with.
+# The digest chain alternated 8192 / 16384 / 20480 / 24576 on the 27B, so the
+# same weights were restarted 92 times in 150 minutes (63 minutes of loading)
+# while only 11 real model swaps happened. Every background request now asks
+# for at least this size: one runner per model stays resident, the KV block
+# is allocated once, and a caller that forgets num_ctx can no longer be
+# silently truncated at the 4096 model default. Larger explicit requests win.
+import os as _os
+_RUNNER_CTX_FLOOR = int(_os.environ.get("OLLAMA_RUNNER_CTX_FLOOR", "24576"))
+
+
+def _runner_ctx(requested: int | None) -> int:
+    """The context size actually requested from Ollama for a background call."""
+    try:
+        req = int(requested or 0)
+    except (TypeError, ValueError):
+        req = 0
+    return max(req, _RUNNER_CTX_FLOOR)
+
 
 class OllamaProvider:
     """Ollama LLM provider — raw HTTP, no LangChain.
@@ -146,11 +166,9 @@ class OllamaProvider:
                 "repeat_penalty": 1.1,
             },
         }
-        if num_ctx:
-            # Models without a Modelfile num_ctx default low (e.g. 4096); a
-            # long grading prompt would silently truncate from the head,
-            # cutting the rubric. Callers with big prompts set this explicitly.
-            payload["options"]["num_ctx"] = num_ctx
+        # Always pin the context: the floor keeps one runner per model resident
+        # (see _RUNNER_CTX_FLOOR); an explicit larger request still wins.
+        payload["options"]["num_ctx"] = _runner_ctx(num_ctx)
 
         if json_mode:
             # Schema enforcement (Ollama 0.17+) or generic JSON mode
@@ -198,7 +216,7 @@ class OllamaProvider:
             # prompt returned hallucinated garbage for 5 weeks, "no ongoing
             # stories identified" every cycle). Mirrors the generate_with_tools
             # num_ctx tripwire.
-            _effective_ctx = num_ctx or 4096
+            _effective_ctx = _runner_ctx(num_ctx)
             _est_prompt_tokens = sum(
                 len(m.get("content") or "") for m in messages) // 4
             if data.get("prompt_eval_count", 0) >= _effective_ctx:
