@@ -6,13 +6,32 @@ the sync copied nothing — the DR legs would have silently stopped updating.
 """
 from __future__ import annotations
 
+import importlib.util
 import os
 import sqlite3
 import time
+from pathlib import Path
 
 import pytest
 
-from scripts import backup_sidecar as bs
+# scripts/ is a repo directory: the image ships only scripts/__init__.py, and the
+# sidecar container bind-mounts the rest. A module-level `from scripts import
+# backup_sidecar` therefore aborted collection for the WHOLE in-container suite
+# (2026-09-02), so load it by path and skip the module when it is not there.
+_SIDECAR = Path(__file__).resolve().parents[1] / "scripts" / "backup_sidecar.py"
+pytestmark = pytest.mark.skipif(
+    not _SIDECAR.exists(),
+    reason="reads scripts/backup_sidecar.py, which the image does not ship")
+
+
+def _load_sidecar():
+    spec = importlib.util.spec_from_file_location("backup_sidecar", _SIDECAR)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+bs = _load_sidecar() if _SIDECAR.exists() else None
 
 
 def _db(path, ok=True):
