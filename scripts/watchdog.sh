@@ -9,6 +9,8 @@
 #   1. container health: `unhealthy` for UNHEALTHY_LIMIT consecutive checks
 #      (the /api/health probe runs on the event loop — a frozen loop fails it);
 #   2. heartbeat staleness: health OK but no monitor checked in HB_STALE_MIN
+#      (suspended while an operator quiet window is open — see
+#      quiet_window_active; the health rule keeps guarding either way)
 #      minutes (catches a dead heartbeat task behind a live HTTP server; the
 #      busiest gap in a healthy system is ~1h — Curiosity Research is hourly).
 #
@@ -75,6 +77,20 @@ hb_stale_minutes() {
     sqlite3 -cmd '.timeout 3000' "$DB" \
         "SELECT CAST((julianday('now') - julianday(MAX(last_check_at)))*1440 AS INTEGER) \
          FROM monitors WHERE enabled=1 AND last_check_at IS NOT NULL;" 2>/dev/null
+}
+
+quiet_window_active() {
+    # An operator-declared quiet window (app/monitors/quiet.py) pauses the
+    # LLM monitor lane ON PURPOSE, so last_check_at stops advancing for every
+    # monitor but the fast lane. That is indistinguishable from a freeze to
+    # the staleness rule: on 2026-09-02 this watchdog correctly-but-wrongly
+    # restarted nova-app 90 minutes into a 3.5h A/B replay and killed it.
+    # Prints 1 while a window is open. Empty/absent row => normal rules.
+    # ONLY the staleness rule is suspended; the health rule still guards, so
+    # a genuinely wedged container is still restarted during a window.
+    sqlite3 -cmd '.timeout 3000' "$DB" \
+        "SELECT CASE WHEN datetime(value) > datetime('now') THEN 1 ELSE 0 END \
+         FROM system_state WHERE key='quiet_until';" 2>/dev/null
 }
 
 restart_target() {
@@ -177,6 +193,11 @@ while true; do
         case "$stale" in
             ''|*[!0-9]*) : ;;   # unreadable/negative — skip, health rule still guards
             *) if [ "$stale" -ge "$HB_STALE_MIN" ]; then
+                   if [ "$(quiet_window_active)" = "1" ]; then
+                       log "heartbeat stale ${stale}m but a quiet window is open — staleness rule suspended (health rule still active)"
+                       sleep "$INTERVAL"
+                       continue
+                   fi
                    since_restart=$(( $(date +%s) - LAST_RESTART ))
                    if [ "$since_restart" -lt "$GRACE_SEC" ]; then
                        # In grace: the heartbeat is (re)working through a long
