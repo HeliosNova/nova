@@ -2716,8 +2716,7 @@ _COMMON_EVIDENCE_CAP = 9000    # chars of findings in the shared block
 _KNOWN_VS_NEW_RE = re.compile(r"(?im)^\s*KNOWN-VS-NEW:\s*(.+?)\s*$")
 
 
-def _common_context(today: str, label: str, analysis_block: str, evidence: str,
-                    prior_block: str = "") -> str:
+def _common_context(today: str, label: str, analysis_block: str, evidence: str) -> str:
     """The invariant evidence pack shared as the BYTE-IDENTICAL PREFIX of every
     synthesis-chain call (synthesis → judge → enrich → verify). llama.cpp reuses
     the KV cache of the longest common prefix across consecutive requests on a
@@ -2725,13 +2724,14 @@ def _common_context(today: str, label: str, analysis_block: str, evidence: str,
     — only the per-stage instructions + draft that come AFTER this block are new
     tokens. Byte-identity is the contract: same caps, same wording, built once.
     (Phase 1 #34; MAX_CONCURRENT_LLM_MONITORS=1 keeps the chain uninterleaved.)
-    `prior_block` (knowing tier, 2026-08-12): the domain dossier — per-run stable,
-    so it lives inside the shared prefix and every chain stage can judge
-    new-vs-known and contradictions against it."""
+
+    The domain dossier used to ride inside this prefix as PRIOR UNDERSTANDING.
+    A paired A/B on 16 frozen topics (2026-09-03) measured that injection as a
+    net negative — see _synthesize_from_evidence — so the pack is evidence
+    only: nothing in it is admissible that today's sources do not support."""
     return (f"Today is {today}. {label} intelligence — evidence pack. The DEEP ANALYSES "
             "and SOURCE FINDINGS below are the ONLY admissible facts for every task that "
             "follows.\n\n"
-            + prior_block
             + analysis_block[:_COMMON_ANALYSIS_CAP]
             + "SOURCE FINDINGS (cite these inline):\n" + evidence[:_COMMON_EVIDENCE_CAP]
             + "\n\n")
@@ -4129,14 +4129,20 @@ _KVN_SCHEMA = {
 }
 
 
-async def _count_known_vs_new(prior_block: str, final: str, *, model: str | None, label: str) -> dict | None:
+async def _count_known_vs_new(prior_text: str, final: str, *, model: str | None, label: str) -> dict | None:
     """Knowing instrumentation v2 (2026-08-12): ONE tiny gated call counting the
     finished digest against the prior dossier. 2026-09-01: max_tokens 80 -> 200
     and a JSON schema — the 80-token budget truncated the reply on the 27B and
-    logged 'None new | None updates' (the only two primed runs in the window)."""
+    logged 'None new | None updates' (the only two primed runs in the window).
+
+    2026-09-03: this is now the ONLY consumer of the dossier in the digest path.
+    It runs on the FINISHED briefing, so it measures novelty without being able
+    to change what was written — which is why retiring the prompt injection did
+    not cost the knowing tier its instrumentation. It carries its own header."""
     try:
         raw = await _invoke_bg([{"role": "user", "content":
-            prior_block +
+            "PRIOR UNDERSTANDING — what Nova knew about this domain before today:\n"
+            + prior_text + "\n\n" +
             "TODAY'S BRIEFING:\n" + final[:9000] +
             "\n\nCount today's developments in the briefing against the PRIOR "
             "UNDERSTANDING above: how many are genuinely NEW (absent from prior), "
@@ -4198,10 +4204,25 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "DEEP ANALYSES — each story already reasoned over by an analyst; draw on these for the "
         f"insight, the 'so what', and the connections:\n{deep}\n\n" if deep else "")
 
-    # Knowing tier (2026-08-12): write today's digest AGAINST what Nova already
-    # understands. The domain dossier primes novelty + contradiction detection
-    # instead of amnesiac re-reporting. Gated + fail-open; no dossier = no block.
-    prior_block = ""
+    # Knowing tier (2026-08-12), injection RETIRED 2026-09-03. The dossier used
+    # to be injected here as PRIOR UNDERSTANDING so the digest could lead with
+    # what was new. A paired A/B over 16 frozen topics — same evidence, arms run
+    # concurrently, priming provably on in one and off in the other — measured
+    # the injection as no gain and a real cost:
+    #     overall   0.838 primed vs 0.844 unprimed   (primed won 7/16, p=0.61)
+    #     support   0.642 primed vs 0.690 unprimed   (primed won 4/16, p=0.099)
+    #     judge     4.61  primed vs 4.55  unprimed   (p=0.34)
+    #     coverage  0.715 primed vs 0.684 unprimed   (p=0.49)
+    #     fabricated 0.000 in both arms
+    # Support is the DETERMINISTIC grounding score, and it fell on 12 of 16
+    # topics: prior context was being restated as if today's sources carried it.
+    # Nothing measured improved. The dossier is still LOADED — the out-of-band
+    # KNOWN-VS-NEW count needs it and cannot alter the digest — but it no longer
+    # reaches any prompt the briefing is written from. (The 2026-08-13 result
+    # that said priming wins is void: priming was silently off for most of its
+    # topics.) Revisit only with a harness that scores novelty framing, which
+    # this one does not measure.
+    prior_text = ""
     if getattr(_cfg, "ENABLE_DOSSIERS", True):
         try:
             from app.core.dossiers import get_domain_dossier, priming_excerpt
@@ -4212,19 +4233,12 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
             # matched the dossier key for 13/39 domains — the rest ran unprimed.
             _d = await asyncio.to_thread(get_domain_dossier, get_db(), label, dossier_key)
             if _d and _d["body"]:
-                prior_block = (
-                    "PRIOR UNDERSTANDING — what Nova already knew about this domain "
-                    "BEFORE today (its standing dossier). Use it to judge what is "
-                    "genuinely NEW vs already known. It is context, NOT today's "
-                    "evidence — never cite it as the source for a new claim. If "
-                    "today's evidence answers, advances or contradicts one of its "
-                    "OPEN QUESTIONS, say so explicitly in the briefing and name "
-                    "the question:\n"
-                    + priming_excerpt(_d["body"]) + "\n\n")
-                logger.info("[Knowing] %s primed by dossier %r", label, _d["dkey"])
+                prior_text = priming_excerpt(_d["body"])
+                logger.info("[Knowing] %s measured against dossier %r "
+                            "(prompt injection retired 2026-09-03)", label, _d["dkey"])
             else:
-                logger.info("[Knowing] %s has no domain dossier yet (key=%r) — unprimed",
-                            label, dossier_key or label)
+                logger.info("[Knowing] %s has no domain dossier yet (key=%r) — "
+                            "no novelty measurement", label, dossier_key or label)
         except Exception as e:
             logger.debug("[Knowing] dossier priming unavailable: %s", e)
 
@@ -4233,7 +4247,7 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     # reused; only each stage's instructions + draft are new tokens. The synthesis
     # call appends any evidence overflow past the shared cap AFTER the pack — the
     # cache reuses up to the divergence point and synthesis still sees everything.
-    common = _common_context(today, label, analysis_block, evidence, prior_block=prior_block)
+    common = _common_context(today, label, analysis_block, evidence)
     _extra = evidence[_COMMON_EVIDENCE_CAP:]
     # Coverage checklist (#67b): the distinct entity anchors surfaced in the
     # findings. Synthesis-recall was dropping found stories (the DeepResearch
@@ -4289,16 +4303,6 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "'(deep analysis: …)'. If you cannot cite a factual claim from the findings, OMIT it. "
         "Use ONLY information present in the analyses/findings "
         "above — never invent a company, number, person, or event.")
-    if prior_block:
-        # Knowing tier: novelty + contradiction discipline against the dossier.
-        # (The KNOWN-VS-NEW count is measured OUT-OF-BAND after the chain — an
-        # in-band marker was dropped by the aggregation merge; probe 2026-08-12.)
-        _syn_prompt += (
-            "\nA PRIOR UNDERSTANDING block is present above. LEAD with what is genuinely "
-            "NEW or CHANGED relative to it — do not re-report known context except where "
-            "needed for sense. Where today's findings CONTRADICT the prior understanding, "
-            "write 'CONTRADICTS PRIOR UNDERSTANDING:' inline and state the correction "
-            "plainly.")
     try:
         # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
         # (owner directive: maximize the best output; extra generations are fine.)
@@ -4354,8 +4358,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     # gated call counting the finished digest against the prior dossier. The
     # v1 in-band marker asked the synthesis to append a count line, but the
     # aggregation merge rewrites candidates and dropped it (probe-verified).
-    if prior_block:
-        _kvn = await _count_known_vs_new(prior_block, final, model=syn_model, label=label)
+    if prior_text:
+        _kvn = await _count_known_vs_new(prior_text, final, model=syn_model, label=label)
         if _kvn:
             logger.info("[Knowing] %s KNOWN-VS-NEW: %s new | %s updates | %s contradictions",
                         label, _kvn.get("new"), _kvn.get("updates"), _kvn.get("contradictions"))
