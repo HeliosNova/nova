@@ -102,6 +102,19 @@ async def replay(model, tag, sets, only, judge):
         g = await grade_report(digest, label, model=judge)
         cov = coverage_score(digest, findings)
         rows.append((label, g, cov, len(digest)))
+        # Append-as-you-go (2026-09-03): the summary used to be written only
+        # after every topic, so a run that died at topic 5 of 16 left NOTHING —
+        # which is exactly what happened when the watchdog restarted the app
+        # mid-replay and when a 38-min-per-topic replay outran its window. One
+        # line per completed topic makes a partial run analysable and lets the
+        # analysis start before the arm finishes.
+        os.makedirs(f"{CEIL}/results", exist_ok=True)
+        with open(f"{CEIL}/results/{tag}.rows.jsonl", "a") as _f:
+            _f.write(json.dumps({
+                "label": label, "overall": g["overall"], "race": g["race_avg"],
+                "support": g["fact"]["support"], "fabricated": g["fact"]["fabricated_rate"],
+                "core_cov": cov["core_coverage"], "chars": len(digest),
+            }) + chr(10))
         print(f"[{tag}] {label[:24]:24} overall={g['overall']:.3f} race={g['race_avg']:.2f} "
               f"support={g['fact']['support']:.2f} fab={g['fact']['fabricated_rate']:.2f} "
               f"core_cov={cov['core_coverage']:.2f} chars={len(digest)}", flush=True)
