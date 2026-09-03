@@ -269,6 +269,73 @@ def snapshot(db, *, cfg=None, now: datetime | None = None) -> list[dict]:
     return out
 
 
+# Below this share of demanded runs the schedule is not a schedule any more —
+# it is a wish list, and the "overdue" signal every priority rule depends on
+# degenerates because everything is overdue at once. Measured 2026-09-03:
+# 1,646 runs demanded per week, 646 delivered (39%), Curiosity Research at 20%
+# of its declared hourly cadence. Reported always; escalated only when severe,
+# because an operator may oversubscribe deliberately.
+SCHEDULE_PRESSURE_FLOOR = 0.25
+# A ratio computed from a handful of runs says nothing. Below this many
+# delivered runs the pressure is reported but never escalated (a two-pathway
+# probe with one stored result escalated to warning, 2026-09-03).
+SCHEDULE_MIN_RUNS = 20
+
+
+def schedule_pressure(db, *, days: int = 7) -> dict:
+    """Delivered vs demanded monitor runs over the window.
+
+    `demanded` is what the enabled cadences add up to; `delivered` is how many
+    results were actually stored. A ratio well under 1 means the card cannot
+    keep up with the schedule, which is invisible from any single monitor: each
+    one merely looks a bit late. Anchored dailies are counted once per day
+    rather than by their raw interval.
+
+    The window shrinks to the install's own age, and an install younger than a
+    day reports no ratio at all: a two-hour-old system has delivered none of a
+    week's runs, which is warm-up rather than saturation (a fresh-install probe
+    caught this reporting 0% and escalating, 2026-09-03).
+    """
+    try:
+        monitors = db.fetchall(
+            "SELECT id, name, schedule_seconds, check_config FROM monitors WHERE enabled = 1")
+        counts = {r["monitor_id"]: int(r["n"]) for r in db.fetchall(
+            "SELECT monitor_id, COUNT(*) AS n FROM monitor_results "
+            "WHERE created_at > datetime('now', ?) GROUP BY monitor_id", (f"-{days} days",))}
+        # counts use the full requested window; `window` below bounds what the
+        # cadences may DEMAND, so a young install cannot look starved
+    except Exception as e:
+        logger.warning("[Pathways] schedule pressure unreadable: %s", e)
+        return {"demanded": 0, "delivered": 0, "ratio": None, "starved": []}
+
+    age_h = _install_age_hours(db, datetime.now(timezone.utc).replace(tzinfo=None))
+    window = float(days) if age_h is None else max(0.0, min(float(days), age_h / 24.0))
+    if window < 1.0:
+        return {"demanded": 0, "delivered": 0, "ratio": None, "starved": [],
+                "note": "install younger than a day — no schedule history yet"}
+
+    demanded = delivered = 0.0
+    per: list[tuple[float, str, int, float]] = []
+    for m in monitors:
+        sched = max(int(m["schedule_seconds"] or 0), 1)
+        want = window * 86400.0 / sched
+        if "anchor_hour" in (m["check_config"] or ""):
+            want = min(want, window)          # anchored dailies run once a day
+        got = counts.get(m["id"], 0)
+        demanded += want
+        delivered += min(got, want)           # a monitor cannot bank credit
+        if want >= 3:
+            per.append((got / want, m["name"], got, want))
+    per.sort()
+    return {
+        "demanded": round(demanded),
+        "delivered": round(delivered),
+        "ratio": round(delivered / demanded, 3) if demanded else None,
+        "starved": [{"name": n, "ratio": round(r, 3), "delivered": g, "demanded": round(w)}
+                    for r, n, g, w in per[:5]],
+    }
+
+
 def liveness_report(db, *, cfg=None, now: datetime | None = None
                     ) -> tuple[str, str, dict[str, str | int | float]]:
     """(status, summary, fields) for the Pathway Liveness monitor.
@@ -284,6 +351,19 @@ def liveness_report(db, *, cfg=None, now: datetime | None = None
     off = [r for r in rows if r["verdict"] == "off"]
     warming = [r for r in rows if r["verdict"] == "warming"]
     fields: dict[str, str | int | float] = {"alive": len(alive), "idle": len(idle), "off": len(off)}
+    press = schedule_pressure(db)
+
+    def _with_pressure(f: dict) -> dict:
+        """Schedule fields go LAST: the rendered line is length-capped and the
+        dead pathway names are the actionable part (they were being pushed off
+        the end, 2026-09-03)."""
+        if press.get("ratio") is not None:
+            f["schedule"] = (f"{press['ratio']:.0%} of demanded runs delivered "
+                             f"({press['delivered']}/{press['demanded']}, 7d)")
+            if press["starved"]:
+                worst = press["starved"][0]
+                f["most_starved"] = f"{worst['name']} at {worst['ratio']:.0%}"
+        return f
     if warming:
         fields["warming"] = len(warming)
     if dead:
@@ -295,8 +375,17 @@ def liveness_report(db, *, cfg=None, now: datetime | None = None
             else:
                 fields[r["name"]] = f"{r['age_hours']:.0f}h silent (window {r['window_hours']:.0f}h)"
         names = ", ".join(r["name"] for r in dead)
-        return "error", f"{len(dead)} pathway(s) DEAD: {names}", fields
+        return "error", f"{len(dead)} pathway(s) DEAD: {names}", _with_pressure(fields)
     tail = f"{len(alive)} writing, {len(idle)} idle, {len(off)} off"
     if warming:
         tail += f", {len(warming)} warming up"
-    return "info", f"{HEALTHY_MARKER} ({tail})", fields
+    # Every writer alive but the schedule badly unmet is its own failure: the
+    # pathways are working, there is simply not enough capacity to run them as
+    # often as declared. Severe cases break the healthy marker so they deliver.
+    if (press.get("ratio") is not None
+            and press["ratio"] < SCHEDULE_PRESSURE_FLOOR
+            and press["delivered"] >= SCHEDULE_MIN_RUNS):
+        return ("warning",
+                f"pathways all writing but the schedule is not being met: "
+                f"{press['ratio']:.0%} of demanded runs delivered", _with_pressure(fields))
+    return "info", f"{HEALTHY_MARKER} ({tail})", _with_pressure(fields)

@@ -15,7 +15,7 @@ from app import __version__
 from app.auth import require_auth
 from app.config import config, _MUTABLE_FIELDS
 from app.database import get_db
-from app.monitors.pathways import snapshot as pathway_snapshot
+from app.monitors.pathways import schedule_pressure, snapshot as pathway_snapshot
 from app.monitors.quiet import quiet_until as _quiet_until
 from app.schema import HealthResponse, StatusResponse
 
@@ -142,6 +142,7 @@ async def status() -> StatusResponse:
             # Liveness registry (2026-09-02): last write per background pathway.
             pathways=pathway_snapshot(db),
             quiet_until=_quiet_until_str(db),
+            schedule=schedule_pressure(db),
         )
 
     counts = await asyncio.to_thread(_sync_status)

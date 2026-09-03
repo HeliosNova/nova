@@ -185,3 +185,7 @@ class StatusResponse(BaseModel):
     pathways: list[dict] = Field(default_factory=list)
     # Quiet window (2026-09-02): end of an operator-declared LLM-lane pause, else None.
     quiet_until: str | None = None
+    # Delivered vs demanded monitor runs over 7 days (app/monitors/pathways.py):
+    # {demanded, delivered, ratio, starved[]}. A ratio well under 1 means the
+    # card cannot keep up with the declared cadences.
+    schedule: dict = Field(default_factory=dict)

@@ -207,7 +207,7 @@ def test_healthy_report_carries_the_marker_and_no_drifting_numbers(seeded, monke
     status, summary, fields = pathways.liveness_report(db, cfg=_cfg(), now=NOW)
     assert status == "info"
     assert summary.startswith(pathways.HEALTHY_MARKER)
-    assert fields == {"alive": 1, "idle": 1, "off": 0}
+    assert fields["alive"] == 1 and fields["idle"] == 1 and fields["off"] == 0
     assert not re.search(r"\d+h", summary)
 
 
