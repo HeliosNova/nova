@@ -146,7 +146,10 @@ def sync_after_consolidation(db, kind: str, dkey: str) -> dict:
 
 def mark_queued(db, dkey: str, question: str, curiosity_id: int | None) -> bool:
     """The question was handed to the curiosity queue."""
-    if not curiosity_id:
+    # CuriosityQueue.add() returns -1 when it refuses a topic (backpressure,
+    # dedup, validation) and -1 is TRUTHY, so a bare falsiness check recorded the
+    # question against a queue row that does not exist (2026-09-03).
+    if not curiosity_id or int(curiosity_id) <= 0:
         return False
     cur = db.execute(
         "UPDATE dossier_questions SET status = 'queued', curiosity_id = ? "
@@ -158,7 +161,10 @@ def mark_queued(db, dkey: str, question: str, curiosity_id: int | None) -> bool:
 
 def mark_researched(db, curiosity_id: int | None, resolution: str) -> bool:
     """Curiosity resolved the queued question (any status but researched)."""
-    if not curiosity_id:
+    # CuriosityQueue.add() returns -1 when it refuses a topic (backpressure,
+    # dedup, validation) and -1 is TRUTHY, so a bare falsiness check recorded the
+    # question against a queue row that does not exist (2026-09-03).
+    if not curiosity_id or int(curiosity_id) <= 0:
         return False
     cur = db.execute(
         "UPDATE dossier_questions SET status = 'researched', resolution = ?, resolved_at = ? "

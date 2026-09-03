@@ -178,6 +178,13 @@ class _LazyConfigInt:
     def __hash__(self):
         return hash(self._val())
 
+# Backpressure high-water mark. Was defined and read NOWHERE until 2026-09-03:
+# the queue instead ran to MAX_QUEUE_SIZE and evicted, so the setting was a lie
+# in the config UI. Above this depth the queue stops accepting BACKGROUND work
+# (dossier questions, tensions, gap detection) and says so; owner-facing and
+# critical items (urgency >= 0.7) still get in. Nothing is lost by refusing a
+# dossier question: the open-questions ledger holds it and the next
+# consolidation offers it again once the queue has drained.
 MAX_PENDING = _LazyConfigInt("MAX_CURIOSITY_PENDING")
 MAX_ATTEMPTS = _LazyConfigInt("MAX_CURIOSITY_ATTEMPTS")
 MAX_QUEUE_SIZE = _LazyConfigInt("MAX_CURIOSITY_QUEUE_SIZE")
@@ -316,14 +323,33 @@ class CuriosityQueue:
                 return False
         return True
 
+    @staticmethod
+    def _sanitize_topic(topic: str) -> str:
+        """Strip formatting that leaks in from dossier and digest bodies.
+
+        A researcher searches the topic verbatim, so markdown goes straight into
+        the query: 26 of 100 pending topics carried `**bold**`, backticks or
+        heading marks on 2026-09-03 (e.g. 'How much of the **$7.5 billion CAD**
+        support package...'). Emphasis and code marks are removed, headings and
+        list bullets are stripped from the front, and whitespace is collapsed.
+        """
+        t = re.sub(r"[`*_]{1,3}", " ", topic or "")
+        t = re.sub(r"^[\s#>\-\*\d.)]+", "", t)
+        return re.sub(r"\s+", " ", t).strip()
+
     def add(self, topic: str, source: str = "gap_detection", urgency: float = 0.5) -> int:
-        """Add a topic to the queue. Deduplicates by boosting urgency if already pending."""
+        """Add a topic to the queue. Deduplicates by boosting urgency if already pending.
+
+        Returns the row id, or -1 when the topic was rejected — including when
+        the queue is applying backpressure. Callers that record the id (the
+        dossier open-questions ledger) MUST check for a positive value.
+        """
         if _SUPPRESS_ORGANIC.get():
             logger.debug(
                 "Curiosity add suppressed (ephemeral run): %r [%s]",
                 topic[:80], source)
             return -1
-        topic = topic.strip()[:500]
+        topic = self._sanitize_topic(topic)[:500]
         if not topic:
             return -1
         # Operator probes and Nova self-references are not knowledge gaps
@@ -412,23 +438,41 @@ class CuriosityQueue:
                 _dm.record_decision("curiosity", score, 0.6, "merged")
                 return row["id"]
 
-        # Cap pending items — FIFO eviction when queue exceeds MAX_CURIOSITY_QUEUE_SIZE
         pending_count = self._db.fetchone(
             "SELECT COUNT(*) AS c FROM curiosity_queue WHERE status = 'pending'"
         )["c"]
+
+        # Backpressure before destruction (2026-09-03). The queue used to run to
+        # MAX_QUEUE_SIZE and then evict the OLDEST pending topic on every add —
+        # the same evict-the-wrong-end shape as the KG ring buffer. Measured: the
+        # queue sat pinned at 100 while the researcher drained ~5/day, so 152
+        # logged evictions destroyed questions that had never been researched
+        # once. Refusing background work at the high-water mark makes the
+        # pressure visible where it is created instead.
+        if pending_count >= MAX_PENDING and urgency < 0.7:
+            logger.info(
+                "Curiosity backpressure: %d pending >= %d — refusing %s topic %r "
+                "(the ledger keeps it; it will be offered again when the queue drains)",
+                pending_count, int(MAX_PENDING), source, topic[:70])
+            return -1
+
         if pending_count >= MAX_QUEUE_SIZE:
-            # FIFO eviction: remove the oldest pending item (insertion order).
-            # Logged (audit 2026-08-17): every other branch logs; a silent evict
-            # meant self-directed learning topics were dropped invisibly under a
-            # sustained gap-detection backlog.
-            self._db.execute(
-                "DELETE FROM curiosity_queue WHERE id = ("
-                "  SELECT id FROM curiosity_queue WHERE status = 'pending' "
-                "  ORDER BY created_at ASC LIMIT 1"
-                ")"
+            # Hard ceiling for the urgent traffic that outranks backpressure.
+            # Evict by VALUE, never by age alone: the least urgent, most-attempted
+            # and stalest row goes, so a fresh critical item can never displace
+            # work that matters more than it does.
+            victim = self._db.fetchone(
+                "SELECT id, topic, urgency, attempts, created_at FROM curiosity_queue "
+                "WHERE status = 'pending' "
+                "ORDER BY urgency ASC, attempts DESC, created_at ASC LIMIT 1"
             )
-            logger.info("Curiosity queue full (%d >= %d) — evicted oldest pending topic (FIFO)",
-                        pending_count, MAX_QUEUE_SIZE)
+            if victim:
+                self._db.execute("DELETE FROM curiosity_queue WHERE id = ?", (victim["id"],))
+                logger.warning(
+                    "Curiosity queue at ceiling (%d >= %d) — evicted the least valuable "
+                    "pending topic (urgency %.2f, %d attempt(s), queued %s): %r",
+                    pending_count, MAX_QUEUE_SIZE, victim["urgency"], victim["attempts"],
+                    victim["created_at"], victim["topic"][:70])
 
         cursor = self._db.execute(
             "INSERT INTO curiosity_queue (topic, source, urgency) VALUES (?, ?, ?)",

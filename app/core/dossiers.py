@@ -942,16 +942,24 @@ async def consolidate_dossiers(db) -> str:
                           and not q.lower().startswith("watch for")][:1]
                     if qs:
                         from app.core.curiosity import CuriosityQueue
+                        # Bounded title prefix: a storyline title can be long
+                        # enough to bury the question in the search query
+                        # ("DeFi Institutionalization & Regulatory Bifurcation
+                        # (Morpho/Aave/Ripple): What is the current status of…").
+                        _topic = f"{cand['title'][:60].rstrip()}: {qs[0]}"
                         _cid = await asyncio.to_thread(
-                            CuriosityQueue(db).add,
-                            f"{cand['title']}: {qs[0]}",
+                            CuriosityQueue(db).add, _topic,
                             "dossier_open_question", 0.6)
-                        res["questions_fed"] = True
-                        try:
-                            from app.core.questions import mark_queued
-                            await asyncio.to_thread(mark_queued, db, cand["dkey"], qs[0], _cid)
-                        except Exception as e:
-                            logger.debug("[Knowing] ledger mark_queued failed: %s", e)
+                        res["questions_fed"] = _cid > 0
+                        if _cid > 0:
+                            try:
+                                from app.core.questions import mark_queued
+                                await asyncio.to_thread(mark_queued, db, cand["dkey"], qs[0], _cid)
+                            except Exception as e:
+                                logger.debug("[Knowing] ledger mark_queued failed: %s", e)
+                        else:
+                            logger.info("[Knowing] %r question not queued (curiosity queue "
+                                        "at capacity) — stays open in the ledger", cand["title"])
                         logger.info("[Knowing] curiosity fed from %r: %s", cand["title"], qs[0][:90])
                 except Exception as e:
                     logger.debug("[Knowing] curiosity feed failed for %r: %s", cand["title"], e)
