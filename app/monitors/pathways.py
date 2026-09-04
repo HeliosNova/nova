@@ -104,8 +104,13 @@ PATHWAYS: tuple[Pathway, ...] = (
             where="status IN ('ok','changed','alert') AND monitor_id IN "
                   "(SELECT id FROM monitors WHERE name = 'System Maintenance')",
             monitor="System Maintenance", describe="daily maintenance completed"),
-    Pathway("trust_ledger", 48, "trust_scores", "updated_at",
-            describe="tool trust score refreshed"),
+    # No trust_ledger pathway. Trust was retired from the database on
+    # 2026-09-01 (one UPDATE per tool call plus an audit row, gating nothing:
+    # can_use() is always True) and is kept in memory for self-awareness. The
+    # pathway outlived its writer and read DEAD from that day on, which breaks
+    # the "all pathways alive" marker permanently — so the canary delivers one
+    # dead verdict, never recovers, and a REAL death after it looks like the
+    # same standing complaint. Reviving this entry means reviving the writer.
     Pathway("dedup_metrics", 48, "dedup_decisions", "created_at",
             describe="a dedup decision was recorded"),
     Pathway("kg_retrieval", 48, "kg_facts", "last_retrieved_at",

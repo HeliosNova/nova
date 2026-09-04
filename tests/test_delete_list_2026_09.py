@@ -73,6 +73,20 @@ async def test_training_pair_writer_is_retired(db, tmp_path, monkeypatch):
     assert not path.exists() or path.stat().st_size == 0
 
 
+def test_no_pathway_watches_the_retired_trust_writer():
+    """A liveness pathway must not outlive the writer it watches.
+
+    trust stopped writing on 2026-09-01, so this entry reported DEAD every
+    cycle from then on and the "all pathways alive" marker could never come
+    back — which is how a canary stops being read.
+    """
+    from app.monitors.pathways import PATHWAYS
+    names = {p.name for p in PATHWAYS}
+    assert "trust_ledger" not in names,         "trust is in-memory since 2026-09-01; revive the writer before the pathway"
+    tables = {p.table for p in PATHWAYS}
+    assert "trust_scores" not in tables
+
+
 def test_rlvr_and_grpo_modules_are_archived():
     import importlib.util
     for mod in ("app.core.rlvr", "app.core.grpo_dataset", "app.core.grpo_verifier",
