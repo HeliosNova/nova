@@ -471,13 +471,19 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
         return
     is_contracts = "contract" in monitor_name.lower() and "award" in monitor_name.lower()
     is_title = _is_title_feed(monitor_name)
-    # Title feeds carry a real (if short) tagline — accept it at ≥30 chars rather
-    # than clearing + force-fetching it (the fetch flakes → bare link). Everyone
-    # else needs ≥60 to clear the "trivial fragment" bar.
-    min_len = 30 if is_title else 60
+    # Everyone needs ≥60 chars to clear the "trivial fragment" bar, title feeds
+    # included (2026-09-04). They used to be let through at ≥30 because their
+    # tagline is item-specific and clearing it meant a flaked fetch rendered a
+    # bare link. That protected the wrong thing: Product Hunt's taglines are
+    # marketing copy ("Your Slack org chart, built by everyone in it."), they
+    # cleared 30 comfortably, and so 14 of 15 items were never enriched and the
+    # digest read as a link list (owner, 2026-09-04). The tagline is now KEPT as
+    # a fallback instead of being the reason not to try.
+    min_len = 60
 
     boiler = _boilerplate_summaries(items)
     thin = []
+    fallback: dict[int, str] = {}
     for it in items:
         s = _clean_feed_summary(getattr(it, "summary", ""))
         title = (getattr(it, "title", "") or "").strip()
@@ -489,11 +495,34 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
             # boilerplate. The ≥3 render-time suppression can't catch a
             # single survivor after its siblings were enriched (seen live:
             # one 'now live on War.gov' line amid four real summaries).
+            #
+            # Item-specific text is worth restoring if enrichment comes back
+            # empty; boilerplate, echoed titles and URL fragments are not, and
+            # those are exactly the ones this clear was written to kill.
+            if s and s not in boiler and s.lower() != title.lower() and "http" not in s[:30]:
+                fallback[id(it)] = s
             if s:
                 it.summary = ""
             thin.append(it)
     if not thin:
         return
+
+    def _restore_feed_text() -> int:
+        """Give back the item-specific feed text set aside above.
+
+        Every exit below this point has already CLEARED the thin summaries, so a
+        return that skips this renders a bare link — which is the failure this
+        whole function exists to prevent.
+        """
+        n = 0
+        for it in thin:
+            if not (getattr(it, "summary", "") or "").strip():
+                prev = fallback.get(id(it))
+                if prev:
+                    it.summary = prev
+                    n += 1
+        return n
+
     # Title feeds (HN) hand us empty feed summaries, so every item is thin and the
     # default cap left the back half as bare title+link (owner: "still getting
     # hyperlinks"). Enrich the whole page for those — the batch is one LLM call and
@@ -561,6 +590,7 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
     if not enrich:
         logger.info("[DomainRunner] native enrich %s: %d thin item(s), 0 usable bodies",
                     monitor_name, len(thin))
+        _restore_feed_text()
         return
 
     from app.core.llm import invoke_nothink
@@ -615,6 +645,7 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
             num_ctx=_enrich_num_ctx(prompt, _max_tokens))
     except Exception as e:
         logger.warning("[DomainRunner] native enrich LLM failed for %s: %s", monitor_name, e)
+        _restore_feed_text()
         return
     import json as _json
     try:
@@ -630,6 +661,7 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
     if not isinstance(sums, list) or len(sums) != len(enrich):
         logger.warning("[DomainRunner] native enrich %s: got %s summaries for %d items — skipping to avoid misalignment",
                        monitor_name, (len(sums) if isinstance(sums, list) else type(sums).__name__), len(enrich))
+        _restore_feed_text()
         return
     cand: list[tuple] = []
     for (it, body), s in zip(enrich, sums):
@@ -674,11 +706,17 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
                            "check MiniCheck doc window / min_prob floor", monitor_name, n_before)
     for it, _body, s in cand:
         it.summary = s
+    # Anything still empty lost its race — no body, a fetch miss, or the entail
+    # gate. Give back the item-specific feed text we set aside rather than
+    # rendering a bare link; a marketing tagline is thin, but it beats nothing,
+    # and this is what let the ≥60 bar be applied to title feeds at all.
+    restored = _restore_feed_text()
     if n_rescued:
         logger.info("[DomainRunner] native enrich %s: extractive retry rescued %d item(s) "
                     "that would have rendered as bare links", monitor_name, n_rescued)
-    logger.info("[DomainRunner] native enrich %s: %d thin, %d bodies, %d summaries written, %d entail-dropped",
-                monitor_name, len(thin), len(enrich), len(cand), n_dropped)
+    logger.info("[DomainRunner] native enrich %s: %d thin, %d bodies, %d summaries written, "
+                "%d entail-dropped, %d fell back to feed text",
+                monitor_name, len(thin), len(enrich), len(cand), n_dropped, restored)
 
 
 async def _render_native_list(monitor_name: str, label: str, emoji: str) -> str:

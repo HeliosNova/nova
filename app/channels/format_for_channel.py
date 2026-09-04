@@ -126,6 +126,50 @@ def to_telegram_html(text: str) -> str:
 # WhatsApp (uses *bold*, _italic_, ~strike~, no links)
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Discord (the canonical dialect — only the link text needs compacting)
+# ---------------------------------------------------------------------------
+
+# A masked link cannot carry an unescaped ")" in its target: Discord ends the
+# link at the first one and the tail leaks into the message as literal text.
+_MASKABLE_URL = re.compile(r"^[^\s()<>]+$")
+
+
+def to_discord(text: str) -> str:
+    """Give a bare <URL> a short visible label, keeping the full URL as target.
+
+    Domain Studies are AUTHORED in Discord markdown, so Discord alone had no
+    converter and shipped `<https://...>` as-is. Discord renders that as a link
+    whose visible text is the whole URL, which is fine for a paragraph-long item
+    and ruinous for a feed row: an EDGAR filing URL is 103 characters and wraps
+    to three blue lines above a one-line body, so SEC Insider Trading, GitHub
+    Security Advisories, Product Hunt, FDA, Hacker News and Research Frontiers
+    all read as link lists rather than reports (owner, 2026-09-04). Telegram had
+    exactly this defect and was fixed on 2026-08-31; the fix was never carried
+    across, because Discord is the format everything else converts FROM.
+
+    Bot messages render masked links, so the same domain + arrow label works
+    here. A URL containing parentheses is left in its <>-suppressed form: Discord
+    would end the link at the first ")" and spill the rest as text, which is a
+    worse failure than a long label.
+    """
+    if not text:
+        return text
+
+    def _mask(m: re.Match) -> str:
+        url = m.group(1)
+        if not _MASKABLE_URL.match(url):
+            return m.group(0)
+        from urllib.parse import urlparse
+        try:
+            host = (urlparse(url).hostname or "").removeprefix("www.")
+        except Exception:
+            host = ""
+        return f"[{host or 'link'} ↗]({url})"
+
+    return _DISCORD_URL_BRACKETED.sub(_mask, text)
+
+
 def to_whatsapp(text: str) -> str:
     """Convert Discord markdown to WhatsApp's variant."""
     if not text:

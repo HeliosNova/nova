@@ -241,6 +241,14 @@ class DiscordBot:
         try:
             channel = self._client.get_channel(int(self.default_channel_id))
             if channel:
+                # Discord is the dialect everything else converts FROM, which is
+                # why it was the one channel with no converter of its own — and
+                # why a bare <URL> shipped with the whole URL as its visible
+                # text. On a feed row whose body is one line, a 100-character
+                # filing URL wraps to three blue lines and the item reads as a
+                # link (owner, 2026-09-04). Telegram was fixed on 2026-08-31.
+                from app.channels.format_for_channel import to_discord
+                message = to_discord(message)
                 # Reserve headroom for a continuation marker so split chunks 2..n
                 # aren't orphaned fragments (a reader otherwise can't tell a
                 # continuation from a new monitor's message).

@@ -816,6 +816,24 @@ def _clean_text(s: str) -> str:
     return s
 
 
+# Below this many characters of actual prose, a GitHub advisory description is a
+# stub rather than a description. The CVE cross-reference that made every row a
+# link scores 40; a real one-sentence description scores well over 100. Compared
+# against an absolute bar, NOT against the summary's length: a real description
+# that is merely SHORTER than the summary is still the better body.
+_ADVISORY_MIN_PROSE = 60
+
+
+def _prose_len(text: str) -> int:
+    """Characters a reader learns something from: markdown links, bold markers
+    and bare identifiers do not count."""
+    t = re.sub(r"\[([^\]]*)\]\([^)]*\)", " ", text or "")   # masked links
+    t = re.sub(r"https?://\S+", " ", t)
+    t = re.sub(r"(?i)cve-[\d-]+|GHSA-[\w-]+", " ", t)
+    t = re.sub(r"[*_`#]", "", t)
+    return len(re.sub(r"\s+", " ", t).strip())
+
+
 def _parse_date(raw: str) -> datetime | None:
     if not raw:
         return None
@@ -885,7 +903,17 @@ async def _fetch_github_advisories(url: str, *, max_items: int = 8) -> list[Feed
             if name and name not in pkgs:
                 pkgs.append(name)
         title = (f"[{sev.upper()}] " if sev else "") + summary
-        body = (a.get("description") or summary)
+        # GitHub's `description` is often nothing but a pointer at NVD - all 15
+        # advisories on 2026-09-04 read "**CVE:** This vulnerability corresponds
+        # to [CVE-...]" and nothing else, so the digest row was an id, a package
+        # and two links (owner: "hyperlinks instead of report"). The advisory's
+        # own `summary` is the real one-liner; it is already the item TITLE,
+        # where the renderer truncates it. So when the description carries less
+        # prose than the summary, show the summary instead of a cross-reference.
+        body = (a.get("description") or "").strip()
+        if _prose_len(body) < _ADVISORY_MIN_PROSE:
+            body = summary
+        body = body or summary
         if pkgs:
             body = f"Affected: {', '.join(pkgs[:6])}. " + body
         if ghsa:
