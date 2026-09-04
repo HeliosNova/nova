@@ -864,8 +864,13 @@ class KnowledgeGraph:
             return
         try:
             collection.delete(ids=[str(fact_id)])
-        except Exception:
-            pass
+        except Exception as e:
+            # A vector that outlives its fact is a GHOST: it keeps matching
+            # queries for a fact the store no longer believes. This project has
+            # cleaned ghost vectors out by hand more than once (35+55 on
+            # 2026-08-31 alone), and every time the delete that should have
+            # removed them failed exactly here, silently.
+            logger.warning("[KG] vector delete failed for fact %s: %r", fact_id, e)
 
     @staticmethod
     def _rrf_fuse(
@@ -1569,8 +1574,12 @@ class KnowledgeGraph:
                         f"WHERE id IN ({placeholders})",
                         tuple(ret_ids),
                     )
-                except Exception:
-                    pass  # backward compat if column missing
+                except Exception as e:
+                    # The "backward compat if column missing" this once guarded
+                    # is long gone — times_retrieved is in the schema snapshot.
+                    # Debug rather than warning because this runs on every
+                    # retrieval, but a real failure is no longer invisible.
+                    logger.debug("[KG] retrieval counter update failed: %r", e)
 
         return final
 
@@ -1617,8 +1626,12 @@ class KnowledgeGraph:
                         f"WHERE id IN ({placeholders})",
                         tuple(ret_ids),
                     )
-                except Exception:
-                    pass  # backward compat if column missing
+                except Exception as e:
+                    # The "backward compat if column missing" this once guarded
+                    # is long gone — times_retrieved is in the schema snapshot.
+                    # Debug rather than warning because this runs on every
+                    # retrieval, but a real failure is no longer invisible.
+                    logger.debug("[KG] retrieval counter update failed: %r", e)
 
         return results
 
@@ -1997,8 +2010,13 @@ class KnowledgeGraph:
                     f"last_retrieved_at = datetime('now') WHERE id IN ({placeholders})",
                     tuple(top_ids),
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # last_retrieved_at is the kg_retrieval pathway's proof of life,
+                # so a sustained failure here already surfaces as a DEAD pathway
+                # — which is why this stays at debug rather than warning on
+                # every retrieval. The aggregate alarm exists; the per-call
+                # reason did not (2026-09-04).
+                logger.debug("[KG] retrieval counter update failed: %r", e)
 
         return [
             Fact(

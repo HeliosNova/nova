@@ -438,8 +438,12 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
             if not _fid and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
                 logger.warning("[Storyline] FORECAST line present but not stored for %r "
                                "— mint format drift?", eff_key)
-    except Exception:
-        pass
+    except Exception as e:
+        # The drift warning above is INSIDE this try, so a raise here suppressed
+        # the very check that was meant to notice a silent mint failure
+        # (2026-09-04). Swallowed still — a storyline must not fail because its
+        # optional forecast did — but reported.
+        logger.warning("[Storyline] forecast mint failed for %r: %r", eff_key, e)
 
     sid = await asyncio.to_thread(
         _record, db, row, story, fresh or story["developments"], summary=summary)

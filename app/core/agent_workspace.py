@@ -202,8 +202,12 @@ def save_workspace(
                     prior = json.loads(prior_raw)
                     if isinstance(prior, dict):
                         merged.update({k: str(v) for k, v in prior.items()})
-            except (json.JSONDecodeError, TypeError):
-                pass
+            except (json.JSONDecodeError, TypeError) as e:
+                # Typed and degrades gracefully — the new findings still merge —
+                # but a workspace quietly losing everything it knew before is
+                # worth a line (2026-09-04).
+                logger.debug("Workspace prior findings unreadable, starting "
+                             "from the new ones only: %r", e)
             merged.update({k: str(v)[:600] for k, v in (findings or {}).items()})
             # Cap merged size — prevent unbounded growth on repeated runs
             if len(merged) > 30:

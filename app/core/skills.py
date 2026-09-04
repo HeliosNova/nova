@@ -374,8 +374,12 @@ class SkillStore:
                 try:
                     collection.delete(ids=[results["ids"][0][0]])
                     logger.info("Semantic dedup: dropped ghost vector for deleted skill #%d", existing_id)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # The success line above is INSIDE this try, so a failure
+                    # logged nothing at all and the ghost survived to match the
+                    # next query (2026-09-04).
+                    logger.warning("Semantic dedup: ghost vector for skill #%d "
+                                   "could not be dropped: %r", existing_id, e)
                 return None
             if existing_row["name"].lower() == name.lower():
                 return None
@@ -653,8 +657,9 @@ class SkillStore:
             if stale_ids:
                 try:
                     collection.delete(ids=stale_ids)
-                except Exception:
-                    pass
+                except Exception as e:
+                    logger.warning("Semantic match: %d stale skill vector(s) "
+                                   "could not be dropped: %r", len(stale_ids), e)
         except Exception as e:
             logger.warning("Semantic skill lookup failed: %s", e)
         return None

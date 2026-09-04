@@ -520,13 +520,21 @@ def _bump_attempts(db, fc: dict) -> str:
                 "resolution = 'auto-retired: could not be graded', resolved_at = datetime('now') WHERE id = ?",
                 (attempts, fc["id"]),
             )
-        except Exception:
-            pass
+        except Exception as e:
+            # Returning "unresolvable" after a failed write tells the caller the
+            # forecast was retired when it was not: it stays open, is picked up
+            # again next cycle, and burns another grading call forever
+            # (2026-09-04). Still swallowed — a grading pass must not die on one
+            # row — but no longer silent.
+            logger.warning("[Forecast] could not retire #%s as unresolvable: %r",
+                           fc["id"], e)
         return "unresolvable"
     try:
         db.execute("UPDATE forecasts SET attempts = ? WHERE id = ?", (attempts, fc["id"]))
-    except Exception:
-        pass
+    except Exception as e:
+        # An attempts counter that silently fails to increment is how a forecast
+        # retries without limit.
+        logger.warning("[Forecast] could not bump attempts on #%s: %r", fc["id"], e)
     return "open"
 
 

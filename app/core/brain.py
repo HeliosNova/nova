@@ -3015,8 +3015,11 @@ async def _refine_response(
                                 quality_score=0.3,
                             )
                         )
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        # A dropped reflexion is a lost learning signal, and
+                        # reflexions feed lesson promotion and the failure
+                        # sweep. Rare enough to be loud (2026-09-04).
+                        logger.warning("Reflexion store failed after critique: %s", e)
 
     # --- Adversarial critique (logic/factual error hunter) ---
     if _run_adversarial:

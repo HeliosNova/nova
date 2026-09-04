@@ -36,6 +36,7 @@ import ast
 import builtins
 import io
 import pathlib
+import re
 import sys
 
 _BUILTINS = set(dir(builtins)) | {
@@ -134,6 +135,47 @@ def check_control_bytes(root: pathlib.Path) -> list[str]:
         if bad:
             out.append(f"{path}: control byte(s) "
                        + ", ".join(hex(b) for b in bad))
+    return out
+
+
+# ------------------------------------------------------- silent write paths
+_WRITE_CALL = re.compile(
+    r"\b(execute|executemany|commit|INSERT|UPDATE|DELETE|\.post|\.put|\.send|"
+    r"send_alert|write|dump|add_fact|add_message|store|save)\b", re.I)
+
+
+def silent_write_sites(root: pathlib.Path) -> list[tuple[str, str]]:
+    """(file, enclosing function) for every `except ...: pass` whose try body
+    writes, sends or fetches.
+
+    An exception swallowed around a WRITE is a lie about success: the caller
+    carries on and reports the work as done. That is how the enrichment gate
+    logged "0 entail-dropped" after timing out, how 8 of 15 SEC filings shipped
+    unannotated, and how fact banking could have reported "0 stored" with no
+    reason at all. 27 such sites existed on 2026-09-04; 12 were given a log line
+    and the rest are accepted in tests/test_silent_writes.py with a reason each.
+    """
+    out: list[tuple[str, str]] = []
+    for path in sorted(root.rglob("*.py")):
+        src = _read(path)
+        try:
+            tree = ast.parse(src)
+        except SyntaxError:
+            continue
+        owner: dict[int, str] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                for ln in range(node.lineno, (node.end_lineno or node.lineno) + 1):
+                    owner.setdefault(ln, node.name)
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Try):
+                continue
+            for h in node.handlers:
+                if len(h.body) != 1 or not isinstance(h.body[0], ast.Pass):
+                    continue
+                body = "\n".join(ast.get_source_segment(src, st) or "" for st in node.body)
+                if _WRITE_CALL.search(body):
+                    out.append((path.as_posix(), owner.get(h.lineno, "<module>")))
     return out
 
 

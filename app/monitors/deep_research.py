@@ -2852,7 +2852,7 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
         return 0
     bodies_blob = " ".join((b or "").lower() for _, _, b in (articles or []))
     combined = (bodies_blob + " " + " ".join(f.lower() for _, _, f in findings)).strip()
-    stored = gate_rejected = garbage = 0
+    stored = gate_rejected = garbage = banking_errors = 0
     for c in cands[:10]:
         if not isinstance(c, dict):
             continue
@@ -2890,10 +2890,15 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
                                  source="researched", provenance=f"deep_research:{topic[:60]}",
                                  trust=0.8 if (support >= 2 or credible) else 0.5):
                 stored += 1
-        except Exception:
-            pass
-    logger.info("[DeepResearch] fact banking (%s): %d candidate(s) → %d stored, %d gate-rejected, %d garbage",
-                topic[:40], len(cands) if isinstance(cands, list) else 0, stored, gate_rejected, garbage)
+        except Exception as e:
+            # This is the knowing tier's core write. Swallowed, the summary line
+            # below still reports "N candidates -> 0 stored" and attributes the
+            # loss to nothing at all — a banking outage would read exactly like
+            # a fact-free digest (2026-09-04).
+            banking_errors += 1
+            logger.warning("[DeepResearch] fact banking failed for %r: %r", (s, p, o), e)
+    logger.info("[DeepResearch] fact banking (%s): %d candidate(s) → %d stored, %d gate-rejected, %d garbage, %d failed",
+                topic[:40], len(cands) if isinstance(cands, list) else 0, stored, gate_rejected, garbage, banking_errors)
     return stored
 
 
