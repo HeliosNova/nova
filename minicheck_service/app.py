@@ -19,6 +19,43 @@ import logging
 import os
 import threading
 
+
+def _cpu_quota() -> int:
+    """CPUs this container may actually use, from its cgroup — not how many the
+    host has.
+
+    torch sizes its thread pool from os.cpu_count(), which reports the HOST's
+    CPUs (12 here) and ignores the cgroup quota (4). It therefore spawned 6
+    intra-op threads to share 4 CPUs of quota and spent the difference being
+    throttled and context-switching. Measured 2026-09-04 on flan-t5-large,
+    8 pairs of 8,000-char docs: 10.05 s/pair at the default 6 threads,
+    8.26 s/pair with threads matched to the quota — 18% off for free, with
+    byte-identical verdicts. (Raising the quota to 8 CPUs and 8 threads made it
+    WORSE, 13.09 s/pair: this model does not scale past a few threads and the
+    extra threads compete with ollama and the app for the same WSL cores.)
+    """
+    try:                                     # cgroup v2
+        raw = open("/sys/fs/cgroup/cpu.max").read().split()
+        if raw[0] != "max":
+            return max(1, round(int(raw[0]) / int(raw[1])))
+    except Exception:
+        pass
+    try:                                     # cgroup v1
+        quota = int(open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us").read())
+        period = int(open("/sys/fs/cgroup/cpu/cpu.cfs_period_us").read())
+        if quota > 0:
+            return max(1, round(quota / period))
+    except Exception:
+        pass
+    return max(1, len(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity")
+               else (os.cpu_count() or 1))
+
+
+_THREADS = int(os.environ.get("MINICHECK_THREADS") or _cpu_quota())
+# Set before torch is imported anywhere: OMP reads these at first use.
+os.environ.setdefault("OMP_NUM_THREADS", str(_THREADS))
+os.environ.setdefault("MKL_NUM_THREADS", str(_THREADS))
+
 from fastapi import FastAPI
 from pydantic import BaseModel, Field
 
@@ -60,9 +97,16 @@ def _get_scorer():
     global _scorer
     with _lock:
         if _scorer is None:
+            import torch
+            try:
+                torch.set_num_threads(_THREADS)
+                torch.set_num_interop_threads(1)
+            except Exception as e:      # interop can only be set before any parallel work
+                logger.warning("thread pinning partial (%s)", e)
             from minicheck.minicheck import MiniCheck
             model = os.getenv("MINICHECK_MODEL", "flan-t5-large")
-            logger.info("loading MiniCheck model %s (CPU)…", model)
+            logger.info("loading MiniCheck model %s (CPU, %d thread(s) for a %d-CPU quota)…",
+                        model, torch.get_num_threads(), _THREADS)
             _scorer = MiniCheck(model_name=model, cache_dir="/cache")
             logger.info("MiniCheck loaded")
         return _scorer
@@ -79,7 +123,7 @@ class Batch(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "loaded": _scorer is not None}
+    return {"ok": True, "loaded": _scorer is not None, "threads": _THREADS}
 
 
 @app.post("/check_batch")
