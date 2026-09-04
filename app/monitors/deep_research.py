@@ -3393,17 +3393,42 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
     return out, n_changed
 
 
+# Any short parenthetical that cites "analysis" instead of a source.
+# WIDENED 2026-09-04 after the owner spotted it live. The v1 pattern required a
+# COLON — it removed "(deep analysis: the Fed pivot)" but not "(deep analysis)".
+# The same 2026-09-01 change that added this stripper also told the synthesis
+# prompt never to write "(deep analysis: …)", naming the exact spelling. The
+# model obeyed the letter and switched to the colon-less form, which sailed
+# through: digests carrying the artifact went from ~10% before that deploy to
+# 34% on 09-02, 45% on 09-03 and 55% on 09-04. A guard and a prompt written
+# against each other, each looking correct alone.
+# A parenthetical is a pseudo-citation when it mentions analysis and carries NO
+# domain token — "(analysis by reuters.com)" is a real attribution and stays.
+_PSEUDO_PAREN_RE = re.compile(r"\s*\(([^)]{0,80})\)")
+_ANALYSIS_WORD_RE = re.compile(r"(?i)\banalys[ei]s\b")
+_DOMAINISH_RE = re.compile(r"[a-z0-9-]+\.[a-z]{2,}")
+# Kept for callers/tests that reference the original name.
 _PSEUDO_CITE_RE = re.compile(r"\s*\((?:deep )?analysis:[^)]*\)")
 
 
 def _strip_pseudo_citations(text: str) -> tuple[str, int]:
-    """Remove '(deep analysis: …)' markers (2026-09-01): they carry no domain
-    token, so _PAREN_CITE_RE never saw them and the sentences they decorated
-    shipped unchecked (8 of 36 factual sentences in one Middle East digest)."""
+    """Remove '(deep analysis…)' markers: they carry no domain token, so
+    _PAREN_CITE_RE never saw them and the sentences they decorated shipped
+    unchecked (8 of 36 factual sentences in one Middle East digest, 2026-09-01).
+    """
     if not text:
         return text, 0
-    out, n = _PSEUDO_CITE_RE.subn("", text)
-    return out, n
+    n = 0
+
+    def _drop(m: "re.Match") -> str:
+        nonlocal n
+        inner = m.group(1)
+        if _ANALYSIS_WORD_RE.search(inner) and not _DOMAINISH_RE.search(inner):
+            n += 1
+            return ""
+        return m.group(0)
+
+    return _PSEUDO_PAREN_RE.sub(_drop, text), n
 
 
 def _decite_analysis(text: str) -> tuple[str, int]:
@@ -3891,7 +3916,7 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
-    final, _ = _strip_pseudo_citations(final)   # "(deep analysis: …)" is not a source (2026-09-01)
+    final, _ = _strip_pseudo_citations(final)   # the digest citing its own analysis is not a source
     final, _ = _decite_analysis(final)   # the digest's own reasoning carries no citation (2026-09-01)
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
     final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
@@ -4299,8 +4324,9 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "above; introduce NO new number, figure, or named entity in this section.\n"
         "Every FACTUAL sentence — an event, figure, quote, or named action — MUST cite its outlet "
         "inline like (cnbc.com). Your own ANALYSIS (implications, connections, what to watch) "
-        "carries NO citation: never attach an outlet to your own reasoning and never write "
-        "'(deep analysis: …)'. If you cannot cite a factual claim from the findings, OMIT it. "
+        "carries NO citation: never attach an outlet to your own reasoning, and never point at "
+        "the analyses themselves as if they were a source — they are your own thinking, not "
+        "evidence. If you cannot cite a factual claim from the findings, OMIT it. "
         "Use ONLY information present in the analyses/findings "
         "above — never invent a company, number, person, or event.")
     try:
@@ -4342,7 +4368,7 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     final, _ = await _ground_claims(final, [f"{t}\n{b}" for t, _u, b in articles], model=syn_model)   # distinctive terms trace too (titles incl.)
     final, _ = await _check_contamination(final, articles, model=syn_model)   # details trace to their CITED source, not a grafted one
     final, _ = await _check_numeric_attribution(final, articles, model=syn_model)   # + figures trace to their CITED source's value
-    final, _ = _strip_pseudo_citations(final)   # "(deep analysis: …)" is not a source (2026-09-01)
+    final, _ = _strip_pseudo_citations(final)   # the digest citing its own analysis is not a source
     final, _ = _decite_analysis(final)   # the digest's own reasoning carries no citation (2026-09-01)
     final, _ = _cite_uncited_sentences(final, articles)   # attribute uncited sibling sentences to their source (deterministic)
     final, _ = await _entailment_gate(final, articles, label=label)   # MiniCheck: cited source must ENTAIL the claim (gated, fail-open)
