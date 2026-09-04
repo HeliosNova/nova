@@ -208,3 +208,23 @@ async def test_a_dead_sidecar_still_leaves_the_text_alone(minicheck_on, monkeypa
     text = _text(SUPPORTED)
     out, n = await dr._entailment_gate(text, ARTS)
     assert out == text and n == 0
+@pytest.mark.asyncio
+async def test_a_miss_reports_how_many_articles_the_host_had(
+        minicheck_on, monkeypatch, caplog):
+    """83% of cited sentences fail this gate. Whether that is the model writing
+    past its sources or the gate reading the wrong two of a host's articles is
+    the whole question, and the drop log cannot tell them apart without this."""
+    arts = ARTS + [("Extra one", "https://example.com/a3", "Unrelated filler about weather."),
+                   ("Extra two", "https://example.com/a4", "More filler about traffic.")]
+    fake, _seen = _client()
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", fake)
+
+    import logging
+    with caplog.at_level(logging.INFO, logger="app.monitors.deep_research"):
+        await dr._entailment_gate(_text(UNSUPPORTED[:1]), arts)
+
+    miss = [r.getMessage() for r in caplog.records if "[entail-miss]" in r.getMessage()]
+    assert miss, "an unsupported claim must still be inspectable"
+    assert "arts=2/4" in miss[0], miss[0]
+    assert "unread_best=" in miss[0] and "read_worst=" in miss[0]

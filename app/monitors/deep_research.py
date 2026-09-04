@@ -3219,11 +3219,25 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
         document does not cost a verdict.
         """
         wts = _weights(claim)
-        rds = {_reg_domain(h) for h in hosts}
-        cand = [i for i, (h, _) in enumerate(articles)
-                if h in hosts or _reg_domain(h) in rds]
-        cand.sort(key=lambda i: -sum(wt for t, wt in wts.items() if t in art_lowers[i]))
+        cand = [i for i, _sc in _ranked_cands(hosts, claim)]
         return " ".join(_windows(wts, i) for i in cand[:1 if narrow else 2])[:6000]
+
+    def _ranked_cands(hosts: list[str], claim: str) -> list[tuple[int, float]]:
+        """Every article the cited hosts supplied, best IDF match first.
+
+        Split out of _doc_for so the miss forensics can say how many articles
+        the host actually had and how well the ones we did NOT read matched.
+        A gate that drops 83% of cited sentences is either reading the wrong
+        two articles or catching a model that wrote past its sources, and the
+        two look identical in the drop log without this.
+        """
+        wts = _weights(claim)
+        rds = {_reg_domain(h) for h in hosts}
+        scored = [(i, sum(wt for t, wt in wts.items() if t in art_lowers[i]))
+                  for i, (h, _) in enumerate(articles)
+                  if h in hosts or _reg_domain(h) in rds]
+        scored.sort(key=lambda p: -p[1])
+        return scored
 
     # collect (line_idx, sentence, cited_hosts) for cited factual sentences
     lines = text.split("\n")
@@ -3358,9 +3372,16 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
     # articles, unentailable analytic lead-ins) after two blind fix attempts.
     for (li, st, hosts), res in list(zip(checks, results))[:24]:
         if not res.get("supported"):
-            _d = _doc_for(hosts, _claim_of(st))
-            logger.info("[entail-miss] p=%.3f hosts=%s claim=%r doc_head=%r doc_len=%d",
-                        res.get("prob", -1), hosts[:3], _claim_of(st)[:110], _d[:90], len(_d))
+            _c = _claim_of(st)
+            _d = _doc_for(hosts, _c)
+            _rk = _ranked_cands(hosts, _c)
+            _read = [sc for _i, sc in _rk[:2]]
+            _unread = [sc for _i, sc in _rk[2:]]
+            logger.info("[entail-miss] p=%.3f hosts=%s arts=%d/%d read_worst=%.2f "
+                        "unread_best=%.2f claim=%r doc_head=%r doc_len=%d",
+                        res.get("prob", -1), hosts[:3], len(_read), len(_rk),
+                        min(_read) if _read else 0.0, max(_unread) if _unread else 0.0,
+                        _c[:110], _d[:90], len(_d))
     if not unsupported:
         logger.info("[DeepResearch] entailment gate: %d/%d cited sentences entailed by their source",
                     len(checks), len(checks))
