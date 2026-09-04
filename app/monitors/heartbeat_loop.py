@@ -20,9 +20,15 @@ from app.monitors.format import (
     format_monitor_result,
     strip_tool_call_artifacts,
 )
-from app.monitors.delivery import _DIGEST_FLUSH_EVERY, DeliveryMixin
-from app.monitors.maintenance import MaintenanceMixin
-from app.monitors.health_checks import HealthChecksMixin
+from app.monitors.delivery import (_DELIVERY_RECOVERY_MAX_AGE_H,
+                                   _DIGEST_FLUSH_EVERY,
+                                   _DIGEST_MAX_BUFFER_AGE, DeliveryMixin)
+from app.monitors.maintenance import (_ORG_WORDS, _PERSON_TITLE_RE,
+                                      _curate_inverted_leads, _person_shaped,
+                                      _skeletal_digest, MaintenanceMixin)
+from app.monitors.health_checks import (_ENTAIL_GATE_LINE_RE,
+                                        _digest_health_verdict,
+                                        HealthChecksMixin)
 from app.monitors.monitor_store import (
     Monitor,
     MonitorResult,  # noqa: F401 — available for callers
@@ -40,17 +46,6 @@ _MAX_CONCURRENT_LLM_MONITORS = 1  # one monitor's GPU work at a time — leaves 
 # forbidden (see _ClassGate): brain-query monitors drive the 9B, and
 # 27B+9B co-residency exceeds the 24GB card — the documented thrash ceiling.
 _MAX_CONCURRENT_DIGEST_MONITORS = 2
-# Post digests progressively as monitors finish, so a large due-batch (or a restart
-# mid-batch) can't strand every update behind the slowest monitor. Small groups keep
-# most of the digest-bundling benefit while making the feed timely + restart-resilient.
-# A sub-threshold buffer (1-2 items) used to wait for the END-OF-TICK flush, which
-# sits behind every remaining slow monitor — a single 27B digest kept a completed
-# briefing hostage for 30+ min, and a restart in that window destroyed it
-# (2026-08-12). The age flusher posts any buffer older than this regardless of size.
-_DIGEST_MAX_BUFFER_AGE = 300  # seconds
-# Buffered alerts older than this at recovery are stale intelligence — drop them
-# rather than posting yesterday's briefing after a long outage.
-_DELIVERY_RECOVERY_MAX_AGE_H = 24
 
 # Monitors whose output is non-factual — skip KG extraction for these
 _NO_KG_MONITORS = frozenset({"Morning Check-in", "Self-Reflection"})
@@ -81,42 +76,6 @@ _SESSION_SUMMARY_RE = re.compile(
 
 
 # Digest Health Canary thresholds (weekly check_type="digest_health").
-# The per-digest summary line the entail gate emits since 2026-08-25:
-#   [entail-gate] <label>: N checked, ... M dropped
-_ENTAIL_GATE_LINE_RE = re.compile(
-    r"\[entail-gate\] .*?: (\d+) checked.*?(\d+) dropped")
-
-
-def _digest_health_verdict(lengths: list[int], linkish: int,
-                           checked: int, dropped: int) -> tuple[str, str]:
-    """(status, summary) for the digest-health canary. Pure for tests.
-
-    error  — pipeline broken: no digests in 7d, thin output (avg < 2000
-             chars — healthy live average is ~8k), or >10% link-only.
-    warning — degradation: avg < 4000 chars, or entail drop-rate > 75%.
-
-    Drop-rate threshold recalibrated 2026-09-02 (was 55%). The metric's
-    DENOMINATOR changed when the gate went from 24 to 48 sentences per
-    digest: it now also checks the marginal tail that used to go unchecked,
-    so a higher share is dropped for the same output. Measured over the 8
-    hours after the change: 11 digests, 326 checked, 193 dropped (59%),
-    while the digests themselves got RICHER (avg 7,230 -> 7,678 chars, the
-    shortest 475 -> 2,812). Substance is what this canary really guards —
-    avg chars and link-only share are unchanged; only this rate moved.
-    """
-    if not lengths:
-        return "error", "no content digests stored in 7 days — pipeline dead?"
-    avg = sum(lengths) / len(lengths)
-    link_share = linkish / len(lengths)
-    drop_rate = (dropped / checked) if checked else 0.0
-    stats = (f"{len(lengths)} digests, avg {avg:.0f} chars, "
-             f"{link_share:.0%} link-only, entail drop {drop_rate:.0%}")
-    if avg < 2000 or link_share > 0.10:
-        return "error", f"digest substance degraded — {stats}"
-    if avg < 4000 or drop_rate > 0.75:
-        return "warning", f"digest quality drifting — {stats}"
-    return "info", stats
-
 
 # Stat-line canaries whose numbers drift every run by design (counts,
 # latencies). Generic numeric change-detection re-delivered their HEALTHY
@@ -238,87 +197,6 @@ def _provisional_acceptable(topic: str, result: str) -> bool:
     return any(t in low for t in topic_tokens)
 
 
-_PERSON_TITLE_RE = re.compile(r"(?i)^(?:dr|mr|mrs|ms|prof|gen|sen|rep|gov|amb)\.?\s")
-_ORG_WORDS = frozenset({
-    "inc", "corp", "llc", "ltd", "fund", "forum", "commission", "institute",
-    "university", "bank", "group", "chase", "capital", "partners", "company",
-    "committee", "council", "agency", "administration", "ministry",
-    "department", "association", "foundation", "laboratory", "labs",
-})
-
-
-def _person_shaped(name: str) -> bool:
-    """Conservative person detector for direction curation: title prefix, or
-    2-3 title-case tokens with no org marker words."""
-    name = (name or "").strip()
-    if _PERSON_TITLE_RE.match(name):
-        return True
-    toks = name.split()
-    if any(t.lower().strip(".,") in _ORG_WORDS for t in toks):
-        return False
-    return 2 <= len(toks) <= 3 and all(t[:1].isupper() for t in toks if t)
-
-
-def _curate_inverted_leads(db) -> int:
-    """Supersede the org-as-subject side of mutual A-leads-B / B-leads-A pairs.
-
-    Extraction sometimes emits both directions ("Citadel leads Ken Griffin"
-    alongside the correct one). Only acts when EXACTLY one side is
-    person-shaped — ambiguous pairs are left alone. Supersession, not
-    deletion: the losing row keeps its audit trail (found live 2026-08-14,
-    4 pairs)."""
-    pairs = db.fetchall(
-        "SELECT a.id aid, a.subject asub, b.id bid, b.subject bsub "
-        "FROM kg_facts a JOIN kg_facts b "
-        "ON LOWER(a.subject)=LOWER(b.object) AND LOWER(a.object)=LOWER(b.subject) "
-        "AND a.predicate=b.predicate AND a.id < b.id "
-        "WHERE a.predicate='leads' AND a.superseded_at IS NULL "
-        "AND b.superseded_at IS NULL LIMIT 20"
-    )
-    n = 0
-    for p in pairs:
-        a_person, b_person = _person_shaped(p["asub"]), _person_shaped(p["bsub"])
-        if a_person == b_person:
-            continue                      # ambiguous — leave both
-        wrong_id = p["bid"] if a_person else p["aid"]
-        n += db.execute(
-            "UPDATE kg_facts SET superseded_at = datetime('now'), "
-            "provenance = COALESCE(provenance,'') || "
-            "' | superseded:inverted-direction-curation' "
-            "WHERE id = ? AND superseded_at IS NULL", (wrong_id,)).rowcount
-    return n
-
-
-def _skeletal_digest(text: str, cap: int = 1200) -> str:
-    """Deterministic skeleton of a digest for demoted retention: headings and
-    bolded lead lines only — the structure and headline claims survive, the
-    prose body (already consolidated into dossiers by now) is released.
-
-    Whole-word bound (2026-08-31): the cap was a hard `out[:cap]` mid-word cut.
-    All 515 stored length==1200 monitor_results rows (Jul 14-24 cohort) are
-    THIS function's output — shape-tested 515/515 skeletal-heading lines, i.e.
-    the cluster earlier attributed to cross_monitor's text[:1200] actually
-    came from here, and every future demotion pass would have kept re-biting.
-    Prefer the last sentence boundary in the tail; fall back to the last
-    whole word + ellipsis (same policy as cross_monitor._synthesize)."""
-    keep = []
-    for ln in (text or "").split("\n"):
-        s = ln.strip()
-        if s.startswith("#") or s.startswith(("* **", "- **", "**")):
-            keep.append(s)
-    out = "\n".join(keep) or (text or "")
-    if len(out) <= cap:
-        return out
-    cut = out[:cap]
-    tail = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
-    if tail >= int(cap * 0.83):
-        return cut[:tail + 1]
-    ws = cut.rfind(" ")
-    return (cut[:ws].rstrip() + "…") if ws > 0 else cut
-
-# ---------------------------------------------------------------------------
-# Deliberation scrubber — strip untagged model deliberation from monitor output
-# ---------------------------------------------------------------------------
 
 _DELIBERATION_PATTERNS = [
     re.compile(r"^(?:wait|okay|ok|hmm|let me|actually)[,\s].*?(?:let me|I(?:'ll| will| should)|re-?read|revis|re-?think|reconsider|check).*$", re.IGNORECASE | re.MULTILINE),
@@ -1941,7 +1819,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             )
             if _is_llm_down:
                 # Don't call fail() — leave attempts unchanged so it retries next cycle
-                return f"[Curiosity skipped — LLM unavailable, will retry]"
+                return "[Curiosity skipped — LLM unavailable, will retry]"
 
             if result and not result.startswith("["):
                 # --- Semantic closure check ---

@@ -79,7 +79,16 @@ def test_skills_methods_not_duplicated():
 
 
 def test_decay_stale_skills_is_wired_into_maintenance():
-    src = (_APP / "monitors" / "heartbeat_loop.py").read_text(encoding="utf-8")
+    """It was dead code once, so the call itself is the assertion.
+
+    Read the METHOD, not the file it happens to live in: maintenance moved
+    to a mixin on 2026-09-04, and this test then failed for a reason that
+    had nothing to do with skill decay.
+    """
+    import inspect
+
+    from app.monitors.heartbeat_loop import HeartbeatLoop
+    src = inspect.getsource(HeartbeatLoop._execute_maintenance)
     assert "svc.skills.decay_stale_skills" in src, \
         "decay_stale_skills must be called from _execute_maintenance (it was dead code)"
 

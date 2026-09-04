@@ -19,6 +19,92 @@ from app.config import config
 logger = logging.getLogger(__name__)
 
 
+# Moved here from heartbeat_loop.py 2026-09-04: the split left these
+# module-level names behind, so every call site above resolved to
+# nothing at runtime and raised NameError into an except.
+_PERSON_TITLE_RE = re.compile(r"(?i)^(?:dr|mr|mrs|ms|prof|gen|sen|rep|gov|amb)\.?\s")
+_ORG_WORDS = frozenset({
+    "inc", "corp", "llc", "ltd", "fund", "forum", "commission", "institute",
+    "university", "bank", "group", "chase", "capital", "partners", "company",
+    "committee", "council", "agency", "administration", "ministry",
+    "department", "association", "foundation", "laboratory", "labs",
+})
+
+
+def _person_shaped(name: str) -> bool:
+    """Conservative person detector for direction curation: title prefix, or
+    2-3 title-case tokens with no org marker words."""
+    name = (name or "").strip()
+    if _PERSON_TITLE_RE.match(name):
+        return True
+    toks = name.split()
+    if any(t.lower().strip(".,") in _ORG_WORDS for t in toks):
+        return False
+    return 2 <= len(toks) <= 3 and all(t[:1].isupper() for t in toks if t)
+
+
+def _curate_inverted_leads(db) -> int:
+    """Supersede the org-as-subject side of mutual A-leads-B / B-leads-A pairs.
+
+    Extraction sometimes emits both directions ("Citadel leads Ken Griffin"
+    alongside the correct one). Only acts when EXACTLY one side is
+    person-shaped — ambiguous pairs are left alone. Supersession, not
+    deletion: the losing row keeps its audit trail (found live 2026-08-14,
+    4 pairs)."""
+    pairs = db.fetchall(
+        "SELECT a.id aid, a.subject asub, b.id bid, b.subject bsub "
+        "FROM kg_facts a JOIN kg_facts b "
+        "ON LOWER(a.subject)=LOWER(b.object) AND LOWER(a.object)=LOWER(b.subject) "
+        "AND a.predicate=b.predicate AND a.id < b.id "
+        "WHERE a.predicate='leads' AND a.superseded_at IS NULL "
+        "AND b.superseded_at IS NULL LIMIT 20"
+    )
+    n = 0
+    for p in pairs:
+        a_person, b_person = _person_shaped(p["asub"]), _person_shaped(p["bsub"])
+        if a_person == b_person:
+            continue                      # ambiguous — leave both
+        wrong_id = p["bid"] if a_person else p["aid"]
+        n += db.execute(
+            "UPDATE kg_facts SET superseded_at = datetime('now'), "
+            "provenance = COALESCE(provenance,'') || "
+            "' | superseded:inverted-direction-curation' "
+            "WHERE id = ? AND superseded_at IS NULL", (wrong_id,)).rowcount
+    return n
+
+
+def _skeletal_digest(text: str, cap: int = 1200) -> str:
+    """Deterministic skeleton of a digest for demoted retention: headings and
+    bolded lead lines only — the structure and headline claims survive, the
+    prose body (already consolidated into dossiers by now) is released.
+
+    Whole-word bound (2026-08-31): the cap was a hard `out[:cap]` mid-word cut.
+    All 515 stored length==1200 monitor_results rows (Jul 14-24 cohort) are
+    THIS function's output — shape-tested 515/515 skeletal-heading lines, i.e.
+    the cluster earlier attributed to cross_monitor's text[:1200] actually
+    came from here, and every future demotion pass would have kept re-biting.
+    Prefer the last sentence boundary in the tail; fall back to the last
+    whole word + ellipsis (same policy as cross_monitor._synthesize)."""
+    keep = []
+    for ln in (text or "").split("\n"):
+        s = ln.strip()
+        if s.startswith("#") or s.startswith(("* **", "- **", "**")):
+            keep.append(s)
+    out = "\n".join(keep) or (text or "")
+    if len(out) <= cap:
+        return out
+    cut = out[:cap]
+    tail = max(cut.rfind("."), cut.rfind("!"), cut.rfind("?"))
+    if tail >= int(cap * 0.83):
+        return cut[:tail + 1]
+    ws = cut.rfind(" ")
+    return (cut[:ws].rstrip() + "…") if ws > 0 else cut
+
+# ---------------------------------------------------------------------------
+# Deliberation scrubber — strip untagged model deliberation from monitor output
+# ---------------------------------------------------------------------------
+
+
 class MaintenanceMixin:
 
     async def _execute_maintenance(self, cfg: dict) -> str:

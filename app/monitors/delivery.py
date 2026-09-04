@@ -31,6 +31,22 @@ logger = logging.getLogger(__name__)
 _DIGEST_FLUSH_EVERY = 3
 
 
+# Moved here from heartbeat_loop.py 2026-09-04: the split left these
+# module-level names behind, so every call site above resolved to
+# nothing at runtime and raised NameError into an except.
+# Post digests progressively as monitors finish, so a large due-batch (or a restart
+# mid-batch) can't strand every update behind the slowest monitor. Small groups keep
+# most of the digest-bundling benefit while making the feed timely + restart-resilient.
+# A sub-threshold buffer (1-2 items) used to wait for the END-OF-TICK flush, which
+# sits behind every remaining slow monitor — a single 27B digest kept a completed
+# briefing hostage for 30+ min, and a restart in that window destroyed it
+# (2026-08-12). The age flusher posts any buffer older than this regardless of size.
+_DIGEST_MAX_BUFFER_AGE = 300  # seconds
+# Buffered alerts older than this at recovery are stale intelligence — drop them
+# rather than posting yesterday's briefing after a long outage.
+_DELIVERY_RECOVERY_MAX_AGE_H = 24
+
+
 class DeliveryMixin:
     """Alert routing, digest batching and the delivery journal."""
 

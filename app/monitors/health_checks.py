@@ -21,6 +21,46 @@ from app.monitors.format import format_monitor_result
 logger = logging.getLogger(__name__)
 
 
+# Moved here from heartbeat_loop.py 2026-09-04: the split left these
+# module-level names behind, so every call site above resolved to
+# nothing at runtime and raised NameError into an except.
+# The per-digest summary line the entail gate emits since 2026-08-25:
+#   [entail-gate] <label>: N checked, ... M dropped
+_ENTAIL_GATE_LINE_RE = re.compile(
+    r"\[entail-gate\] .*?: (\d+) checked.*?(\d+) dropped")
+
+
+def _digest_health_verdict(lengths: list[int], linkish: int,
+                           checked: int, dropped: int) -> tuple[str, str]:
+    """(status, summary) for the digest-health canary. Pure for tests.
+
+    error  — pipeline broken: no digests in 7d, thin output (avg < 2000
+             chars — healthy live average is ~8k), or >10% link-only.
+    warning — degradation: avg < 4000 chars, or entail drop-rate > 75%.
+
+    Drop-rate threshold recalibrated 2026-09-02 (was 55%). The metric's
+    DENOMINATOR changed when the gate went from 24 to 48 sentences per
+    digest: it now also checks the marginal tail that used to go unchecked,
+    so a higher share is dropped for the same output. Measured over the 8
+    hours after the change: 11 digests, 326 checked, 193 dropped (59%),
+    while the digests themselves got RICHER (avg 7,230 -> 7,678 chars, the
+    shortest 475 -> 2,812). Substance is what this canary really guards —
+    avg chars and link-only share are unchanged; only this rate moved.
+    """
+    if not lengths:
+        return "error", "no content digests stored in 7 days — pipeline dead?"
+    avg = sum(lengths) / len(lengths)
+    link_share = linkish / len(lengths)
+    drop_rate = (dropped / checked) if checked else 0.0
+    stats = (f"{len(lengths)} digests, avg {avg:.0f} chars, "
+             f"{link_share:.0%} link-only, entail drop {drop_rate:.0%}")
+    if avg < 2000 or link_share > 0.10:
+        return "error", f"digest substance degraded — {stats}"
+    if avg < 4000 or drop_rate > 0.75:
+        return "warning", f"digest quality drifting — {stats}"
+    return "info", stats
+
+
 class HealthChecksMixin:
 
     async def _execute_db_size_check(self) -> str:
@@ -154,7 +194,6 @@ class HealthChecksMixin:
 
     async def _execute_ollama_latency_check(self) -> str:
         """Measure Ollama response latency with a trivial prompt."""
-        import time
         try:
             from app.core import llm
             provider = llm.get_provider()
