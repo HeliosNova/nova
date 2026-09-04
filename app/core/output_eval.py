@@ -114,13 +114,24 @@ def _ensure_table(db) -> None:
             "CREATE INDEX IF NOT EXISTS idx_output_quality_created "
             "ON output_quality_log(created_at)"
         )
-        try:
-            db.execute("ALTER TABLE output_quality_log ADD COLUMN novelty REAL")
-        except sqlite3.Error:
-            pass  # column exists
+        for _col, _type in (("novelty", "REAL"), ("judge_regime", "TEXT")):
+            try:
+                db.execute(f"ALTER TABLE output_quality_log ADD COLUMN {_col} {_type}")
+            except sqlite3.Error:
+                pass  # column exists
     except sqlite3.Error as e:
         logger.warning("[OutputEval] table create failed: %s", e)
 
+
+# Judge REGIME. These scores describe the grader as much as the digest, and the
+# grader changed on 2026-09-02: it used to read the first 3,000 characters of an
+# 8,000-character digest and floor every score to 8, so it always reported ~9.6.
+# The current judge reads 12,000, refuses to score on a bogus critique, and adds
+# canaries. Comparing across that boundary reads an instrument change as a
+# quality change — which is exactly what it looked like on 2026-09-04 when the
+# average appeared to fall from 9.63 to 8.51. Score within a regime; to compare
+# eras, re-grade the old digests with the CURRENT judge.
+JUDGE_REGIME = "2026-09-02-full-read"
 
 _YEAR_RE = re.compile(r"\b(?:19|20)\d\d\b")
 _PSEUDO_CITE_RE = re.compile(r"\((?:deep )?analysis:")
@@ -352,13 +363,14 @@ async def grade_recent_outputs(db, *, sample_size: int = 20, hours: int = 24) ->
             await asyncio.to_thread(
                 db.execute,
                 "INSERT INTO output_quality_log (monitor_id, monitor_name, result_id, "
-                "relevance, facts, freshness, format, avg_score, critique, novelty) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "relevance, facts, freshness, format, avg_score, critique, novelty, "
+                "judge_regime) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     r["monitor_id"], r["monitor_name"], r["id"],
                     scores["relevance"], scores["facts"], scores["freshness"], scores["format"],
                     avg, scores["critique"],
                     _novelty(r["value"], await asyncio.to_thread(_dossier_body_for, db, r["monitor_name"])),
+                    JUDGE_REGIME,
                 ),
             )
         except sqlite3.Error as e:
