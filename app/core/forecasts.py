@@ -672,8 +672,22 @@ def calibration(db, *, key_prefix: str | None = None, min_n: int = 1,
     hit_rate = sum(o for _, o in outcomes) / n
     mean_conf = sum(c for c, _ in outcomes) / n
     brier = sum((c - o) ** 2 for c, o in outcomes) / n
+    # Brier alone cannot say whether the confidence was WORTH anything, and
+    # "0.25 = coin flip" is the wrong yardstick. The real baseline is predicting
+    # this record's own base rate for every claim, which scores
+    # hit_rate * (1 - hit_rate). Measured 2026-09-04 over 105 resolved
+    # forecasts: stated confidence scored 0.2541 and always saying 0.60 scored
+    # 0.2400 -- the stated numbers were WORSE than ignoring the claim. Fitting a
+    # shrinkage on those same outcomes (leave-one-out) reached 0.2425, still
+    # short. Skill is that comparison as one number: > 0 means the confidence
+    # carried information, <= 0 means it did not, and no recalibration can
+    # manufacture what is not there.
+    base = hit_rate * (1.0 - hit_rate)
+    skill = (1.0 - brier / base) if base > 0 else None
     return {"n": n, "hit_rate": round(hit_rate, 3), "mean_conf": round(mean_conf, 3),
-            "gap": round(mean_conf - hit_rate, 3), "brier": round(brier, 3)}
+            "gap": round(mean_conf - hit_rate, 3), "brier": round(brier, 3),
+            "base_brier": round(base, 3),
+            "skill": (round(skill, 3) if skill is not None else None)}
 
 
 def calibration_buckets(db, *, min_bucket: int = 5) -> list[tuple[float, float, int]]:
@@ -701,17 +715,46 @@ def global_calibration_note(db, *, min_n: int = 20) -> str | None:
     minting at 0.7/0.8 with a Brier at coin-flip. None below `min_n`."""
     cal = calibration(db, min_n=min_n)
     if not cal:
-        return None
+        # The regime stamp means a fresh estimator has no record of its own, and
+        # at these horizons that silence lasts months — during which the model
+        # mints with no feedback at all. The retired record cannot supply the
+        # NUMBERS (this estimator states lower confidences than the one that
+        # produced them, so its bucket mapping would be actively wrong), but one
+        # thing it says does not depend on the estimator: across 105 outcomes,
+        # stated confidence had no edge over predicting the base rate, and that
+        # is a lesson about which CLAIMS are worth minting, not about what
+        # number to put on them. Carry only that, and label where it came from.
+        old = calibration(db, min_n=min_n, regime=None)
+        if not old or old.get("skill") is None or old["skill"] > 0:
+            return None
+        return (
+            f"CALIBRATION RECORD: this estimator has too few resolved forecasts to "
+            f"score yet. Under the RETIRED estimator (n={old['n']}), stated confidence "
+            f"had no measured edge over simply predicting the base rate "
+            f"(skill {old['skill']:+.2f}). Its numbers do not carry over, but its "
+            f"lesson does: mint a forecast only when the claim is specific and dated "
+            f"enough that being wrong would be obvious. A number on a vague claim is "
+            f"what produced that record."
+        )
     parts = [f"{b:.1f}->{rate:.0%} (n={n})" for b, rate, n in calibration_buckets(db)]
     bucket_text = ", ".join(parts) if parts else "not enough per-bucket data"
     return (
-        f"CALIBRATION RECORD (all Nova forecasts, n={cal['n']}): stated confidence -> "
+        f"CALIBRATION RECORD (this estimator, n={cal['n']}): stated confidence -> "
         f"delivered hit rate: {bucket_text}. Overall stated {cal['mean_conf']:.0%} vs "
         f"delivered {cal['hit_rate']:.0%} (Brier {cal['brier']:.2f}; 0.25 = coin flip). "
         f"State the confidence you would actually bet at: where 0.8 has delivered "
         f"~{next((rate for b, rate, _ in calibration_buckets(db) if b == 0.8), cal['hit_rate']):.0%}, "
         f"a claim you feel is 0.8 belongs at that number. Prefer a dated, checkable "
         f"claim at 0.6 over a vague one at 0.9."
+        + (
+            f" NOTE: across this record stated confidence has NO measured edge over "
+            f"simply predicting the base rate (skill {cal['skill']:+.2f}; Brier "
+            f"{cal['brier']:.3f} against {cal['base_brier']:.3f} for always saying "
+            f"{cal['hit_rate']:.0%}). Do not mint a forecast unless the claim is "
+            f"specific and dated enough that being wrong would be obvious - a number "
+            f"on a vague claim is what produced this record."
+            if (cal.get("skill") is not None and cal["skill"] <= 0) else ""
+        )
     )
 
 

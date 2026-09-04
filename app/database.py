@@ -1360,6 +1360,24 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 36 (2026-09-04): Training Job Watch hourly -> daily. The
+        # trainer was archived in June; the monitor has returned the identical
+        # "no training history yet" string every run since, and at hourly it was
+        # 168 of the 1,646 runs the schedule demands each week while only 37%
+        # of that demand is being met.
+        if 36 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "UPDATE monitors SET schedule_seconds = 86400, "
+                    "cooldown_minutes = 1380 "
+                    "WHERE name = 'Training Job Watch' AND schedule_seconds < 86400")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (36,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

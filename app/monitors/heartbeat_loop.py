@@ -39,13 +39,32 @@ from app.monitors.monitor_store import (
 logger = logging.getLogger(__name__)
 
 _MAX_CONCURRENT_LLM_MONITORS = 1  # one monitor's GPU work at a time — leaves the 3090 free for a side process (owner 2026-06-30)
-# Digest-class (27B deep-research) monitors may overlap each other at width 2:
-# a digest spends minutes in network gather and the CPU MiniCheck gate while
-# the GPU idles — a second digest fills that idle time, and Ollama queues
-# same-model calls so the 27B is never contended. Cross-CLASS overlap stays
-# forbidden (see _ClassGate): brain-query monitors drive the 9B, and
-# 27B+9B co-residency exceeds the 24GB card — the documented thrash ceiling.
-_MAX_CONCURRENT_DIGEST_MONITORS = 2
+# Digest-class (27B deep-research) monitors may overlap each other: a digest
+# spends minutes in network gather and the CPU MiniCheck gate while the GPU
+# idles — another digest fills that idle time, and Ollama queues same-model
+# calls so the 27B is never contended. Cross-CLASS overlap stays forbidden (see
+# _ClassGate): brain-query monitors drive the 9B, and 27B+9B co-residency
+# exceeds the 24GB card — the documented thrash ceiling.
+#
+# 2 -> 3 on 2026-09-04. Entailment became the chain's dominant cost when the
+# sidecar serialized (08-26) and the enrichment gate stopped timing out (08-29),
+# and it is CPU work with the GPU idle: 19.8 of a digest's 30.8 minutes. A third
+# digest costs no VRAM — every digest monitor drives the SAME resident 27B — and
+# overlaps its gather and synthesis against the other two's entailment.
+#
+# This is a measurement, not a certainty: the sidecar is one serial queue, so
+# the extra digest may simply wait in it. REVERT TO 2 if
+# scripts/throughput_panel.py shows runs/hour flat or down over a full day, or
+# if minutes-per-run rises while runs/hour does not.
+_MAX_CONCURRENT_DIGEST_MONITORS = 3
+
+# Questions to drain per Curiosity Research run, and the wall clock that bounds
+# them. One per run left 50 pending against ~1.5 resolutions a day (2026-09-04);
+# the scheduling slot, not the research, was the scarce thing. The budget is
+# checked BETWEEN items so a single slow think() can overrun it but a batch
+# cannot compound.
+_CURIOSITY_BATCH = 3
+_CURIOSITY_RUN_BUDGET = 420.0    # seconds
 
 # Monitors whose output is non-factual — skip KG extraction for these
 _NO_KG_MONITORS = frozenset({"Morning Check-in", "Self-Reflection"})
@@ -1787,13 +1806,49 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         )
 
     async def _execute_curiosity_research(self, cfg: dict) -> str:
-        """Pick the top curiosity item, research it, store findings."""
+        """Drain several queued questions per run, not one.
+
+        One item per run was the whole bottleneck. Measured 2026-09-04: 50
+        questions pending, ~1.5 resolved a DAY, and a 7-to-9 day wait between a
+        dossier asking a question and curiosity answering it (created 08-23 ->
+        resolved 09-02). The monitor declares an hourly cadence and delivers 20%
+        of it, so the queue is drained roughly five times a day, one item each.
+
+        The scheduling slot is the expensive part - the tick has already paid to
+        get here - so take several questions while we hold it. Bounded by a wall
+        clock, because each item is a think() call and a slow one must not hold
+        the tick behind it.
+        """
         from app.core.brain import get_services
 
         svc = get_services()
         if not svc.curiosity:
             return "[Curiosity engine not initialized — skipped]"
 
+        batch = max(1, int(cfg.get("batch") or _CURIOSITY_BATCH))
+        budget = float(cfg.get("seconds") or _CURIOSITY_RUN_BUDGET)
+        started = time.monotonic()
+        lines: list[str] = []
+        for i in range(batch):
+            if i and (time.monotonic() - started) > budget:
+                logger.info("[Curiosity] run budget spent after %d item(s)", i)
+                break
+            out = await self._research_one_curiosity(svc)
+            lines.append(out)
+            # Nothing left, or the machinery is down: stop asking.
+            if out.startswith("[No pending") or "LLM unavailable" in out:
+                break
+        if not lines:
+            return "[No pending curiosity items — skipped]"
+        if len(lines) == 1:
+            return lines[0]
+        done = sum(1 for x in lines if x.startswith("CURIOSITY RESOLVED")
+                   or x.startswith("CURIOSITY PROVISIONAL"))
+        return (f"CURIOSITY BATCH | {done}/{len(lines)} resolved this run\n"
+                + "\n".join(lines))
+
+    async def _research_one_curiosity(self, svc) -> str:
+        """Take the top queued question, research it, store what it found."""
         item = await asyncio.to_thread(svc.curiosity.get_next)
         if not item:
             return "[No pending curiosity items — skipped]"

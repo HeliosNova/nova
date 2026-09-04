@@ -957,8 +957,16 @@ class MonitorStore:
                 "name": "Training Job Watch",
                 "check_type": "training_job",
                 "check_config": {},
-                "schedule_seconds": 3600,   # hourly
-                "cooldown_minutes": 55,
+                # Daily, not hourly (2026-09-04). The weight trainer was
+                # archived 2026-06-12 and Fine-Tune Check is seeded disabled, so
+                # this returned the identical string "no training history yet"
+                # 101 times in 14 days. At hourly it demanded 168 runs a week -
+                # 10% of the whole schedule's demand, against a 37% delivery
+                # rate - and took a real slot every time it came due. A revived
+                # trainer is not something an hourly poll notices sooner in any
+                # way that matters. Existing installs get this via migration 36.
+                "schedule_seconds": 86400,
+                "cooldown_minutes": 1380,
                 "notify_condition": "on_change",
             },
             {

@@ -82,9 +82,30 @@ def test_the_column_and_index_exist_in_a_fresh_schema(db):
 
 
 def test_the_prompt_feedback_uses_the_scoped_record(db):
-    """global_calibration_note must not teach from the retired regime."""
+    """The retired regime may supply its lesson, never its numbers.
+
+    Narrowed 2026-09-04. This asserted `is None`, on the principle that old-code
+    outcomes must not describe how Nova forecasts now. That is right about the
+    bucket mapping — this estimator states LOWER confidences than the one that
+    produced those outcomes, so "0.8 has delivered 62%" would be actively wrong
+    advice. But it left the mint prompt with no feedback at all for the months
+    it takes 20 new forecasts to resolve, and one finding does not depend on the
+    estimator: stated confidence had no edge over predicting the base rate,
+    which is a lesson about which CLAIMS are worth minting.
+
+    It also passed for the wrong reason. An all-miss record makes skill
+    undefined (base = p(1-p) = 0), so the fallback declined on a division guard
+    rather than on anything this test meant. The record below resolves both
+    ways, so the guard is the one under test.
+    """
     from app.core.forecasts import global_calibration_note
-    for _ in range(30):
+    for _ in range(18):
+        _resolved(db, 0.95, "hit", created="2026-08-10 12:00:00")
+    for _ in range(12):
         _resolved(db, 0.95, "miss", created="2026-08-10 12:00:00")
-    assert global_calibration_note(db, min_n=20) is None, \
-        "30 legacy outcomes must not become advice about how Nova forecasts now"
+    note = global_calibration_note(db, min_n=20)
+    assert note is not None, "silence for months is not the honest answer either"
+    assert "RETIRED estimator" in note
+    assert "specific and dated" in note
+    for leaked in ("delivered hit rate", "belongs at that number", "->"):
+        assert leaked not in note, f"retired-regime numbers leaked in: {leaked}"
