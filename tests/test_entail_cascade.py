@@ -188,6 +188,29 @@ async def test_the_probe_samples_across_the_briefing_not_its_lead(
         "the probe never looked past the lead"
 
 
+def test_a_site_judged_not_worth_narrowing_is_re_measured_eventually():
+    """The rate memory was a one-way latch: once a call site measured below the
+    bar it never measured again for the life of the process. Restarts reset it,
+    so it would never have been loud - which is the shape of thing that ends up
+    silently off for weeks here."""
+    dr._NARROW_RATE.clear()
+    dr._NARROW_SKIPS.clear()
+    key = "some monitor:gate"
+
+    assert dr._narrow_worth_it(key), "an unknown site must be probed"
+    dr._record_narrow_rate(key, 0.10)                 # measured: not worth it
+
+    seq = [dr._narrow_worth_it(key) for _ in range(dr._NARROW_REPROBE_EVERY + 5)]
+    assert seq[0] is False, "it should stop narrowing immediately"
+    assert sum(seq) == 1, "exactly one re-probe per cycle, not every call"
+    assert seq.index(True) == dr._NARROW_REPROBE_EVERY - 1
+
+    dr._record_narrow_rate(key, 0.90)                 # sources improved
+    assert dr._narrow_worth_it(key), "a recovered site must narrow again at once"
+    dr._NARROW_RATE.clear()
+    dr._NARROW_SKIPS.clear()
+
+
 @pytest.mark.asyncio
 async def test_a_dead_sidecar_still_leaves_the_text_alone(minicheck_on, monkeypatch):
     class _Dead:

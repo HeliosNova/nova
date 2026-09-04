@@ -3043,14 +3043,32 @@ def _is_analytical(claim: str) -> bool:
 # heuristic, not a fact, and a restart should re-measure rather than trust a
 # stale number.
 _NARROW_RATE: dict[str, float] = {}
+_NARROW_SKIPS: dict[str, int] = {}
 _NARROW_MIN_RATE = 0.30      # break-even is ~0.275 (2.42s narrow vs 8.79s full)
 _NARROW_PROBE_N = 8
+_NARROW_REPROBE_EVERY = 20   # a known-bad site gets re-measured this often
 
 
 def _narrow_worth_it(key: str) -> bool:
-    """Unknown sites are probed; known-bad ones are not re-probed every cycle."""
+    """Unknown sites are probed; known-bad ones are re-probed occasionally.
+
+    The first version of this was a one-way latch: once a call site measured
+    below the bar it never measured again for the life of the process. Restarts
+    reset it, so it was never going to be loud — which is exactly the shape of
+    thing that ends up silently off for weeks here. A monitor whose sources
+    improve deserves to be found out, so every _NARROW_REPROBE_EVERY skips buys
+    one probe: ~5% of the saving, in exchange for the decision staying current.
+    """
     prior = _NARROW_RATE.get(key)
-    return prior is None or prior >= _NARROW_MIN_RATE
+    if prior is None or prior >= _NARROW_MIN_RATE:
+        _NARROW_SKIPS.pop(key, None)
+        return True
+    n = _NARROW_SKIPS.get(key, 0) + 1
+    if n >= _NARROW_REPROBE_EVERY:
+        _NARROW_SKIPS[key] = 0
+        return True
+    _NARROW_SKIPS[key] = n
+    return False
 
 
 def _record_narrow_rate(key: str, rate: float) -> None:
@@ -3097,13 +3115,60 @@ _CHROME_SNIPPETS = (
 # "3 min read") — prose mentioning them is far longer
 _CHROME_SHORT = ("advertisement", "min read")
 _CHROME_TIME_RE = re.compile(r"(?:\d{1,2}:\d{2}\s*)+|1x")
+# A navigation menu is a RUN of short unpunctuated lines. Four, not three:
+# three short lines in a row happen in real prose (a pull quote, a byline
+# block); six in a row are a section menu.
+_NAV_LINE_MAX = 45
+_NAV_RUN_MIN = 4
+_SENT_END_CHARS = frozenset('.!?:;"\'”)')
+
+
+def _nav_run_indices(lines: list[str]) -> set[int]:
+    """Indices belonging to a run of at least _NAV_RUN_MIN nav-shaped lines.
+
+    Structural, because a blocklist of site strings loses to the next site.
+    Live 2026-09-04: a claim about rate expectations was scored against
+    "Video / Big Business / So Expensive / View From Above / Small Business /
+    Authorized Account" — CNBC's section menu. Six consecutive short unpunctuated
+    lines beat the real article on IDF overlap and became the evidence window.
+
+    One short line is a heading and stays; several in a row are a menu. Digits
+    are the escape hatch: a run of short numeric lines is a table or a ticker
+    list, which is content.
+    """
+    nav = [i for i, ln in enumerate(lines)
+           if 0 < len(ln.strip()) < _NAV_LINE_MAX
+           and ln.strip()[-1] not in _SENT_END_CHARS
+           and not any(ch.isdigit() for ch in ln)]
+    out: set[int] = set()
+    run: list[int] = []
+    for i in nav:
+        if run and i == run[-1] + 1:
+            run.append(i)
+            continue
+        if len(run) >= _NAV_RUN_MIN:
+            out.update(run)
+        run = [i]
+    if len(run) >= _NAV_RUN_MIN:
+        out.update(run)
+    return out
 
 
 def _scrub_chrome(body: str) -> str:
+    lines = body.split("\n")
+    nav = _nav_run_indices(lines)
     keep = []
-    for ln in body.split("\n"):
+    for i, ln in enumerate(lines):
         low = ln.strip().lower().replace("\xa0", " ")
         if not low:
+            continue
+        if i in nav:
+            continue
+        # A short ALL-CAPS line is a masthead or a control, never prose
+        # ("FREE ACCOUNT", "SUBSCRIBE", "LOG IN"). Live 2026-09-04: "FREE
+        # ACCOUNT" opened the evidence window for a market claim.
+        bare = ln.strip()
+        if len(bare) < 30 and bare.isupper() and any(c.isalpha() for c in bare):
             continue
         if len(low) < 160 and any(s in low for s in _CHROME_SNIPPETS):
             continue
