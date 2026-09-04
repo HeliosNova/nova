@@ -152,6 +152,54 @@
 
 ---
 
+## Phase 5 — Found by measurement 2026-09-03/04 (not in the original program)
+
+Everything here came from looking at what Nova PRODUCED rather than at whether
+tests passed. Ordered by measured value.
+
+- [ ] **5.1 Ensemble the forecast probability.** Nova takes ONE verbalized `0.x`
+  from a single generation — the weakest method in the literature — and is 15
+  points overconfident (hit 0.60 at stated 0.75, legacy regime). Sample the
+  probability k times and aggregate. Cheap: the FORECAST line is a short
+  generation. Measure inside the new regime (`forecasts.REGIME`) so the effect
+  is attributable. Evidence: verbalized confidence is consistently poorly
+  calibrated and sampling-based aggregation beats it (arxiv 2412.14737,
+  Science Advances adp1528).
+- [ ] **5.2 Entailment cascade — 1.55x on the digest bottleneck, zero quality
+  cost.** Entailment is 64% of a digest (19.8 of 30.8 min) with the GPU idle.
+  Measured on 60 real pairs: a 2,754-char document scores 3.6x faster and
+  agrees with the 5,508-char production document 93% of the time — but newly
+  DROPS 4 of 60 supported claims, which is a quality cut and therefore refused.
+  Crucially nothing narrow-supported was rejected at full width, so scoring
+  narrow first and re-checking ONLY the unsupported at full width gives
+  verdicts identical to today at ~1.55x. Take the cascade, not the trim.
+- [ ] **5.3 Resolution criteria at mint.** Metaculus practice: a threshold and
+  an authoritative source in the FORECAST line. NOTE: the obvious version of
+  this (reject claims with no number) was measured and REFUSED — no-number
+  claims are unresolvable 6% of the time vs 9% for numbered ones. This is about
+  informativeness, not rescue.
+- [ ] **5.4 Clean-room re-grade (owner approved).** Re-score a sample of pre-
+  and post-fix digests with the CURRENT judge so the instrument is constant and
+  only the code era differs. ~1h GPU. This is the only honest way to answer
+  'is Nova actually better now', because the judge changed on 09-02.
+- [ ] **5.5 Learned recalibration — BLOCKED, revisit later.** The best post-hoc
+  method (Beta-Bernoulli, arxiv 2605.27668) trains on 7,824 resolved questions;
+  Nova has 103 and all are legacy-regime. Revisit at ~30+ resolved in the
+  current regime.
+
+### Shipped 2026-09-03/04 (measurement-driven, outside the plan)
+- [x] Priming RETIRED on a 16-topic paired A/B (no gain, cost to grounding).
+- [x] Self-citation stripper widened — a guard and a prompt written against
+      each other let `(deep analysis)` climb from ~10% to 55% of digests.
+- [x] Curiosity backpressure (the queue was destroying unread questions).
+- [x] Schedule pressure measured and surfaced: 1,646 runs demanded/week, 608
+      delivered (37%).
+- [x] Entity timelines — the bitemporal trail nothing had ever read.
+- [x] Storyline re-attachment; markup stripped at every write boundary.
+- [x] Regime stamps on forecasts AND judge scores; `scripts/quality_panel.py`.
+- [x] Entailment threads pinned to the cgroup quota (18%); more CPUs measured
+      WORSE (13.09 vs 8.26 s/pair) and refused.
+
 ## Phase 4 — Structural (after the above are live)
 
 - Task 4.1: Split HeartbeatLoop into scheduler / executors / delivery / maintenance-steps with a `pathway_runs` ledger. — NOT STARTED (the pathway registry + e2e tick now give the safety net for it).
