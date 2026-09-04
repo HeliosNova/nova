@@ -178,7 +178,8 @@
   "resolution",
   "resolved_at",
   "source_monitor",
-  "attempts"
+  "attempts",
+  "regime"
  ],
  "goals": [
   "id",

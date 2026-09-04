@@ -1324,6 +1324,26 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 34 (2026-09-04): scoring regime on forecasts. A track record
+        # only describes the process that produced it. Every forecast resolved
+        # before this date was minted under the 30-day clamp with an undated
+        # resolver, so pooling it with current outcomes hides whether anything
+        # improved. Existing rows stay NULL and are matched by date.
+        if 34 not in applied:
+            conn.execute("BEGIN")
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(forecasts)")}
+                if "regime" not in cols:
+                    conn.execute("ALTER TABLE forecasts ADD COLUMN regime TEXT")
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_forecasts_regime "
+                    "ON forecasts (regime, status)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (34,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

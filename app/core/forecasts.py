@@ -44,6 +44,20 @@ logger = logging.getLogger(__name__)
 # the 30-day cap silently rewrote "by Q4 2026" into a month and graded the
 # forecast before its own deadline.
 _MIN_DAYS, _MAX_DAYS = 1, 365
+# Scoring REGIME. A track record is only evidence about the process that
+# produced it, and this one changed on 2026-09-02: before that date every
+# forecast was clamped to a 30-day horizon, the resolver searched the raw claim
+# with no date filter, and the judge was never told its window. Pooling those
+# outcomes with new ones answers no question you would want to ask — on
+# 2026-09-04 all 103 resolved forecasts came from the old regime, so the 0.60
+# hit rate against 0.75 stated confidence was a verdict on code that no longer
+# runs. Calibration therefore scores WITHIN a regime, and any future change to
+# how forecasts are minted or graded bumps this string so the effect of the
+# change is measurable instead of averaged away.
+REGIME = "2026-09-02-dated"
+REGIME_LEGACY = "pre-2026-09-02"
+REGIME_CUTOVER = "2026-09-02 03:00:00"
+
 _DEFAULT_DAYS = 30
 
 # Open claims at or above this token-Jaccard within the same family are the
@@ -228,17 +242,17 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
         if dup is not None:
             cur = db.execute(
                 "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, "
-                "resolution, source_monitor) VALUES (?, ?, ?, ?, 'restated', ?, ?)",
+                "resolution, source_monitor, regime) VALUES (?, ?, ?, ?, 'restated', ?, ?, ?)",
                 (claim[:500], storyline_key[:80], confidence, dup["resolves_at"],
-                 f"restates #{dup['id']}", source_monitor[:80]),
+                 f"restates #{dup['id']}", source_monitor[:80], REGIME),
             )
             logger.info("[Forecast] restated #%d (%.2f): %s", dup["id"], confidence, claim[:80])
             return cur.lastrowid
         cur = db.execute(
-            "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, source_monitor) "
-            "VALUES (?, ?, ?, ?, 'open', ?)",
+            "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, "
+            "source_monitor, regime) VALUES (?, ?, ?, ?, 'open', ?, ?)",
             (claim[:500], storyline_key[:80], confidence,
-             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80]),
+             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80], REGIME),
         )
         logger.info("[Forecast] minted #%s resolves %s (%.2f): %s",
                     cur.lastrowid, target.date().isoformat(), confidence, claim[:80])
@@ -510,18 +524,43 @@ async def resolve_one(db, fc: dict) -> str:
 # Track record and calibration
 # ---------------------------------------------------------------------------
 
-def accuracy(db) -> dict:
-    """Rolling track record over resolved (hit/miss) forecasts."""
+def _regime_clause(regime: str | None) -> tuple[str, tuple]:
+    """SQL fragment scoping a query to one scoring regime.
+
+    Rows minted before the column existed carry NULL, so the legacy regime is
+    matched by date as well as by value — a backfill is not required for the
+    numbers to be right.
+    """
+    if regime is None:
+        return "", ()
+    if regime == REGIME_LEGACY:
+        return (" AND (regime = ? OR (regime IS NULL AND created_at < ?))",
+                (REGIME_LEGACY, REGIME_CUTOVER))
+    return (" AND (regime = ? OR (regime IS NULL AND created_at >= ?))",
+            (regime, REGIME_CUTOVER))
+
+
+def accuracy(db, *, regime: str | None = REGIME) -> dict:
+    """Rolling track record over resolved (hit/miss) forecasts.
+
+    Scoped to the current scoring regime by default (see REGIME): a record
+    produced by code that no longer runs is history, not a measurement of how
+    Nova forecasts now. Pass regime=None to pool everything.
+    """
+    clause, args = _regime_clause(regime)
     try:
-        rows = db.fetchall("SELECT status FROM forecasts WHERE status IN ('hit','miss')")
+        rows = db.fetchall(
+            "SELECT status FROM forecasts WHERE status IN ('hit','miss')" + clause, args)
     except Exception:
-        return {"resolved": 0, "hits": 0, "rate": None}
+        return {"resolved": 0, "hits": 0, "rate": None, "regime": regime}
     hits = sum(1 for r in rows if r["status"] == "hit")
     n = len(rows)
-    return {"resolved": n, "hits": hits, "rate": round(hits / n, 2) if n else None}
+    return {"resolved": n, "hits": hits,
+            "rate": round(hits / n, 2) if n else None, "regime": regime}
 
 
-def calibration(db, *, key_prefix: str | None = None, min_n: int = 1) -> dict | None:
+def calibration(db, *, key_prefix: str | None = None, min_n: int = 1,
+                regime: str | None = REGIME) -> dict | None:
     """Calibration over resolved forecasts: is stated confidence WORTH its
     number? (judgment rung, 2026-08-14). gap > 0 = overconfident (claimed more
     than delivered); Brier score penalizes both miscalibration and hedging.
@@ -532,6 +571,9 @@ def calibration(db, *, key_prefix: str | None = None, min_n: int = 1) -> dict | 
     if key_prefix:
         where += " AND storyline_key LIKE ?"
         args = (key_prefix + "%",)
+    clause, rargs = _regime_clause(regime)
+    where += clause
+    args = args + rargs
     try:
         rows = db.fetchall(
             f"SELECT confidence, status FROM forecasts WHERE {where}", args)
