@@ -501,6 +501,9 @@ EVENT_META_EXCL_SQL = (
 
 
 def _event_summary(dev: str, cap: int = 300) -> str:
+    from app.core.text_utils import strip_markup
+    dev = strip_markup(dev)     # a stored event is re-read by digests, dossier
+    #                             consolidation and entity timelines (2026-09-04)
     """Whole-word bound for stored event summaries (2026-08-31). The old
     `dev[:300]` hard cut left 948 of 1,761 storyline_events at exactly 300
     chars ending mid-word — the timeline the frontend, dossier consolidation

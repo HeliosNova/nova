@@ -47,10 +47,13 @@ def extract_questions(body: str, *, limit: int = 8) -> list[str]:
     'will X happen' lines are forecast material, not questions)."""
     from app.core.dossiers import _extract_open_questions, _is_future_question
     out: list[str] = []
+    from app.core.text_utils import strip_markup
     for q in _extract_open_questions(body, limit=limit):
         if _is_future_question(q) or q.lower().startswith("watch for"):
             continue
-        out.append(q)
+        q = strip_markup(q)     # the question becomes a curiosity search query
+        if q:
+            out.append(q)
     return out
 
 

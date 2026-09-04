@@ -333,9 +333,8 @@ class CuriosityQueue:
         support package...'). Emphasis and code marks are removed, headings and
         list bullets are stripped from the front, and whitespace is collapsed.
         """
-        t = re.sub(r"[`*_]{1,3}", " ", topic or "")
-        t = re.sub(r"^[\s#>\-\*\d.)]+", "", t)
-        return re.sub(r"\s+", " ", t).strip()
+        from app.core.text_utils import strip_markup
+        return strip_markup(topic)
 
     def add(self, topic: str, source: str = "gap_detection", urgency: float = 0.5) -> int:
         """Add a topic to the queue. Deduplicates by boosting urgency if already pending.

@@ -220,7 +220,10 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
     clamped to [1, 365] days from now. A near-duplicate of an open forecast in
     the same family is stored as `restated` (a confidence update, not a bet).
     """
-    claim = (claim or "").strip()
+    from app.core.text_utils import strip_markup
+    # The claim is web-searched verbatim when the forecast is graded, so
+    # emphasis marks go in as query text (2026-09-04).
+    claim = strip_markup(claim)
     if len(claim) < 12:
         return None
     now = _now()

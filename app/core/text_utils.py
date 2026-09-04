@@ -169,3 +169,55 @@ def estimate_tokens(text: str) -> int:
     )
     non_cjk = len(text) - cjk_count
     return int(non_cjk / 3.25)  # 4 -> 3.25 (2026-09-01): Ollama counted 16.6k tokens where the estimate said 13.5k + int(cjk_count / 1.5)
+
+
+_MARKUP_RE = re.compile(r"[`*_]{1,3}")
+_LEAD_JUNK_RE = re.compile(r"^[\s#>\-\*\d.)]+")
+_MD_LINK_RE = re.compile(r"\[([^\]]{1,120})\]\([^)]*\)")
+_WS_RE = re.compile(r"\s+")
+
+
+def strip_markup(text: str) -> str:
+    """Plain text from model output, for any field that is later SEARCHED,
+    SPOKEN, or fed back into a prompt.
+
+    Digest prose is markdown, and every field extracted from it inherits the
+    emphasis marks. Measured 2026-09-04: 1,327 of 1,959 storyline events, 20 of
+    259 open questions and 4 open forecast claims carried `**bold**` or
+    backticks — and a storyline event is read back by the digest, by dossier
+    consolidation and by entity timelines, while a curiosity topic is searched
+    verbatim. Markdown links collapse to their text; emphasis, code marks,
+    heading and bullet prefixes go; whitespace collapses.
+
+    NOT for the digest bodies themselves — those are meant to be markdown.
+    """
+    t = _MD_LINK_RE.sub(r"\1", text or "")
+    t = _MARKUP_RE.sub(" ", t)
+    t = _LEAD_JUNK_RE.sub("", t)
+    return _WS_RE.sub(" ", t).strip()
+
+
+_MARKUP_RE = re.compile(r"[`*_]{1,3}")
+_LEAD_JUNK_RE = re.compile(r"^[\s#>\-\*\d.)]+")
+_MD_LINK_RE = re.compile(r"\[([^\]]{1,120})\]\([^)]*\)")
+_WS_RE = re.compile(r"\s+")
+
+
+def strip_markup(text: str) -> str:
+    """Plain text from model output, for any field that is later SEARCHED,
+    SPOKEN, or fed back into a prompt.
+
+    Digest prose is markdown, and every field extracted from it inherits the
+    emphasis marks. Measured 2026-09-04: 1,327 of 1,959 storyline events, 20 of
+    259 open questions and 4 open forecast claims carried `**bold**` or
+    backticks — and a storyline event is read back by the digest, by dossier
+    consolidation and by entity timelines, while a curiosity topic is searched
+    verbatim. Markdown links collapse to their text; emphasis, code marks,
+    heading and bullet prefixes go; whitespace collapses.
+
+    NOT for the digest bodies themselves — those are meant to be markdown.
+    """
+    t = _MD_LINK_RE.sub(r"\1", text or "")
+    t = _MARKUP_RE.sub(" ", t)
+    t = _LEAD_JUNK_RE.sub("", t)
+    return _WS_RE.sub(" ", t).strip()
