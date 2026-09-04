@@ -527,6 +527,21 @@ async def get_kg_graph(
     return {"nodes": nodes, "links": links, "communities": legend}
 
 
+@router.get("/kg/timeline", dependencies=[Depends(require_auth)])
+async def kg_entity_timeline(
+    subject: str = Query(..., min_length=2, max_length=100),
+    days: int = Query(180, ge=1, le=3650),
+    limit: int = Query(40, ge=1, le=200),
+):
+    """Dated events for one entity: what was learned, what was REVISED (with
+    what replaced it), which story threads named it, and which consolidations
+    changed their mind about it. Read-only — the trail is written by the KG's
+    own bitemporal bookkeeping."""
+    from app.core.timelines import entity_timeline
+    events = await asyncio.to_thread(entity_timeline, get_db(), subject, days=days, limit=limit)
+    return {"subject": subject, "days": days, "count": len(events), "events": events}
+
+
 @router.get("/kg/stats", dependencies=[Depends(require_auth)])
 async def get_kg_stats():
     """Return KG statistics."""

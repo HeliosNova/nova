@@ -650,9 +650,26 @@ def _entities_needing_update(db) -> list[dict]:
 
 
 def _entity_sources(db, subject: str, since: str | None) -> str:
-    """An entity's consolidation material: its verified KG facts + recent digest
-    passages that mention it (bounded)."""
+    """An entity's consolidation material: a DATED timeline, its verified KG
+    facts, and recent digest passages that mention it (bounded).
+
+    The timeline was added 2026-09-03. This prompt asks for "5-10 dated bullets
+    of the major shifts, oldest→newest" while the material below carries no
+    dates and drops every superseded fact, so the model had to invent the
+    history it was being graded on. The KG has been bitemporal since 2026-05-16
+    and nothing read the trail. (Timelines are deliberately absent from digest
+    synthesis — see _synthesize_from_evidence — because prior context there
+    measurably costs grounding. Here prior understanding IS the product.)
+    """
     lines = []
+    try:
+        from app.core.timelines import timeline_block
+        block = timeline_block(db, subject, cap=4000)
+        if block:
+            lines.append(block)
+            lines.append("")
+    except Exception as e:
+        logger.debug("[Knowing] timeline unavailable for %r: %s", subject, e)
     try:
         facts = db.fetchall(
             "SELECT predicate, object, confidence FROM kg_facts "
