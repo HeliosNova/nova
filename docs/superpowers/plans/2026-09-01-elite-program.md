@@ -157,7 +157,7 @@
 Everything here came from looking at what Nova PRODUCED rather than at whether
 tests passed. Ordered by measured value.
 
-- [ ] **5.1 Ensemble the forecast probability.** Nova takes ONE verbalized `0.x`
+- [x] **5.1 Ensemble the forecast probability — DONE 2026-09-04 (3d4d1ce).** Confidence is now the mean of the stated value and 3 sampled estimates (base-rate-first prompt); `conf_spread` stored to answer 'does disagreement predict error' later; unreachable model keeps the stated number so a mint is never blocked; REGIME bumped to `2026-09-04-ensembled`. Nova takes ONE verbalized `0.x`
   from a single generation — the weakest method in the literature — and is 15
   points overconfident (hit 0.60 at stated 0.75, legacy regime). Sample the
   probability k times and aggregate. Cheap: the FORECAST line is a short
@@ -165,7 +165,7 @@ tests passed. Ordered by measured value.
   is attributable. Evidence: verbalized confidence is consistently poorly
   calibrated and sampling-based aggregation beats it (arxiv 2412.14737,
   Science Advances adp1528).
-- [ ] **5.2 Entailment cascade — 1.55x on the digest bottleneck, zero quality
+- [x] **5.2 Entailment cascade — DONE 2026-09-04 (bd173bd).** Narrow document first, full-width re-check only for the failures, at all three call sites. Verdicts identical to before; the naive trim was refused because it dropped 4 of 60 true sentences. **5.2 (original text)** Entailment cascade — 1.55x on the digest bottleneck, zero quality
   cost.** Entailment is 64% of a digest (19.8 of 30.8 min) with the GPU idle.
   Measured on 60 real pairs: a 2,754-char document scores 3.6x faster and
   agrees with the 5,508-char production document 93% of the time — but newly
@@ -173,7 +173,7 @@ tests passed. Ordered by measured value.
   Crucially nothing narrow-supported was rejected at full width, so scoring
   narrow first and re-checking ONLY the unsupported at full width gives
   verdicts identical to today at ~1.55x. Take the cascade, not the trim.
-- [ ] **5.3 Resolution criteria at mint.** Metaculus practice: a threshold and
+- [~] **5.3 Resolution criteria at mint — NOT SHIPPED, and deliberately.** Nova's own data refused the measurable half: no-number claims are unresolvable 6% of the time against 9% for numbered ones, so the falsifiability gate has no support here. What remains is an informativeness argument with no instrument behind it, and an unmeasured prompt change is exactly what let `(deep analysis)` climb for three days. Revisit only with a rubric that can score it. ORIGINAL: Metaculus practice: a threshold and
   an authoritative source in the FORECAST line. NOTE: the obvious version of
   this (reject claims with no number) was measured and REFUSED — no-number
   claims are unresolvable 6% of the time vs 9% for numbered ones. This is about
