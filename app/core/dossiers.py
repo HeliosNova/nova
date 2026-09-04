@@ -805,10 +805,10 @@ async def _update_dossier(db, cand: dict, sources: str, syn_model: str | None,
     try:
         from app.config import config as _cfg
         if getattr(_cfg, "ENABLE_FORECASTS", True):
-            from app.core.forecasts import parse_and_store_forecast
-            fid = await asyncio.to_thread(parse_and_store_forecast, db, out,
-                                          storyline_key=f"dossier:{cand['dkey'][:60]}",
-                                          source_monitor="Knowledge Consolidation")
+            from app.core.forecasts import parse_and_store_forecast_ensembled
+            fid = await parse_and_store_forecast_ensembled(
+                db, out, storyline_key=f"dossier:{cand['dkey'][:60]}",
+                source_monitor="Knowledge Consolidation", model=syn_model)
             if fid:
                 logger.info("[Knowing] forecast minted (#%s) from %r", fid, cand["title"])
             elif "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():

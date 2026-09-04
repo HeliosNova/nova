@@ -1344,6 +1344,22 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 35 (2026-09-04): spread of the sampled confidences. A single
+        # verbalized probability is the weakest estimator there is; forecasts are
+        # now minted from the mean of several samples, and the spread is kept so
+        # "does disagreement predict error" can be answered from data later.
+        if 35 not in applied:
+            conn.execute("BEGIN")
+            try:
+                cols = {r[1] for r in conn.execute("PRAGMA table_info(forecasts)")}
+                if "conf_spread" not in cols:
+                    conn.execute("ALTER TABLE forecasts ADD COLUMN conf_spread REAL")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (35,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

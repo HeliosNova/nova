@@ -179,7 +179,8 @@
   "resolved_at",
   "source_monitor",
   "attempts",
-  "regime"
+  "regime",
+  "conf_spread"
  ],
  "goals": [
   "id",

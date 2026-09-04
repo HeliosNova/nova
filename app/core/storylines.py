@@ -429,12 +429,12 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
     try:
         from app.config import config as _cfg
         if getattr(_cfg, "ENABLE_FORECASTS", True):
-            from app.core.forecasts import parse_and_store_forecast
-            # to_thread (2026-08-31): sync INSERT on the loop (forecasts.py:36
-            # tripwire); dossiers.py:701 already threads this same call.
-            _fid = await asyncio.to_thread(
-                parse_and_store_forecast, db, out, storyline_key=eff_key,
-                source_monitor="Storyline Tracker")
+            from app.core.forecasts import parse_and_store_forecast_ensembled
+            # The ensembled minter is async: it samples the probability a few
+            # times before storing, and threads the INSERT itself (forecasts.py
+            # tripwire on loop writes).
+            _fid = await parse_and_store_forecast_ensembled(
+                db, out, storyline_key=eff_key, source_monitor="Storyline Tracker")
             if not _fid and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
                 logger.warning("[Storyline] FORECAST line present but not stored for %r "
                                "— mint format drift?", eff_key)

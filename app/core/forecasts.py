@@ -54,8 +54,12 @@ _MIN_DAYS, _MAX_DAYS = 1, 365
 # runs. Calibration therefore scores WITHIN a regime, and any future change to
 # how forecasts are minted or graded bumps this string so the effect of the
 # change is measurable instead of averaged away.
-REGIME = "2026-09-02-dated"
+REGIME = "2026-09-04-ensembled"
 REGIME_LEGACY = "pre-2026-09-02"
+# Every regime this store has seen, newest first. A change to how forecasts are
+# minted or graded appends here and bumps REGIME, so its effect is measurable
+# instead of averaged into the record.
+REGIME_HISTORY = ("2026-09-04-ensembled", "2026-09-02-dated", REGIME_LEGACY)
 REGIME_CUTOVER = "2026-09-02 03:00:00"
 
 _DEFAULT_DAYS = 30
@@ -212,7 +216,8 @@ def _find_open_duplicate(db, claim: str, storyline_key: str):
 
 def create_forecast(db, claim: str, *, days: int | None = None, confidence: float,
                     storyline_key: str = "", source_monitor: str = "",
-                    resolves_on: str | None = None) -> int | None:
+                    resolves_on: str | None = None,
+                    spread: float | None = None) -> int | None:
     """Record a falsifiable forecast. Returns the row id or None.
 
     Resolution date = the explicit `resolves_on` date (or `days` from now,
@@ -253,9 +258,9 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
             return cur.lastrowid
         cur = db.execute(
             "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, "
-            "source_monitor, regime) VALUES (?, ?, ?, ?, 'open', ?, ?)",
+            "source_monitor, regime, conf_spread) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
             (claim[:500], storyline_key[:80], confidence,
-             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80], REGIME),
+             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80], REGIME, spread),
         )
         logger.info("[Forecast] minted #%s resolves %s (%.2f): %s",
                     cur.lastrowid, target.date().isoformat(), confidence, claim[:80])
@@ -269,6 +274,83 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
 # (2026-09-01) or the legacy "<N> days" horizon. The trailing 'confidence'
 # word is tolerated: the dossier prompt's own template reads '<0.x
 # confidence>', and the 27B dutifully writes the word.
+_CONF_SCHEMA = {
+    "type": "object",
+    "properties": {"probability": {"type": "number"}},
+    "required": ["probability"],
+}
+_CONF_PROMPT = (
+    "Estimate the probability that this claim turns out TRUE by its resolution "
+    "date. Think about the base rate for this kind of event first, then adjust "
+    "for what the context says.\n\n"
+    "CLAIM: {claim}\n\nCONTEXT:\n{context}\n\n"
+    'Reply JSON only: {{"probability": <number between 0 and 1>}}'
+)
+# Samples per forecast. Verbalized confidence from a single generation is the
+# weakest estimator in the literature and Nova's legacy record is 15 points
+# overconfident (hit 0.60 against a stated 0.75); aggregating several samples is
+# the cheapest known improvement. Three keeps the GPU cost at a few seconds per
+# mint (~20-35 mints/day).
+_CONF_SAMPLES = 3
+
+
+async def _ensemble_confidence(claim: str, context: str, *, k: int = _CONF_SAMPLES,
+                               model: str | None = None) -> tuple[float | None, float | None]:
+    """Mean and spread of k independently sampled probabilities for `claim`.
+
+    Returns (None, None) when the model cannot be reached or returns nothing
+    usable — the caller then keeps the confidence the forecast line stated, so
+    this can only improve an estimate, never block a mint.
+    """
+    prompt = _CONF_PROMPT.format(claim=claim[:400], context=(context or "")[:2500])
+    got: list[float] = []
+    for _ in range(max(1, k)):
+        try:
+            raw = await llm.invoke_nothink(
+                [{"role": "user", "content": prompt}], json_mode=True,
+                json_schema=_CONF_SCHEMA, max_tokens=60, temperature=0.7,
+                model=model, num_ctx=4096)
+            data = llm.extract_json_object(raw) if isinstance(raw, str) else (raw or {})
+            p = float(data.get("probability"))
+            if 0.0 <= p <= 1.0:
+                got.append(p)
+        except Exception as e:
+            logger.debug("[Forecast] confidence sample failed: %s", e)
+    if not got:
+        return None, None
+    mean = sum(got) / len(got)
+    spread = (max(got) - min(got)) if len(got) > 1 else 0.0
+    return mean, spread
+
+
+async def parse_and_store_forecast_ensembled(
+        db, text: str, *, storyline_key: str = "", source_monitor: str = "",
+        model: str | None = None, k: int = _CONF_SAMPLES):
+    """Mint a forecast, replacing the single stated confidence with the mean of
+    the stated value and k independently sampled estimates.
+
+    The stated number is kept in the average because it is the only estimate
+    written with the full analysis in context; the samples are what stop one
+    generation's number standing alone. The spread is recorded so a later
+    question — does disagreement predict error? — has data to answer it.
+    """
+    m = _FORECAST_LINE.search(text or "")
+    if not m:
+        return None
+    claim = m.group("claim").strip()
+    stated = float(m.group("conf")) if m.group("conf") else 0.55
+    mean, spread = await _ensemble_confidence(claim, text, k=k, model=model)
+    conf = stated if mean is None else (stated + mean * k) / (1 + k)
+    if mean is not None:
+        logger.info("[Forecast] confidence %.2f stated -> %.2f ensembled "
+                    "(%d samples, spread %.2f): %s", stated, conf, k, spread, claim[:70])
+    date = m.group("date")
+    days = int(m.group("days")) if m.group("days") else None
+    return await asyncio.to_thread(
+        create_forecast, db, claim, days=days, resolves_on=date, confidence=conf,
+        storyline_key=storyline_key, source_monitor=source_monitor, spread=spread)
+
+
 _FORECAST_LINE = re.compile(
     r"(?im)^\s*FORECAST:\s*(?P<claim>.+?)\s*\|\s*"
     r"(?:(?:resolves|resolve|resolution|by|due|on)\s*:?\s*)?"
