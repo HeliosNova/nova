@@ -282,7 +282,6 @@ async def _entail_gate_enrich_summaries(monitor_name: str, cand: list[tuple], mi
     # MiniCheck false-drop grounded summaries (the needle sat past the cut).
     # 8000 is where the sidecar caps anyway (_MAX_DOC_CHARS), so asking for 12000
     # only paid transfer cost for bytes the verifier never read.
-    pairs = [{"doc": body[:8000], "claim": s} for _it, body, s in cand]
     # Chunked (2026-08-29). This posted every pair in ONE 120s request, which a
     # 10-pair batch cannot finish, so under digest contention it timed out and
     # fail-opened. Observed live the same day: "entailment unavailable
@@ -295,20 +294,62 @@ async def _entail_gate_enrich_summaries(monitor_name: str, cand: list[tuple], mi
     # 90s budget leaves real headroom, and a failed chunk now degrades only its
     # own 3 items. Enrichment is background work — a longer tail is far cheaper
     # than an ungrounded publish.
-    _CHUNK, _CHUNK_TIMEOUT = 3, 90.0
+    #
+    # Narrow-first cascade (2026-09-04). Correct as that fix was, nobody costed
+    # it: entailment stopped conceding under contention and became the digest
+    # chain's dominant expense. Delivered monitor runs per active hour fell from
+    # 6.4 to 4.0 the following day and stayed there for five days, and the drop
+    # is invisible per-monitor — every monitor merely looks a little late.
+    #
+    # Entailment cost scales steeply with document length (measured the same day
+    # on 60 live pairs: 2,754 chars 2.42 s/pair, 5,508 chars 8.79 s/pair), so
+    # each summary is now scored against the HEAD of its own page first and only
+    # the ones that come up short are re-read at full width. That is exact by
+    # construction, not by luck: a claim entailed by part of a document is
+    # entailed by the document, so a narrow PASS needs no confirmation, and
+    # every narrow failure still gets the full 8,000 chars. The needle-past-the-
+    # cut case that motivated the wide window in the first place (2026-08-19) is
+    # precisely the case the second pass exists to cover — this cascade resolves
+    # that tension instead of re-litigating it.
+    _NARROW, _CHUNK, _NARROW_CHUNK, _CHUNK_TIMEOUT = 2600, 3, 6, 90.0
+
+    def _accepted(r: dict) -> bool:
+        """The verdict this gate would reach on `r` — the same test the keep
+        loop below applies, so the second pass re-checks exactly what the first
+        would have dropped and nothing else."""
+        if r.get("prob") == -1.0:
+            return True          # degraded: another pass buys another timeout
+        return (r.get("prob", 0.0) >= min_prob) if min_prob is not None             else bool(r.get("supported"))
+
     results: list[dict] = []
     try:
         async with httpx.AsyncClient(timeout=_CHUNK_TIMEOUT) as client:
-            for i in range(0, len(pairs), _CHUNK):
-                chunk = pairs[i:i + _CHUNK]
-                try:
-                    r = await client.post(f"{url}/check_batch", json={"pairs": chunk})
-                    r.raise_for_status()
-                    results.extend(r.json()["results"])
-                except Exception as e:
-                    logger.warning("[DomainRunner] native enrich chunk %d unavailable (%r) — "
-                                   "%d summary(s) kept unverified", i // _CHUNK, e, len(chunk))
-                    results.extend({"supported": True, "prob": -1.0} for _ in chunk)
+
+            async def _post(pairs: list[dict], chunk: int, tag: str) -> list[dict]:
+                out: list[dict] = []
+                for i in range(0, len(pairs), chunk):
+                    part = pairs[i:i + chunk]
+                    try:
+                        r = await client.post(f"{url}/check_batch", json={"pairs": part})
+                        r.raise_for_status()
+                        out.extend(r.json()["results"])
+                    except Exception as e:
+                        logger.warning("[DomainRunner] native enrich %s chunk %d unavailable "
+                                       "(%r) — %d summary(s) kept unverified",
+                                       tag, i // chunk, e, len(part))
+                        out.extend({"supported": True, "prob": -1.0} for _ in part)
+                return out
+
+            results = await _post([{"doc": body[:_NARROW], "claim": s}
+                                   for _it, body, s in cand], _NARROW_CHUNK, "narrow")
+            todo = [i for i, r in enumerate(results) if not _accepted(r)]
+            if todo:
+                full = await _post([{"doc": cand[i][1][:8000], "claim": cand[i][2]}
+                                    for i in todo], _CHUNK, "full")
+                for i, r2 in zip(todo, full):
+                    results[i] = r2
+            logger.info("[DomainRunner] native enrich %s: %d summary(s), "
+                        "%d needed the full page", monitor_name, len(cand), len(todo))
     except Exception as e:
         logger.warning("[DomainRunner] native enrich entailment unavailable (%r) — fail-open", e)
         return cand

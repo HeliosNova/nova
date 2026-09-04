@@ -9,6 +9,8 @@ of dropping; evidence is built per-ARTICLE (a busy host's later articles used
 to be amputated by the per-host [:24000] concatenation cap)."""
 from __future__ import annotations
 
+import re
+
 import pytest
 
 import app.monitors.deep_research as dr
@@ -60,11 +62,80 @@ def _fake_client_factory(script):
     return _FakeClient, calls
 
 
+# --------------------------------------------------------------------------
+# A stub that answers from CONTENT rather than call order.
+#
+# The gate decides how many requests to make and in what order, and it changes:
+# it now scores a narrow document first and re-checks only the failures at full
+# width (2026-09-04). A stub scripted by call index silently re-aims when that
+# happens - the same script then answers different questions and the test keeps
+# passing, or fails for a reason that has nothing to do with the gate. This one
+# entails a claim when the document carries enough of its content words, so a
+# test states what the sidecar KNOWS and the gate's verdicts are what is under
+# test.
+# --------------------------------------------------------------------------
+_STOP = {"the", "and", "for", "that", "this", "with", "from", "have", "has", "had",
+         "been", "were", "was", "are", "its", "their", "them", "they", "into",
+         "over", "also", "such", "when", "then", "than", "there", "here", "what",
+         "each", "other", "some", "more", "most", "will", "would", "could",
+         "about", "after", "before", "between", "which", "whose", "said", "says",
+         "but", "not", "any", "all", "one", "two", "new"}
+
+
+def _content_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower())
+            if len(w) > 3 and w not in _STOP]
+
+
+def _semantic_client_factory(threshold: float = 0.8):
+    """MiniCheck stand-in: a claim is entailed when the document carries at
+    least `threshold` of its content words."""
+    calls = {"n": 0, "payloads": [], "claims": []}
+
+    def _supported(doc: str, claim: str) -> bool:
+        words = _content_words(claim)
+        if not words:
+            return False
+        low = (doc or "").lower()
+        return sum(1 for w in words if w in low) / len(words) >= threshold
+
+    class _FakeClient:
+        def __init__(self, *a, **kw):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+        async def post(self, url, json=None):
+            calls["payloads"].append(json)
+            calls["n"] += 1
+            out = []
+            for pair in json["pairs"]:
+                calls["claims"].append(pair["claim"])
+                ok = _supported(pair["doc"], pair["claim"])
+                out.append({"supported": ok, "prob": 0.95 if ok else 0.03})
+            return _FakeResponse(out)
+
+    return _FakeClient, calls
+
+
 @pytest.fixture
 def minicheck_on():
     config.update(ENABLE_MINICHECK=True)
     yield
     config.update(ENABLE_MINICHECK=False)
+
+
+@pytest.fixture(autouse=True)
+def _forget_narrow_rates():
+    """The cascade remembers each call site's narrow-support rate in process,
+    so one test's evidence must not decide the next one's request pattern."""
+    dr._NARROW_RATE.clear()
+    yield
+    dr._NARROW_RATE.clear()
 
 
 @pytest.mark.asyncio
@@ -75,16 +146,10 @@ async def test_gate_disabled_is_noop():
 
 @pytest.mark.asyncio
 async def test_recite_and_drop(minicheck_on, monkeypatch):
-    # first batch: sentence1 supported, sentence2 unsupported (wrong host),
-    # sentence3 unsupported. second batch (alternates): apple claim entailed by
-    # cnbc.com; merger claim entailed by nobody.
-    first = [{"supported": True, "prob": 0.97},
-             {"supported": False, "prob": 0.04},
-             {"supported": False, "prob": 0.02}]
-    # alt pairs: (apple↔cnbc), (merger↔reuters)  — order follows per_host iteration
-    second = [{"supported": True, "prob": 0.93},
-              {"supported": False, "prob": 0.03}]
-    fake, calls = _fake_client_factory([first, second])
+    # The sidecar knows only what the two articles say: the Fed sentence is
+    # entailed by the source it cites, the Apple claim is entailed by cnbc.com
+    # (which it does NOT cite), and the merger claim is entailed by nobody.
+    fake, calls = _semantic_client_factory()
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", fake)
 
@@ -125,18 +190,20 @@ async def test_clause_rescue_keeps_anchored_sentence(minicheck_on, monkeypatch):
     # structurally transformative element is …") but the copula tail — the
     # factual core — IS entailed by the cited source: the sentence must be
     # KEPT with its citation, not dropped.
-    first = [{"supported": False, "prob": 0.02}]     # primary: whole sentence fails
-    second = [{"supported": True, "prob": 0.94}]     # clause pass: tail entailed
-    fake, calls = _fake_client_factory([first, second])
+    # The source entails the copula tail verbatim but not the analytic framing
+    # wrapped around it, so the whole sentence falls below the bar while its
+    # factual core clears it.
+    fake, calls = _semantic_client_factory()
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", fake)
 
     out, n = await dr._entailment_gate(FRAMED, FRAMED_ARTS)
     assert out == FRAMED and n == 0                  # kept verbatim, nothing changed
-    # the clause pass judged a SUB-claim, not the whole sentence again
-    clause_claim = calls["payloads"][1]["pairs"][0]["claim"]
-    assert "most structurally transformative" not in clause_claim
-    assert "election commission announcement" in clause_claim
+    # the rescue judged a SUB-claim, not the whole sentence again
+    subs = [c for c in calls["claims"]
+            if "election commission announcement" in c
+            and "most structurally transformative" not in c]
+    assert subs, f"no sub-claim was ever checked; saw {calls['claims']}"
 
 
 @pytest.mark.asyncio
@@ -149,9 +216,7 @@ async def test_fabrication_drops_even_with_clause_pass(minicheck_on, monkeypatch
         ("Tech story", "https://cnbc.com/apple", "Apple launched a new laptop with the M5 chip today."),
         ("Fed report", "https://reuters.com/fed", "The Federal Reserve held rates steady at 4 percent."),
     ]
-    first = [{"supported": False, "prob": 0.02}]
-    clause = [{"supported": False, "prob": 0.03}] * 8   # replayed for however many sub-claims
-    fake, _ = _fake_client_factory([first, clause])
+    fake, _ = _semantic_client_factory()
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", fake)
 
@@ -193,9 +258,7 @@ async def test_analytical_sentence_decited_not_dropped(minicheck_on, monkeypatch
             "sector-wide fatigue with fragmented offerings (cnbc.com).\n")
     arts = [("Tech story", "https://cnbc.com/apple",
              "Apple launched a new laptop with the M5 chip today.")]
-    first = [{"supported": False, "prob": 0.03}]
-    rest = [{"supported": False, "prob": 0.03}] * 8
-    fake, _ = _fake_client_factory([first, rest])
+    fake, _ = _semantic_client_factory()
     import httpx
     monkeypatch.setattr(httpx, "AsyncClient", fake)
 
@@ -310,3 +373,62 @@ def test_scrub_chrome_removes_player_junk():
     # prose that merely mentions a chrome word survives
     prose = "The advertisement industry spent 40 billion dollars on streaming platforms this year."
     assert dr._scrub_chrome(prose) == prose
+# ---------------------------------------------------------------------------
+# The narrow-first cascade (2026-09-04)
+#
+# Entailment was 64% of a digest's wall clock, and cost scales steeply with
+# document length. Every pair is now scored against ONE article first and only
+# the failures are re-checked against two. Measured on 60 real pairs, nothing
+# the narrow document supported was rejected at full width, so the cascade
+# reproduces the full-width verdict set rather than trading recall for speed.
+# These two tests pin both halves of that claim: a narrow failure still gets
+# its full-width verdict, and a narrow pass costs exactly one request.
+# ---------------------------------------------------------------------------
+SPLIT_ARTS = [
+    ("The deal", "https://example.com/a1",
+     "Alpha Corp acquired Beta Labs in a transaction announced this week."),
+    ("The terms", "https://example.com/a2",
+     "The acquisition was valued at 4 billion dollars and closed in March."),
+]
+SPLIT_TEXT = ("* Alpha Corp acquired Beta Labs for 4 billion dollars in March "
+              "(example.com).\n")
+
+
+@pytest.mark.asyncio
+async def test_a_narrow_failure_is_rechecked_at_full_width(minicheck_on, monkeypatch):
+    """The evidence is split across two articles on one host, so no single
+    article entails the sentence and the pair of them does. The verdict must be
+    the full-width one — the sentence survives — and the wide document must be
+    read only after the narrow one came up short."""
+    fake, calls = _semantic_client_factory()
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", fake)
+
+    out, n = await dr._entailment_gate(SPLIT_TEXT, SPLIT_ARTS)
+    assert out == SPLIT_TEXT and n == 0
+
+    assert calls["n"] == 2, f"expected narrow then full, got {calls['n']} request(s)"
+    narrow_doc = calls["payloads"][0]["pairs"][0]["doc"]
+    full_doc = calls["payloads"][1]["pairs"][0]["doc"]
+    assert "billion" not in narrow_doc, "the narrow pass read more than one article"
+    assert "billion" in full_doc and "acquired Beta Labs" in full_doc
+
+
+@pytest.mark.asyncio
+async def test_a_narrow_pass_never_pays_for_the_full_document(minicheck_on, monkeypatch):
+    """The cheap path is the point: a sentence its own source entails outright
+    is scored once, against one article."""
+    arts = [("Fed report", "https://reuters.com/fed",
+             "The Federal Reserve held rates steady at 4 percent."),
+            ("Fed sidebar", "https://reuters.com/fed2",
+             "Policymakers signalled patience on any further move."),
+            ]
+    text = "* The Federal Reserve held rates steady at 4 percent this week (reuters.com).\n"
+    fake, calls = _semantic_client_factory()
+    import httpx
+    monkeypatch.setattr(httpx, "AsyncClient", fake)
+
+    out, n = await dr._entailment_gate(text, arts)
+    assert out == text and n == 0
+    assert calls["n"] == 1, "a supported claim must not trigger the full-width pass"
+    assert "Policymakers" not in calls["payloads"][0]["pairs"][0]["doc"]

@@ -3032,6 +3032,33 @@ def _is_analytical(claim: str) -> bool:
     return bool(_ANALYTICAL_RE.search(claim))
 
 
+# How often the NARROW document alone entails a claim, per (monitor, call site).
+#
+# The cascade below is only worth running while this is high, and it varies far
+# more by topic than any single sample suggested: a 60-pair offline sample sat at
+# 70% supported, while two live digests on 2026-09-04 ran 83% and 87%
+# UNSUPPORTED — topics whose cited hosts had no matching article, where both
+# widths fail and a narrow pass is pure tax. So the rate is measured per call
+# site and remembered, and a site known to fail skips the narrow pass entirely
+# rather than paying a probe every cycle. In-process on purpose: it is a cost
+# heuristic, not a fact, and a restart should re-measure rather than trust a
+# stale number.
+_NARROW_RATE: dict[str, float] = {}
+_NARROW_MIN_RATE = 0.30      # break-even is ~0.275 (2.42s narrow vs 8.79s full)
+_NARROW_PROBE_N = 8
+
+
+def _narrow_worth_it(key: str) -> bool:
+    """Unknown sites are probed; known-bad ones are not re-probed every cycle."""
+    prior = _NARROW_RATE.get(key)
+    return prior is None or prior >= _NARROW_MIN_RATE
+
+
+def _record_narrow_rate(key: str, rate: float) -> None:
+    prior = _NARROW_RATE.get(key)
+    _NARROW_RATE[key] = rate if prior is None else (prior + rate) / 2.0
+
+
 def _sub_claims(claim: str) -> list[str]:
     """Informative sub-claims of a synthesis sentence: its clauses plus the
     copula/appraisal tail ("the most transformative element IS <fact>" → the
@@ -3246,38 +3273,78 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
         return results
 
     async def _check_cascade(specs: list[tuple[list[str], str]], *,
-                             fail_open: bool) -> list[dict] | None:
-        """Score every pair against the NARROW document first, then re-check at
-        full width only the ones it could not support.
+                             fail_open: bool, site: str) -> list[dict] | None:
+        """Score pairs against the NARROW document first, then re-check at full
+        width only the ones it could not support.
 
         Measured on 60 real claim/document pairs (2026-09-04): the narrow
         document agrees with the full one on 93% of verdicts, and — this is what
         makes the cascade exact rather than a trade — NOTHING the narrow
         document supported was rejected at full width. So narrow-supported is a
         subset of full-supported, and re-checking only the narrow failures
-        reproduces the full-width verdict set while scoring most pairs at a
-        third of the cost. Taking the trim alone would have been 3x faster and
-        dropped 4 of 60 true sentences; that is a quality cut, and refused.
+        reproduces the full-width verdict set.
+
+        Exact is not the same as cheap, and the first version of this said it
+        was. A narrow pass costs 2.42 s a pair and a full one 8.79, so the
+        cascade pays only while more than ~27% of pairs clear the narrow
+        document. That sample sat at 70%; two live digests the same morning ran
+        83% and 87% UNSUPPORTED, and there the cascade would have been ~10%
+        SLOWER. So each call site measures its own rate (`_NARROW_RATE`) and a
+        site known to fail goes straight to full width. The clause rescue and
+        the alternate re-cite settle there quickly, which is right: both exist
+        to re-examine claims that already failed once.
         """
-        narrow = [{"doc": _doc_for(h, c, narrow=True), "claim": c} for h, c in specs]
-        res = await _check_pairs(narrow, fail_open=fail_open)
-        if res is None:
-            return None
-        todo = [i for i, r in enumerate(res) if not r.get("supported")]
+        key = f"{label}:{site}"
+        n = len(specs)
+
+        def _full(idx):
+            return [{"doc": _doc_for(specs[i][0], specs[i][1]), "claim": specs[i][1]}
+                    for i in idx]
+
+        def _narrow(idx):
+            return [{"doc": _doc_for(specs[i][0], specs[i][1], narrow=True),
+                     "claim": specs[i][1]} for i in idx]
+
+        res: list[dict | None] = [None] * n
+        rate = None
+        if _narrow_worth_it(key):
+            # Spread the probe rather than taking the head: a briefing's opening
+            # sentences are its lead, and their support rate is not the rest's.
+            probe_idx = (list(range(n)) if n <= _NARROW_PROBE_N else
+                         sorted({round(i * n / _NARROW_PROBE_N)
+                                 for i in range(_NARROW_PROBE_N)}))
+            probe = await _check_pairs(_narrow(probe_idx), fail_open=fail_open)
+            if probe is None:
+                return None
+            for i, r in zip(probe_idx, probe):
+                res[i] = r
+            rate = sum(1 for r in probe if r.get("supported")) / max(1, len(probe))
+            _record_narrow_rate(key, rate)
+            rest = [i for i in range(n) if res[i] is None]
+            if rest and rate >= _NARROW_MIN_RATE:
+                more = await _check_pairs(_narrow(rest), fail_open=fail_open)
+                if more is None:
+                    return None
+                for i, r in zip(rest, more):
+                    res[i] = r
+
+        n_narrow = sum(1 for r in res if r is not None)
+        todo = [i for i in range(n) if res[i] is None or not res[i].get("supported")]
         if todo:
-            full = [{"doc": _doc_for(specs[i][0], specs[i][1]), "claim": specs[i][1]}
-                    for i in todo]
-            res_full = await _check_pairs(full, fail_open=fail_open)
+            res_full = await _check_pairs(_full(todo), fail_open=fail_open)
             if res_full is None:
-                return None if not fail_open else res
+                if not fail_open or any(res[i] is None for i in todo):
+                    return None
+                return [r for r in res]          # narrow verdicts, all accepted
             for i, r2 in zip(todo, res_full):
                 res[i] = r2
-        logger.info("[entail-cascade] %s: %d pair(s), %d needed the full document",
-                    label, len(specs), len(todo))
-        return res
+        logger.info("[entail-cascade] %s/%s: %d pair(s), %d scored narrow "
+                    "(support %s), %d read at full width", label, site, n, n_narrow,
+                    "unprobed" if rate is None else f"{rate:.0%}", len(todo))
+        return [r for r in res]
 
     results = await _check_cascade([(hosts, _claim_of(st)) for _, st, hosts in checks],
-                                   fail_open=True)
+                                   fail_open=True, site="gate")
     if results is None:
         return text, 0
     if all(r.get("prob") == -1.0 for r in results):
@@ -3319,7 +3386,7 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
             clause_meta.append((li, st))
     anchored: set[tuple[int, str]] = set()
     if clause_specs:
-        c_res = await _check_cascade(clause_specs, fail_open=False) or []
+        c_res = await _check_cascade(clause_specs, fail_open=False, site="clause") or []
         for key, res in zip(clause_meta, c_res):
             if res.get("supported"):
                 anchored.add(key)
@@ -3357,7 +3424,7 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
             alt_meta.append((li, st, h))
     alt_results: list[dict] = []
     if alt_pairs:
-        alt_results = await _check_cascade(alt_pairs, fail_open=False) or []
+        alt_results = await _check_cascade(alt_pairs, fail_open=False, site="alt") or []
     entailed_by: dict[tuple[int, str], str] = {}
     for (li, st, h), res in zip(alt_meta, alt_results):
         if res.get("supported") and (li, st) not in entailed_by:
