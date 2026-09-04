@@ -1,4 +1,4 @@
-"""How much work is Nova actually delivering, and what is it waiting on?
+r"""How much work is Nova actually delivering, and what is it waiting on?
 
 Written 2026-09-04, after a throughput regression sat undetected for a week.
 Delivered monitor runs per active hour fell from 6.4 to 3.8 on 2026-08-28 and
@@ -29,9 +29,13 @@ minutes to exclude idle stretches and concluded digests had not slowed down -
 the cap had excluded exactly the expensive runs. A single digest measured 52
 minutes the morning this was written.
 
-Read-only. Run it before and after any deploy that touches the digest chain:
+Read-only. Run it before and after any deploy that touches the digest chain.
+The image ships only scripts/__init__.py, so run it in an ephemeral container
+with the tree and the data volume mounted rather than through `docker exec`:
 
-    docker exec nova-app python /app/scripts/throughput_panel.py [days]
+    MSYS_NO_PATHCONV=1 docker run --rm -v "F:\Helios Project\nova_:/app" \
+        -v nova__nova_data:/data -w /app nova-app:latest \
+        python scripts/throughput_panel.py [days]
 """
 from __future__ import annotations
 
