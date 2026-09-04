@@ -26,6 +26,8 @@ treated as dead).
 """
 from __future__ import annotations
 
+import hashlib
+
 import logging
 import os
 from dataclasses import dataclass
@@ -341,6 +343,87 @@ def schedule_pressure(db, *, days: int = 7) -> dict:
     }
 
 
+CONSTANT_MIN_RUNS = 8
+CONSTANT_WINDOW_DAYS = 14
+
+
+def constant_monitors(db, *, days: int = CONSTANT_WINDOW_DAYS,
+                      min_runs: int = CONSTANT_MIN_RUNS) -> list[dict]:
+    """Monitors whose output has been byte-identical every run in the window.
+
+    A pathway check asks whether a writer still writes. This asks the next
+    question: is what it writes worth the slot? Found on 2026-09-04 by one ad-hoc
+    query — Training Job Watch had returned "no training history yet" 101 times
+    in 14 days, hourly, for a trainer archived in June, while the schedule was
+    delivering 37% of what it demanded. Goal Derivation and Auto-Tool Synthesis
+    were the same shape.
+
+    A constant monitor is not necessarily broken: it can be legitimately idle
+    for want of input, which is why this is a report and not an alarm. What it
+    is, always, is a candidate for a longer cadence.
+    """
+    try:
+        rows = db.fetchall(
+            "SELECT m.name AS name, mr.value AS value "
+            "FROM monitor_results mr JOIN monitors m ON m.id = mr.monitor_id "
+            "WHERE m.enabled = 1 AND mr.value IS NOT NULL "
+            f"AND mr.created_at >= date('now', '-{int(days)} days')",
+        )
+    except Exception:
+        return []
+    seen: dict[str, set[str]] = {}
+    counts: dict[str, int] = {}
+    for r in rows:
+        name = r["name"]
+        seen.setdefault(name, set()).add(hashlib.md5(
+            (r["value"] or "").encode("utf-8", "replace")).hexdigest())
+        counts[name] = counts.get(name, 0) + 1
+    out = [{"name": n, "runs": counts[n], "distinct": len(h)}
+           for n, h in seen.items()
+           if len(h) == 1 and counts[n] >= min_runs]
+    out.sort(key=lambda d: -d["runs"])
+    return out
+
+
+THROUGHPUT_STEP_DROP = 0.20      # a fall this deep is a cost change, not weather
+
+
+def throughput_step(db, *, days: int = 18) -> dict | None:
+    """Delivered runs per ACTIVE hour, oldest third against newest third.
+
+    Schedule pressure says the cadences are not being met; it cannot say when
+    that started or that anything changed, because it has no before. This does.
+    Measured 2026-09-04: runs per active hour fell 6.5 -> 4.1 on 2026-08-28 and
+    stayed there for a week with nothing noticing — the app was up ~24 hours a
+    day, digests kept their length, their sources and their scores, and every
+    monitor merely ran a little less often.
+
+    Per ACTIVE hour, not per day, so a genuine outage reads as downtime rather
+    than as a cost regression.
+    """
+    try:
+        rows = db.fetchall(
+            "SELECT substr(created_at, 1, 10) AS day, "
+            "COUNT(*) AS runs, COUNT(DISTINCT substr(created_at, 12, 2)) AS hrs "
+            "FROM monitor_results "
+            f"WHERE created_at >= date('now', '-{int(days)} days') "
+            "GROUP BY day ORDER BY day")
+    except Exception:
+        return None
+    # Drop today: a partial day always reads as a fall.
+    series = [(r["day"], r["runs"] / r["hrs"]) for r in rows if r["hrs"]][:-1]
+    if len(series) < 8:
+        return None
+    k = max(3, len(series) // 3)
+    old = sum(v for _d, v in series[:k]) / k
+    new = sum(v for _d, v in series[-k:]) / k
+    if not old:
+        return None
+    return {"before": round(old, 2), "after": round(new, 2),
+            "change": round((new - old) / old, 3), "days": len(series),
+            "stepped_down": (new - old) / old <= -THROUGHPUT_STEP_DROP}
+
+
 def liveness_report(db, *, cfg=None, now: datetime | None = None
                     ) -> tuple[str, str, dict[str, str | int | float]]:
     """(status, summary, fields) for the Pathway Liveness monitor.
@@ -368,6 +451,16 @@ def liveness_report(db, *, cfg=None, now: datetime | None = None
             if press["starved"]:
                 worst = press["starved"][0]
                 f["most_starved"] = f"{worst['name']} at {worst['ratio']:.0%}"
+        const = constant_monitors(db)
+        if const:
+            f["saying_nothing"] = ", ".join(
+                f"{c['name']} ({c['runs']}x identical)" for c in const[:3])
+        step = throughput_step(db)
+        if step and step["stepped_down"]:
+            f["throughput_step"] = (
+                f"{step['before']:.1f} -> {step['after']:.1f} runs/active hour "
+                f"({step['change']:+.0%} over {step['days']}d) — something costs "
+                f"more per run than it used to")
         return f
     if warming:
         fields["warming"] = len(warming)
