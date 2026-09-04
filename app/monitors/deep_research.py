@@ -2852,7 +2852,6 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
         return 0
     bodies_blob = " ".join((b or "").lower() for _, _, b in (articles or []))
     combined = (bodies_blob + " " + " ".join(f.lower() for _, _, f in findings)).strip()
-    src_texts = [f.lower() for _, _, f in findings]
     stored = gate_rejected = garbage = 0
     for c in cands[:10]:
         if not isinstance(c, dict):
