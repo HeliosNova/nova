@@ -25,8 +25,6 @@ _WRITE_LOCK_TIMEOUT = 120.0
 _instances: dict[str, "SafeDB"] = {}
 _instance_lock = threading.Lock()
 
-SCHEMA_VERSION = 1
-
 SCHEMA_SQL = """
 -- Conversations
 CREATE TABLE IF NOT EXISTS conversations (
@@ -1675,11 +1673,6 @@ def get_db(db_path: str | None = None) -> SafeDB:
         if db_path not in _instances:
             _instances[db_path] = SafeDB(db_path)
         return _instances[db_path]
-
-
-def get_async_db(db_path: str | None = None) -> AsyncSafeDB:
-    """Get an AsyncSafeDB wrapper for the given path."""
-    return AsyncSafeDB(get_db(db_path))
 
 
 def close_all() -> None:

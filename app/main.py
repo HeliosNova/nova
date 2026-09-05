@@ -614,10 +614,14 @@ async def lifespan(app: FastAPI):
     if channel_tasks:
         await asyncio.gather(*channel_tasks, return_exceptions=True)
 
-    # Unload Whisper model
+    # Unload the voice models. BOTH of them: shutdown released Whisper and left
+    # Piper resident, even though the TTS endpoint loads it lazily on first use
+    # and unload_synthesizer() was written for exactly this (2026-09-04). Found
+    # while auditing dead code — the function was not dead, it was unwired.
     if config.ENABLE_VOICE:
-        from app.core.voice import unload_transcriber
+        from app.core.voice import unload_synthesizer, unload_transcriber
         unload_transcriber()
+        unload_synthesizer()
 
     # Cancel background tasks
     await task_manager.cancel_all()

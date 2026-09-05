@@ -85,7 +85,6 @@ _DOMAIN_PROFILES: dict[str, tuple[str, str, str]] = {
 
 # Date patterns we'll look for in URLs and snippets to confirm freshness.
 _URL_DATE_RE = re.compile(r"/(\d{4})[-/](\d{1,2})[-/](\d{1,2})/?")
-_URL_YEAR_RE = re.compile(r"/(\d{4})/")
 # Month-name + year inside URL slug, e.g. /ai-models-april-2026/, /april-2026-roundup/, /apr2026/
 _URL_SLUG_MONTH_YEAR_RE = re.compile(
     r"(?i)(?:^|[/\-_])("
@@ -939,79 +938,6 @@ def _confirm_fresh(
     # the caller (run_domain_study) will fetch the page and try OG/JSON-LD
     # meta tags. That's slower but correct.
     return None
-
-
-_FORMAT_PROMPT = """You are formatting a Domain Study report. The research has already been done — your ONLY job is to render the items below into the exact required format.
-
-DOMAIN: {label}
-EMOJI: {emoji}
-TODAY: {today_human}
-
-ITEMS (already verified fresh — DO NOT question the dates):
-
-{items_block}
-
-═══ REQUIRED OUTPUT — copy this format EXACTLY ═══
-
-## {emoji} {label} — {today_human}
-
-**1. [Concise headline derived from item 1's title, ≤80 chars]**
-*{emoji} Source: [outlet from item 1] · Date: {today_human_short} · [URL from item 1]*
-[Write 2-3 sentences using ONLY the snippet content provided for item 1. Include one named entity or specific number from the snippet.]
-
-**2. [Headline from item 2]**
-*{emoji} Source: ... · Date: ... · [URL]*
-[2-3 sentences from item 2's snippet]
-
-(continue for all provided items)
-
-═══ HARD RULES ═══
-- Use the EXACT date provided for each item — do not adjust, hedge, or invent dates
-- Use the EXACT URL — do not modify the domain or path
-- Do not add items that aren't in the list above
-- Do not use phrases like "approximately", "around", "early/mid/late"
-- Do not include a "Sources:" footer
-- Start your response with the `##` header — no preamble
-"""
-
-
-async def _format_with_llm(label: str, emoji: str, items: list[dict]) -> str:
-    """Hand a verified-fresh list to the LLM purely for formatting.
-    The LLM has no choice about dates or sources — only headline phrasing
-    and short summaries from the provided snippets.
-    """
-    from app.core.llm import invoke_nothink
-
-    today = datetime.now(timezone.utc)
-    today_human = today.strftime("%B %d, %Y")
-    today_short = today.strftime("%b %d, %Y")
-
-    items_block_lines = []
-    for i, it in enumerate(items, 1):
-        items_block_lines.append(
-            f"--- Item {i} ---\n"
-            f"  TITLE: {it['title']}\n"
-            f"  OUTLET: {it['outlet']}\n"
-            f"  DATE: {it['date_str']}\n"
-            f"  URL: {it['url']}\n"
-            f"  SNIPPET: {it['snippet'][:600]}\n"
-        )
-    items_block = "\n".join(items_block_lines)
-
-    prompt = _FORMAT_PROMPT.format(
-        label=label, emoji=emoji,
-        today_human=today_human, today_human_short=today_short,
-        items_block=items_block,
-    )
-    try:
-        out = await invoke_nothink(
-            [{"role": "user", "content": prompt}],
-            max_tokens=1500, temperature=0.2,
-        )
-    except Exception as e:
-        logger.warning("[DomainRunner] format LLM failed: %s", e)
-        return ""
-    return (out or "").strip()
 
 
 _HTML_TAG_RE = re.compile(r"<[^>]+>")

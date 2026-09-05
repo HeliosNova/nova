@@ -216,11 +216,6 @@ async def wait_for_interactive_quiet(max_wait_s: float = 300.0, poll_s: float = 
     return waited
 
 
-def get_capabilities() -> ProviderCapabilities:
-    """Get the current provider's capabilities."""
-    return get_provider().capabilities
-
-
 # ---------------------------------------------------------------------------
 # Module-level API (delegates to current provider)
 #

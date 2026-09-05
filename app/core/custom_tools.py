@@ -196,62 +196,7 @@ def _check_dynamic_tool_safety_text(code: str) -> str | None:
 # Runtime sandbox preamble — injected into every dynamic tool script.
 # Defence-in-depth for sandboxed/standard tiers. At 'full'/'none' the
 # preamble is replaced with a no-op so tools can hit network and disk freely.
-_SANDBOX_PREAMBLE_STRICT = '''\
-import sys as _sys
-
-# --- Block network access at runtime ---
-class _BlockedSocket:
-    def __init__(self, *a, **kw):
-        raise PermissionError("Network access is blocked in dynamic tools")
-    def __getattr__(self, name):
-        raise PermissionError("Network access is blocked in dynamic tools")
-
-# Poison the socket module so any network library fails
-class _FakeSocketModule:
-    socket = _BlockedSocket
-    AF_INET = AF_INET6 = SOCK_STREAM = SOCK_DGRAM = 0
-    def __getattr__(self, name):
-        if callable(getattr(type(self), name, None)):
-            return lambda *a, **kw: (_ for _ in ()).throw(
-                PermissionError("Network access is blocked in dynamic tools"))
-        raise PermissionError("Network access is blocked in dynamic tools")
-
-_sys.modules["socket"] = _FakeSocketModule()
-_sys.modules["http"] = type(_sys)("http")
-_sys.modules["http.client"] = type(_sys)("http.client")
-_sys.modules["urllib"] = type(_sys)("urllib")
-_sys.modules["urllib.request"] = type(_sys)("urllib.request")
-
-# --- Restrict open() to read-only in sandbox dir ---
-_sandbox_dir = _sys.modules["__main__"].__dict__.get("_SANDBOX_DIR", ".")
-_original_open = open
-
-def _restricted_open(file, mode="r", *args, **kwargs):
-    if any(m in str(mode) for m in ("w", "a", "x", "+")):
-        from pathlib import Path as _P
-        resolved = _P(str(file)).resolve()
-        sandbox = _P(_sandbox_dir).resolve()
-        if not (resolved == sandbox or str(resolved).startswith(str(sandbox) + _sys.modules["os.path"].sep if "os.path" in _sys.modules else str(sandbox))):
-            raise PermissionError(
-                f"Write access outside sandbox dir is blocked: {file}"
-            )
-    return _original_open(file, mode, *args, **kwargs)
-
-try:
-    import builtins as _builtins
-    _builtins.open = _restricted_open
-except Exception:
-    pass
-
-del _sys, _BlockedSocket, _FakeSocketModule
-'''
-
 _SANDBOX_PREAMBLE_PERMISSIVE = "# (no runtime sandbox — owner directive)\n"
-
-
-def _sandbox_preamble() -> str:
-    """Per owner directive 2026-04-25: no runtime sandbox. Sovereign machine."""
-    return _SANDBOX_PREAMBLE_PERMISSIVE
 
 
 # Use the no-op preamble at module-level too (DynamicTool.execute reads this)

@@ -544,10 +544,6 @@ def _detect_category(query: str) -> str:
     return "general"
 
 
-def _looks_like_news(query: str) -> bool:
-    return _detect_category(query) == "news"
-
-
 def _merge_unique(
     results_lists: list[list[SearchResult]],
     *,

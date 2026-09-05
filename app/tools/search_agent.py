@@ -80,35 +80,8 @@ def _score_result(title: str, url: str, snippet: str) -> int:
     return score
 
 
-_RESULT_RE = re.compile(
-    r"\[\d+\]\s*\(([^)]+)\)\s*(.+?)\n\s*(https?://\S+)\n\s*(.+?)(?=\n\[|$)",
-    re.DOTALL,
-)
-
-
-def _parse_search_output(text: str) -> list[dict]:
-    """Parse the format produced by native_search.format_results into dicts."""
-    out: list[dict] = []
-    for m in _RESULT_RE.finditer(text or ""):
-        engine, title, url, snippet = m.group(1), m.group(2).strip(), m.group(3).strip(), m.group(4).strip()
-        out.append({"engine": engine, "title": title, "url": url, "snippet": snippet})
-    return out
-
-
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
 _WHITESPACE_RE = re.compile(r"\s+")
-
-
-def _strip_html(html: str) -> str:
-    """Crude HTML→text. Good enough for extracting paragraphs."""
-    if not html:
-        return ""
-    # Remove script/style blocks first
-    html = re.sub(r"<(?:script|style)[^>]*>.*?</(?:script|style)>",
-                  " ", html, flags=re.DOTALL | re.IGNORECASE)
-    text = _HTML_TAG_RE.sub(" ", html)
-    text = _WHITESPACE_RE.sub(" ", text)
-    return text.strip()
 
 
 _EXTRACT_PROMPT = (

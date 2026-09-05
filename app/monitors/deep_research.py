@@ -551,31 +551,6 @@ _FACT_PROMPT = (
 )
 
 
-async def _headlines(label: str) -> list[str]:
-    """Recent headlines for the domain, across engines/modes, blocked hosts
-    removed. Searches run concurrently — each can sit on the 30s engine timeout,
-    so serial would cost minutes."""
-    from app.tools import native_search
-    year = _NOW().strftime("%Y")
-
-    async def _s(q, mode):
-        try:
-            return await native_search.search(q, max_results=12, mode=mode)
-        except Exception:
-            return []
-
-    queries = [(f"{label} news {year}", "news"),
-               (f"{label} biggest news this week", "news"),
-               (f"{label} latest developments", "general")]
-    results = await asyncio.gather(*[_s(q, m) for q, m in queries])
-    heads = []
-    for rs in results:
-        for r in rs:
-            if r.title and not _blocked(r.url) and not _too_old(getattr(r, "published_date", "")):
-                heads.append(r.title)
-    return list(dict.fromkeys(heads))  # dedup, keep order
-
-
 # Outlet-homepage / feed-channel "headlines" that describe the OUTLET rather than an
 # event ("Associated Press News publishes breaking headlines", "BBC Home reports world
 # news and business updates", "<Outlet> Today covers latest developments in <region>").

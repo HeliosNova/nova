@@ -254,44 +254,6 @@ def format_plan_for_prompt(plan: dict) -> str:
     return "[PLAN]\n" + "\n".join(lines) + "\n[Follow this plan step by step.]"
 
 
-_DECOMPOSABLE_RE = re.compile(
-    r"\b(compare|contrast|analyze|evaluate|examine|assess)\b"
-    r".{0,150}"
-    r"\b(dimension|aspect|criterion|factor|angle|metric|perspective|front)\w*"
-    r"\s*[:：,]",
-    re.IGNORECASE | re.DOTALL,
-)
-
-
-def is_decomposable(query: str) -> bool:
-    """Return True if the query enumerates 2+ explicit dimensions/aspects to analyze.
-
-    Detects patterns like "compare X vs Y across N dimensions: a, b, c" or
-    "analyze these aspects: latency, throughput, cost".
-    """
-    if not _DECOMPOSABLE_RE.search(query):
-        return False
-    colon_match = re.search(r"[:：]\s*(.+)", query, re.DOTALL)
-    if not colon_match:
-        return False
-    raw = colon_match.group(1)
-    items = [x.strip() for x in re.split(r",\s*|\s+and\s+", raw) if x.strip() and len(x.strip()) > 1]
-    return len(items) >= 2
-
-
-def _extract_sub_questions(query: str) -> list[str]:
-    """Parse an enumerated-dimension query into one sub-question per dimension."""
-    colon_match = re.search(r"[:：]\s*(.+)", query, re.DOTALL)
-    if not colon_match:
-        return []
-    raw = colon_match.group(1).strip()
-    items = [x.strip() for x in re.split(r",\s*|\s+and\s+", raw) if x.strip() and len(x.strip()) > 1]
-    if len(items) < 2:
-        return []
-    base = query[: colon_match.start()].strip().rstrip(":,").strip()
-    return [f"{base} — focus specifically on {item}" for item in items]
-
-
 async def solve_sub_questions(
     sub_questions: list[dict],
     user_facts: str = "",
