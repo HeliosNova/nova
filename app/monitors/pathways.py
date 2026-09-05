@@ -84,6 +84,14 @@ PATHWAYS: tuple[Pathway, ...] = (
     Pathway("question_ledger", 48, "dossier_questions", "last_seen_at",
             flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
             describe="the open-questions frontier was reconciled"),
+    # The ledger's other half. sync_after_consolidation writes a row for every
+    # REVISED: line a consolidation emits, so this going quiet while
+    # question_ledger keeps writing means the dossiers stopped CHANGING their
+    # mind — they are being rewritten but no longer revising anything, which
+    # reads as a healthy knowing tier from every other angle (2026-09-04).
+    Pathway("belief_revisions", 48, "belief_revisions", "created_at",
+            flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
+            describe="a consolidation recorded a changed belief"),
     Pathway("forecast_minting", 48, "forecasts", "created_at",
             flag="ENABLE_FORECASTS", describe="a falsifiable forecast was minted"),
     Pathway("forecast_resolution", 48, "forecasts", "resolved_at",
@@ -120,10 +128,26 @@ PATHWAYS: tuple[Pathway, ...] = (
     Pathway("eval_harness", 48, path="{EVAL_REPORT_PATH}/eval_history.jsonl",
             flag="ENABLE_EVAL_HARNESS", monitor="Quality Eval Harness",
             describe="the nightly eval appended its history"),
+    # Dream's procedural memory: near-duplicate lessons collapsed into one
+    # canonical generalisation. Two weeks, not one, because the cycle caps at 3
+    # clusters and refuses to re-consolidate the same family within 7 days — a
+    # tighter window would cry wolf on a quiet fortnight.
+    Pathway("procedural_memory", 336, "procedural_clusters", "created_at",
+            flag="ENABLE_PROCEDURAL_CONSOLIDATION", monitor="Dream Consolidation",
+            describe="near-duplicate lessons were generalised"),
+    # Reads "off" while its monitor is disabled, which is the point: the
+    # registry should say WHY a writer is quiet, not just that it is. Its input
+    # (capability_gaps) is deliberately NOT a pathway — see the note below.
+    Pathway("auto_tool_candidates", 168, "auto_tool_candidates", "created_at",
+            monitor="Auto-Tool Synthesis",
+            describe="a capability gap was turned into a tool candidate"),
     # Usage-gated: these only write when the owner talks to Nova. Silence is
     # reported as idle, never dead.
     Pathway("chat_messages", 168, "messages", "created_at", usage_gated=True,
             describe="a chat turn was stored"),
+    Pathway("agent_workspace", 168, "agent_workspace", "created_at",
+            flag="ENABLE_DELIBERATION", usage_gated=True,
+            describe="deliberation kept a scratchpad across turns"),
     Pathway("lessons", 168, "lessons", "created_at", usage_gated=True,
             describe="a correction became a lesson"),
     Pathway("reflexions", 168, "reflexions", "created_at", usage_gated=True,
@@ -133,6 +157,30 @@ PATHWAYS: tuple[Pathway, ...] = (
     Pathway("tool_actions", 168, "action_log", "created_at", usage_gated=True,
             describe="a tool call was logged"),
 )
+
+# Deliberately NOT pathways, so the next audit does not re-add them (2026-09-04,
+# after 24 of 40 timestamped tables were found unwatched and most of them
+# rightly so):
+#
+#   capability_gaps    Written only when a query matches no skill, uses no
+#                      tools AND scores under 0.5 — a narrow conjunction that is
+#                      SUPPOSED to be rare, and the table has never held a row.
+#                      A liveness probe cannot tell "the writer died" from "the
+#                      condition was never met", so it would read dead forever.
+#                      That is exactly the mistake trust_ledger made.
+#   pending_deliveries An empty table is the HEALTHY state — it is a journal
+#                      that drains. A pathway here would be inverted.
+#   trust_scores       Retired from the database 2026-09-01 on purpose; the
+#                      pathway outlived its writer and broke the canary for
+#                      three days before anyone noticed.
+#   user_facts         Zero by design.
+#   verifiable_signals RLVR was archived 2026-09-01.
+#   auth_lockouts, system_state, background_tasks, conversation_summaries,
+#   goals, prompt_modules, custom_tools, documents, event_queue,
+#   heartbeat_instructions, salience_weights, active_memories
+#                      Event-driven or configuration, not background writers
+#                      that fail by silence.
+#   monitor_dedup_log  Already covered by the dedup_decisions pathway.
 
 _BY_NAME: dict[str, Pathway] = {p.name: p for p in PATHWAYS}
 
