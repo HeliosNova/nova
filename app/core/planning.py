@@ -138,6 +138,26 @@ Rules:
 - Only mark decomposable when sub-questions are truly independent and tool-free"""
 
 
+# max_tokens is a CEILING, not a target, so raising it costs nothing when the
+# model stops on its own — measured 2026-09-05 on a quiet GPU: 900 ran 2.1s
+# against 512's 2.3s, identical output size, 6/6 parses either way.
+#
+# It buys the tail. 51 plans were cut mid-generation at 512 in eight days, the
+# median already 2,376 characters, and a cut plan is unterminated JSON that
+# survives only if extract_json_object can salvage a prefix.
+#
+# A json_schema was tried here and REJECTED on measurement. Bounding the shape
+# by grammar is this codebase's usual fix for small-model JSON, but paired
+# trials on a quiet GPU put it 32% slower (2.9s vs 2.2s) with LONGER output
+# (650 vs 520 chars) and no parse benefit — the grammar permits five
+# sub_questions and the model dutifully fills them. It does not earn 0.7s on a
+# path that already times out under GPU contention.
+#
+# NOTE the sampling limit: those trial plans came back at ~520 characters, so
+# they never approached the ceiling. The queries that truncate in production are
+# longer ones carrying reflexions_text, which this A/B did not reproduce.
+
+
 async def create_plan(
     query: str,
     tool_names: list[str],
@@ -160,7 +180,7 @@ async def create_plan(
                 ],
                 json_mode=True,
                 json_prefix="{",
-                max_tokens=512,  # 300 truncated longer plans → "Unterminated string"
+                max_tokens=900,
                 temperature=0.1,
             ),
             timeout=config.INTERNAL_LLM_TIMEOUT,
