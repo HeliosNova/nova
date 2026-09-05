@@ -16,6 +16,15 @@ import pathlib
 
 import pytest
 
+# scripts/ is NOT baked into the image (only scripts/__init__.py), so the
+# in-container test path documented in CLAUDE.md cannot import these checks.
+# Skip loudly rather than silently: a check that quietly does not run is worse
+# than one that is absent, because it looks covered.
+pytest.importorskip(
+    "scripts.sanity_scan",
+    reason="scripts/ is not in the image — run the suite with the tree mounted: "
+           "docker run --rm -v \"<repo>:/app\" -w /app nova-app:latest python -m pytest")
+
 from scripts.sanity_scan import (
     check_control_bytes,
     check_duplicate_definitions,

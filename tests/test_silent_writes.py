@@ -18,6 +18,17 @@ from __future__ import annotations
 import pathlib
 from collections import Counter
 
+import pytest
+
+# scripts/ is NOT baked into the image (only scripts/__init__.py), so the
+# in-container test path documented in CLAUDE.md cannot import these checks.
+# Skip loudly rather than silently: a check that quietly does not run is worse
+# than one that is absent, because it looks covered.
+pytest.importorskip(
+    "scripts.sanity_scan",
+    reason="scripts/ is not in the image — run the suite with the tree mounted: "
+           "docker run --rm -v \"<repo>:/app\" -w /app nova-app:latest python -m pytest")
+
 from scripts.sanity_scan import silent_write_sites
 
 APP = pathlib.Path(__file__).resolve().parent.parent / "app"

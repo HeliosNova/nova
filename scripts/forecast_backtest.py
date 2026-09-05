@@ -25,7 +25,14 @@ Brier score, lower is better; 0.25 is what you get by always saying 0.5.
 
     MSYS_NO_PATHCONV=1 docker run --rm -v "F:\Helios Project\nova_:/app" \
         -v nova__nova_data:/data --network nova__default -w /app \
+        -e PYTHONPATH=/app -e LLM_MODEL=nova-ft \
         nova-app:latest python scripts/forecast_backtest.py [limit]
+
+Both env vars are load-bearing and neither fails obviously: without PYTHONPATH
+the import of app.core dies, and without LLM_MODEL the config default names a
+tag Ollama does not have, so every sample 404s on /api/chat and the run reports
+"no forecast could be re-estimated" as though the data were at fault. Takes
+~40 minutes for 105 forecasts and competes with the digest chain for the GPU.
 """
 from __future__ import annotations
 
