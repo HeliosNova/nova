@@ -26,11 +26,16 @@ def _aged_install(db):
     db.execute("UPDATE schema_version SET applied_at = datetime('now', '-30 days')")
 
 
-def _mon(db, name, sched, runs, *, enabled=1, config="{}"):
+def _mon(db, name, sched, runs, *, enabled=1, config="{}", age_days=30):
+    """`age_days` matters: a monitor younger than the pressure window cannot
+    have delivered a window's worth of runs, so it is excluded from the STARVED
+    list (it still counts toward demand). Added 2026-09-05 after the Engineering
+    Report named ITSELF the worst offender hours after being created."""
     db.execute("INSERT INTO monitors (name, check_type, check_config, schedule_seconds, "
-               "enabled, cooldown_minutes, notify_condition, category) "
-               "VALUES (?, 'system_health', ?, ?, ?, 60, 'on_change', 'system')",
-               (name, config, sched, enabled))
+               "enabled, cooldown_minutes, notify_condition, category, created_at) "
+               "VALUES (?, 'system_health', ?, ?, ?, 60, 'on_change', 'system', "
+               "datetime('now', ?))",
+               (name, config, sched, enabled, f"-{age_days} days"))
     mid = db.fetchone("SELECT id FROM monitors WHERE name = ?", (name,))["id"]
     for i in range(runs):
         db.execute("INSERT INTO monitor_results (monitor_id, status, value, created_at) "

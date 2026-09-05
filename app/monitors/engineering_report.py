@@ -73,6 +73,13 @@ def cascade_support(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
             "runs": {k: len(v) for k, v in sorted(sites.items())}}
 
 
+def _short(item: str) -> str:
+    """The headline of one attention line — the summary is capped at 80 chars,
+    so three of them have to fit in the part a reader always sees."""
+    head = item.split(" — ")[0].split(" (")[0]
+    return head[:34].rstrip()
+
+
 def _curiosity(db) -> dict:
     """Queue depth and the latency that made it a C grade."""
     out: dict = {}
@@ -201,9 +208,16 @@ def build_report(db) -> tuple[str, str, dict]:
             f"{c['name']} ({c['runs']}x identical)" for c in quiet[:3])
 
     if attention:
-        fields["look_at"] = " | ".join(attention[:4])
+        # The rendered line is capped at 400 characters and fields are dropped
+        # from the END, so the actionable ones go FIRST — the numbers below are
+        # context and can afford to fall off. Learned on 2026-09-03, when dead
+        # pathway names were being pushed off by schedule stats, and re-learned
+        # here on the first live run: `look_at` was last and vanished entirely.
+        fields = {**{f"look_at_{i + 1}": a for i, a in enumerate(attention[:3])},
+                  **fields}
         status = "error" if dead else "warning"
-        summary = f"{len(attention)} thing(s) to look at: {attention[0]}"
+        summary = f"{len(attention)} to look at: " + "; ".join(
+            _short(a) for a in attention[:3])
     else:
         status = "info"
         summary = "nothing crossed a bar today"

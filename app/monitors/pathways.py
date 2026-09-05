@@ -353,7 +353,8 @@ def schedule_pressure(db, *, days: int = 7) -> dict:
     """
     try:
         monitors = db.fetchall(
-            "SELECT id, name, schedule_seconds, check_config FROM monitors WHERE enabled = 1")
+            "SELECT id, name, schedule_seconds, check_config, created_at "
+            "FROM monitors WHERE enabled = 1")
         counts = {r["monitor_id"]: int(r["n"]) for r in db.fetchall(
             "SELECT monitor_id, COUNT(*) AS n FROM monitor_results "
             "WHERE created_at > datetime('now', ?) GROUP BY monitor_id", (f"-{days} days",))}
@@ -379,7 +380,21 @@ def schedule_pressure(db, *, days: int = 7) -> dict:
         got = counts.get(m["id"], 0)
         demanded += want
         delivered += min(got, want)           # a monitor cannot bank credit
-        if want >= 3:
+        # A monitor younger than the window cannot have delivered a window's
+        # worth of runs, so naming it starved is arithmetic, not a finding: the
+        # Engineering Report flagged ITSELF at "14% of its declared cadence" on
+        # its first run (2026-09-05) and displaced a real item to do it. It
+        # still counts toward demanded/delivered — the schedule genuinely is
+        # oversubscribed by it — it just cannot be named the worst offender.
+        young = False
+        try:
+            created = m["created_at"]
+            young = bool(created) and (
+                datetime.now(timezone.utc).replace(tzinfo=None)
+                - datetime.strptime(str(created)[:19], _TS)) < timedelta(days=window)
+        except (ValueError, TypeError):
+            young = False
+        if want >= 3 and not young:
             per.append((got / want, m["name"], got, want))
     per.sort()
     return {
