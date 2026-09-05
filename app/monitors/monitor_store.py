@@ -572,6 +572,9 @@ class MonitorStore:
         # optional background writer — core, because silence is the one
         # failure nothing else can see.
         "Pathway Liveness",
+        # Core on purpose: a report that has to be switched on is a report
+        # nobody switched on. It is deterministic and costs no LLM call.
+        "Engineering Report",
     })
 
     def seed_defaults(self) -> int:
