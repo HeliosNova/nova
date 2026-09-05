@@ -31,7 +31,7 @@ def _quiet(monkeypatch):
     monkeypatch.setattr(er, "cascade_support", lambda *a, **k: None)
     import app.monitors.pathways as pw
     monkeypatch.setattr(pw, "throughput_step", lambda db, **k: {
-        "before": 6.5, "after": 6.4, "change": -0.02, "days": 18, "stepped_down": False})
+        "before": 6.5, "after": 6.4, "change": -0.02, "best": 6.5, "days": 18, "stepped_down": False})
     monkeypatch.setattr(pw, "schedule_pressure", lambda db, **k: {
         "ratio": 0.95, "delivered": 100, "demanded": 105, "starved": []})
     monkeypatch.setattr(pw, "constant_monitors", lambda db, **k: [])
@@ -61,7 +61,7 @@ def test_a_dead_pathway_leads_the_list_and_is_an_error(monkeypatch):
         {"name": "kg_growth", "verdict": "alive"},
         {"name": "storylines", "verdict": "dead"}])
     monkeypatch.setattr(pw, "throughput_step", lambda db, **k: {
-        "before": 6.5, "after": 4.0, "change": -0.38, "days": 18, "stepped_down": True})
+        "before": 6.5, "after": 4.0, "change": -0.38, "best": 6.5, "days": 18, "stepped_down": True})
     status, summary, fields = er.build_report(_DB())
     assert status == "error"
     assert "storylines" in summary, "a dead writer outranks a slow one"
@@ -73,7 +73,7 @@ def test_the_regression_that_started_all_this_would_be_named(monkeypatch):
     _quiet(monkeypatch)
     import app.monitors.pathways as pw
     monkeypatch.setattr(pw, "throughput_step", lambda db, **k: {
-        "before": 6.5, "after": 4.1, "change": -0.37, "days": 18, "stepped_down": True})
+        "before": 6.5, "after": 4.1, "change": -0.37, "best": 6.5, "days": 18, "stepped_down": True})
     status, summary, fields = er.build_report(_DB())
     assert status == "warning"
     assert "delivery is DOWN" in fields["look_at_1"]
@@ -164,7 +164,7 @@ def test_the_actionable_fields_are_ordered_first(monkeypatch):
     _quiet(monkeypatch)
     import app.monitors.pathways as pw
     monkeypatch.setattr(pw, "throughput_step", lambda db, **k: {
-        "before": 6.5, "after": 4.1, "change": -0.37, "days": 18, "stepped_down": True})
+        "before": 6.5, "after": 4.1, "change": -0.37, "best": 6.5, "days": 18, "stepped_down": True})
     _status, _summary, fields = er.build_report(_DB())
     keys = list(fields)
     assert keys[0].startswith("look_at")
@@ -176,6 +176,6 @@ def test_the_summary_carries_the_findings_not_a_count(monkeypatch):
     _quiet(monkeypatch)
     import app.monitors.pathways as pw
     monkeypatch.setattr(pw, "throughput_step", lambda db, **k: {
-        "before": 6.5, "after": 4.1, "change": -0.37, "days": 18, "stepped_down": True})
+        "before": 6.5, "after": 4.1, "change": -0.37, "best": 6.5, "days": 18, "stepped_down": True})
     _status, summary, _fields = er.build_report(_DB())
     assert "delivery is DOWN" in summary

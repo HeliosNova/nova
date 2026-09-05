@@ -13,7 +13,12 @@ restarting a container and the fix for the other is finding what got expensive.
 """
 from __future__ import annotations
 
-from app.monitors.pathways import THROUGHPUT_STEP_DROP, throughput_step
+from app.monitors.pathways import (
+    BASELINE_DAYS,
+    RECENT_DAYS,
+    THROUGHPUT_STEP_DROP,
+    throughput_step,
+)
 
 
 class _DB:
@@ -29,12 +34,21 @@ def _flat(n, rate=6.0, hrs=24):
     return [(f"2026-08-{i + 1:02d}", int(rate * hrs), hrs) for i in range(n)]
 
 
-def _stepped(n, before=6.5, after=4.0, hrs=24):
-    out = []
-    for i in range(n):
-        rate = before if i < n // 2 else after
-        out.append((f"2026-08-{i + 1:02d}", int(rate * hrs), hrs))
-    return out
+def _stepped(n=None, before=6.5, after=4.0, hrs=24):
+    """A step that landed RECENTLY — healthy for the baseline week, low for the
+    recent days. A step in the middle of the window is deliberately NOT caught:
+    once it ages into the baseline the comparison clears, which is the whole
+    point of a rolling window (see test_a_step_that_was_FIXED_stops_being_reported)."""
+    rates = [before] * BASELINE_DAYS + [after] * RECENT_DAYS
+    return [(f"2026-08-{i + 1:02d}", int(r * hrs), hrs) for i, r in enumerate(rates)]
+
+
+def _recovered(hrs=24):
+    """Healthy, a step down, then a repair that lands — the shape of
+    2026-08-28 through 09-04. The old fixed-thirds comparison never cleared on
+    this; it read "DOWN 33%" for a week after the fix."""
+    rates = [6.5] * 7 + [3.9] * 7 + [6.4] * RECENT_DAYS
+    return [(f"2026-08-{i + 1:02d}", int(r * hrs), hrs) for i, r in enumerate(rates)]
 
 
 def test_a_flat_record_is_not_a_step():
@@ -43,7 +57,7 @@ def test_a_flat_record_is_not_a_step():
 
 
 def test_a_real_step_down_is_caught():
-    got = throughput_step(_DB(_stepped(16) + [("today", 10, 4)]))
+    got = throughput_step(_DB(_stepped() + [("today", 10, 4)]))
     assert got["stepped_down"]
     assert got["before"] > got["after"]
     assert got["change"] <= -THROUGHPUT_STEP_DROP
@@ -64,8 +78,30 @@ def test_downtime_is_not_mistaken_for_cost():
     assert not got["stepped_down"], got
 
 
+def test_a_step_that_was_FIXED_stops_being_reported():
+    """The whole reason this was rewritten. An alarm that keeps firing after the
+    repair teaches people to ignore it."""
+    got = throughput_step(_DB(_recovered() + [("today", 10, 4)]))
+    assert got["stepped_down"] is False, got
+    assert got["change"] > 0, "recovery should read as an improvement"
+
+
+def test_the_windows_best_stretch_is_carried():
+    """A rolling baseline cannot say "back to normal" — as a regression ages it
+    contaminates its own baseline. `best` is how a reader tells "no longer
+    getting worse" from "recovered"."""
+    got = throughput_step(_DB(_recovered() + [("today", 10, 4)]))
+    assert got["best"] >= 6.4
+    assert got["after"] <= got["best"]
+
+
+def test_the_comparison_is_recent_against_the_prior_week():
+    got = throughput_step(_DB(_flat(RECENT_DAYS + BASELINE_DAYS) + [("today", 10, 4)]))
+    assert got is not None and got["days"] == RECENT_DAYS + BASELINE_DAYS
+
+
 def test_too_short_a_record_says_nothing():
-    assert throughput_step(_DB(_flat(5))) is None
+    assert throughput_step(_DB(_flat(RECENT_DAYS + BASELINE_DAYS - 1))) is None
 
 
 def test_a_broken_store_returns_none_rather_than_raising():

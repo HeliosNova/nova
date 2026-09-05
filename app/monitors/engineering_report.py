@@ -135,12 +135,19 @@ def build_report(db) -> tuple[str, str, dict]:
 
     step = throughput_step(db)
     if step:
+        # Carry the window's BEST alongside the trend: the rolling comparison
+        # says whether things are getting worse, and cannot say whether they are
+        # back to normal — as a regression ages it contaminates its own
+        # baseline. "4.7 now, best 6.7" tells a reader both.
+        best = step.get("best")
         fields["delivery"] = (f"{step['after']:.1f} runs/active hour "
-                              f"({step['change']:+.0%} over {step['days']}d)")
+                              f"({step['change']:+.0%} vs prior week"
+                              + (f", best {best:.1f}" if best else "") + ")")
         if step["stepped_down"]:
             attention.append(
                 f"delivery is DOWN {abs(step['change']):.0%} ({step['before']:.1f} -> "
-                f"{step['after']:.1f} runs/active hour) — something costs more per run")
+                f"{step['after']:.1f} runs/active hour vs the prior week) — "
+                f"something costs more per run")
 
     press = schedule_pressure(db)
     if press.get("ratio") is not None:

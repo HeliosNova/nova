@@ -449,6 +449,18 @@ def constant_monitors(db, *, days: int = CONSTANT_WINDOW_DAYS,
 
 
 THROUGHPUT_STEP_DROP = 0.20      # a fall this deep is a cost change, not weather
+# Rolling, not fixed thirds. The first version compared the oldest third of an
+# 18-day window with the newest, which detects a step but cannot see it FIXED:
+# on 2026-09-05 throughput was back to 6.2 runs/active hour against a 6.5
+# pre-regression baseline, and the report still read "delivery is DOWN 33%" —
+# and would have for another week, because the window still held the bad days.
+# An alarm that keeps firing after the repair teaches people to ignore it.
+#
+# Replayed over the real 08-14..09-04 series, this pair flags on 08-29 (one day
+# after the step), holds through 09-02, and clears on 09-04 as the recovery
+# lands. The old shape never cleared at all.
+RECENT_DAYS = 3
+BASELINE_DAYS = 7
 
 
 def throughput_step(db, *, days: int = 18) -> dict | None:
@@ -475,14 +487,20 @@ def throughput_step(db, *, days: int = 18) -> dict | None:
         return None
     # Drop today: a partial day always reads as a fall.
     series = [(r["day"], r["runs"] / r["hrs"]) for r in rows if r["hrs"]][:-1]
-    if len(series) < 8:
+    if len(series) < RECENT_DAYS + BASELINE_DAYS:
         return None
-    k = max(3, len(series) // 3)
-    old = sum(v for _d, v in series[:k]) / k
-    new = sum(v for _d, v in series[-k:]) / k
+    recent = series[-RECENT_DAYS:]
+    base = series[-(RECENT_DAYS + BASELINE_DAYS):-RECENT_DAYS]
+    new = sum(v for _d, v in recent) / len(recent)
+    old = sum(v for _d, v in base) / len(base)
     if not old:
         return None
-    return {"before": round(old, 2), "after": round(new, 2),
+    # The best stretch the window has seen, so a reader can tell "no longer
+    # getting worse" from "back to normal" — a rolling baseline cannot say the
+    # second, because the regression contaminates its own baseline as it ages.
+    best = max(sum(v for _d, v in series[i:i + RECENT_DAYS]) / RECENT_DAYS
+               for i in range(len(series) - RECENT_DAYS + 1))
+    return {"before": round(old, 2), "after": round(new, 2), "best": round(best, 2),
             "change": round((new - old) / old, 3), "days": len(series),
             "stepped_down": (new - old) / old <= -THROUGHPUT_STEP_DROP}
 
