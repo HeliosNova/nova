@@ -185,7 +185,7 @@ class TestMonitorStore:
         # tier's daily distillation cycle, 2026-08-12) = 74, +1 (Digest Health
         # Canary — weekly digest-output canary, 2026-08-25) = 75.
         # +1 (Pathway Liveness — the liveness registry monitor, 2026-09-02) = 76.
-        assert count == 76
+        assert count == 77
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)

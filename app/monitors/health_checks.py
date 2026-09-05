@@ -30,8 +30,63 @@ _ENTAIL_GATE_LINE_RE = re.compile(
     r"\[entail-gate\] .*?: (\d+) checked.*?(\d+) dropped")
 
 
+_LOG_DATE_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})")
+
+
+def entail_gate_totals(days: int = 7, log_glob: str = "/data/logs/nova-app.log*",
+                       today: str | None = None) -> tuple[int, int]:
+    """(checked, dropped) from the entail-gate summary lines, WITHIN a window.
+
+    This used to sum every rotated log file with no window at all, while the
+    digest lengths beside it used 7 days — so the drop-rate was a lifetime
+    average over 13,000 samples sitting at 52%, against a warning threshold of
+    75%. A single catastrophic day could not have moved it: the threshold was
+    unreachable and the canary could not fire on the thing it exists to watch
+    (measured 2026-09-04). Daily rates over the same period ran 49-57%, which is
+    the signal that was being averaged away.
+
+    Lines carry a leading ISO date; anything older than the window, or without
+    one, is skipped. Whole files are skipped by mtime first.
+    """
+    import glob as _glob
+    import os
+    from datetime import date, timedelta
+
+    base = date.fromisoformat(today) if today else date.today()
+    cutoff = (base - timedelta(days=max(1, days))).isoformat()
+    checked = dropped = 0
+    try:
+        paths = _glob.glob(log_glob)
+    except OSError:
+        return 0, 0
+    for lp in paths:
+        try:
+            if os.path.getmtime(lp) < (time.time() - (days + 1) * 86400):
+                continue                      # rotated out before the window
+            with open(lp, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    m = _ENTAIL_GATE_LINE_RE.search(line)
+                    if not m:
+                        continue
+                    d = _LOG_DATE_RE.match(line)
+                    if not d or d.group(1) < cutoff:
+                        continue
+                    checked += int(m.group(1))
+                    dropped += int(m.group(2))
+        except OSError:
+            continue
+    return checked, dropped
+
+
+# A day this far above the trailing week is a step, not weather. Measured
+# 2026-09-04: daily rates ran 49-57% across eight days, so ~8 points of ordinary
+# spread; 12 clears that without waiting for a collapse.
+DROP_RATE_STEP = 0.12
+
+
 def _digest_health_verdict(lengths: list[int], linkish: int,
-                           checked: int, dropped: int) -> tuple[str, str]:
+                           checked: int, dropped: int,
+                           recent_rate: float | None = None) -> tuple[str, str]:
     """(status, summary) for the digest-health canary. Pure for tests.
 
     error  — pipeline broken: no digests in 7d, thin output (avg < 2000
@@ -58,6 +113,16 @@ def _digest_health_verdict(lengths: list[int], linkish: int,
         return "error", f"digest substance degraded — {stats}"
     if avg < 4000 or drop_rate > 0.75:
         return "warning", f"digest quality drifting — {stats}"
+    # An absolute bar on a 7-day mean is blunt: with ~8,000 samples in the
+    # window, a single catastrophic day moves it a few points, so 0.75 is
+    # reachable only by a sustained collapse. The sharper question is whether
+    # the rate JUMPED — that is what a gate or prompt change does — so today is
+    # compared with the week behind it (2026-09-04).
+    if (recent_rate is not None and checked >= 200
+            and recent_rate - drop_rate >= DROP_RATE_STEP):
+        return ("warning",
+                f"entail drop-rate jumped to {recent_rate:.0%} today against "
+                f"{drop_rate:.0%} over the week — {stats}")
     return "info", stats
 
 
@@ -354,20 +419,12 @@ class HealthChecksMixin:
 
         lengths, linkish = await asyncio.to_thread(_stats)
 
-        checked = dropped = 0
-        try:
-            import glob as _glob
-            for lp in _glob.glob("/data/logs/nova-app.log*"):
-                with open(lp, encoding="utf-8", errors="replace") as f:
-                    for line in f:
-                        m = _ENTAIL_GATE_LINE_RE.search(line)
-                        if m:
-                            checked += int(m.group(1))
-                            dropped += int(m.group(2))
-        except OSError:
-            pass
+        checked, dropped = await asyncio.to_thread(entail_gate_totals, 7)
+        day_checked, day_dropped = await asyncio.to_thread(entail_gate_totals, 1)
+        recent_rate = (day_dropped / day_checked) if day_checked >= 100 else None
 
-        status, summary = _digest_health_verdict(lengths, linkish, checked, dropped)
+        status, summary = _digest_health_verdict(lengths, linkish, checked, dropped,
+                                                 recent_rate=recent_rate)
         fields: dict[str, str | int | float] = {
             "digests_7d": len(lengths),
             "avg_chars": int(sum(lengths) / len(lengths)) if lengths else 0,
@@ -390,6 +447,21 @@ class HealthChecksMixin:
 
         status, summary, fields = await asyncio.to_thread(liveness_report, get_db())
         return format_monitor_result("Pathway Liveness", status, summary, fields)
+
+    async def _execute_engineering_report(self) -> str:
+        """One daily readout of whether Nova is delivering, and what to look at.
+
+        Deterministic; measures nothing new. Every number comes from a function
+        that already existed, assembled in one place and delivered WHETHER OR
+        NOT anything is wrong — because the 2026-08-28 throughput regression ran
+        for a week behind twenty monitors that each only spoke on their own
+        threshold.
+        """
+        from app.database import get_db
+        from app.monitors.engineering_report import build_report
+
+        status, summary, fields = await asyncio.to_thread(build_report, get_db())
+        return format_monitor_result("Engineering Report", status, summary, fields)
 
     async def _execute_kg_health_check(self) -> str:
         """Check Knowledge Graph health: node count, edge count, fragmentation."""

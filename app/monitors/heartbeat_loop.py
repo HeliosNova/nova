@@ -436,7 +436,8 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                     if due:
                         logger.info("[Heartbeat] %d monitor(s) due", len(due))
 
-                        _FAST_TYPES = {"system_health", "maintenance", "pathway_liveness"}
+                        _FAST_TYPES = {"system_health", "maintenance", "pathway_liveness",
+                                       "engineering_report"}
                         fast = [m for m in due if m.check_type in _FAST_TYPES]
                         slow = [m for m in due if m.check_type not in _FAST_TYPES]
 
@@ -943,6 +944,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         "auto_tool": lambda self, m, cfg: self._execute_auto_tool_synthesis(),
         "output_eval": lambda self, m, cfg: self._execute_output_eval(),
         "pathway_liveness": lambda self, m, cfg: self._execute_pathway_liveness(),
+        "engineering_report": lambda self, m, cfg: self._execute_engineering_report(),
     }
 
     async def _execute_check(self, monitor: Monitor) -> str:

@@ -1045,7 +1045,7 @@ class TestHeartbeatSeedCount:
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 76
+        assert len(all_monitors) == 77
 
 
 class TestMemoryLearningEval:

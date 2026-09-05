@@ -92,6 +92,7 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "kg_health",
     "digest_health",
     "pathway_liveness",
+    "engineering_report",
     "maintenance",
     "finetune",
     "consolidation",
@@ -834,6 +835,11 @@ class MonitorStore:
             # (storylines, dossiers, forecasts, curiosity, KG banking, eval...)
             # checked against the silence it is allowed. Fast lane, no LLM.
             {"name": "Pathway Liveness", "check_type": "pathway_liveness", "schedule_seconds": 21600, "cooldown_minutes": 300, "notify_condition": "on_change",
+             "check_config": {}},
+            # Daily and notify_condition "always": the whole point is that it
+            # speaks even when nothing is wrong. A report that only appears on a
+            # threshold is another thing that can stay quiet for a week.
+            {"name": "Engineering Report", "check_type": "engineering_report", "schedule_seconds": 86400, "cooldown_minutes": 1380, "notify_condition": "always",
              "check_config": {}},
             # --- Expanded Domain Studies (all prompts anchored to TODAY) ---
             {"name": "Domain Study: AI and ML", "check_type": "query", "schedule_seconds": 28800, "cooldown_minutes": 420, "notify_condition": "always",
