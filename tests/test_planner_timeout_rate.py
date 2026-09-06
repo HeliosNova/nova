@@ -40,8 +40,18 @@ def _log(tmp_path, lines):
     return str(p)
 
 
+BRAIN = "2026-09-06 09:00:00,000 [INFO] app.core.brain []: "
+
+
 def _ok(secs, steps=3):
-    return f"{PRE}[planning] plan ready in {secs}s ({steps} steps, multi_step)" + chr(10)
+    """A real success writes BOTH lines: brain's count and planning's duration."""
+    return (f"{PRE}[planning] plan ready in {secs}s ({steps} steps, multi_step)" + chr(10)
+            + f"{BRAIN}Query planned: {steps} steps" + chr(10))
+
+
+def _ok_uninstrumented(steps=3):
+    """A success from before 2026-09-06: counted, but with no duration."""
+    return f"{BRAIN}Query planned: {steps} steps" + chr(10)
 
 
 def _timeout():
@@ -53,6 +63,24 @@ def test_a_successful_plan_records_how_long_it_took(tmp_path):
     assert got["planned"] == 2 and got["failed"] == 0
     assert got["fail_rate"] == 0.0
     assert got["slowest_ok"] == 8.1
+
+
+def test_successes_from_BEFORE_the_duration_line_still_count(tmp_path):
+    """The bug this field shipped with, live, for about twenty minutes.
+
+    Counting successes off the new duration line made the report read
+    "planning 0 ok / 3 timeout (100%)" on the day it deployed. The three
+    failures were real and came from a day with THIRTY-FIVE successes beside
+    them, none of which had been instrumented yet. Absent evidence of success
+    is not evidence of total failure — the same trap as reading a missing
+    cascade line as 0% support.
+    """
+    got = er.planner_health(
+        1, _log(tmp_path, [_ok_uninstrumented()] * 35 + [_timeout()] * 3),
+        today="2026-09-06")
+    assert got["planned"] == 35
+    assert round(got["fail_rate"], 2) == 0.08
+    assert "slowest_ok" not in got, "no duration was recorded, so none is claimed"
 
 
 def test_the_rate_distinguishes_a_bad_afternoon_from_an_outage(tmp_path):

@@ -83,7 +83,15 @@ _PLAN_FAIL_RE = re.compile(r"Planning failed: (\w+)")
 # the mistake schedule_pressure made: "planner failed: TimeoutError x3" reads
 # identically at 3-of-3 (catastrophic) and 3-of-38 (a bad afternoon). The
 # measured spread across one week was 40% down to 0%.
-_PLAN_OK_RE = re.compile(r"\[planning\] plan ready in ([0-9.]+)s")
+# The DENOMINATOR comes from brain's pre-existing success line, which has
+# history; the duration comes from the line added 2026-09-06, which does not.
+# Reading the count off the new line made the field report "0 ok / 3 timeout
+# (100%)" on the day it shipped — the three failures were real and from a day
+# with 35 uninstrumented successes beside them. Absent evidence of success is
+# not evidence of total failure, the same trap as reading a missing cascade
+# line as 0% support.
+_PLAN_OK_RE = re.compile(r"Query planned: \d+ steps")
+_PLAN_SECS_RE = re.compile(r"\[planning\] plan ready in ([0-9.]+)s")
 
 
 def _scan(days: int, log_glob: str, today: str | None, handler) -> None:
@@ -152,6 +160,7 @@ def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
     caps: Counter = Counter()
     fails: Counter = Counter()
     secs: list[float] = []
+    oks = [0]
 
     def _h(line: str) -> None:
         m = _TRUNC_RE.search(line)
@@ -163,20 +172,22 @@ def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
         f = _PLAN_FAIL_RE.search(line)
         if f:
             fails[f.group(1)] += 1
-        ok = _PLAN_OK_RE.search(line)
-        if ok:
-            secs.append(float(ok.group(1)))
+        if _PLAN_OK_RE.search(line):
+            oks[0] += 1
+        d = _PLAN_SECS_RE.search(line)
+        if d:
+            secs.append(float(d.group(1)))
 
     _scan(days, log_glob, today, _h)
-    if not caps and not fails and not secs:
+    if not caps and not fails and not oks[0]:
         return None
     out: dict = {"truncations": dict(caps.most_common(4)),
                  "plan_failures": dict(fails.most_common(3))}
     nfail = sum(fails.values())
-    if secs or nfail:
-        out["planned"] = len(secs)
+    if oks[0] or nfail:
+        out["planned"] = oks[0]
         out["failed"] = nfail
-        total = len(secs) + nfail
+        total = oks[0] + nfail
         out["fail_rate"] = (nfail / total) if total else None
         if secs:
             # The slowest plan that SUCCEEDED, against a 60s ceiling. Well under
