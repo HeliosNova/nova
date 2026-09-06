@@ -187,6 +187,18 @@ class _LazyConfigInt:
 # consolidation offers it again once the queue has drained.
 MAX_PENDING = _LazyConfigInt("MAX_CURIOSITY_PENDING")
 MAX_ATTEMPTS = _LazyConfigInt("MAX_CURIOSITY_ATTEMPTS")
+
+# Starvation aging, applied at SELECT time only (see get_next).
+# 0.03/day closes the measured 0.09 gap between a 0.6 backlog item and a fresh
+# 0.69 in three days, so nothing waits a week on priority alone.
+# The cap EXCEEDS the 0.5-0.7 urgency range rather than merely spanning it: at
+# exactly 0.20 an aged 0.5 reaches 0.70 and ties a fresh 0.70, leaving the
+# outcome to float representation and tie-break order. 0.25 makes an item that
+# has waited ~8 days genuinely outrank anything fresh, and still bounds the
+# aging so a stale row cannot own the queue for ever - which would be the same
+# starvation pointed the other way.
+AGING_PER_DAY = 0.03
+AGING_CAP = 0.25
 MAX_QUEUE_SIZE = _LazyConfigInt("MAX_CURIOSITY_QUEUE_SIZE")
 
 
@@ -483,7 +495,22 @@ class CuriosityQueue:
         return cursor.lastrowid
 
     def get_next(self) -> CuriosityItem | None:
-        """Highest-urgency pending item.
+        """Highest-urgency pending item, with the wait counted as urgency.
+
+        Measured 2026-09-06: three questions minted on 08-30 were answered on
+        09-06, having waited 7.4, 7.4 and 7.5 days, and every one of them
+        resolved on its FIRST attempt. They were not hard; they were behind a
+        stream of 0.69s. Seven fresh 0.69 items were minted that week and each
+        jumped a backlog of about forty 0.6s. A pure urgency sort has no term
+        for how long something has been waiting, so a small steady supply of
+        slightly-more-urgent work defers the rest indefinitely.
+
+        The aging is applied in the ORDER BY ONLY and is never written back.
+        The stored `urgency` column is read elsewhere as a THRESHOLD -
+        daemon.py counts pending items at >= 0.7 to decide whether to run its
+        idle ~5-minute critical loop, and a stream sitting in that band once
+        drove ~124 unresolvable brain.think() calls a day (2026-08-18). Aging
+        a row's stored urgency into that band would recreate exactly that.
 
         A reserved every-third pick for source='dossier_tension' was added on
         2026-09-01 against the reading that those items were starving behind
@@ -499,11 +526,13 @@ class CuriosityQueue:
         that fed it is gone.
         """
         row = self._db.fetchone(
-                "SELECT * FROM curiosity_queue "
-                "WHERE status = 'pending' AND attempts < ? "
-                "ORDER BY urgency DESC, created_at ASC LIMIT 1",
-                (int(MAX_ATTEMPTS),),
-            )
+            "SELECT * FROM curiosity_queue "
+            "WHERE status = 'pending' AND attempts < ? "
+            "ORDER BY (urgency + MIN(?, MAX(0.0, "
+            "    julianday('now') - julianday(COALESCE(created_at, 'now'))) * ?)) DESC, "
+            "created_at ASC LIMIT 1",
+            (int(MAX_ATTEMPTS), AGING_CAP, AGING_PER_DAY),
+        )
         return self._row_to_item(row) if row else None
 
     def resolve(self, item_id: int, resolution: str) -> None:
