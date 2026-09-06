@@ -1376,6 +1376,43 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 37 (2026-09-06): retire the pending numeric-tension research.
+        # source='dossier_tension' asks which of Nova's OWN two digests is right
+        # ("Current Events says 209 billion but Latin America says 65 billion"),
+        # and the pass behind this queue searches the web, so it cannot answer.
+        # Lifetime record: 0 resolved, 6 failed, 15 dismissed across 26 items,
+        # against 75% for dossier_open_question through the same pass. Each
+        # pending row would otherwise consume MAX_CURIOSITY_ATTEMPTS research
+        # runs from a loop resolving about one question a day.
+        #
+        # An UPDATE, deliberately: migration 37's first draft INSERTed a monitor
+        # row and broke 12 fixtures that assert an empty table. Data already in
+        # the queue is exactly what a migration is for; new installs have none
+        # and the mint site is gone, so this is a no-op there.
+        if 37 not in applied:
+            conn.execute("BEGIN")
+            try:
+                # curiosity_queue is created LAZILY on first use, so it is
+                # absent on a fresh install and an unguarded UPDATE here raises
+                # OperationalError straight out of startup. Found by running
+                # the migration against an empty database rather than an
+                # existing one, which is the only place this shows up.
+                has_q = conn.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' "
+                    "AND name='curiosity_queue'").fetchone()
+                if has_q:
+                    conn.execute(
+                        "UPDATE curiosity_queue SET status = 'dismissed', "
+                        "resolution = 'retired: a web pass cannot settle a "
+                        "disagreement between two of Nova''s own digests', "
+                        "resolved_at = CURRENT_TIMESTAMP "
+                        "WHERE source = 'dossier_tension' AND status = 'pending'")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (37,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

@@ -59,7 +59,28 @@ def test_queue_rejects_probes_from_organic_sources_only(db):
 
 # --- tensions get a quota --------------------------------------------------
 
-def test_every_third_pick_prefers_a_pending_tension(db):
+def test_no_slot_is_reserved_for_tensions_any_more(db):
+    """This asserted the opposite until 2026-09-06, and the change is the point.
+
+    A reserved every-third pick was added on 2026-09-01 to fix what looked like
+    starvation: "32 minted, 0 resolved". Five days later, with a third of this
+    loop's throughput reserved for them, the lifetime record was still
+
+        dossier_tension        0 resolved,  6 failed, 15 dismissed   (0%)
+        dossier_open_question 21 resolved,  7 failed, 32 dismissed  (75%)
+
+    Starvation was not why they failed. A tension asks which of Nova's OWN two
+    digests is right — "Current Events says 209 billion but Latin America says
+    65 billion" — and the pass behind this queue searches the web, so it cannot
+    answer. The judge said as much: "the response fails to resolve the
+    contradiction". At MAX_ATTEMPTS=3 each one cost three research passes from
+    a loop that resolves about one question a day.
+
+    Tensions are no longer minted at all (app/core/dossiers.py); detection and
+    the dossier's own ⚡ Tension line stay, which was always the contract
+    _numeric_tensions documented: "surfaces the tension for investigation;
+    never auto-resolves".
+    """
     q = CuriosityQueue(db)
     for i in range(4):
         db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
@@ -69,8 +90,21 @@ def test_every_third_pick_prefers_a_pending_tension(db):
                "VALUES ('Macroeconomics says 5.3% but Finance says 3.8% for GDP growth', "
                "'dossier_tension', 0.5, 'pending', 0)")
     picks = [q.get_next().source for _ in range(3)]
-    assert picks[:2] == ["dossier_open_question", "dossier_open_question"]
-    assert picks[2] == "dossier_tension"
+    assert picks == ["dossier_open_question"] * 3, (
+        "a 0%-yield source must not preempt a 75% one on a fixed quota")
+
+
+def test_a_tension_is_never_queued_for_research(db):
+    """The mint site is gone, so nothing re-creates the rows the migration
+    retired. Guards against a well-meaning restore of the block."""
+    import inspect
+
+    from app.core import dossiers
+    src = inspect.getsource(dossiers)
+    assert '"dossier_tension"' not in src.replace("# ", ""), (
+        "dossiers must not add a dossier_tension item to the curiosity queue")
+    assert "_numeric_tensions" in src, "detection stays"
+    assert "tension_note" in src, "the dossier body still shows the disagreement"
 
 
 def test_quota_falls_through_when_no_tension_pending(db):

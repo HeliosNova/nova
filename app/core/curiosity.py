@@ -483,21 +483,22 @@ class CuriosityQueue:
         return cursor.lastrowid
 
     def get_next(self) -> CuriosityItem | None:
-        """Highest-urgency pending item; every third pick prefers a pending
-        dossier_tension — contradictions between Nova's own monitors are the
-        most valuable signal it produces and they starved behind 0.6-0.7 open
-        questions (32 minted, 0 resolved before 2026-09-01)."""
-        self._pick_count = getattr(self, "_pick_count", 0) + 1
-        row = None
-        if self._pick_count % 3 == 0:
-            row = self._db.fetchone(
-                "SELECT * FROM curiosity_queue "
-                "WHERE status = 'pending' AND attempts < ? AND source = 'dossier_tension' "
-                "ORDER BY urgency DESC, created_at ASC LIMIT 1",
-                (int(MAX_ATTEMPTS),),
-            )
-        if row is None:
-            row = self._db.fetchone(
+        """Highest-urgency pending item.
+
+        A reserved every-third pick for source='dossier_tension' was added on
+        2026-09-01 against the reading that those items were starving behind
+        0.6-0.7 open questions ("32 minted, 0 resolved"). It was a hypothesis,
+        and it has now been tested: five days later, with a third of this
+        loop's throughput reserved for them, the count was STILL 0 resolved
+        against 6 failed and 15 dismissed. Starvation was not why they failed.
+
+        A tension asks which of Nova's own two digests is right, and the
+        research pass behind this queue reads the web. dossier_open_question,
+        which asks about the world, resolves at 75% through the same pass. So
+        the tension is no longer minted (app/core/dossiers.py) and the slot
+        that fed it is gone.
+        """
+        row = self._db.fetchone(
                 "SELECT * FROM curiosity_queue "
                 "WHERE status = 'pending' AND attempts < ? "
                 "ORDER BY urgency DESC, created_at ASC LIMIT 1",

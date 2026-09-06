@@ -1015,17 +1015,28 @@ async def consolidate_dossiers(db) -> str:
             tension_note = "\n- ⚡ **Tension:** " + "\n- ⚡ **Tension:** ".join(tensions)
             logger.info("[Knowing] %d cross-dossier tension(s): %s",
                         len(tensions), tensions[0][:120])
-            from app.core.curiosity import CuriosityQueue
-            # Urgency 0.5 (was 0.7): a tension is worth a NORMAL-priority research
-            # pass, not the daemon's CRITICAL loop (fires every idle ~5-min tick
-            # whenever any pending item is ≥0.7). At 0.7 the false-tension stream
-            # drove ~124 unresolvable brain.think()/day (2026-08-18 audit). Below
-            # 0.7 it still gets researched via get_next and self-limits after
-            # MAX_CURIOSITY_ATTEMPTS, but never pins critical_curiosity>0.
-            await asyncio.to_thread(
-                CuriosityQueue(db).add,
-                f"Resolve contradiction: {_wtrim(tensions[0], 180)}",
-                "dossier_tension", 0.5)
+            # NOT queued for curiosity research any more (2026-09-06). A
+            # tension is a disagreement between two of Nova's OWN stored
+            # digests — "Current Events says 209 billion but Latin America says
+            # 65 billion" — and a web research pass cannot settle which of
+            # Nova's records is right. The judge said so in as many words:
+            # "the response fails to resolve the contradiction".
+            #
+            # Measured over the queue's lifetime: source='dossier_tension'
+            # scored 0 resolved, 6 failed, 15 dismissed. Not a low rate. ZERO,
+            # across 26 items, while dossier_open_question ran 21/28 = 75%.
+            # At MAX_CURIOSITY_ATTEMPTS=3 those failures alone consumed 18
+            # research passes from a loop that answers about one question a day.
+            #
+            # The 2026-09-01 reading of this was that they were STARVED, and
+            # they were given a reserved every-third pick in get_next to fix it.
+            # Five days and a third of curiosity's throughput later the count is
+            # still zero, so starvation was not the cause and that slot is gone
+            # too. The detection stays and the tension is still written into the
+            # dossier body above: _numeric_tensions "surfaces the tension for
+            # investigation; never auto-resolves", which was always the right
+            # contract. Resolving it needs to read Nova's own records, which is
+            # a different capability from web research and does not exist yet.
     except Exception as e:
         logger.debug("[Knowing] tension scan failed: %s", e)
 
