@@ -74,7 +74,10 @@ def cascade_support(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
 
 
 _STAGE1_RE = re.compile(r"\[Curiosity\] stage-1 reject \(([^)]+)\)")
-_TRUNC_RE = re.compile(r"\[truncation\] \w+ hit max_tokens \((\d+)\)")
+# The caller, then the ceiling. Older lines name the helper ("invoke_nothink")
+# because until 2026-09-06 the tripwire could not see past it; those still
+# parse, they just cannot be attributed.
+_TRUNC_RE = re.compile(r"\[truncation\] ([\w.]+) hit max_tokens \((\d+)\)")
 _PLAN_FAIL_RE = re.compile(r"Planning failed: (\w+)")
 
 
@@ -147,7 +150,10 @@ def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
     def _h(line: str) -> None:
         m = _TRUNC_RE.search(line)
         if m:
-            caps[m.group(1)] += 1
+            who, cap = m.group(1), m.group(2)
+            # Legacy lines name only the helper and carry no attribution, so
+            # they stay keyed by ceiling alone rather than pretending otherwise.
+            caps[cap if who == "invoke_nothink" else f"{who}@{cap}"] += 1
         f = _PLAN_FAIL_RE.search(line)
         if f:
             fails[f.group(1)] += 1
@@ -455,16 +461,26 @@ def build_report(db) -> tuple[str, str, dict]:
 
     ph = planner_health(1)
     if ph:
+        # NOT called "planner": the tripwire logs the LLM helper's name, never
+        # the caller, so these ceilings belong to whoever asked for them —
+        # critique and storylines at 700, brain synthesis and tool_triggers at
+        # 800. Reporting them under a planner heading was a first-day mistake.
         bits = []
         if ph["truncations"]:
             bits.append("cut at " + ", ".join(f"{k}x{v}" for k, v in ph["truncations"].items()))
         if ph["plan_failures"]:
-            bits.append("failed: " + ", ".join(f"{k} x{v}" for k, v in ph["plan_failures"].items()))
-        fields["planner"] = "; ".join(bits)
-        if ph["truncations"].get("900"):
+            bits.append("planner failed: "
+                        + ", ".join(f"{k} x{v}" for k, v in ph["plan_failures"].items()))
+        fields["truncation"] = "; ".join(bits)
+        # 900 is NOT unique to the planner — heartbeat_loop's curiosity answer and
+        # the search agent ask for it too, which is why the tripwire had to learn
+        # to name its caller before this rule could mean anything.
+        n900 = sum(v for k, v in ph["truncations"].items()
+                   if k.endswith("@900") and k.startswith("planning"))
+        if n900:
             attention.append(
                 f"the planner is STILL truncating at its new 900 ceiling "
-                f"({ph['truncations']['900']}x) — it needs more")
+                f"({n900}x) — it needs more")
 
     kn = _knowing(db)
     fields["knowing"] = (f"+{kn.get('kg_facts_24h', 0)} facts/24h, "

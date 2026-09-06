@@ -25,6 +25,38 @@ from app.core.providers._retry import retry_on_transient
 
 logger = logging.getLogger(__name__)
 
+def _truncation_caller() -> str:
+    """Name the call site that asked for the ceiling, not the helper.
+
+    The tripwire hardcoded "invoke_nothink", the one function every background
+    generation passes through, so a truncation could never be attributed to the
+    code that chose the cap. THREE separate sites ask for max_tokens=900
+    (planning, the curiosity answer in heartbeat_loop, the search agent) and the
+    daily report was about to blame the planner for the others' cuts.
+
+    Only runs when a truncation actually fires, so the stack walk costs nothing
+    in the normal path. Falls back to the old name rather than raising: this is
+    a warning and must never be the thing that breaks a generation.
+    """
+    try:
+        import inspect
+        import os
+        # No leading skip: the path filter drops this function and every
+        # provider frame on its own, and a hardcoded [2:] was silently
+        # stepping OVER the real caller when the stack was shallow.
+        for fr in inspect.stack()[:14]:
+            path = fr.filename.replace(os.sep, "/")
+            if "/core/providers/" in path or path.endswith("/core/llm.py"):
+                continue
+            mod = os.path.basename(path)
+            if mod.endswith(".py"):
+                mod = mod[:-3]
+            return mod + "." + fr.function
+    except Exception:
+        pass
+    return "invoke_nothink"
+
+
 # Context window for CHAT generations. Without an explicit num_ctx Ollama loads
 # the model at its Modelfile default (4096) and SILENTLY TRUNCATES the prompt —
 # found 2026-07-07: the ~11k-token system prompt (identity + lessons + KG facts
@@ -204,9 +236,9 @@ class OllamaProvider:
             # ratio in this warning is the fingerprint of budget burned outside
             # visible content (e.g. thinking tokens despite think:false).
             if data.get("done_reason") == "length":
-                logger.warning("[truncation] invoke_nothink hit max_tokens (%d) — output cut mid-generation "
+                logger.warning("[truncation] %s hit max_tokens (%d) — output cut mid-generation "
                                "(model=%s, %d chars, eval=%s, prompt_eval=%s)",
-                               max_tokens, model, len(content),
+                               _truncation_caller(), max_tokens, model, len(content),
                                data.get("eval_count"), data.get("prompt_eval_count"))
 
             # Silent PROMPT-truncation tripwire (2026-08-11): without an explicit

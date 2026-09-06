@@ -34,6 +34,30 @@ PLANFAIL = ('{d} 09:00:00,000 [WARNING] app.core.planning []: '
             'Planning failed: TimeoutError()\n')
 
 
+class _ReportDB:
+    """Enough of a store for build_report; every measurement is stubbed."""
+
+    def fetchone(self, _q, _a=()):
+        return {"c": 0, "oldest": None, "d": None}
+
+    def fetchall(self, _q, _a=()):
+        return []
+
+
+def _stub_rest(monkeypatch):
+    """Silence every measurement this file is not testing."""
+    import app.monitors.pathways as pw
+    monkeypatch.setattr(pw, "throughput_step", lambda db, **k: None)
+    monkeypatch.setattr(pw, "schedule_pressure", lambda db, **k: {
+        "ratio": 0.95, "delivered": 100, "demanded": 105, "starved": []})
+    monkeypatch.setattr(pw, "constant_monitors", lambda db, **k: [])
+    monkeypatch.setattr(pw, "snapshot", lambda db, **k: [])
+    import app.monitors.health_checks as hc
+    monkeypatch.setattr(hc, "entail_gate_totals", lambda d, *a, **k: (0, 0))
+    import app.core.forecasts as fc
+    monkeypatch.setattr(fc, "calibration", lambda db, **k: None)
+
+
 def _log(tmp_path, text):
     p = tmp_path / "nova-app.log"
     p.write_text(text, encoding="utf-8")
@@ -83,30 +107,14 @@ def test_a_quiet_planner_reads_as_none(tmp_path):
 
 
 def test_a_900_truncation_becomes_something_to_look_at(monkeypatch):
-    """The pre-registered check for yesterday's ceiling raise."""
+    """The pre-registered check for the 2026-09-05 ceiling raise."""
     monkeypatch.setattr(er, "planner_health", lambda *a, **k: {
-        "truncations": {"900": 5}, "plan_failures": {}})
+        "truncations": {"planning.plan@900": 5}, "plan_failures": {}})
     monkeypatch.setattr(er, "curiosity_stage1", lambda *a, **k: None)
     monkeypatch.setattr(er, "cascade_support", lambda *a, **k: None)
-    import app.monitors.pathways as pw
-    monkeypatch.setattr(pw, "throughput_step", lambda db, **k: None)
-    monkeypatch.setattr(pw, "schedule_pressure", lambda db, **k: {
-        "ratio": 0.95, "delivered": 100, "demanded": 105, "starved": []})
-    monkeypatch.setattr(pw, "constant_monitors", lambda db, **k: [])
-    monkeypatch.setattr(pw, "snapshot", lambda db, **k: [])
-    import app.monitors.health_checks as hc
-    monkeypatch.setattr(hc, "entail_gate_totals", lambda d, *a, **k: (0, 0))
-    import app.core.forecasts as fc
-    monkeypatch.setattr(fc, "calibration", lambda db, **k: None)
-
-    class _DB:
-        def fetchone(self, _q, _a=()):
-            return {"c": 0, "oldest": None, "d": None}
-
-        def fetchall(self, _q, _a=()):
-            return []
-
-    _status, _summary, fields = er.build_report(_DB())
+    monkeypatch.setattr(er, "product_quality", lambda *a, **k: None)
+    _stub_rest(monkeypatch)
+    _status, _summary, fields = er.build_report(_ReportDB())
     assert "STILL truncating at its new 900 ceiling" in fields["look_at_1"]
 
 
@@ -158,3 +166,76 @@ def test_the_executor_records_before_it_renders():
     from app.monitors import health_checks as hc
     src = inspect.getsource(hc.HealthChecksMixin._execute_engineering_report)
     assert src.index("append_snapshot") < src.index("format_monitor_result")
+
+
+def test_the_tripwire_names_the_caller_not_the_helper():
+    """900 is NOT unique to the planner, which is how this nearly went wrong.
+
+    A first pass asserted that only planning.py asks for max_tokens=900 and made
+    the report's "the planner is STILL truncating" line depend on it. The suite
+    said otherwise: heartbeat_loop's curiosity answer and the search agent ask
+    for 900 too. The tripwire hardcoded "invoke_nothink" — the one helper every
+    background generation passes through — so no truncation in this codebase has
+    ever been attributable to the code that chose the cap.
+    """
+    import inspect
+    from app.core.providers import ollama
+    src = inspect.getsource(ollama)
+    assert '[truncation] %s hit max_tokens' in src, "the caller must be a parameter"
+    assert "_truncation_caller()" in src
+
+
+def test_the_caller_walk_resolves_a_real_frame():
+    """Not a source-string check: the first version skipped inspect.stack()[:2]
+    and stepped straight over the caller it existed to find."""
+    import types
+    from app.core.providers import ollama
+    mod = types.ModuleType("planning")
+    src = "def plan():" + chr(10) + "    return f()" + chr(10)
+    exec(compile(src, "/app/app/core/planning.py", "exec"), mod.__dict__)
+    mod.f = ollama._truncation_caller
+    assert mod.plan() == "planning.plan"
+
+
+def test_the_caller_walk_never_raises():
+    """It runs inside a warning. A broken stack must not kill a generation."""
+    from app.core.providers import ollama
+    assert isinstance(ollama._truncation_caller(), str)
+
+
+def test_a_truncation_is_keyed_by_caller_and_ceiling(tmp_path):
+    pre = "2026-09-06 09:00:00,000 [WARNING] app.core.providers.ollama []: [truncation] "
+    g = _log(tmp_path, "".join(
+        pre + who + " hit max_tokens (900) - cut" + chr(10)
+        for who in ("planning.plan", "search_agent.run")))
+    got = er.planner_health(1, g, today="2026-09-06")
+    assert got["truncations"] == {"planning.plan@900": 1, "search_agent.run@900": 1}
+
+
+def test_only_the_PLANNERS_900_raises_the_planner_alarm(monkeypatch):
+    """A 900 cut in the search agent is not evidence the planner needs more."""
+    monkeypatch.setattr(er, "planner_health", lambda *a, **k: {
+        "truncations": {"search_agent.run@900": 5}, "plan_failures": {}})
+    monkeypatch.setattr(er, "curiosity_stage1", lambda *a, **k: None)
+    monkeypatch.setattr(er, "cascade_support", lambda *a, **k: None)
+    monkeypatch.setattr(er, "product_quality", lambda *a, **k: None)
+    _stub_rest(monkeypatch)
+    _status, _summary, fields = er.build_report(_ReportDB())
+    assert not [k for k in fields if k.startswith("look_at")]
+
+
+def test_a_legacy_line_still_parses_but_claims_no_attribution(tmp_path):
+    g = _log(tmp_path, TRUNC.format(d="2026-09-06", cap=900))
+    assert er.planner_health(1, g, today="2026-09-06")["truncations"] == {"900": 1}
+
+
+def test_the_field_does_not_claim_every_ceiling_is_the_planners(monkeypatch):
+    monkeypatch.setattr(er, "planner_health", lambda *a, **k: {
+        "truncations": {"700": 2}, "plan_failures": {"TimeoutError": 3}})
+    monkeypatch.setattr(er, "curiosity_stage1", lambda *a, **k: None)
+    monkeypatch.setattr(er, "cascade_support", lambda *a, **k: None)
+    monkeypatch.setattr(er, "product_quality", lambda *a, **k: None)
+    _stub_rest(monkeypatch)
+    _status, _summary, fields = er.build_report(_ReportDB())
+    assert "planner" not in fields, "a 700 cut is critique's or storylines', not the planner's"
+    assert fields["truncation"] == "cut at 700x2; planner failed: TimeoutError x3"
