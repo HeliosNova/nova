@@ -2013,8 +2013,20 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         Two-stage: cheap heuristic (length + deflection patterns) → LLM judge.
         The LLM judge runs on FAST_MODEL with strict json output, single call.
         """
-        # Stage 1: cheap heuristics
+        # Stage 1: cheap heuristics.
+        #
+        # These reject before the judge ever runs, and until 2026-09-06 they did
+        # it SILENTLY: of 340 closure failures since 08-20, 169 were logged by
+        # the judge and the other 171 — half of them — left no record of why.
+        # Half the failures of the loop that answers Nova's own questions were
+        # undiagnosable, which is why this instruments rather than changes
+        # anything. Several markers are phrases a good answer legitimately
+        # contains while hedging one sub-part ("unclear from", "uncertain
+        # about"); whether that is actually happening is now measurable instead
+        # of arguable.
         if not result or len(result.strip()) < 80:
+            logger.info("[Curiosity] stage-1 reject (too short: %d chars): %s",
+                        len(result.strip()) if result else 0, topic[:70])
             return False
         rl = result.lower()[:600]
         deflection_markers = (
@@ -2024,7 +2036,10 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             "no findings", "no data available", "unclear from",
             "i'm not sure", "i am not sure", "uncertain about",
         )
-        if any(m in rl for m in deflection_markers):
+        hit = next((m for m in deflection_markers if m in rl), None)
+        if hit:
+            logger.info("[Curiosity] stage-1 reject (deflection %r at %d chars): %s",
+                        hit, len(result), topic[:70])
             return False
 
         # Stage 2: LLM judge — does this answer the question?
