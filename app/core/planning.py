@@ -10,6 +10,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 
 from app.config import config
 from app.core import llm
@@ -162,6 +163,7 @@ async def create_plan(
     query: str,
     tool_names: list[str],
     reflexions_text: str = "",
+    timeout: float | None = None,
 ) -> dict | None:
     """Create a step-by-step plan for a complex query.
 
@@ -171,6 +173,13 @@ async def create_plan(
     if reflexions_text:
         system += f"\n\nWarnings from past failures:\n{reflexions_text}"
 
+    # How long a plan takes is the number that decides what to do when one
+    # FAILS. Every planning failure since 2026-08-29 has been a TimeoutError
+    # against a 60s ceiling, and the count alone cannot say whether 60s is
+    # tight (generation genuinely takes that long) or irrelevant (the call
+    # sat waiting for a 9B runner to load behind the resident 27B). Those
+    # have opposite fixes. The slowest SUCCESSFUL plan settles it.
+    t0 = time.monotonic()
     try:
         raw = await asyncio.wait_for(
             llm.invoke_nothink(
@@ -183,7 +192,7 @@ async def create_plan(
                 max_tokens=900,
                 temperature=0.1,
             ),
-            timeout=config.INTERNAL_LLM_TIMEOUT,
+            timeout=timeout or float(config.INTERNAL_LLM_TIMEOUT),
         )
         if not raw:
             return None
@@ -246,6 +255,8 @@ async def create_plan(
         if complexity not in ("simple", "multi_step", "decomposable"):
             complexity = "multi_step"
 
+        logger.info("[planning] plan ready in %.1fs (%d steps, %s)",
+                    time.monotonic() - t0, len(validated), complexity)
         return {
             "steps": validated,
             "sub_questions": sub_questions,
@@ -258,7 +269,7 @@ async def create_plan(
         # with an empty message, because the exceptions that actually reach here
         # are httpx timeouts whose str() is "". repr() keeps the class name, which
         # is the only part that identifies the fault.
-        logger.warning("Planning failed: %r", e)
+        logger.warning("Planning failed: %r after %.1fs", e, time.monotonic() - t0)
         return None
 
 

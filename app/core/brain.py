@@ -1338,6 +1338,7 @@ async def _build_messages(
     history: list[dict],
     image: str | None,
     intent: str,
+    channel: str = "",
 ) -> tuple[list[dict], bool, dict | None]:
     """Build system prompt, manage context window, assemble messages, run query planning.
 
@@ -1440,7 +1441,25 @@ async def _build_messages(
         if should_plan(query, intent):
             try:
                 tool_names = [t["name"] for t in _get_available_tools()]
-                plan = await create_plan(query, tool_names, ctx.reflexions_text)
+                # 294 measured plans: p50 2.5s, p90 13.2s, p99 47.1s, max 56.5s
+                # against a 60s ceiling, with 23 timeouts sitting in the part of
+                # that tail which spilled over. The tail is not slow generation
+                # - it is a 9B planning call waiting for the GPU behind resident
+                # 27B digests (observed: a batch of 9 dispatched as
+                # other,other,digest x7, and the plan behind it took 56.5s).
+                #
+                # A timeout is a CEILING, not a target: a resident model still
+                # answers in 2.5s. So BACKGROUND work, where latency is free,
+                # gets room to absorb one model load. Interactive chat keeps the
+                # 60s budget, because a user waiting two minutes for a plan is a
+                # worse outcome than an answer produced without one - planning
+                # failure is graceful and costs quality, not correctness.
+                # Same shape as gsw.py's max(INTERNAL_LLM_TIMEOUT, 60): a
+                # per-call-site adjustment of the shared value, not a new flag.
+                plan_timeout = (max(float(config.INTERNAL_LLM_TIMEOUT), 120.0)
+                                if channel == "monitor" else None)
+                plan = await create_plan(query, tool_names, ctx.reflexions_text,
+                                         timeout=plan_timeout)
                 if plan:
                     plan_text = format_plan_for_prompt(plan)
                     messages.append({"role": "system", "content": plan_text})
@@ -4037,7 +4056,7 @@ async def think(
 
         # --- Step 6: Build messages + planning ---
         messages, was_planned, plan = await _build_messages(
-            svc, ctx, query, history, image, intent
+            svc, ctx, query, history, image, intent, channel
         )
 
         # Save user message

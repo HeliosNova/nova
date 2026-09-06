@@ -79,6 +79,11 @@ _STAGE1_RE = re.compile(r"\[Curiosity\] stage-1 reject \(([^)]+)\)")
 # parse, they just cannot be attributed.
 _TRUNC_RE = re.compile(r"\[truncation\] ([\w.]+) hit max_tokens \((\d+)\)")
 _PLAN_FAIL_RE = re.compile(r"Planning failed: (\w+)")
+# The denominator. Counting failures alone was this field's own version of
+# the mistake schedule_pressure made: "planner failed: TimeoutError x3" reads
+# identically at 3-of-3 (catastrophic) and 3-of-38 (a bad afternoon). The
+# measured spread across one week was 40% down to 0%.
+_PLAN_OK_RE = re.compile(r"\[planning\] plan ready in ([0-9.]+)s")
 
 
 def _scan(days: int, log_glob: str, today: str | None, handler) -> None:
@@ -146,6 +151,7 @@ def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
     from collections import Counter
     caps: Counter = Counter()
     fails: Counter = Counter()
+    secs: list[float] = []
 
     def _h(line: str) -> None:
         m = _TRUNC_RE.search(line)
@@ -157,12 +163,27 @@ def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
         f = _PLAN_FAIL_RE.search(line)
         if f:
             fails[f.group(1)] += 1
+        ok = _PLAN_OK_RE.search(line)
+        if ok:
+            secs.append(float(ok.group(1)))
 
     _scan(days, log_glob, today, _h)
-    if not caps and not fails:
+    if not caps and not fails and not secs:
         return None
-    return {"truncations": dict(caps.most_common(4)),
-            "plan_failures": dict(fails.most_common(3))}
+    out: dict = {"truncations": dict(caps.most_common(4)),
+                 "plan_failures": dict(fails.most_common(3))}
+    nfail = sum(fails.values())
+    if secs or nfail:
+        out["planned"] = len(secs)
+        out["failed"] = nfail
+        total = len(secs) + nfail
+        out["fail_rate"] = (nfail / total) if total else None
+        if secs:
+            # The slowest plan that SUCCEEDED, against a 60s ceiling. Well under
+            # it means a timeout is queueing or a model swap, and raising the
+            # ceiling is the wrong fix; close to it means 60s is simply tight.
+            out["slowest_ok"] = max(secs)
+    return out
 
 
 def _short(item: str) -> str:
@@ -468,13 +489,31 @@ def build_report(db) -> tuple[str, str, dict]:
         bits = []
         if ph["truncations"]:
             bits.append("cut at " + ", ".join(f"{k}x{v}" for k, v in ph["truncations"].items()))
-        if ph["plan_failures"]:
+        if ph.get("fail_rate") is not None:
+            bits.append(f"planning {ph['planned']} ok / {ph['failed']} timeout "
+                        f"({ph['fail_rate']:.0%})")
+        if ph.get("slowest_ok") is not None:
+            bits.append(f"slowest plan {ph['slowest_ok']:.0f}s")
+        if ph["plan_failures"] and not ph.get("failed"):
             bits.append("planner failed: "
                         + ", ".join(f"{k} x{v}" for k, v in ph["plan_failures"].items()))
         fields["truncation"] = "; ".join(bits)
         # 900 is NOT unique to the planner — heartbeat_loop's curiosity answer and
         # the search agent ask for it too, which is why the tripwire had to learn
         # to name its caller before this rule could mean anything.
+        # A RATE, not a count. 3 timeouts out of 38 is a bad afternoon; 3 out of
+        # 3 is an outage, and the old field rendered them identically. The bar is
+        # 15% because the measured week ran 40% at its worst and 0% at its best.
+        if (ph.get("fail_rate") or 0) >= 0.15 and (ph["planned"] + ph["failed"]) >= 10:
+            slow = ph.get("slowest_ok")
+            hint = (f"slowest plan that DID finish took {slow:.0f}s of 60 — "
+                    + ("the ceiling is tight" if slow and slow > 30
+                       else "so this is queueing behind a model load, not slow generation")
+                    ) if slow else "no plan finished, so the ceiling tells us nothing"
+            attention.append(
+                f"{ph['fail_rate']:.0%} of plans timed out "
+                f"({ph['failed']}/{ph['planned'] + ph['failed']}) — {hint}")
+
         n900 = sum(v for k, v in ph["truncations"].items()
                    if k.endswith("@900") and k.startswith("planning"))
         if n900:
