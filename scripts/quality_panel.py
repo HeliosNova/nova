@@ -24,23 +24,13 @@ import re
 import sqlite3
 from collections import defaultdict
 
-# A short parenthetical naming "analysis" with no domain token is the digest
-# citing its own reasoning — mirrors deep_research._strip_pseudo_citations.
-_PAREN = re.compile(r"\(([^)]{0,80})\)")
-_ANALYSIS = re.compile(r"(?i)\banalys[ei]s\b")
-_DOMAINISH = re.compile(r"[a-z0-9-]+\.[a-z]{2,}")
-_CITE = re.compile(r"\(([a-z0-9-]+\.[a-z]{2,})\)")
+# The digest-shape measures live in app/monitors/engineering_report.py so the
+# daily report and this panel cannot drift apart. A second copy of a regex is
+# how `strip_markup` came to be defined twice, with the second silently winning.
+from app.monitors.engineering_report import digest_shape  # noqa: E402
+
 _DATED = re.compile(r"\b20\d\d-\d\d-\d\d\b|\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
                     r"[a-z]*\s+\d{1,2}\b")
-# Scaffolding the model is never supposed to ship.
-_LEAKS = (
-    re.compile(r"(?i)\bas an ai\b"),
-    re.compile(r"(?i)\b(?:step|stage) \d+/\d+\b"),
-    re.compile(r"(?i)\bnot specified here\b"),
-    re.compile(r"(?i)\bsearch results?\b"),
-    re.compile(r"</?tool_call>"),
-    re.compile(r"(?i)\bI (?:cannot|can't) (?:access|browse)\b"),
-)
 
 
 def panel(db_path: str, days: int) -> None:
@@ -60,16 +50,10 @@ def panel(db_path: str, days: int) -> None:
         v = r["value"]
         s = day[r["created_at"][:10]]
         s["n"] += 1
-        s["chars"] += len(v)
-        s["cites"] += len(_CITE.findall(v))
-        s["pseudo"] += sum(1 for m in _PAREN.finditer(v)
-                           if _ANALYSIS.search(m.group(1)) and not _DOMAINISH.search(m.group(1)))
+        shape = digest_shape(v)
+        for k in ("chars", "cites", "pseudo", "leaks", "linkonly", "thin"):
+            s[k] += shape[k]
         s["dated"] += len(_DATED.findall(v))
-        s["leaks"] += sum(1 for rx in _LEAKS if rx.search(v))
-        if len(v) < 600 and "http" in v:
-            s["linkonly"] += 1
-        if len(v) < 2500:
-            s["thin"] += 1
 
     print("PRODUCT — what the digests look like (deterministic, no model involved)")
     print(f"{'day':<12}{'digests':>8}{'avg chars':>10}{'cites':>7}{'PSEUDO':>8}"

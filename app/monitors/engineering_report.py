@@ -73,6 +73,92 @@ def cascade_support(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
             "runs": {k: len(v) for k, v in sorted(sites.items())}}
 
 
+_STAGE1_RE = re.compile(r"\[Curiosity\] stage-1 reject \(([^)]+)\)")
+_TRUNC_RE = re.compile(r"\[truncation\] \w+ hit max_tokens \((\d+)\)")
+_PLAN_FAIL_RE = re.compile(r"Planning failed: (\w+)")
+
+
+def _scan(days: int, log_glob: str, today: str | None, handler) -> None:
+    """Walk the persisted logs inside a window, feeding lines to `handler`.
+
+    The container's own log is lost on every restart — and this session
+    restarted nova-app nine times in a day — so everything here reads
+    /data/logs, which lives on the volume and survives.
+    """
+    import glob as _glob
+    import os
+    import time as _time
+    from datetime import date, timedelta
+
+    base = date.fromisoformat(today) if today else date.today()
+    cutoff = (base - timedelta(days=max(1, days))).isoformat()
+    try:
+        paths = _glob.glob(log_glob)
+    except OSError:
+        return
+    for lp in paths:
+        try:
+            if os.path.getmtime(lp) < (_time.time() - (days + 1) * 86400):
+                continue
+            with open(lp, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line[:10] >= cutoff:
+                        handler(line)
+        except OSError:
+            continue
+
+
+def curiosity_stage1(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
+                     today: str | None = None) -> dict | None:
+    """Why curiosity's cheap pre-filter rejected an answer, by reason.
+
+    Half of all closure failures came from stage 1 and logged nothing until
+    2026-09-06 (171 of 340 since 08-20). The open question this answers: are
+    the deflection markers killing answers that actually settled the question
+    but hedged one sub-part? A marker dominating this list is the suspect.
+    """
+    from collections import Counter
+    reasons: Counter = Counter()
+
+    def _h(line: str) -> None:
+        m = _STAGE1_RE.search(line)
+        if m:
+            r = m.group(1)
+            reasons["too short" if r.startswith("too short") else
+                    r.split(" at ")[0].replace("deflection ", "")] += 1
+
+    _scan(days, log_glob, today, _h)
+    return dict(reasons.most_common(5)) if reasons else None
+
+
+def planner_health(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
+                   today: str | None = None) -> dict | None:
+    """Whether the planner is still being cut off, and how often it times out.
+
+    The ceiling went 512 -> 900 on 2026-09-05 with a caveat: the A/B that
+    justified it never reproduced the long queries that truncate, so "900 is
+    enough" was untested. A `900` here says it is not. Timeouts are the larger,
+    untouched problem — 60s against a GPU the digest chain owns.
+    """
+    from collections import Counter
+    caps: Counter = Counter()
+    fails: Counter = Counter()
+
+    def _h(line: str) -> None:
+        m = _TRUNC_RE.search(line)
+        if m:
+            caps[m.group(1)] += 1
+        f = _PLAN_FAIL_RE.search(line)
+        if f:
+            fails[f.group(1)] += 1
+
+    _scan(days, log_glob, today, _h)
+    if not caps and not fails:
+        return None
+    return {"truncations": dict(caps.most_common(4)),
+            "plan_failures": dict(fails.most_common(3))}
+
+
 def _short(item: str) -> str:
     """The headline of one attention line — the summary is capped at 80 chars,
     so three of them have to fit in the part a reader always sees."""
@@ -119,6 +205,139 @@ def _knowing(db) -> dict:
     return out
 
 
+# ---------------------------------------------------------------------------
+# What the digests LOOK like. Deterministic, no model, no network.
+#
+# The report above answers "is Nova delivering less than it was". It cannot see
+# the other regression: delivering the same amount, worse. On 2026-09-04 digests
+# citing "(deep analysis)" climbed 10% -> 34% -> 45% -> 55% over three days with
+# the suite green and every throughput number flat, and the OWNER found it.
+#
+# These are the same measures scripts/quality_panel.py uses, defined HERE and
+# imported there, because a second copy of a regex is how `strip_markup` came to
+# be defined twice with the second silently winning.
+# ---------------------------------------------------------------------------
+_PAREN = re.compile(r"\(([^)]{0,80})\)")
+_ANALYSIS = re.compile(r"(?i)\banalys[ei]s\b")
+_DOMAINISH = re.compile(r"[a-z0-9-]+\.[a-z]{2,}")
+_CITE = re.compile(r"\(([a-z0-9-]+\.[a-z]{2,})\)")
+_LEAKS = (
+    re.compile(r"(?i)\bas an ai\b"),
+    re.compile(r"(?i)\b(?:step|stage) \d+/\d+\b"),
+    re.compile(r"(?i)\bnot specified here\b"),
+    re.compile(r"(?i)\bsearch results?\b"),
+    re.compile(r"</?tool_call>"),
+    re.compile(r"(?i)\bI (?:cannot|can't) (?:access|browse)\b"),
+)
+
+
+# Post-fix (2026-09-04) this measured 0.00 across 125 digests while the four
+# days before it ran 1.41-2.36, so anything above a rounding error is a
+# regression and not a topic-mix wobble.
+_PSEUDO_FLOOR = 0.25
+
+
+def digest_shape(value: str) -> dict:
+    """The deterministic fingerprint of one digest.
+
+    `pseudo` is the load-bearing one: a short parenthetical naming "analysis"
+    with no domain token in it is the briefing citing its own reasoning instead
+    of a source. `linkonly` is the owner's recurring complaint in numeric form.
+    """
+    return {
+        "chars": len(value),
+        "cites": len(_CITE.findall(value)),
+        "pseudo": sum(1 for m in _PAREN.finditer(value)
+                      if _ANALYSIS.search(m.group(1))
+                      and not _DOMAINISH.search(m.group(1))),
+        "leaks": sum(1 for rx in _LEAKS if rx.search(value)),
+        "linkonly": 1 if (len(value) < 600 and "http" in value) else 0,
+        "thin": 1 if len(value) < 2500 else 0,
+    }
+
+
+def product_quality(db, days: int = 1, baseline_days: int = 7) -> dict | None:
+    """Yesterday's digest shape against the week before it.
+
+    Absolute values move with topic mix; a STEP against the trailing week is
+    what a prompt or gate change looks like, which is the only comparison worth
+    waking someone for.
+
+    `check_type='query'` and NOT `category='content'`, which was the first
+    version and was wrong. The content category also carries curiosity answers
+    (470 chars on average), storyline summaries (3,786) and forecast resolution
+    notes (770) — none of which are briefings. Measured that way, raising
+    `_CURIOSITY_BATCH` to 3 on 2026-09-04 read as digests getting shorter and
+    the thin count tripling: a change I made deliberately, arriving as a quality
+    alarm. Grading an artifact against a shape it never had is this codebase's
+    most repeated mistake; do not widen this back to the category.
+    """
+    def _window(where: str, args: tuple) -> dict | None:
+        try:
+            rows = db.fetchall(
+                "SELECT mr.value FROM monitor_results mr "
+                "JOIN monitors m ON m.id = mr.monitor_id "
+                "WHERE m.check_type = 'query' AND mr.value IS NOT NULL "
+                "AND LENGTH(mr.value) > 400 AND " + where, args)
+        except Exception:
+            return None
+        if not rows:
+            return None
+        tot = {"n": len(rows), "chars": 0, "cites": 0, "pseudo": 0,
+               "leaks": 0, "linkonly": 0, "thin": 0}
+        for r in rows:
+            for k, v in digest_shape(r["value"]).items():
+                tot[k] += v
+        return tot
+
+    recent = _window("mr.created_at > datetime('now', ?)", (f"-{days} days",))
+    if not recent:
+        return None
+    base = _window(
+        "mr.created_at <= datetime('now', ?) AND mr.created_at > datetime('now', ?)",
+        (f"-{days} days", f"-{days + baseline_days} days"))
+    out = {"n": recent["n"], "chars": recent["chars"] // recent["n"],
+           "cites": recent["cites"] / recent["n"],
+           "pseudo": recent["pseudo"] / recent["n"],
+           "leaks": recent["leaks"], "linkonly": recent["linkonly"],
+           "thin": recent["thin"]}
+    if base and base["n"] >= 5:
+        out["base_chars"] = base["chars"] // base["n"]
+        out["base_cites"] = base["cites"] / base["n"]
+        out["base_pseudo"] = base["pseudo"] / base["n"]
+        out["base_n"] = base["n"]
+    return out
+
+
+SNAPSHOT_PATH = "/data/eng_report.jsonl"
+
+
+def append_snapshot(status: str, summary: str, fields: dict,
+                    path: str = SNAPSHOT_PATH) -> bool:
+    """Keep the FULL field set, because the delivered line cannot.
+
+    format_monitor_result caps a result at 400 characters and drops fields from
+    the end, so the row stored in monitor_results holds the findings and the
+    first few numbers and loses the rest. That is right for a message and wrong
+    for a record: comparing this morning with last week is the entire reason
+    the report exists, and half its fields would not survive to be compared.
+
+    One JSON line per run, on the data volume so it outlives a container. Never
+    raises — it runs inside a monitor.
+    """
+    import json
+    from datetime import datetime, timezone
+    try:
+        row = {"at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+               "status": status, "summary": summary, **fields}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, default=str) + "\n")
+        return True
+    except Exception as e:
+        logger.warning("[EngReport] snapshot not written: %r", e)
+        return False
+
+
 def build_report(db) -> tuple[str, str, dict]:
     """(status, summary, fields) — always delivers, never only on a threshold."""
     from app.core.forecasts import calibration
@@ -148,6 +367,45 @@ def build_report(db) -> tuple[str, str, dict]:
                 f"delivery is DOWN {abs(step['change']):.0%} ({step['before']:.1f} -> "
                 f"{step['after']:.1f} runs/active hour vs the prior week) — "
                 f"something costs more per run")
+
+    prod = product_quality(db)
+    if prod:
+        bits = [f"{prod['n']} digests", f"{prod['chars']} chars",
+                f"{prod['cites']:.1f} cites"]
+        if prod["pseudo"]:
+            bits.append(f"{prod['pseudo']:.2f} self-cites")
+        if prod["thin"]:
+            bits.append(f"{prod['thin']} thin")
+        fields["product"] = ", ".join(bits)
+        # The owner's recurring complaint, in numbers. A digest under 600 chars
+        # carrying a URL is the link-only failure, and is never acceptable.
+        if prod["linkonly"]:
+            attention.append(
+                f"{prod['linkonly']} digest(s) came back as bare links in 24h")
+        if prod["leaks"]:
+            attention.append(
+                f"{prod['leaks']} digest(s) leaked scaffolding text in 24h")
+        # Self-citation is a prompt/guard mismatch — the shape that ran 10% ->
+        # 55% over three days in 2026-09 with every other number flat.
+        #
+        # An ABSOLUTE floor, not only a step, because a rolling baseline cannot
+        # see a return to a level it still contains. The 09-04 fix took this to
+        # 0.00 across 125 digests while the trailing week still averages 1.67,
+        # so for the next week a regression all the way back to 1.0 would
+        # compute as an IMPROVEMENT and say nothing. Same trap the fixed-thirds
+        # throughput window had, one metric over.
+        bp = prod.get("base_pseudo")
+        stepped = bp is not None and prod["pseudo"] >= 0.20 and prod["pseudo"] > bp + 0.15
+        if prod["pseudo"] >= _PSEUDO_FLOOR or stepped:
+            was = f" vs {bp:.2f} the week before" if bp is not None else ""
+            attention.append(
+                f"digests are citing their own analysis again "
+                f"({prod['pseudo']:.2f}/digest{was})")
+        bc = prod.get("base_chars")
+        if bc and prod["chars"] < bc * 0.75:
+            attention.append(
+                f"digests got shorter: {prod['chars']} chars vs {bc} the week "
+                f"before — check the synthesis ceiling, not the schedule")
 
     press = schedule_pressure(db)
     if press.get("ratio") is not None:
@@ -185,6 +443,28 @@ def build_report(db) -> tuple[str, str, dict]:
                 attention.append(
                     f"curiosity takes {cur['latency_days']} days to answer a question")
         fields["curiosity"] = ", ".join(bits)
+
+    st1 = curiosity_stage1(1)
+    if st1:
+        fields["curiosity_rejects"] = ", ".join(f"{k} x{v}" for k, v in st1.items())
+        top, n = next(iter(st1.items()))
+        if top != "too short" and n >= 3:
+            attention.append(
+                f"curiosity's stage-1 filter killed {n} answer(s) on {top!r} "
+                f"before the judge saw them")
+
+    ph = planner_health(1)
+    if ph:
+        bits = []
+        if ph["truncations"]:
+            bits.append("cut at " + ", ".join(f"{k}x{v}" for k, v in ph["truncations"].items()))
+        if ph["plan_failures"]:
+            bits.append("failed: " + ", ".join(f"{k} x{v}" for k, v in ph["plan_failures"].items()))
+        fields["planner"] = "; ".join(bits)
+        if ph["truncations"].get("900"):
+            attention.append(
+                f"the planner is STILL truncating at its new 900 ceiling "
+                f"({ph['truncations']['900']}x) — it needs more")
 
     kn = _knowing(db)
     fields["knowing"] = (f"+{kn.get('kg_facts_24h', 0)} facts/24h, "

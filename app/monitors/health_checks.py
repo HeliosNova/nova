@@ -458,9 +458,12 @@ class HealthChecksMixin:
         threshold.
         """
         from app.database import get_db
-        from app.monitors.engineering_report import build_report
+        from app.monitors.engineering_report import append_snapshot, build_report
 
         status, summary, fields = await asyncio.to_thread(build_report, get_db())
+        # Record BEFORE rendering: the delivered line is capped at 400 chars and
+        # drops fields from the end, so the stored result cannot be the record.
+        await asyncio.to_thread(append_snapshot, status, summary, fields)
         return format_monitor_result("Engineering Report", status, summary, fields)
 
     async def _execute_kg_health_check(self) -> str:
