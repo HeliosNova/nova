@@ -154,7 +154,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
                 conf = _SOURCE_CONFIDENCE.get(source_name, _DEFAULT_SOURCE_CONFIDENCE)
 
             try:
-                safe = await kg.check_and_resolve_contradictions(s, p, o, conf)
+                safe = await kg.check_and_resolve_contradictions(s, p, o, conf, model=model)
                 if not safe:
                     continue
             except Exception as e:

@@ -1245,12 +1245,19 @@ class KnowledgeGraph:
         predicate: str,
         new_object: str,
         new_confidence: float = 0.8,
+        *,
+        model: str | None = None,
     ) -> bool:
         """Check for contradicting facts and resolve via LLM. Returns True if safe to add.
 
         Uses read-under-lock -> LLM call (no lock) -> re-read-and-write-under-lock
         pattern to avoid holding the lock during slow LLM calls while still
         preventing stale-data races.
+
+        `model` is the caller's model (2026-09-08): a digest's post-run
+        extraction holds the 27B, and asking the default 9B for a 16-token
+        verdict evicted it and reloaded it for the next step. Chat and
+        curiosity pass nothing and keep the default.
         """
         subject = subject.strip()
         predicate = normalize_predicate(predicate)
@@ -1309,6 +1316,7 @@ class KnowledgeGraph:
                         "required": ["keep"],
                     },
                     temperature=0.1,
+                    model=model,
                 )
                 obj = llm.extract_json_object(raw)
                 if not obj:
