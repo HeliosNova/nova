@@ -1104,10 +1104,14 @@ async def _read_bodies(picks: list, *, read_target: int, browser_budget: int) ->
 async def _gather_sources(subject: str, *, read_target: int, browser_budget: int = 6) -> list:
     """Deep single-story gather: facet-expand the subject, search, read."""
     year = _NOW().strftime("%Y")
+    # model=_syn_model(): the one chain call left on the default 9B after the
+    # 2026-09-01 one-model change. Live 2026-09-08 16:13 UTC it loaded the 9B
+    # ten seconds after '-> 5 stories' and evicted the resident 27B, which then
+    # reloaded for the next step — two loads per digest for three JSON strings.
     raw = await _invoke_bg([{"role": "user", "content":
         f"3 web-search queries digging into this {year} story from different facets "
         f"(what happened, numbers/who, reactions/analysis): '{subject}'. JSON array of 3."}],
-        json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=160)
+        json_mode=True, json_schema=_STRING_ARRAY_SCHEMA, max_tokens=160, model=_syn_model())
     extra = [a for a in _json_array(raw) if isinstance(a, str) and len(a) > 8][:3]
     angles = [subject, f"{subject} {year}"] + extra
     search_picks, aux_picks = await asyncio.gather(

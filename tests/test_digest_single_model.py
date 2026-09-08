@@ -70,3 +70,31 @@ async def test_without_a_synthesis_model_the_default_model_is_used(monkeypatch):
     finally:
         _cfg.update(MONITOR_SYNTHESIS_MODEL=old)
     assert seen and seen[0].get("model") is None
+
+
+@pytest.mark.asyncio
+async def test_the_per_story_facet_queries_use_the_synthesis_model(monkeypatch, syn_model):
+    """Found live 2026-09-08 16:13 UTC: a Domain Study finished, the next one
+    started, logged '-> 5 stories', and ten seconds later Ollama loaded the 9B
+    and evicted the 27B for the facet-query planner in _gather_sources - the
+    one call in the chain still model-less after the 2026-09-01 change. Then
+    the 27B reloaded for the next step. Two loads per digest, for three short
+    JSON strings."""
+    seen: list[dict] = []
+
+    async def _fake(messages, **kwargs):
+        seen.append(kwargs)
+        return '["what happened", "numbers and who", "reactions"]'
+
+    async def _no_search(angles, **kwargs):
+        return []
+
+    async def _no_aux(subjects, **kwargs):
+        return []
+
+    monkeypatch.setattr(deep_research, "_invoke_bg", _fake)
+    monkeypatch.setattr(deep_research, "_search_candidates", _no_search)
+    monkeypatch.setattr(deep_research, "_aux_news", _no_aux)
+    await deep_research._gather_sources("Hedge funds increase Big Tech exposure", read_target=4)
+    assert seen, "no LLM call recorded"
+    assert [k.get("model") for k in seen] == [syn_model] * len(seen), [k.get("model") for k in seen]
