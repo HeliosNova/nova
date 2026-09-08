@@ -86,12 +86,21 @@ async def test_a_clean_answer_still_reaches_the_judge(monkeypatch, caplog):
 
 
 @pytest.mark.asyncio
-async def test_a_judge_failure_still_resolves_rather_than_looping(monkeypatch):
-    """Unchanged behaviour, restated: a broken judge must not requeue forever."""
+async def test_a_judge_failure_is_not_a_verdict(monkeypatch):
+    """This asserted `is True` until 2026-09-07, and the change is the point.
+
+    "A broken judge must not requeue forever" was the reason for defaulting
+    to resolve. MAX_ATTEMPTS already bounds the loop, and the default had a
+    cost the reason never weighed: on 2026-09-07 the judge timed out behind a
+    saturated GPU nine times in one day and each time banked whatever text it
+    had been handed - "The model is busy right now" - as a resolution, then
+    sent it to the owner. None means "could not judge"; the caller defers the
+    item without burning its attempt (tests/test_curiosity_busy_model_is_not_an_answer.py).
+    """
     from app.core import llm as llm_mod
 
     async def _boom(*_a, **_k):
         raise RuntimeError("model down")
 
     monkeypatch.setattr(llm_mod, "invoke_nothink", _boom)
-    assert await _loop()._curiosity_closure_check("FOMC split", GOOD) is True
+    assert await _loop()._curiosity_closure_check("FOMC split", GOOD) is None

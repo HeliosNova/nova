@@ -1356,7 +1356,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         if text:
                             tokens.append(text)
                     elif event.type == EventType.DONE:
-                        grounding = dict(event.data.get("grounding") or {})
+                        grounding.update(dict(event.data.get("grounding") or {}))
+                    elif event.type == EventType.ERROR:
+                        # think() answers a timed-out or unreachable model with a
+                        # friendly sentence and an ERROR event carrying the code
+                        # ('llm_busy' / 'llm_unavailable'). The code is the
+                        # contract; the wording is not (2026-09-07: nine
+                        # questions were "resolved" with the busy sentence).
+                        grounding["code"] = str(event.data.get("code") or "error")
         except asyncio.TimeoutError:
             logger.warning("[Heartbeat] _think_query timed out for: %s", query[:80])
             return "[Query timed out]", {}
@@ -1897,10 +1904,17 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         try:
             result, grounding = await self._think_query_meta(research_query)
 
-            # LLM failures should NOT count toward attempt limit — they'll resolve when LLM recovers
-            _is_llm_down = result and (
-                result.startswith("I can't reach the language model")
-                or result.startswith("I attempted to use tools but couldn't complete")
+            # LLM failures should NOT count toward attempt limit — they'll resolve when LLM recovers.
+            # Matched on the ERROR code first: the busy/unavailable sentences are
+            # answers the model never made, and on 2026-09-07 the busy one was
+            # banked as a resolution nine times because only one wording was known.
+            _is_llm_down = (
+                grounding.get("code") in ("llm_busy", "llm_unavailable")
+                or (result and (
+                    result.startswith("I can't reach the language model")
+                    or result.startswith("The model is busy right now")
+                    or result.startswith("I attempted to use tools but couldn't complete")
+                ))
             )
             if _is_llm_down:
                 # Don't call fail() — leave attempts unchanged so it retries next cycle
@@ -1927,6 +1941,15 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 # Pattern check filters obvious deflections; LLM judge handles
                 # the rest. Failed closure → requeue (fail() bumps attempts).
                 _resolved_ok = await self._curiosity_closure_check(item.topic, result)
+                if _resolved_ok is None:
+                    # The judge could not answer (timed out behind a digest, or
+                    # raised). That is not a yes: nothing is banked, nothing is
+                    # sent, and the attempt is not burned - the question was
+                    # never actually judged.
+                    logger.info("[Curiosity] closure judge unavailable — deferred without "
+                                "attempt burn: %s", item.topic[:80])
+                    return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                            f"reason=judge_unavailable")
                 if not _resolved_ok:
                     # ANALYTICAL/forecast questions ("Can India's markets absorb
                     # $50B?" — the dossier open-question style) structurally
@@ -2114,9 +2137,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 logger.info("[Curiosity] judge says no: %s", str(obj.get("reason", ""))[:120])
             return answered
         except Exception as e:
-            # On judge failure, default to True so we don't loop forever
-            logger.warning("[Curiosity] closure judge failed (defaulting to resolve): %s", e)
-            return True
+            # A judge that could not answer has not said yes. This used to
+            # default to True "so we don't loop forever" - MAX_ATTEMPTS bounds
+            # the loop, and on 2026-09-07 the default banked "The model is busy
+            # right now" as a resolution while the judge itself was timing out
+            # behind the same saturated GPU. None means "could not judge"; the
+            # caller defers without burning the attempt.
+            logger.warning("[Curiosity] closure judge unavailable (deferring): %s", e)
+            return None
 
     async def _send_curiosity_followup(self, topic: str, findings: str) -> None:
         """Send a proactive message when curiosity resolves a topic the user asked about."""
