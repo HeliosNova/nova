@@ -135,6 +135,22 @@ _SPECIALIZED = {
 }
 
 
+def _feed_model() -> str | None:
+    """The synthesis model for every LLM call in the feed-digest chain (2026-09-08).
+
+    `_monitor_class` files feed-backed digests in the same residency class as
+    the Domain Studies on the premise that they drive the 27B. They did not:
+    the five calls in this chain (insight line, extractive retry, thin-item
+    enrichment, snippet rewrite, cross-cutting analysis) were model-less, so a
+    Hacker News digest ran the 9B three-wide beside 27B Domain Studies and
+    Ollama evicted one for the other on every call — measured 15:20-15:27 UTC:
+    six loads in five minutes, the 27B resident for twenty seconds at a time.
+    One model per class, as the 2026-09-01 change did for deep_research.
+    """
+    from app.monitors.deep_research import _syn_model
+    return _syn_model()
+
+
 async def _native_insight(label: str, items: list) -> str:
     """One-line 'what's notable' across today's list items — the throughline a bare
     link list can't give. Synthesized from titles only (cheap, one LLM pass, no
@@ -162,7 +178,7 @@ async def _native_insight(label: str, items: list) -> str:
             f"the 2-3 most notable themes a reader should clock. Be concrete; do NOT restate the list, "
             f"do NOT add preamble. Never state totals or aggregate figures you computed yourself — "
             f"only numbers that appear verbatim in an item.\n\n{blob}"}],
-            max_tokens=110, temperature=0.3)
+            max_tokens=110, temperature=0.3, model=_feed_model())
     except Exception:
         return ""
     out = re.sub(r"\s+", " ", (out or "").strip())
@@ -424,7 +440,7 @@ async def _extractive_retry(monitor_name: str, label: str, redo: list[tuple]) ->
             [{"role": "user", "content": prompt}],
             json_mode=True, json_schema=schema,
             max_tokens=max_tokens, temperature=0.0,
-            num_ctx=_enrich_num_ctx(prompt, max_tokens))
+            num_ctx=_enrich_num_ctx(prompt, max_tokens), model=_feed_model())
     except Exception as e:
         logger.warning("[DomainRunner] extractive retry LLM failed for %s: %r", monitor_name, e)
         return []
@@ -641,7 +657,7 @@ async def _enrich_thin_native_items(monitor_name: str, label: str, items: list) 
             [{"role": "user", "content": prompt}],
             json_mode=True, json_schema=schema,
             max_tokens=_max_tokens, temperature=0.2,
-            num_ctx=_enrich_num_ctx(prompt, _max_tokens))
+            num_ctx=_enrich_num_ctx(prompt, _max_tokens), model=_feed_model())
     except Exception as e:
         logger.warning("[DomainRunner] native enrich LLM failed for %s: %s", monitor_name, e)
         _restore_feed_text()
@@ -1438,6 +1454,7 @@ async def _enrich_summaries(label: str, items: list[dict]) -> list[dict]:
                 out = await invoke_nothink(
                     [{"role": "user", "content": prompt}],
                     max_tokens=180, temperature=0.1,  # tight budget = no rambling
+                    model=_feed_model(),
                 )
         except Exception as e:
             logger.warning("[DomainRunner] summary LLM failed: %s", e)
@@ -2154,6 +2171,7 @@ async def _synthesize_insight(label: str, items: list[dict]) -> str:
         out = await invoke_nothink(
             [{"role": "user", "content": prompt}],
             max_tokens=220, temperature=0.4,
+            model=_feed_model(),
         )
         out = (out or "").strip()
         # Guard against the model echoing the instructions or a headline list.
