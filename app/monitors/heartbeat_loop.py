@@ -1928,6 +1928,20 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 # ever sees the text, so it cannot catch this (2026-09-07: an
                 # answer at p=0.02 on every claim was resolved, lessoned and
                 # sent to the owner). Not knowledge: requeue, never resolve.
+                # The gate could not check at all (sidecar down or still loading
+                # its model — every chunk failed). A verifier that could not
+                # check has not cleared the answer: on 2026-09-08 22:51 UTC, the
+                # first run after an outage, a question that had scored 3 of 3
+                # claims unsupported five hours earlier was banked as a
+                # provisional resolution during the sidecar's warm-up minute.
+                # Defer without burning the attempt, as a judge that could not
+                # answer does.
+                if grounding.get("inert"):
+                    logger.info("[Curiosity] entailment gate could not check the answer "
+                                "(sidecar unavailable) — deferred without attempt burn: %s",
+                                item.topic[:80])
+                    return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                            f"reason=grounding_unavailable")
                 if grounding.get("guard"):
                     logger.info("[Curiosity] answer unsupported by its own evidence "
                                 "(%d of %d claims failed entailment) — requeued: %s",

@@ -229,3 +229,27 @@ async def test_no_verdict_at_all_keeps_the_old_path(monkeypatch, db):
 
     assert out.startswith("CURIOSITY RESOLVED"), out
     assert judged == [TOPIC]
+
+
+@pytest.mark.asyncio
+async def test_an_inert_gate_defers_rather_than_banks(monkeypatch, db):
+    """2026-09-08 22:51 UTC, first curiosity run after an outage: the entailment
+    sidecar was still loading, the gate logged "every chunk failed — gate inert",
+    and the same Apple question that had scored 3 of 3 claims unsupported at
+    17:08 was banked as a provisional resolution. A verifier that could not
+    check has not cleared the answer: defer without burning the attempt, the way
+    a judge that could not answer does."""
+    db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
+               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+    queue = CuriosityQueue(db)
+    lp, judged, sent = _loop(monkeypatch, queue, SUPPORTED,
+                             {"guard": False, "checked": 3, "unsupported": 0, "inert": True})
+
+    out = await lp._research_one_curiosity(_Svc(queue))
+
+    assert out.startswith("CURIOSITY DEFERRED"), out
+    assert "grounding_unavailable" in out
+    row = db.fetchone("SELECT status, attempts, resolution FROM curiosity_queue")
+    assert row["status"] == "pending" and row["attempts"] == 0, dict(row)
+    assert not row["resolution"]
+    assert judged == [] and sent == []
