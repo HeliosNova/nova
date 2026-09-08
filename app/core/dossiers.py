@@ -814,8 +814,10 @@ async def _update_dossier(db, cand: dict, sources: str, syn_model: str | None,
             elif "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
                 # a FORECAST line was emitted but didn't parse/store — the exact
                 # silent seam that zeroed minting for weeks pre-2026-08-13.
+                from app.core.forecasts import forecast_line_excerpt
                 logger.warning("[Knowing] FORECAST line present but not stored for %r "
-                               "— mint format drift?", cand["title"])
+                               "— mint format drift? line=%r",
+                               cand["title"], forecast_line_excerpt(out))
     except Exception as e:
         logger.warning("[Knowing] forecast minting failed for %r: %s", cand["title"], e)
 

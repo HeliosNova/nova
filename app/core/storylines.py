@@ -136,7 +136,12 @@ _UPDATE_PROMPT = (
 )
 
 # Parses an optional 'STATE: <entity> | <current status>' line for KG state-tracking.
-_STATE_RE = re.compile(r"(?im)^\s*STATE:\s*(?P<entity>[^|\n]{2,70}?)\s*\|\s*(?P<status>[^\n|]{2,70}?)\s*$")
+# The status stops before an inline "FORECAST:" — the model sometimes runs the
+# two tail lines together (replayed 2026-09-07: "STATE: X | Active intervention
+# initiated FORECAST: ..."), and the forecast text is not the thread's status.
+_STATE_RE = re.compile(
+    r"(?im)^\s*STATE:\s*(?P<entity>[^|\n]{2,70}?)\s*\|\s*(?P<status>[^\n|]{2,70}?)"
+    r"\s*(?:FORECAST:[^\n]*)?$")
 
 
 def _collect_items(db) -> list[dict]:
@@ -436,8 +441,10 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
             _fid = await parse_and_store_forecast_ensembled(
                 db, out, storyline_key=eff_key, source_monitor="Storyline Tracker")
             if not _fid and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
+                from app.core.forecasts import forecast_line_excerpt
                 logger.warning("[Storyline] FORECAST line present but not stored for %r "
-                               "— mint format drift?", eff_key)
+                               "— mint format drift? line=%r",
+                               eff_key, forecast_line_excerpt(out))
     except Exception as e:
         # The drift warning above is INSIDE this try, so a raise here suppressed
         # the very check that was meant to notice a silent mint failure

@@ -494,8 +494,15 @@ class CuriosityQueue:
         _dm.record_decision("curiosity", max_jaccard, 0.6, "inserted_new")
         return cursor.lastrowid
 
-    def get_next(self) -> CuriosityItem | None:
+    def get_next(self, exclude_ids=()) -> CuriosityItem | None:
         """Highest-urgency pending item, with the wait counted as urgency.
+
+        `exclude_ids` are rows the caller has already tried in THIS run. A
+        failed attempt changes neither urgency nor age, so without it the same
+        row is the top of the queue again immediately: on 2026-09-07 one
+        question was picked, failed, picked, failed and picked a third time
+        inside one three-minute run (attempts 0 -> 1 -> 2), and with a batch
+        of three that is the whole run spent on one question.
 
         Measured 2026-09-06: three questions minted on 08-30 were answered on
         09-06, having waited 7.4, 7.4 and 7.5 days, and every one of them
@@ -525,13 +532,20 @@ class CuriosityQueue:
         the tension is no longer minted (app/core/dossiers.py) and the slot
         that fed it is gone.
         """
+        excluded = sorted({int(i) for i in (exclude_ids or ())})
+        not_in = ""
+        params: list = [int(MAX_ATTEMPTS)]
+        if excluded:
+            not_in = " AND id NOT IN (" + ",".join("?" * len(excluded)) + ")"
+            params.extend(excluded)
+        params.extend([AGING_CAP, AGING_PER_DAY])
         row = self._db.fetchone(
             "SELECT * FROM curiosity_queue "
-            "WHERE status = 'pending' AND attempts < ? "
+            "WHERE status = 'pending' AND attempts < ?" + not_in + " "
             "ORDER BY (urgency + MIN(?, MAX(0.0, "
             "    julianday('now') - julianday(COALESCE(created_at, 'now'))) * ?)) DESC, "
             "created_at ASC LIMIT 1",
-            (int(MAX_ATTEMPTS), AGING_CAP, AGING_PER_DAY),
+            tuple(params),
         )
         return self._row_to_item(row) if row else None
 

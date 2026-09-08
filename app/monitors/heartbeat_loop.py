@@ -1218,11 +1218,22 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         return "\n".join(lines)
 
     async def _think_query(self, query: str) -> str:
-        """Run a query through brain.think() and collect the text response.
+        """Run a query through brain.think() and collect the text response."""
+        text, _meta = await self._think_query_meta(query)
+        return text
+
+    async def _think_query_meta(self, query: str) -> tuple[str, dict]:
+        """Run a query through brain.think(); return (text, grounding verdict).
 
         Prepends live system context so the LLM knows about monitors,
         conversations, and learning activity.  Uses ephemeral=True to
         avoid polluting conversation history.
+
+        The verdict is what the chat entailment gate did with the answer
+        (`{checked, unsupported, dropped, guard, inert}` — see
+        brain._entail_gate_chat_verdict), read off the DONE event; `{}` when
+        the gate did not run. The curiosity path needs it because the text
+        alone cannot say whether the evidence supported it.
         """
         from app.core.brain import think, get_services
         from app.schema import EventType
@@ -1332,6 +1343,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             enriched_query = output_contract + query
 
         tokens = []
+        grounding: dict = {}
         try:
             async with asyncio.timeout(config.GENERATION_TIMEOUT):
                 # Research whitelist (2026-09-01): monitor-channel generations
@@ -1343,17 +1355,19 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         text = event.data.get("text", "")
                         if text:
                             tokens.append(text)
+                    elif event.type == EventType.DONE:
+                        grounding = dict(event.data.get("grounding") or {})
         except asyncio.TimeoutError:
             logger.warning("[Heartbeat] _think_query timed out for: %s", query[:80])
-            return "[Query timed out]"
+            return "[Query timed out]", {}
         except Exception as e:
             logger.error("[Heartbeat] think() failed: %s", e, exc_info=True)
-            return f"[Query failed: {e}]"
+            return f"[Query failed: {e}]", {}
 
         result = "".join(tokens).strip()
         result = _strip_deliberation(result)
         result = strip_tool_call_artifacts(result)
-        return result
+        return result, grounding
 
     async def _execute_instruction(self, inst) -> None:
         """Execute a user-defined heartbeat instruction via brain.think()."""
@@ -1831,11 +1845,16 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         budget = float(cfg.get("seconds") or _CURIOSITY_RUN_BUDGET)
         started = time.monotonic()
         lines: list[str] = []
+        # Ids already tried in THIS run. A failed attempt does not move a row
+        # down the queue, so without this the batch re-asks the question it
+        # just failed (measured 2026-09-07: one question, three picks, three
+        # minutes, attempts 0 -> 1 -> 2). Three slots, three questions.
+        tried: set[int] = set()
         for i in range(batch):
             if i and (time.monotonic() - started) > budget:
                 logger.info("[Curiosity] run budget spent after %d item(s)", i)
                 break
-            out = await self._research_one_curiosity(svc)
+            out = await self._research_one_curiosity(svc, tried)
             lines.append(out)
             # Nothing left, or the machinery is down: stop asking.
             if out.startswith("[No pending") or "LLM unavailable" in out:
@@ -1849,11 +1868,20 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         return (f"CURIOSITY BATCH | {done}/{len(lines)} resolved this run\n"
                 + "\n".join(lines))
 
-    async def _research_one_curiosity(self, svc) -> str:
-        """Take the top queued question, research it, store what it found."""
-        item = await asyncio.to_thread(svc.curiosity.get_next)
+    async def _research_one_curiosity(self, svc, tried: set[int] | None = None) -> str:
+        """Take the top queued question, research it, store what it found.
+
+        `tried` is the run's set of ids already researched; the pick skips
+        them and the chosen id is added, so one run never asks twice.
+        """
+        if tried:
+            item = await asyncio.to_thread(svc.curiosity.get_next, exclude_ids=set(tried))
+        else:
+            item = await asyncio.to_thread(svc.curiosity.get_next)
         if not item:
             return "[No pending curiosity items — skipped]"
+        if tried is not None:
+            tried.add(item.id)
 
         # Research via think() — memory-first, web only for public/external facts.
         research_query = (
@@ -1867,7 +1895,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             f"Provide a concise, factual summary."
         )
         try:
-            result = await self._think_query(research_query)
+            result, grounding = await self._think_query_meta(research_query)
 
             # LLM failures should NOT count toward attempt limit — they'll resolve when LLM recovers
             _is_llm_down = result and (
@@ -1879,6 +1907,21 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 return "[Curiosity skipped — LLM unavailable, will retry]"
 
             if result and not result.startswith("["):
+                # The entailment gate scored the answer against the evidence its
+                # own searches retrieved and would have stripped MOST of it; the
+                # over-strip guard kept the text whole, which is right for a
+                # person reading chat and wrong here. The closure judge only
+                # ever sees the text, so it cannot catch this (2026-09-07: an
+                # answer at p=0.02 on every claim was resolved, lessoned and
+                # sent to the owner). Not knowledge: requeue, never resolve.
+                if grounding.get("guard"):
+                    logger.info("[Curiosity] answer unsupported by its own evidence "
+                                "(%d of %d claims failed entailment) — requeued: %s",
+                                int(grounding.get("unsupported", 0)),
+                                int(grounding.get("checked", 0)), item.topic[:80])
+                    await asyncio.to_thread(svc.curiosity.fail, item.id)
+                    return (f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | "
+                            f"reason=unsupported_by_evidence")
                 # --- Semantic closure check ---
                 # Verify the result ACTUALLY answers the original question.
                 # Pattern check filters obvious deflections; LLM judge handles

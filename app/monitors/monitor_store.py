@@ -532,7 +532,10 @@ class MonitorStore:
         "KG Health Monitor",
         "System Health",
         "Ollama Model Loaded",
-        "Training Job Watch",
+        # "Training Job Watch" retired from the defaults 2026-09-07: the
+        # constant-monitor scan's own first catch — 85 identical "no training
+        # history yet" runs for a trainer archived in June. Still in the
+        # catalog for an owner who revives training.
         "KG Growth Rate",
         # Meta / self-improvement (telegram-only)
         "Storyline Tracker",

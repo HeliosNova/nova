@@ -88,3 +88,11 @@ def test_the_liveness_report_surfaces_it(monkeypatch):
     status, summary, fields = pw.liveness_report(_DB([]))
     assert status == "info" and pw.HEALTHY_MARKER in summary
     assert "Training Job Watch (101x identical)" in fields["saying_nothing"]
+
+
+def test_training_job_watch_is_no_longer_switched_on_by_default():
+    """The scan's own first catch, retired 2026-09-07: 85 identical runs since
+    the count was reset, one a day, for a trainer archived in June. It stays
+    in the catalog so an owner who revives training can switch it on."""
+    from app.monitors.monitor_store import MonitorStore
+    assert "Training Job Watch" not in MonitorStore._CORE_ENABLED

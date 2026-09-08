@@ -334,41 +334,89 @@ async def parse_and_store_forecast_ensembled(
     generation's number standing alone. The spread is recorded so a later
     question — does disagreement predict error? — has data to answer it.
     """
-    m = _FORECAST_LINE.search(text or "")
-    if not m:
+    parsed = _parse_forecast_line(text)
+    if parsed is None:
         return None
-    claim = m.group("claim").strip()
-    stated = float(m.group("conf")) if m.group("conf") else 0.55
+    claim, date, days, stated = parsed
     mean, spread = await _ensemble_confidence(claim, text, k=k, model=model)
     conf = stated if mean is None else (stated + mean * k) / (1 + k)
     if mean is not None:
         logger.info("[Forecast] confidence %.2f stated -> %.2f ensembled "
                     "(%d samples, spread %.2f): %s", stated, conf, k, spread, claim[:70])
-    date = m.group("date")
-    days = int(m.group("days")) if m.group("days") else None
     return await asyncio.to_thread(
         create_forecast, db, claim, days=days, resolves_on=date, confidence=conf,
         storyline_key=storyline_key, source_monitor=source_monitor, spread=spread)
 
 
+# What the model writes, not what the prompt asked for (2026-09-07). Replaying
+# the storyline prompt on the live 9B lost 3 of 12 forecasts to two shapes:
+# STATE and FORECAST run together on ONE line ("STATE: X | status FORECAST:
+# claim | resolves ... | 0.7"), so a line-start anchor never fires; and the
+# "| resolves YYYY-MM-DD" segment omitted when the deadline already sits inside
+# the claim ("...by December 31, 2026 | 0.9 confidence"). 44 forecasts were
+# lost to those in eleven days. So: FORECAST: may start mid-line, the claim is
+# everything up to the first pipe on that line, the resolves segment is
+# optional when the claim carries a deadline, "confidence 0.7" and "0.7
+# confidence" both read, and a trailing period is tolerated. The discipline is
+# the DATE, not the punctuation: a claim with no deadline anywhere still mints
+# nothing, and 'FORECAST: none' is still the opt-out.
 _FORECAST_LINE = re.compile(
-    r"(?im)^\s*FORECAST:\s*(?P<claim>.+?)\s*\|\s*"
-    r"(?:(?:resolves|resolve|resolution|by|due|on)\s*:?\s*)?"
-    r"(?:(?P<date>20\d{2}-\d{2}-\d{2})|(?P<days>\d+)\s*(?:days?|d)?)\s*"
-    r"(?:\|\s*(?P<conf>0?\.\d+|1(?:\.0)?)\s*(?:confidence)?)?\s*$"
+    r"(?im)(?:^|(?<=\s))FORECAST:\s*(?P<claim>[^|\n]+?)\s*"
+    r"(?:\|\s*(?:(?:resolves|resolve|resolution|by|due|on)\s*:?\s*)?"
+    r"(?:(?P<date>20\d{2}-\d{2}-\d{2})|(?P<days>\d+)\s*(?:days?|d)?)\s*)?"
+    r"(?:\|\s*(?:confidence\s*:?\s*)?(?P<conf>0?\.\d+|1(?:\.0)?)\s*(?:confidence)?)?"
+    r"[\s.]*$"
 )
+_NO_FORECAST = frozenset({"none", "no forecast", "n/a", "nothing", "no"})
+
+
+def _parse_forecast_line(text: str) -> tuple[str, str | None, int | None, float] | None:
+    """(claim, explicit date, legacy days, stated confidence) or None.
+
+    None for no line, the 'FORECAST: none' opt-out, and a claim that carries
+    no deadline anywhere — neither a resolves date, a day count, nor a date
+    inside the claim. Shared by both minters so they cannot drift apart.
+    """
+    m = _FORECAST_LINE.search(text or "")
+    if not m:
+        return None
+    claim = m.group("claim").strip().rstrip(".").strip()
+    if not claim or claim.lower() in _NO_FORECAST:
+        return None
+    date = m.group("date")
+    days = int(m.group("days")) if m.group("days") else None
+    if not date and days is None and claim_deadline(claim) is None:
+        return None
+    stated = float(m.group("conf")) if m.group("conf") else 0.55
+    return claim, date, days, stated
+
+
+_FORECAST_ANY_LINE = re.compile(r"(?m)^[^\n]*FORECAST[^\n]*$")
+
+
+def forecast_line_excerpt(text: str, limit: int = 240) -> str:
+    """The FORECAST line as the model actually wrote it, for a warning.
+
+    44 "FORECAST line present but not stored" warnings in eleven days, and not
+    one carried the line — the raw output is stored nowhere (the summary is
+    cut at CHANGED and the tail lines are stripped from it), so the drift was
+    undiagnosable. Uppercase only: prose says "the IEA forecasts" all day.
+    """
+    last = ""
+    for m in _FORECAST_ANY_LINE.finditer(text or ""):
+        line = m.group(0).strip()
+        if line:
+            last = line
+    return last[:limit]
 
 
 def parse_and_store_forecast(db, text: str, *, storyline_key: str = "",
                              source_monitor: str = "") -> int | None:
     """Extract a FORECAST line from LLM output and store it."""
-    m = _FORECAST_LINE.search(text or "")
-    if not m:
+    parsed = _parse_forecast_line(text)
+    if parsed is None:
         return None
-    claim = m.group("claim").strip()
-    conf = float(m.group("conf")) if m.group("conf") else 0.55
-    date = m.group("date")
-    days = int(m.group("days")) if m.group("days") else None
+    claim, date, days, conf = parsed
     return create_forecast(db, claim, days=days, resolves_on=date, confidence=conf,
                            storyline_key=storyline_key, source_monitor=source_monitor)
 

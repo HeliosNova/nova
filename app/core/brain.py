@@ -651,6 +651,13 @@ def _best_evidence_window(doc: str, claim: str, width: int = _CHAT_ENTAIL_WINDOW
 
 
 async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str:
+    """MiniCheck gate for tool-backed chat answers — text only (see below)."""
+    text, _verdict = await _entail_gate_chat_verdict(final_content, tool_results)
+    return text
+
+
+async def _entail_gate_chat_verdict(final_content: str,
+                                    tool_results: list[dict]) -> tuple[str, dict]:
     """MiniCheck gate for tool-backed chat answers (2026-08-19).
 
     The heuristic claim validator keys on digits/entities, so qualitative
@@ -660,19 +667,28 @@ async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str
     evidence or it is dropped. Same sidecar, thresholds, and show-your-work
     logging as the digest gate. Fail-open on any service failure; over-strip
     guarded (>50% of chars would go → keep original).
+
+    Returns (text, verdict). The verdict says what the gate DID, because the
+    text alone cannot: `{checked, unsupported, dropped, guard, inert}`, or `{}`
+    when the gate did not run. `guard` means a majority-unsupported answer was
+    kept whole — right for a person reading chat, wrong for an unattended loop
+    that would bank it as knowledge (2026-09-07: a curiosity answer scoring
+    p=0.02 on every claim was resolved, lessoned and sent to the owner because
+    the closure judge only ever saw the text). The verdict rides think()'s DONE
+    event so such a caller can decide for itself.
     """
     from app.config import config as _cfg
     if not final_content or not tool_results:
-        return final_content
+        return final_content, {}
     if not getattr(_cfg, "ENABLE_MINICHECK", False):
-        return final_content
+        return final_content, {}
     url = (getattr(_cfg, "MINICHECK_URL", "") or "").rstrip("/")
     if not url:
-        return final_content
+        return final_content, {}
 
     doc = "\n\n".join((tr.get("output") or "")[:4000] for tr in tool_results[:6])[:12000]
     if len(doc) < 200:
-        return final_content
+        return final_content, {}
 
     # Factual-shaped sentences: statements long enough to carry a claim.
     # Deliberately NOT digit-gated — that's the hole this closes.
@@ -684,7 +700,7 @@ async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str
             continue
         cands.append((s, plain))
     if not cands:
-        return final_content
+        return final_content, {}
     # Digit-bearing claims first (most checkable), then the rest.
     cands.sort(key=lambda t: (not any(c.isdigit() for c in t[1])))
     cands = cands[:_CHAT_ENTAIL_MAX_CLAIMS]
@@ -719,31 +735,37 @@ async def _entail_gate_chat(final_content: str, tool_results: list[dict]) -> str
                 logger.warning("[chat-entail] chunk %d unavailable (%r) — %d claim(s) fail-open",
                                i // _CHAT_ENTAIL_CHUNK, e, len(chunk))
                 results.extend({"supported": True, "prob": -1.0} for _ in chunk)
+    verdict = {"checked": len(cands), "unsupported": 0, "dropped": 0,
+               "guard": False, "inert": False}
     if all(r.get("prob") == -1.0 for r in results):
         logger.warning("[chat-entail] every chunk failed — gate inert this turn")
-        return final_content
+        verdict["inert"] = True
+        return final_content, verdict
 
     out = final_content
     dropped = 0
     for (orig, plain), res in zip(cands, results):
         if res.get("supported"):
             continue
+        verdict["unsupported"] += 1
         if orig in out:
             out = out.replace(orig, "", 1)
             dropped += 1
             logger.warning("[chat-entail-drop] p=%.3f claim=%r",
                            float(res.get("prob", 0.0)), plain[:140])
+    verdict["dropped"] = dropped
     if not dropped:
-        return final_content
+        return final_content, verdict
     # Tidy: collapse whitespace artifacts left by removals.
     out = re.sub(r"[ \t]{2,}", " ", out)
     out = re.sub(r"\n{3,}", "\n\n", out).strip()
     if len(out) < 0.5 * len(final_content) or len(out) < 60:
         logger.warning("[chat-entail] over-strip guard: %d/%d chars would remain — keeping original",
                        len(out), len(final_content))
-        return final_content
+        verdict["guard"] = True
+        return final_content, verdict
     logger.info("[chat-entail] dropped %d unsupported sentence(s)", dropped)
-    return out
+    return out, verdict
 
 
 def _guard_validated_content(pre_validate: str, validated: str) -> str:
@@ -4238,6 +4260,7 @@ async def think(
 
         # --- Step 8: Ephemeral early return ---
         if ephemeral:
+            _grounding: dict = {}
             if gen.final_content:
                 final_content = _sanitize_answer(gen.final_content)
                 evidence = build_evidence(
@@ -4255,7 +4278,8 @@ async def think(
                 )
                 final_content = _guard_validated_content(
                     _pre_validate_content_ephemeral, final_content)
-                final_content = await _entail_gate_chat(final_content, gen.tool_results)
+                final_content, _grounding = await _entail_gate_chat_verdict(
+                    final_content, gen.tool_results)
                 if stripped_reasons:
                     for r in stripped_reasons:
                         logger.warning("[claim-validator-ephemeral] %s", r)
@@ -4289,6 +4313,10 @@ async def think(
                     "ephemeral": True,
                     "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
                     "decomposed": False,
+                    # What the entailment gate did with the answer, for the
+                    # unattended callers (curiosity research) that must not
+                    # bank a majority-unsupported answer as knowledge.
+                    "grounding": _grounding,
                 },
             )
             return

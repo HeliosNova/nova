@@ -33,7 +33,7 @@ def _loop(monkeypatch, outcomes):
     seen = {"n": 0}
     seq = list(outcomes)
 
-    async def _one(_self, _svc):
+    async def _one(_self, _svc, tried=None):
         seen["n"] += 1
         return seq[min(seen["n"] - 1, len(seq) - 1)]
 
@@ -100,7 +100,7 @@ async def test_the_wall_clock_bounds_the_run(monkeypatch):
 
     orig = hb.HeartbeatLoop._research_one_curiosity
 
-    async def _slow(self, svc):
+    async def _slow(self, svc, tried=None):
         clock["t"] += 1000.0          # each item blows the budget
         return await orig(self, svc)
 
