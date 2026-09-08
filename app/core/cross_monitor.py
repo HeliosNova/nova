@@ -153,6 +153,19 @@ class ThemeCluster:
         return len(self.monitors)
 
 
+def _syn_model() -> str | None:
+    """The synthesis model for this module's background calls (2026-09-08).
+
+    check_type "synthesis" is filed in the 27B residency class, so the
+    scheduler batches it beside the Domain Studies — but its three LLM calls
+    were model-less (the default 9B), which makes Ollama evict the 27B for
+    them and reload it for the next digest step. The causal probe below was
+    routed here on 2026-08-14 for quality; the other three follow now.
+    """
+    from app.config import config as _cfg
+    return (getattr(_cfg, "MONITOR_SYNTHESIS_MODEL", "") or "").strip() or None
+
+
 def _extract_signals(text: str) -> set[str]:
     """Extract candidate cluster keys from a monitor result.
 
@@ -321,6 +334,7 @@ async def _validate_cluster_keys(keys: list[str]) -> set[str]:
             json_prefix="{",
             max_tokens=600,
             temperature=0.0,
+            model=_syn_model(),
         )
     except Exception as e:
         logger.warning("[Synthesis] cluster-key validation failed: %s", e)
@@ -449,6 +463,7 @@ async def _synthesize_cluster(cluster: ThemeCluster, *, hours: int) -> str:
             [{"role": "user", "content": prompt}],
             max_tokens=320,
             temperature=0.2,
+            model=_syn_model(),
         )
     except Exception as e:
         logger.warning("[Synthesis] LLM call failed for '%s': %s", cluster.key, e)
@@ -703,7 +718,7 @@ async def meta_synthesis(db, *, hours: int = 36) -> str:
             "biggest cross-cutting thread. IGNORE stories confined to one domain. Use ONLY what's in "
             "the leads — invent nothing. No preamble, no restating the list.\n\n"
             f"LEADS:\n{blob}"}],
-            max_tokens=750, temperature=0.3, num_ctx=8192)
+            max_tokens=750, temperature=0.3, num_ctx=8192, model=_syn_model())
         out = (out or "").strip()
     except Exception as e:
         logger.warning("[MetaSynthesis] failed: %s", e)
