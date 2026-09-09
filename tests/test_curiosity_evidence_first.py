@@ -79,7 +79,7 @@ async def test_a_question_is_read_extracted_synthesized_and_gated(monkeypatch, s
     calls = _stub_chain(monkeypatch)
     text, stats = await dr.research_question(QUESTION)
     assert text == ANSWER
-    assert calls["gather"] and calls["gather"][0][0] == QUESTION
+    assert calls["gather"] and calls["gather"][0][0] == dr._question_subject(QUESTION)
     assert calls["findings"] and calls["findings"][0][1].get("model") == syn_model
     assert len(calls["invoke"]) == 1, "one synthesis call"
     assert calls["invoke"][0][1].get("model") == syn_model
@@ -201,3 +201,36 @@ async def test_no_sources_under_degraded_search_is_deferred_not_burned(monkeypat
     assert out.startswith("CURIOSITY DEFERRED"), out
     row = db.fetchone("SELECT status, attempts FROM curiosity_queue")
     assert row["status"] == "pending" and row["attempts"] == 0
+
+
+# --- what the first live run showed (2026-09-09 14:31 UTC) --------------------
+# "1 source(s), 0 finding(s), 0 chars" for a 195-character topic. Two things:
+# the topic carries its dossier label ("East Asia: Alliance Fracture & ...
+# (Trump/Ulchi): What specific ...?") and the raw string was used as two of
+# the five search angles; and the chain was given a browser budget of 2, so
+# the 12 candidates that block plain http were never read. Probed with the
+# digest chain's own budget of 6: the same question read 4 articles, not 2.
+
+LABELLED = ("East Asia: Alliance Fracture & Strategic Realignment (Trump/Ulchi): What specific "
+            "asymmetric capabilities (drones/missiles) has Taiwan finalized for deployment with "
+            "the new supplementary funding?")
+
+
+def test_the_search_subject_is_the_question_not_the_label():
+    assert dr._question_subject(LABELLED) == (
+        "What specific asymmetric capabilities (drones/missiles) has Taiwan finalized for "
+        "deployment with the new supplementary funding?")
+    assert dr._question_subject("Science: What is the current response rate?") == \
+        "What is the current response rate?"
+    assert dr._question_subject("Plain question without a label?") == "Plain question without a label?"
+    assert dr._question_subject("Resolve contradiction: A says 2 but B says 4") == \
+        "Resolve contradiction: A says 2 but B says 4", "a colon inside a statement is not a label"
+
+
+@pytest.mark.asyncio
+async def test_the_chain_searches_the_question_with_the_digest_browser_budget(monkeypatch, syn_model):
+    calls = _stub_chain(monkeypatch)
+    await dr.research_question(LABELLED)
+    subject, kw = calls["gather"][0]
+    assert subject == dr._question_subject(LABELLED)
+    assert kw.get("browser_budget") == 6

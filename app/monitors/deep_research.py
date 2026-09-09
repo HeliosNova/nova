@@ -1135,6 +1135,32 @@ async def _gather_sources(subject: str, *, read_target: int, browser_budget: int
     return await _read_bodies(picks, read_target=read_target, browser_budget=browser_budget)
 
 
+_QUESTION_START_RE = re.compile(
+    r"^(?:what|which|who|whom|whose|when|where|why|how|is|are|was|were|do|does|did|"
+    r"can|could|will|would|should|has|have|had|to what extent)\b", re.IGNORECASE)
+
+
+def _question_subject(topic: str) -> str:
+    """The question inside a curiosity topic, without its dossier label.
+
+    Dossier questions are minted as "<domain or dossier title>: <question>" and
+    the title can itself contain colons ("East Asia: Alliance Fracture & ...
+    (Trump/Ulchi): What specific ..."). The first live run (2026-09-09 14:31
+    UTC) used the whole 195-character string as two of its five search angles
+    and read one source. The question is the text after the LAST ': ' whose
+    remainder reads as a question; anything else is left whole (a statement
+    with a colon in it is not a label).
+    """
+    t = (topic or "").strip()
+    idx = t.rfind(": ")
+    while idx > 0:
+        rest = t[idx + 2:].strip()
+        if rest and _QUESTION_START_RE.match(rest):
+            return rest
+        idx = t.rfind(": ", 0, idx)
+    return t
+
+
 async def research_question(question: str, *, read_target: int = 6,
                             today: str | None = None) -> tuple[str, dict]:
     """The evidence-first chain for ONE question (2026-09-09): gather and read
@@ -1150,7 +1176,12 @@ async def research_question(question: str, *, read_target: int = 6,
     nothing to answer from; the caller decides what that costs the question.
     """
     stats: dict = {"evidence_first": True, "sources": 0, "findings": 0, "entail_dropped": 0}
-    arts = await _gather_sources(question, read_target=read_target, browser_budget=2)
+    # The digest chain's own browser budget (6). Probed on the first live
+    # question with 2: fourteen on-topic candidates, twelve of them news sites
+    # that block plain http, two escalations, one usable article. With 6 the
+    # same question read four.
+    subject = _question_subject(question)
+    arts = await _gather_sources(subject, read_target=read_target, browser_budget=6)
     stats["sources"] = len(arts)
     if len(arts) < 2:
         stats["reason"] = "no_sources"
