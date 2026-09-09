@@ -58,6 +58,14 @@ _MAX_CONCURRENT_LLM_MONITORS = 1  # one monitor's GPU work at a time — leaves 
 # if minutes-per-run rises while runs/hour does not.
 _MAX_CONCURRENT_DIGEST_MONITORS = 3
 
+# Slow monitors dispatched per tick (2026-09-09). Two rounds of the digest
+# width plus a couple of 9B-class monitors: enough to keep the card busy between
+# scans, small enough that a monitor that becomes due mid-batch waits for one
+# digest round (~30-50 min), not for a 30-50 monitor backlog (hours). The
+# ordering that reaches this cap is get_due's overdue ratio with the starvation
+# floor applied, so the head of the list is the priority by construction.
+_MAX_SLOW_PER_TICK = 2 * _MAX_CONCURRENT_DIGEST_MONITORS + 2
+
 # Questions to drain per Curiosity Research run, and the wall clock that bounds
 # them. One per run left 50 pending against ~1.5 resolutions a day (2026-09-04);
 # the scheduling slot, not the research, was the scarce thing. The budget is
@@ -517,6 +525,22 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         slow = _class_floor_order(
                             slow, self._monitor_class,
                             datetime.now(timezone.utc).replace(tzinfo=None))
+                        # Dispatch the most overdue few and look again (2026-09-09).
+                        # A tick used to await the WHOLE slow batch — 30-50 monitors
+                        # after a restart, hours of work — before scanning for what
+                        # had become due meanwhile, so the hourly lane waited behind
+                        # the entire backlog (measured: Curiosity and the Storyline
+                        # Tracker due 01:09, still waiting at 01:16 behind a batch of
+                        # 26). get_due is overdue-ratio ordered and the floor above
+                        # has already promoted starved 9B-class monitors, so the
+                        # head of the list IS the priority. The class gate still
+                        # forbids cross-class overlap: no extra swaps, only a shorter
+                        # wait for whatever becomes due next.
+                        if len(slow) > _MAX_SLOW_PER_TICK:
+                            logger.info("[Heartbeat] %d slow monitor(s) due — dispatching the %d "
+                                        "most overdue this tick; the rest on the next scan",
+                                        len(slow), _MAX_SLOW_PER_TICK)
+                            slow = slow[:_MAX_SLOW_PER_TICK]
                         slow = _batch_by_class(slow, self._monitor_class)
                         if len(slow) > 1:
                             _classes = [self._monitor_class(m) for m in slow]
