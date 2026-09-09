@@ -1135,6 +1135,57 @@ async def _gather_sources(subject: str, *, read_target: int, browser_budget: int
     return await _read_bodies(picks, read_target=read_target, browser_budget=browser_budget)
 
 
+async def research_question(question: str, *, read_target: int = 6,
+                            today: str | None = None) -> tuple[str, dict]:
+    """The evidence-first chain for ONE question (2026-09-09): gather and read
+    articles, extract findings on the synthesis model, synthesize a short cited
+    answer, entail-gate it against the articles it read.
+
+    Built for curiosity. After every integrity fix of 2026-09-07/08 its yield
+    was still zero: the 02:05 UTC run came back 6/6, 7/8 and 4/4 claims
+    unsupported by the answer's own search evidence. The gate was right - the
+    research path was chat-style think(), the 9B reading search SNIPPETS and
+    writing from memory past them - while the dossiers the questions come from
+    are written by this chain. Returns ("", {"reason": ...}) when there is
+    nothing to answer from; the caller decides what that costs the question.
+    """
+    stats: dict = {"evidence_first": True, "sources": 0, "findings": 0, "entail_dropped": 0}
+    arts = await _gather_sources(question, read_target=read_target, browser_budget=2)
+    stats["sources"] = len(arts)
+    if len(arts) < 2:
+        stats["reason"] = "no_sources"
+        return "", stats
+    findings = await _findings(arts, question, model=_syn_model())
+    stats["findings"] = len(findings)
+    if not findings:
+        stats["reason"] = "no_findings"
+        return "", stats
+    evidence = _annotated_evidence(findings)
+    today = today or _NOW().strftime("%B %d, %Y")
+    hosts = sorted({_host(u) for _, u, _ in findings})
+    prompt = (
+        f"Today is {today}. Answer the question below from the EVIDENCE only.\n\n"
+        f"QUESTION: {question}\n\n"
+        "Rules:\n"
+        "- 3 to 6 sentences, no preamble, no bullet list.\n"
+        "- Every factual sentence ends with a citation in parentheses naming one of "
+        f"these hosts exactly: {', '.join(hosts)}.\n"
+        "- Give dates and figures as the evidence states them; invent nothing.\n"
+        "- If the evidence does not settle the question, say in one sentence what is "
+        "known and what is not, still cited.\n\n"
+        f"EVIDENCE:\n{evidence}"
+    )
+    text = await _invoke_bg([{"role": "user", "content": prompt}],
+                            max_tokens=500, temperature=0.2, num_ctx=8192, model=_syn_model())
+    text = (text or "").strip()
+    if not text:
+        stats["reason"] = "empty_synthesis"
+        return "", stats
+    text, dropped = await _entailment_gate(text, arts, label="curiosity")
+    stats["entail_dropped"] = int(dropped or 0)
+    return (text or "").strip(), stats
+
+
 async def _overview_angles(subjects: list[str], *, model: str | None = None) -> list[str]:
     """Facet-expand the stories into article-finding queries. The bare subject
     phrase tends to surface landing/SEO pages; a 'what happened / numbers' facet

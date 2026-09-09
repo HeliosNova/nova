@@ -126,6 +126,10 @@ async def test_the_string_form_still_returns_only_text(minicheck_on, monkeypatch
 # ---------------------------------------------------------------------------
 # the curiosity loop acts on it
 # ---------------------------------------------------------------------------
+# These seed source='agent_failure': the think() path. Since 2026-09-09 dossier
+# questions go through the evidence-first chain instead
+# (tests/test_curiosity_evidence_first.py); the guard/inert verdicts tested
+# here come from think()'s chat gate and apply to the sources that still use it.
 
 @pytest.fixture
 def db(tmp_path):
@@ -185,7 +189,7 @@ TOPIC = "Science: What is the current response rate of personalized mRNA vaccine
 @pytest.mark.asyncio
 async def test_a_guarded_answer_is_requeued_not_resolved(monkeypatch, db):
     db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
-               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+               "VALUES (?, 'agent_failure', 0.6, 'pending', 0)", (TOPIC,))
     queue = CuriosityQueue(db)
     lp, judged, sent = _loop(monkeypatch, queue, UNSUPPORTED,
                              {"guard": True, "checked": 5, "unsupported": 5, "inert": False})
@@ -204,7 +208,7 @@ async def test_a_guarded_answer_is_requeued_not_resolved(monkeypatch, db):
 @pytest.mark.asyncio
 async def test_a_clean_verdict_still_resolves_through_the_judge(monkeypatch, db):
     db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
-               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+               "VALUES (?, 'agent_failure', 0.6, 'pending', 0)", (TOPIC,))
     queue = CuriosityQueue(db)
     lp, judged, sent = _loop(monkeypatch, queue, SUPPORTED,
                              {"guard": False, "checked": 3, "unsupported": 0, "inert": False})
@@ -221,7 +225,7 @@ async def test_a_clean_verdict_still_resolves_through_the_judge(monkeypatch, db)
 async def test_no_verdict_at_all_keeps_the_old_path(monkeypatch, db):
     """Gate off, no tools, or sidecar inert: nothing is known, so nothing changes."""
     db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
-               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+               "VALUES (?, 'agent_failure', 0.6, 'pending', 0)", (TOPIC,))
     queue = CuriosityQueue(db)
     lp, judged, sent = _loop(monkeypatch, queue, SUPPORTED, {})
 
@@ -240,7 +244,7 @@ async def test_an_inert_gate_defers_rather_than_banks(monkeypatch, db):
     check has not cleared the answer: defer without burning the attempt, the way
     a judge that could not answer does."""
     db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
-               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+               "VALUES (?, 'agent_failure', 0.6, 'pending', 0)", (TOPIC,))
     queue = CuriosityQueue(db)
     lp, judged, sent = _loop(monkeypatch, queue, SUPPORTED,
                              {"guard": False, "checked": 3, "unsupported": 0, "inert": True})

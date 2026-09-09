@@ -74,6 +74,14 @@ _MAX_SLOW_PER_TICK = 2 * _MAX_CONCURRENT_DIGEST_MONITORS + 2
 _CURIOSITY_BATCH = 3
 _CURIOSITY_RUN_BUDGET = 420.0    # seconds
 
+# Question sources researched through the evidence-first digest chain
+# (deep_research.research_question) instead of chat-style think() (2026-09-09).
+# Dossier questions are about the world and come from digests that chain
+# wrote; the other sources (agent, reflexion, quiz failures) can be about the
+# owner's own work and keep the memory-first path. Yield before this change,
+# after every integrity fix: 0 of 12 - every answer written past its snippets.
+_EVIDENCE_FIRST_SOURCES = frozenset({"dossier_open_question", "dossier_tension"})
+
 # Monitors whose output is non-factual — skip KG extraction for these
 _NO_KG_MONITORS = frozenset({"Morning Check-in", "Self-Reflection"})
 
@@ -1241,6 +1249,28 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
 
         return "\n".join(lines)
 
+    async def _research_evidence_first(self, question: str) -> tuple[str, dict]:
+        """Research one curiosity question through the digest chain
+        (deep_research.research_question): read articles, extract findings on
+        the synthesis model, synthesize with citations, entail-gate against
+        what was read. Returns (text, stats); text is "" when there was nothing
+        to answer from, and a failure is reported as a bracketed marker the
+        caller already knows how to treat."""
+        from app.monitors.deep_research import research_question
+        try:
+            async with asyncio.timeout(config.GENERATION_TIMEOUT):
+                text, stats = await research_question(question)
+        except asyncio.TimeoutError:
+            logger.warning("[Curiosity] evidence-first research timed out for: %s", question[:80])
+            return "[Query timed out]", {}
+        except Exception as e:
+            logger.error("[Curiosity] evidence-first research failed: %s", e, exc_info=True)
+            return f"[Query failed: {e}]", {}
+        logger.info("[Curiosity] evidence-first: %d source(s), %d finding(s), %d entail-dropped, "
+                    "%d chars: %s", stats.get("sources", 0), stats.get("findings", 0),
+                    stats.get("entail_dropped", 0), len(text), question[:80])
+        return text, stats
+
     async def _think_query(self, query: str) -> str:
         """Run a query through brain.think() and collect the text response."""
         text, _meta = await self._think_query_meta(query)
@@ -1926,7 +1956,18 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             f"Provide a concise, factual summary."
         )
         try:
-            result, grounding = await self._think_query_meta(research_query)
+            if item.source in _EVIDENCE_FIRST_SOURCES:
+                result, grounding = await self._research_evidence_first(item.topic)
+                if not result and grounding.get("reason") == "no_sources":
+                    from app.tools.native_search import search_health
+                    if search_health() < 0.25:
+                        logger.info("[Curiosity] no sources under degraded search (health=%.2f) "
+                                    "— deferred without attempt burn: %s",
+                                    search_health(), item.topic[:80])
+                        return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                                f"reason=search_degraded")
+            else:
+                result, grounding = await self._think_query_meta(research_query)
 
             # LLM failures should NOT count toward attempt limit — they'll resolve when LLM recovers.
             # Matched on the ERROR code first: the busy/unavailable sentences are

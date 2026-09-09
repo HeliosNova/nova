@@ -39,7 +39,7 @@ def db(tmp_path):
 def _add(db, topic, urgency=0.6, days_old=1):
     db.execute(
         "INSERT INTO curiosity_queue (topic, source, urgency, status, attempts, created_at) "
-        "VALUES (?, 'dossier_open_question', ?, 'pending', 0, datetime('now', ?))",
+        "VALUES (?, 'agent_failure', ?, 'pending', 0, datetime('now', ?))",
         (topic, urgency, f"-{days_old} days"))
 
 

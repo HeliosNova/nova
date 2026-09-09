@@ -46,7 +46,7 @@ def db(tmp_path):
         "status TEXT, attempts INT DEFAULT 0, resolution TEXT, "
         "created_at TEXT DEFAULT CURRENT_TIMESTAMP, resolved_at TEXT)")
     d.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
-              "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (TOPIC,))
+              "VALUES (?, 'agent_failure', 0.6, 'pending', 0)", (TOPIC,))
     yield d
     d.close()
 
