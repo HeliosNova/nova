@@ -108,6 +108,28 @@ def _get_scorer():
             logger.info("loading MiniCheck model %s (CPU, %d thread(s) for a %d-CPU quota)…",
                         model, torch.get_num_threads(), _THREADS)
             _scorer = MiniCheck(model_name=model, cache_dir="/cache")
+            # GPU build only (Dockerfile.minicheck-gpu + the compose overlay):
+            # the package puts the model on CUDA when torch can see one, and
+            # MINICHECK_HALF=1 halves it. Measured 2026-09-09 on 16 real pairs:
+            # fp32 0.78 s/pair (3.4 GB peak), fp16 0.48 s/pair (~1.7 GB), CPU
+            # 9.62 s/pair, same supported count. No-op on the CPU image.
+            if os.getenv("MINICHECK_HALF") == "1":
+                try:
+                    mod = None
+                    for path in (("model", "model"), ("model",)):
+                        obj = _scorer
+                        for p in path:
+                            obj = getattr(obj, p)
+                        if isinstance(obj, torch.nn.Module):
+                            mod = obj
+                            break
+                    if mod is not None and torch.cuda.is_available():
+                        mod.half()
+                        logger.info("MiniCheck running in fp16 on %s", next(mod.parameters()).device)
+                    else:
+                        logger.info("MINICHECK_HALF set but no CUDA module found — staying as loaded")
+                except Exception as e:
+                    logger.warning("fp16 switch failed (%s) — staying as loaded", e)
             logger.info("MiniCheck loaded")
         return _scorer
 

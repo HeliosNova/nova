@@ -1,0 +1,27 @@
+# MiniCheck entailment sidecar, GPU build (2026-09-09). Same service as
+# Dockerfile.minicheck with CUDA torch instead of CPU torch, plus a C compiler:
+# torch 2.14's CUDA kernels are compiled through triton at first use and the
+# slim base has no gcc (the CPU build never needed one).
+#
+# Measured on the same 16 real digest pairs (5,000-char docs) beside the live
+# 27B: CPU 4 threads 9.62 s/pair, GPU fp32 0.78 s/pair, GPU fp16 0.48 s/pair,
+# same supported count. Entailment is ~20 of a digest's 31 minutes on CPU, so
+# this alone takes a digest to ~13-15 minutes with the same verdicts.
+#
+# VRAM is the constraint, and it is the owner's call: fp16 needs ~1.7 GB (fp32
+# peaks at 3.4 GB). 24 GB - 17 GB (27B) - 3 GiB reserve leaves ~4 GB, so it
+# fits beside the 27B; beside the 9B (predicted 20.7 GB) only if the reserve
+# shrinks. Switch on with:
+#   docker compose -f docker-compose.yml -f docker-compose.minicheck-gpu.yml up -d --build minicheck
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends git gcc libc6-dev \
+    && rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cu130 \
+    && pip install --no-cache-dir "minicheck @ git+https://github.com/Liyan06/MiniCheck.git@main" \
+       accelerate fastapi uvicorn \
+    && python -c "import nltk; nltk.download('punkt_tab'); nltk.download('punkt')" \
+    && python -c "import torch; assert torch.version.cuda, torch.__version__"
+COPY minicheck_service/app.py /srv/app.py
+ENV HF_HOME=/cache
+EXPOSE 8080
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8080", "--app-dir", "/srv"]

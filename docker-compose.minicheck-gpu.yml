@@ -1,0 +1,28 @@
+# Overlay: run the MiniCheck entailment sidecar on the GPU in fp16 (2026-09-09).
+#
+#   docker compose -f docker-compose.yml -f docker-compose.minicheck-gpu.yml up -d --build minicheck
+#
+# Revert by running plain `docker compose up -d --build minicheck`.
+#
+# Why: measured 9.62 s/pair on 4 CPUs vs 0.48 s/pair on the GPU in fp16 (same
+# 16 real digest pairs, same verdict count), and entailment is ~20 of a digest's
+# 31 minutes. Why not already on: VRAM. fp16 takes ~1.7 GB; beside the resident
+# 27B (17 GB) and the 3 GiB reserve that fits; beside the 9B (predicted 20.7 GB)
+# Ollama would spill layers to CPU unless OLLAMA_GPU_OVERHEAD shrinks. That is
+# the owner's reserve, so this stays an overlay until that call is made.
+services:
+  minicheck:
+    build:
+      context: .
+      dockerfile: Dockerfile.minicheck-gpu
+    image: nova-minicheck:gpu
+    cpus: 2.0
+    environment:
+      MINICHECK_HALF: "1"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
