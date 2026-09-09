@@ -18,6 +18,7 @@ import asyncio
 import html
 import logging
 import re
+import time
 from collections import deque
 from dataclasses import dataclass
 from html.parser import HTMLParser
@@ -63,6 +64,32 @@ DEFAULT_TIMEOUT = 30.0
 # operator deliberately overrides it.
 SEARCH_TIMEOUT = config.WEB_SEARCH_TIMEOUT
 DEFAULT_MAX_RESULTS = 10
+
+# Fan-out bound (2026-09-09). Measured 2026-09-08 14:22-14:23 UTC: SearXNG
+# answered 67 queries in one minute, then three digests fired every angle on
+# both categories at once (~48 requests in a second) and 56 timed out upstream
+# while the instance itself kept answering direct queries in 1.5 s. Six in
+# flight keeps the same throughput and turns the burst into a short queue.
+_SEARXNG_MAX_CONCURRENT = 6
+_searxng_gate_state: tuple = (None, None)   # (event loop, semaphore)
+
+
+def _searxng_gate() -> asyncio.Semaphore:
+    """The process-wide SearXNG semaphore, re-created per event loop (asyncio
+    primitives bind to the loop that first uses them; tests and restarts make
+    new loops)."""
+    global _searxng_gate_state
+    loop = asyncio.get_running_loop()
+    if _searxng_gate_state[0] is not loop:
+        _searxng_gate_state = (loop, asyncio.Semaphore(_SEARXNG_MAX_CONCURRENT))
+    return _searxng_gate_state[1]
+
+
+# Brave is the last rung of the ladder, so a burst of SearXNG failures lands on
+# it all at once: 26 requests in one second on 2026-09-08, all 429. After a 429
+# it rests for this long instead of turning one burst into a rate-limit strike.
+_BRAVE_COOLDOWN_S = 60.0
+_brave_blocked_until = 0.0
 
 # Rotating User-Agents to avoid being fingerprinted as a bot from a fixed UA.
 import random
@@ -409,11 +436,26 @@ async def _search_bing(query: str, max_results: int) -> list[SearchResult]:
 
 
 async def _search_brave(query: str, max_results: int) -> list[SearchResult]:
-    text = await _fetch(
-        "https://search.brave.com/search",
-        params={"q": query, "source": "web"},
-        timeout=SEARCH_TIMEOUT,
-    )
+    global _brave_blocked_until
+    if time.monotonic() < _brave_blocked_until:
+        return []
+    try:
+        async with httpx.AsyncClient(headers=_headers(), timeout=SEARCH_TIMEOUT,
+                                     follow_redirects=True) as client:
+            resp = await client.get("https://search.brave.com/search",
+                                    params={"q": query, "source": "web"})
+        if resp.status_code == 429:
+            _brave_blocked_until = time.monotonic() + _BRAVE_COOLDOWN_S
+            logger.warning("native_search: brave answered 429 — resting %.0fs", _BRAVE_COOLDOWN_S)
+            return []
+        if resp.status_code >= 400:
+            logger.warning("native_search fetch failed for https://search.brave.com/search: %s",
+                           resp.status_code)
+            return []
+        text = resp.text
+    except Exception as e:
+        logger.warning("native_search fetch failed for https://search.brave.com/search: %s", e)
+        return []
     if not text:
         return []
     return _parse_brave(text)[:max_results]
@@ -441,7 +483,7 @@ async def _search_searxng(
         # angles run concurrently and the slowest gates the batch (manual audit
         # 2026-07-09). At ~12s the healthy engines have long since answered; a
         # laggard is dropped rather than allowed to stall the digest.
-        async with httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
+        async with _searxng_gate(), httpx.AsyncClient(timeout=SEARCH_TIMEOUT) as client:
             params: dict = {
                 "q": query,
                 "format": "json",
