@@ -497,7 +497,7 @@ def get_relevant_dossiers(db, query: str, *, limit: int = 1, open_questions: boo
     scored.sort(key=lambda x: x[0], reverse=True)
     out = []
     want_gaps = _ASKS_GAPS_RE.search(query or "") is not None if open_questions is None else open_questions
-    for _, r in scored[:limit]:
+    for score, r in scored[:limit]:
         body = r["body"]
         m = re.search(r"(?is)## Current understanding\s*(.+?)(?=\n## |\Z)", body)
         # 2,000 chars (was 900: ~71% of a median 3,141-char section was cut).
@@ -506,7 +506,10 @@ def get_relevant_dossiers(db, query: str, *, limit: int = 1, open_questions: boo
             m2 = _OPEN_Q_SECTION_RE.search(body)
             if m2 and m2.group(1).strip():
                 excerpt += "\n\nOpen questions (what Nova does not yet know):\n" + _bound(m2.group(1).strip(), 600)
-        out.append({"title": r["title"], "excerpt": excerpt})
+        # score = token overlap + 2 per title token hit (2026-09-09): the
+        # knowing-first gate reads it to tell "this dossier is ABOUT the
+        # question" (a title hit plus two more tokens) from a passing overlap.
+        out.append({"title": r["title"], "excerpt": excerpt, "score": int(score)})
     return out
 
 

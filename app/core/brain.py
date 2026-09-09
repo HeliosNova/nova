@@ -794,6 +794,7 @@ class _ThinkContext:
     lessons_text: str = ""
     kg_facts_text: str = ""
     kg_facts_count: int = 0
+    dossiers: list[dict] = field(default_factory=list)   # retrieved dossiers, with scores
     reflexions_text: str = ""
     reflexions_count: int = 0
     retrieved_context: str = ""
@@ -1100,6 +1101,7 @@ async def _gather_context(
                 default=None,
             )
             if _dossiers:
+                ctx.dossiers = list(_dossiers)
                 _dtext = (
                     "Standing knowledge dossiers (Nova's accumulated understanding). Answer "
                     "from them when they cover the question and cite them as (dossier: <title>); "
@@ -1696,7 +1698,17 @@ _KNOWING_ASK_RE = re.compile(
     r"(?:per|according to) my notes|in my notes)\b")
 
 
-def _knowing_answers_query(query: str, kg_facts_text: str, lessons_text: str) -> bool:
+# A retrieved dossier "covers" the query at this retriever score: one title
+# token in the query plus at least two more overlapping tokens (2026-09-09).
+# The nightly knowing eval showed the gap: "Fusion Energy Pilots" was retrieved
+# and injected for "Where do things stand with Iceland's experimental fusion
+# project?" and the 9B still ran five web rounds to the circuit breaker, because
+# the gate below could only see the rendered text, never how well it matched.
+_KNOWING_COVER_SCORE = 4
+
+
+def _knowing_answers_query(query: str, kg_facts_text: str, lessons_text: str,
+                           dossiers: list[dict] | None = None) -> bool:
     """Knowing-first gate (2026-09-01): the answer is already in the prompt as a
     standing dossier or an owner-taught lesson — generate WITHOUT tools so the
     model reads what it knows instead of hunting the web past it. Measured
@@ -1710,6 +1722,8 @@ def _knowing_answers_query(query: str, kg_facts_text: str, lessons_text: str) ->
     # send every "what's the latest on X" back to the web).
     if _KNOWING_TOOL_VERB_RE.search(query):
         return False
+    if dossiers and any(int(d.get("score") or 0) >= _KNOWING_COVER_SCORE for d in dossiers):
+        return True
     q_tokens = {t.lower() for t in re.findall(r"[A-Za-z][A-Za-z0-9'-]{2,}", query)}
     has_dossier = "Standing knowledge dossier" in (kg_facts_text or "")
     if has_dossier and _KNOWING_ASK_RE.search(query):
@@ -4160,7 +4174,8 @@ async def think(
             logger.info("[facts-first] KG subject matches query — tool-less generation")
             _gen_tools = []
         elif intent == "general" and _knowing_answers_query(
-                query, ctx.kg_facts_text or "", ctx.lessons_text or ""):
+                query, ctx.kg_facts_text or "", ctx.lessons_text or "",
+                dossiers=ctx.dossiers):
             logger.info("[knowing-first] dossier/lesson covers the query — tool-less generation")
             _gen_tools = []
 
