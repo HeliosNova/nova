@@ -1969,6 +1969,15 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             else:
                 result, grounding = await self._think_query_meta(research_query)
 
+            # Every model call that follows (closure judge, lesson extraction, the
+            # follow-up) runs on the model already resident for this answer: the
+            # evidence-first chain leaves the 27B loaded, and asking the default
+            # 9B instead needs an eviction Ollama defers until the runner idles.
+            _judge_model = None
+            if grounding.get("evidence_first"):
+                from app.monitors.deep_research import _syn_model
+                _judge_model = _syn_model()
+
             # LLM failures should NOT count toward attempt limit — they'll resolve when LLM recovers.
             # Matched on the ERROR code first: the busy/unavailable sentences are
             # answers the model never made, and on 2026-09-07 the busy one was
@@ -2019,7 +2028,8 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 # Verify the result ACTUALLY answers the original question.
                 # Pattern check filters obvious deflections; LLM judge handles
                 # the rest. Failed closure → requeue (fail() bumps attempts).
-                _resolved_ok = await self._curiosity_closure_check(item.topic, result)
+                _resolved_ok = await self._curiosity_closure_check(item.topic, result,
+                                                                   model=_judge_model)
                 if _resolved_ok is None:
                     # The judge could not answer (timed out behind a digest, or
                     # raised). That is not a yes: nothing is banked, nothing is
@@ -2126,7 +2136,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         raw = await llm_mod.invoke_nothink(
                             [{"role": "user", "content": extract_prompt}],
                             json_mode=True, json_prefix="{",
-                            max_tokens=200, model=config.FAST_MODEL,
+                            max_tokens=200, model=_judge_model or config.FAST_MODEL,
                         )
                         obj = llm_mod.extract_json_object(raw)
                         lesson_text = (obj.get("lesson", "") if obj else "").strip()
@@ -2142,7 +2152,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         logger.warning("[Heartbeat] Curiosity lesson extraction failed: %s", e)
 
                 # --- Proactive follow-up: tell the user what we learned ---
-                await self._send_curiosity_followup(item.topic, result)
+                await self._send_curiosity_followup(item.topic, result, model=_judge_model)
 
                 return f"CURIOSITY RESOLVED | topic={item.topic[:80]} | findings={result[:200]}"
             else:
@@ -2152,7 +2162,8 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             await asyncio.to_thread(svc.curiosity.fail, item.id)
             return f"CURIOSITY ERROR | topic={item.topic[:80]} | error={e}"
 
-    async def _curiosity_closure_check(self, topic: str, result: str) -> bool:
+    async def _curiosity_closure_check(self, topic: str, result: str,
+                                       model: str | None = None) -> bool:
         """Return True if `result` plausibly answers the curiosity `topic`.
 
         Two-stage: cheap heuristic (length + deflection patterns) → LLM judge.
@@ -2208,7 +2219,12 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             raw = await llm_mod.invoke_nothink(
                 [{"role": "user", "content": judge_prompt}],
                 json_mode=True, json_prefix="{",
-                max_tokens=120, model=config.FAST_MODEL, temperature=0.0,
+                # `model` (2026-09-09): the evidence-first path passes the synthesis
+                # model so the verdict runs on the RESIDENT 27B. On the default 9B
+                # this call needed an eviction that Ollama defers until the runner
+                # idles - with three digests queued that is never, and a judge
+                # sat 20+ minutes behind them (14:35 UTC).
+                max_tokens=120, model=model or config.FAST_MODEL, temperature=0.0,
             )
             obj = llm_mod.extract_json_object(raw) or {}
             answered = bool(obj.get("answers"))
@@ -2225,7 +2241,8 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             logger.warning("[Curiosity] closure judge unavailable (deferring): %s", e)
             return None
 
-    async def _send_curiosity_followup(self, topic: str, findings: str) -> None:
+    async def _send_curiosity_followup(self, topic: str, findings: str,
+                                       model: str | None = None) -> None:
         """Send a proactive message when curiosity resolves a topic the user asked about."""
         from app.core import llm
 
@@ -2242,6 +2259,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 [{"role": "user", "content": prompt}],
                 max_tokens=250,
                 temperature=0.5,
+                model=model,
             )
             followup = followup.strip()
             followup = _strip_deliberation(followup)

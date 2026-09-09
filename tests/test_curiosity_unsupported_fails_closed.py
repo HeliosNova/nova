@@ -166,13 +166,13 @@ def _loop(monkeypatch, queue, answer, meta):
     monkeypatch.setattr(hb.HeartbeatLoop, "_think_query_meta", _meta, raising=False)
     monkeypatch.setattr(hb.HeartbeatLoop, "_think_query", _text)
 
-    async def _closure(_self, topic, result):
+    async def _closure(_self, topic, result, **kw):
         judged.append(topic)
         return True    # the judge, reading only the text, would have accepted it
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_curiosity_closure_check", _closure)
 
-    async def _follow(_self, topic, findings):
+    async def _follow(_self, topic, findings, **kw):
         sent.append(topic)
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_send_curiosity_followup", _follow)

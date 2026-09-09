@@ -144,12 +144,12 @@ def _loop(monkeypatch, queue):
     monkeypatch.setattr(hb.HeartbeatLoop, "_think_query_meta", _meta, raising=False)
     monkeypatch.setattr(dr, "research_question", _rq)
 
-    async def _closure(_self, topic, result):
+    async def _closure(_self, topic, result, **kw):
         return True
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_curiosity_closure_check", _closure)
 
-    async def _follow(_self, topic, findings):
+    async def _follow(_self, topic, findings, **kw):
         return None
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_send_curiosity_followup", _follow)
@@ -234,3 +234,41 @@ async def test_the_chain_searches_the_question_with_the_digest_browser_budget(mo
     subject, kw = calls["gather"][0]
     assert subject == dr._question_subject(LABELLED)
     assert kw.get("browser_budget") == 6
+
+
+# --- the verdict runs on the resident model ------------------------------------
+# 14:35 UTC: the evidence chain left the 27B resident, then the closure judge
+# asked the default 9B - an eviction Ollama defers until the runner idles, and
+# with three digests queued on it that was never. The judge sat 20+ minutes.
+
+@pytest.mark.asyncio
+async def test_the_closure_check_judges_on_the_model_it_is_given(monkeypatch):
+    from app.core import llm as llm_mod
+    seen = {}
+
+    async def _fake(messages, **kw):
+        seen.update(kw)
+        return '{"answers": true, "reason": "concrete"}'
+
+    monkeypatch.setattr(llm_mod, "invoke_nothink", _fake)
+    lp = object.__new__(hb.HeartbeatLoop)
+    ok = await lp._curiosity_closure_check(QUESTION, ANSWER, model="qwen3.8:27b")
+    assert ok is True
+    assert seen.get("model") == "qwen3.8:27b"
+
+
+@pytest.mark.asyncio
+async def test_an_evidence_first_answer_is_judged_on_the_synthesis_model(monkeypatch, db, syn_model):
+    db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, attempts) "
+               "VALUES (?, 'dossier_open_question', 0.6, 'pending', 0)", (QUESTION,))
+    queue = CuriosityQueue(db)
+    lp, seen = _loop(monkeypatch, queue)
+    judged = {}
+
+    async def _closure(_self, topic, result, **kw):
+        judged.update(kw)
+        return True
+
+    monkeypatch.setattr(hb.HeartbeatLoop, "_curiosity_closure_check", _closure)
+    await lp._research_one_curiosity(_Svc(queue))
+    assert judged.get("model") == syn_model

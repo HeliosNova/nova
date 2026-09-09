@@ -97,12 +97,12 @@ def _loop(monkeypatch, queue, answer="A plain answer with nothing to verify.", m
     monkeypatch.setattr(hb.HeartbeatLoop, "_think_query_meta", _meta, raising=False)
     monkeypatch.setattr(hb.HeartbeatLoop, "_think_query", _text)
 
-    async def _closure(_self, topic, result):
+    async def _closure(_self, topic, result, **kw):
         return closure
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_curiosity_closure_check", _closure)
 
-    async def _follow(_self, topic, findings):
+    async def _follow(_self, topic, findings, **kw):
         return None
 
     monkeypatch.setattr(hb.HeartbeatLoop, "_send_curiosity_followup", _follow)
