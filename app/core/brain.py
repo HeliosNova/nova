@@ -1621,14 +1621,31 @@ _PLAN_TAIL_RE = re.compile(
 )
 
 
-def _draft_is_unfinished(text: str) -> bool:
-    """True when a draft is cut off or ends announcing its next step."""
+# Process narration anywhere in a TOOL-BACKED final answer (2026-09-09). The
+# tail rule above only sees "let me <verb>" ending the text; the nightly
+# knowing eval failed twice on "...404 error. Let me try navigating to the
+# homepage and search from there for ..., or use web_search with more specific
+# terms like ..." - a next move announced mid-text after the circuit breaker
+# had already stopped the tools. Only consulted when tools ran, so chat
+# answers that legitimately say "let me try to explain" are untouched.
+_NARRATION_RE = re.compile(
+    r"(?i)\b(?:let me (?:try|navigate|search|look|check|fetch|browse|use|go|attempt)"
+    r"|i(?:'ll| will)(?: now)? (?:try|navigate|search|look|check|fetch|browse|use|attempt)"
+    r"|try navigating|let me (?:instead )?(?:re-?)?(?:run|query))\b"
+)
+
+
+def _draft_is_unfinished(text: str, tools_ran: bool = False) -> bool:
+    """True when a draft is cut off, ends announcing its next step, or - when
+    tools ran - narrates a next move anywhere instead of answering."""
     t = (text or "").strip()
     if not t:
         return False
     if _TRUNCATION_MARKER in t:
         return True
-    return bool(_PLAN_TAIL_RE.search(t[-200:]))
+    if _PLAN_TAIL_RE.search(t[-200:]):
+        return True
+    return bool(tools_ran and _NARRATION_RE.search(t))
 
 
 # --- Deflection detection (2026-08-19) -------------------------------------
@@ -4212,7 +4229,8 @@ async def think(
         # next step or carries the token-limit marker — process narration, not
         # an answer. One tool-free rewrite pass over the already-gathered
         # context; keep the repair only if it is itself finished.
-        if gen.final_content and _draft_is_unfinished(gen.final_content):
+        if gen.final_content and _draft_is_unfinished(gen.final_content,
+                                                      tools_ran=bool(gen.tool_results)):
             logger.warning("[unfinished-draft] repairing (tail: %r)",
                            gen.final_content[-120:])
             messages.append({"role": "assistant", "content": gen.final_content})
