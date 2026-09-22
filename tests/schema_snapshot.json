@@ -180,7 +180,8 @@
   "source_monitor",
   "attempts",
   "regime",
-  "conf_spread"
+  "conf_spread",
+  "criterion"
  ],
  "goals": [
   "id",

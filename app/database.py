@@ -1413,6 +1413,24 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 38 (2026-09-22): forecasts.criterion — the resolution
+        # criterion fixed at mint ("Settles TRUE if <source> reports <observable>
+        # by <date>"). The mint-time validator writes it and the resolver's
+        # judge is given it, so "what settles this" is decided once, when the
+        # forecast is made, not guessed months later. Same night the forecast
+        # record was reset to zero to start the new regime clean.
+        if 38 not in applied:
+            conn.execute("BEGIN")
+            try:
+                fc_cols = {r[1] for r in conn.execute("PRAGMA table_info(forecasts)")}
+                if fc_cols and "criterion" not in fc_cols:
+                    conn.execute("ALTER TABLE forecasts ADD COLUMN criterion TEXT")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (38,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

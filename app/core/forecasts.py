@@ -54,12 +54,12 @@ _MIN_DAYS, _MAX_DAYS = 1, 365
 # runs. Calibration therefore scores WITHIN a regime, and any future change to
 # how forecasts are minted or graded bumps this string so the effect of the
 # change is measurable instead of averaged away.
-REGIME = "2026-09-04-ensembled"
+REGIME = "2026-09-22-criterion"
 REGIME_LEGACY = "pre-2026-09-02"
 # Every regime this store has seen, newest first. A change to how forecasts are
 # minted or graded appends here and bumps REGIME, so its effect is measurable
 # instead of averaged into the record.
-REGIME_HISTORY = ("2026-09-04-ensembled", "2026-09-02-dated", REGIME_LEGACY)
+REGIME_HISTORY = ("2026-09-22-criterion", "2026-09-04-ensembled", "2026-09-02-dated", REGIME_LEGACY)
 REGIME_CUTOVER = "2026-09-02 03:00:00"
 
 _DEFAULT_DAYS = 30
@@ -217,7 +217,7 @@ def _find_open_duplicate(db, claim: str, storyline_key: str):
 def create_forecast(db, claim: str, *, days: int | None = None, confidence: float,
                     storyline_key: str = "", source_monitor: str = "",
                     resolves_on: str | None = None,
-                    spread: float | None = None) -> int | None:
+                    spread: float | None = None, criterion: str = "") -> int | None:
     """Record a falsifiable forecast. Returns the row id or None.
 
     Resolution date = the explicit `resolves_on` date (or `days` from now,
@@ -250,17 +250,20 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
         if dup is not None:
             cur = db.execute(
                 "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, "
-                "resolution, source_monitor, regime) VALUES (?, ?, ?, ?, 'restated', ?, ?, ?)",
+                "resolution, source_monitor, regime, criterion) "
+                "VALUES (?, ?, ?, ?, 'restated', ?, ?, ?, ?)",
                 (claim[:500], storyline_key[:80], confidence, dup["resolves_at"],
-                 f"restates #{dup['id']}", source_monitor[:80], REGIME),
+                 f"restates #{dup['id']}", source_monitor[:80], REGIME, (criterion or "")[:400]),
             )
             logger.info("[Forecast] restated #%d (%.2f): %s", dup["id"], confidence, claim[:80])
             return cur.lastrowid
         cur = db.execute(
             "INSERT INTO forecasts (claim, storyline_key, confidence, resolves_at, status, "
-            "source_monitor, regime, conf_spread) VALUES (?, ?, ?, ?, 'open', ?, ?, ?)",
+            "source_monitor, regime, conf_spread, criterion) "
+            "VALUES (?, ?, ?, ?, 'open', ?, ?, ?, ?)",
             (claim[:500], storyline_key[:80], confidence,
-             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80], REGIME, spread),
+             target.strftime("%Y-%m-%d %H:%M:%S"), source_monitor[:80], REGIME, spread,
+             (criterion or "")[:400]),
         )
         logger.info("[Forecast] minted #%s resolves %s (%.2f): %s",
                     cur.lastrowid, target.date().isoformat(), confidence, claim[:80])
@@ -274,6 +277,76 @@ def create_forecast(db, claim: str, *, days: int | None = None, confidence: floa
 # (2026-09-01) or the legacy "<N> days" horizon. The trailing 'confidence'
 # word is tolerated: the dossier prompt's own template reads '<0.x
 # confidence>', and the 27B dutifully writes the word.
+# Mint-time validator (2026-09-22, the record reset to zero the same day).
+# OpenForecaster's single largest lever was not the model: of 745k candidate
+# questions generated from news, ~7% survived a validator demanding a genuinely
+# future-facing binary outcome, an explicit resolution criterion (which source
+# settles it, in what form), a consistent deadline and no leakage. Nova minted
+# free-text claims and validated nothing: 48 of 969 forecasts ended
+# unresolvable, 17 were restatements, the judge guessed what "settles" meant,
+# and skill sat at -0.06. The criterion is stored and handed to the judge.
+_VALIDATE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "accept": {"type": "boolean"},
+        "claim": {"type": "string"},
+        "criterion": {"type": "string"},
+        "reason": {"type": "string"},
+    },
+    "required": ["accept", "reason"],
+}
+_VALIDATE_PROMPT = (
+    "Today is {today}. A briefing proposed this forecast, resolving on {due}:\n\n"
+    "  \"{claim}\"\n\n"
+    "CONTEXT (the briefing it came from):\n{context}\n\n"
+    "Decide whether it is a usable forecast. ACCEPT only if ALL hold:\n"
+    "1. ONE binary outcome that will be publicly knowable by {due} (not a trend, "
+    "not a bundle of outcomes, not an opinion).\n"
+    "2. It is genuinely uncertain today — not already true, not already decided, "
+    "not a restatement of an announced plan, target, guidance or schedule.\n"
+    "3. A specific public source could settle it (an official release, a filing, "
+    "a court docket, a published statistic, a named outlet's report of an event).\n"
+    "4. {due} is consistent with any deadline the claim itself states.\n"
+    "If accepted, restate the claim in one precise sentence (keep every number, "
+    "name and date; add nothing) and write ONE sentence naming what settles it "
+    "and how (\"Settles TRUE if <source> reports/publishes <observable> by {due}; "
+    "FALSE otherwise\").\n"
+    'Reply JSON only: {{"accept": true|false, "claim": "<restated or original>", '
+    '"criterion": "<one sentence>", "reason": "<one short sentence>"}}'
+)
+
+
+async def validate_candidate(claim: str, resolves_on: str | None, context: str, *,
+                             model: str | None = None) -> tuple[bool, str, str, str]:
+    """(accept, canonical_claim, criterion, reason) for a proposed forecast.
+
+    An unreachable or unparseable validator ACCEPTS the claim as written with
+    an empty criterion: the record then looks like the previous regime for that
+    row rather than losing the forecast, and the log line says so.
+    """
+    due = (resolves_on or "")[:10] or "its resolution date"
+    prompt = _VALIDATE_PROMPT.format(today=_now().date().isoformat(), due=due,
+                                     claim=claim[:400], context=(context or "")[:2500])
+    try:
+        raw = await llm.invoke_nothink(
+            [{"role": "user", "content": prompt}], json_mode=True,
+            json_schema=_VALIDATE_SCHEMA, max_tokens=220, temperature=0.1,
+            model=model, num_ctx=4096)
+        data = llm.extract_json_object(raw) if isinstance(raw, str) else (raw or {})
+        accept = bool(data.get("accept"))
+        reason = str(data.get("reason") or "").strip()[:200]
+        if not accept:
+            return False, claim, "", reason or "rejected by validator"
+        canonical = str(data.get("claim") or "").strip() or claim
+        if len(canonical) < 12 or len(canonical) > 2 * len(claim) + 80:
+            canonical = claim                      # a rewrite that lost or invented text
+        criterion = str(data.get("criterion") or "").strip()[:400]
+        return True, canonical, criterion, reason
+    except Exception as e:
+        logger.warning("[Forecast] validator unavailable (%s) — minting unvalidated", e)
+        return True, claim, "", "validator unavailable"
+
+
 _CONF_SCHEMA = {
     "type": "object",
     "properties": {"probability": {"type": "number"}},
@@ -338,14 +411,22 @@ async def parse_and_store_forecast_ensembled(
     if parsed is None:
         return None
     claim, date, days, stated = parsed
-    mean, spread = await _ensemble_confidence(claim, text, k=k, model=model)
+    ok, claim, criterion, reason = await validate_candidate(claim, date, text, model=model)
+    if not ok:
+        logger.info("[Forecast] rejected at mint (%s): %s", reason, claim[:80])
+        return None
+    # The samples see the criterion too: a probability for "X happens" and one
+    # for "source S reports X by D" are different questions.
+    ctx = (f"RESOLUTION CRITERION: {criterion}\n\n" if criterion else "") + (text or "")
+    mean, spread = await _ensemble_confidence(claim, ctx, k=k, model=model)
     conf = stated if mean is None else (stated + mean * k) / (1 + k)
     if mean is not None:
         logger.info("[Forecast] confidence %.2f stated -> %.2f ensembled "
                     "(%d samples, spread %.2f): %s", stated, conf, k, spread, claim[:70])
     return await asyncio.to_thread(
         create_forecast, db, claim, days=days, resolves_on=date, confidence=conf,
-        storyline_key=storyline_key, source_monitor=source_monitor, spread=spread)
+        storyline_key=storyline_key, source_monitor=source_monitor, spread=spread,
+        criterion=criterion)
 
 
 # What the model writes, not what the prompt asked for (2026-09-07). Replaying
@@ -441,6 +522,7 @@ def list_due(db, limit: int = 12) -> list[dict]:
 _RESOLVE_PROMPT = (
     "You made this forecast on {created}; it resolves on {due}; today is {today}:\n\n"
     "  \"{claim}\"\n\n"
+    "{criterion_block}"
     "RECENT EVIDENCE (live web search run today; each line carries the article's "
     "date where known):\n{evidence}\n\n"
     "Judge STRICTLY from the evidence above — do NOT use prior knowledge or "
@@ -618,9 +700,14 @@ async def resolve_one(db, fc: dict) -> str:
         return _bump_attempts(db, fc)
     created = str(fc.get("created_at", "?"))[:10]
     due = str(fc.get("resolves_at", "?"))[:10]
+    criterion = (fc.get("criterion") or "").strip()
+    criterion_block = (
+        f"RESOLUTION CRITERION, fixed when the forecast was made — judge against THIS, "
+        f"not against your own reading of the claim:\n  {criterion}\n\n"
+        if criterion else "")
     prompt = _RESOLVE_PROMPT.format(
         created=created, due=due, today=_now().date().isoformat(),
-        claim=fc["claim"], evidence=evidence)
+        claim=fc["claim"], evidence=evidence, criterion_block=criterion_block)
     try:
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": prompt}],
