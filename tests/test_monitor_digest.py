@@ -234,3 +234,29 @@ async def test_failed_broadcast_keeps_journal_row_and_rebuffers():
     assert len(lp._digest_buffer) == 1
     assert lp._digest_buffer[0][4] == 9
     db.executemany.assert_not_called()
+
+
+def test_knowing_tier_writers_are_not_capped_when_bundled():
+    """Knowledge Consolidation and Cross-Monitor Synthesis are system-category
+    (Telegram only) by routing choice; their output is the product. Bundled
+    beside another item they were cut to the 600-char status cap — a 625-char
+    consolidation turn sat on Telegram at 09:25 UTC on 2026-09-22."""
+    lp = _loop()
+    consolidation = "## 📚 KNOWING — 8 dossier(s) consolidated\n" + "k" * 3000
+    items = [("Knowledge Consolidation", consolidation), ("System Health", "y" * 3000)]
+    cats = {"Knowledge Consolidation": "system", "System Health": "system"}
+    out = lp._format_digest(items, cats, longform={"Knowledge Consolidation"})
+    assert consolidation in out
+    assert ("y" * 700) not in out
+
+
+@pytest.mark.asyncio
+async def test_longform_names_come_from_check_type(db):
+    from app.monitors.monitor_store import MonitorStore
+    lp = _loop()
+    lp.store = MonitorStore(db)
+    lp.store.seed_defaults()
+    names = {"Knowledge Consolidation", "Cross-Monitor Synthesis", "System Health", "Storyline Tracker"}
+    assert await lp._longform_names(names) == {"Knowledge Consolidation", "Cross-Monitor Synthesis",
+                                               "Storyline Tracker"}
+    assert await _loop()._longform_names(names) == set()      # no store: the cap applies as before

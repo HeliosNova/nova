@@ -47,6 +47,13 @@ _DIGEST_MAX_BUFFER_AGE = 300  # seconds
 _DELIVERY_RECOVERY_MAX_AGE_H = 24
 
 
+# Knowing-tier writers are system-category (Telegram only) by routing choice,
+# and their output is the product, not a status line: a consolidation runs
+# ~3,000 chars, Cross-Monitor Synthesis ~3,850. Bundled beside another item
+# they were cut to the 600-char status cap (a 625-char consolidation turn
+# sat on Telegram at 09:25 UTC 2026-09-22). Exempt by check type.
+_LONGFORM_CHECK_TYPES = frozenset({"consolidation", "synthesis", "storyline"})
+
 class DeliveryMixin:
     """Alert routing, digest batching and the delivery journal."""
 
@@ -207,7 +214,31 @@ class DeliveryMixin:
         except Exception as e:
             logger.debug("[Heartbeat] channel turn not recorded: %s", e)
 
-    def _format_digest(self, items: list[tuple[str, str]], categories: dict | None = None) -> str:
+    async def _longform_names(self, names) -> set[str]:
+        """Names among `names` whose monitor is a long-form writer (see
+        _LONGFORM_CHECK_TYPES). Empty when there is no store to ask."""
+        store = getattr(self, "store", None)
+        if store is None or not names:
+            return set()
+
+        def _look() -> set[str]:
+            out: set[str] = set()
+            for n in names:
+                try:
+                    m = store.get_by_name(n)
+                except Exception:
+                    m = None
+                if m is not None and getattr(m, "check_type", None) in _LONGFORM_CHECK_TYPES:
+                    out.add(n)
+            return out
+
+        try:
+            return await asyncio.to_thread(_look)
+        except Exception:
+            return set()
+
+    def _format_digest(self, items: list[tuple[str, str]], categories: dict | None = None,
+                       longform=None) -> str:
         """One message from a cycle's alerts. Single item keeps its plain form;
         multiple get a digest with each monitor as a section.
 
@@ -217,16 +248,20 @@ class DeliveryMixin:
         Only operational/system status lines get the scannable per-item cap (they're
         short, so it rarely bites — it's just a runaway guard). The channel adapters
         already split over-long messages, so a full briefing delivers fine.
-        `categories` maps monitor name → category; absent → cap applies to all."""
+        `categories` maps monitor name → category; absent → cap applies to all.
+        `longform` names monitors whose output is the product despite a
+        system category (the knowing-tier writers, see _LONGFORM_CHECK_TYPES);
+        they post in full like content."""
         if len(items) == 1:
             name, msg = items[0]
             return f"[{name}]\n" + msg.lstrip("\n")
         categories = categories or {}
+        longform = longform or set()
         cap = int(getattr(config, "MONITOR_DIGEST_ITEM_MAX_CHARS", 600))
         parts = [f"🛰 **Monitor digest — {len(items)} updates**", ""]
         for name, msg in items:
             body = (msg or "").strip()
-            if categories.get(name) != "content" and len(body) > cap:
+            if categories.get(name) != "content" and name not in longform and len(body) > cap:
                 body = body[:cap].rstrip() + " […]"
             parts.append(f"## {name}")
             parts.append(body)
@@ -257,6 +292,7 @@ class DeliveryMixin:
             for tgt, name, msg, cat, row_id, _ts in buf:
                 groups.setdefault(tgt, []).append((name, msg, row_id))
                 cats[name] = cat
+            longform = await self._longform_names(set(cats))
             for tgt, entries in groups.items():
                 try:
                     kept = entries
@@ -290,7 +326,7 @@ class DeliveryMixin:
                             logger.warning("[Heartbeat] salience ranking skipped: %s", e)
                             kept = entries
                     items = [(n, m) for n, m, _ in kept]
-                    digest = self._format_digest(items, cats)
+                    digest = self._format_digest(items, cats, longform)
                     if await self._broadcast(digest, set(tgt)):
                         logger.info("[Heartbeat] digest sent: %d update(s) → %s",
                                     len(items), ",".join(sorted(tgt)))
