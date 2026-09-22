@@ -135,12 +135,8 @@ PATHWAYS: tuple[Pathway, ...] = (
     Pathway("procedural_memory", 336, "procedural_clusters", "created_at",
             flag="ENABLE_PROCEDURAL_CONSOLIDATION", monitor="Dream Consolidation",
             describe="near-duplicate lessons were generalised"),
-    # Reads "off" while its monitor is disabled, which is the point: the
-    # registry should say WHY a writer is quiet, not just that it is. Its input
-    # (capability_gaps) is deliberately NOT a pathway — see the note below.
-    Pathway("auto_tool_candidates", 168, "auto_tool_candidates", "created_at",
-            monitor="Auto-Tool Synthesis",
-            describe="a capability gap was turned into a tool candidate"),
+    # (auto_tool_candidates left the registry 2026-09-22 with its monitor,
+    # Auto-Tool Synthesis, which the owner cut from the catalog.)
     # Usage-gated: these only write when the owner talks to Nova. Silence is
     # reported as idle, never dead.
     Pathway("chat_messages", 168, "messages", "created_at", usage_gated=True,

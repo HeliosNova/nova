@@ -42,10 +42,10 @@ def test_procedural_memory_gets_a_window_wide_enough_for_its_own_cap():
     assert p.flag == "ENABLE_PROCEDURAL_CONSOLIDATION"
 
 
-def test_a_writer_behind_a_disabled_monitor_reports_off_not_dead():
-    """The registry should say WHY a writer is quiet."""
-    p = BY_NAME["auto_tool_candidates"]
-    assert p.monitor == "Auto-Tool Synthesis"
+def test_a_cut_writer_leaves_the_registry_with_its_monitor():
+    """Auto-Tool Synthesis was cut from the catalog 2026-09-22; a pathway
+    pointed at a writer that cannot write reads dead forever."""
+    assert "auto_tool_candidates" not in BY_NAME
 
 
 def test_deliberation_scratchpads_are_usage_gated():
@@ -67,6 +67,8 @@ def test_deliberation_scratchpads_are_usage_gated():
      "broke the canary for three days"),
     ("user_facts", "zero by design"),
     ("verifiable_signals", "RLVR archived 2026-09-01"),
+    ("auto_tool_candidates",
+     "its writer, Auto-Tool Synthesis, was cut from the catalog 2026-09-22"),
     ("auth_lockouts", "a security event, not a background writer"),
     ("system_state", "key-value configuration"),
     ("goals", "event-driven"),

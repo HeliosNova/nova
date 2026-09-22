@@ -185,7 +185,11 @@ class TestMonitorStore:
         # tier's daily distillation cycle, 2026-08-12) = 74, +1 (Digest Health
         # Canary — weekly digest-output canary, 2026-08-25) = 75.
         # +1 (Pathway Liveness — the liveness registry monitor, 2026-09-02) = 76.
-        assert count == 77
+        # +1 (Engineering Report, 2026-09-05) = 77; then -8 on 2026-09-22 (owner
+        # cut the inert catalog: Skill Validation, Fine-Tune Check, Capability
+        # Review, Goal Derivation, Auto-Tool Synthesis, Prompt Optimizer, KG
+        # Consistency Check, Training Job Watch) = 69.
+        assert count == 69
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)
@@ -193,7 +197,6 @@ class TestMonitorStore:
         assert "System Health" in names
         assert "World Awareness" in names
         # New system monitors
-        assert "Training Job Watch" in names
         assert "KG Growth Rate" in names
         assert "Ollama Model Loaded" in names
         # Niche domain studies still in catalog but seeded disabled
@@ -205,9 +208,7 @@ class TestMonitorStore:
         assert "FOMC and Fed Watch" in names
         # Teaching/self-improvement monitors
         assert "Curiosity Research" in names
-        assert "Fine-Tune Check" in names
         assert "Lesson Quiz" in names
-        assert "Skill Validation" in names
         assert "Quality Eval Harness" in names
 
     def test_core_monitors_enabled_by_default(self, store):
@@ -245,15 +246,14 @@ class TestMonitorStore:
                 f"niche monitor '{niche}' should be disabled by default"
             )
 
-    def test_quiz_and_skill_seeded_on_change(self, store):
-        """Quiz and Skill Validation should seed with notify_condition='on_change'."""
+    def test_quiz_seeded_on_change(self, store):
+        """Lesson Quiz seeds with notify_condition='on_change' (Skill Validation
+        left the catalog 2026-09-22)."""
         store.seed_defaults()
         quiz = store.get_by_name("Lesson Quiz")
-        skill = store.get_by_name("Skill Validation")
         assert quiz is not None
-        assert skill is not None
         assert quiz.notify_condition == "on_change"
-        assert skill.notify_condition == "on_change"
+        assert store.get_by_name("Skill Validation") is None
 
     def test_seed_defaults_idempotent(self, store):
         store.seed_defaults()

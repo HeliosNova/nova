@@ -753,30 +753,9 @@ class MaintenanceMixin:
             and isinstance(svc.learning._db, SafeDB)
         )
 
-        # Loop A — Quiz failures → Curiosity re-research
-        # Lessons with 3+ quiz failures in last 7 days → queue for curiosity re-research
-        if has_db and svc.curiosity:
-            try:
-                db = svc.learning._db
-                failing = await asyncio.to_thread(
-                    db.fetchall,
-                    "SELECT id, topic FROM lessons "
-                    "WHERE quiz_failures >= 3 "
-                    "AND last_quizzed_at > datetime('now', '-7 days')"
-                )
-                requeued = 0
-                for row in failing:
-                    topic = row["topic"]
-                    # Prefix to pass CuriosityQueue validation (15+ chars, 4+ words)
-                    padded = f"Re-research and verify: {topic}"
-                    cid = await asyncio.to_thread(
-                        svc.curiosity.add, padded, source="quiz_feedback", urgency=0.7)
-                    if cid > 0:
-                        requeued += 1
-                if requeued:
-                    parts.append(f"quiz→curiosity: {requeued} topics re-queued")
-            except Exception as e:
-                logger.warning("[Heartbeat] Loop A (quiz→curiosity) failed: %s", e)
+        # Loop A (quiz failures → curiosity re-research) cut 2026-09-22: zero
+        # of its questions ever resolved, and one of them consumed six research
+        # passes in a day.
 
         # Loop B — Skill degradation → Early validation
         # Skills with 0.3 ≤ success_rate < 0.5 and 5+ uses → force Skill Validation next cycle

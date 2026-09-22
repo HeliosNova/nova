@@ -507,25 +507,9 @@ class DreamConsolidator:
                     result.curiosity_dismissed += 1
                 except Exception as e:
                     result.errors.append(f"dismiss curiosity: {e}")
-            elif not (item.get("resolution") or "").startswith("[dream-reset"):
-                # Factual questions with transient failures → ONE reset for retry.
-                # Unconditional resets made MAX_CURIOSITY_ATTEMPTS meaningless:
-                # every dream cycle handed exhausted items a fresh attempts=0, so
-                # unanswerable topics churned research forever (observed live
-                # 2026-08-26 — a 7-day-old urgency-0.9 item re-researched every
-                # daemon tick). The marker in `resolution` grants exactly one
-                # second life; an item that exhausts its attempts AGAIN stays
-                # failed as the audit trail. resolve() overwrites the marker on
-                # success, so resolved items are unaffected.
-                try:
-                    await self._db.execute(
-                        "UPDATE curiosity_queue SET status='pending', attempts=0, "
-                        "resolution='[dream-reset ' || datetime('now') || ']' WHERE id=?",
-                        (item["id"],),
-                    )
-                    result.curiosity_reset += 1
-                except Exception as e:
-                    result.errors.append(f"reset curiosity: {e}")
+            # The one-time "second life" reset (attempts=0 with a [dream-reset]
+            # marker) was cut 2026-09-22: it re-opened a question that had
+            # already failed three ways that morning. Failed stays failed.
 
     async def _refresh_stale_facts(self, signals: GatherSignals, result: ConsolidationResult):
         """Refresh access timestamps for system-critical facts. Never prune user-stated facts."""

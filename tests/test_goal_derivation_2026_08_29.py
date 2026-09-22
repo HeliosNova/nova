@@ -25,21 +25,6 @@ from app.core import goal_deriver
 from app.monitors import heartbeat_loop
 
 
-class TestCapabilityReviewOrdering:
-    def test_derive_runs_before_gaps_are_marked_reviewed(self):
-        """derive_goals() must be called BEFORE the reviewed=1 update."""
-        src = inspect.getsource(heartbeat_loop)
-        derive = src.find("derive_goals(db, max_new_goals=3)")
-        mark = src.find("SET reviewed = 1")
-        assert derive != -1, "derive_goals call not found"
-        assert mark != -1, "reviewed=1 update not found"
-        assert derive < mark, (
-            "capability review marks gaps reviewed BEFORE deriving goals; "
-            "derive_goals selects WHERE reviewed = 0, so its input is emptied "
-            "first and the capability_gap source can never mint a goal"
-        )
-
-
 class TestGapClusterKeying:
     """The cluster key must come from content, not from position."""
 

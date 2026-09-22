@@ -63,21 +63,14 @@ _SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
     "ChromaDB Integrity",
     "KG Health Monitor",
     "Dream Consolidation",
-    "Capability Review",
     "Quality Eval Harness",
-    "Prompt Optimizer",
     "System Health",
     "System Maintenance",
-    "Fine-Tune Check",
-    "Skill Validation",
     "Lesson Quiz",
     "Auto-Monitor Detector",
-    "Training Job Watch",
     "KG Growth Rate",
     "Ollama Model Loaded",
-    "Goal Derivation",
     "Cross-Monitor Synthesis",
-    "Auto-Tool Synthesis",
     "Output Quality Eval",
     "Digest Health Canary",
     "Pathway Liveness",
@@ -94,21 +87,14 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "pathway_liveness",
     "engineering_report",
     "maintenance",
-    "finetune",
     "consolidation",
     "dream_consolidation",
-    "capability_review",
     "eval",
-    "prompt_analyzer",
     "quiz",
-    "skill_test",
     "auto_monitor",
-    "training_job",
     "kg_growth",
     "ollama_model",
-    "goal_derivation",
     "synthesis",
-    "auto_tool",
     "output_eval",
 })
 
@@ -702,14 +688,6 @@ class MonitorStore:
                 "notify_condition": "on_change",
             },
             {
-                "name": "Skill Validation",
-                "check_type": "skill_test",
-                "check_config": {},
-                "schedule_seconds": 43200,  # 12h
-                "cooldown_minutes": 660,
-                "notify_condition": "on_change",
-            },
-            {
                 "name": "Curiosity Research",
                 "check_type": "curiosity",
                 "check_config": {},
@@ -731,30 +709,6 @@ class MonitorStore:
                 "check_config": {},
                 "schedule_seconds": 86400,  # daily
                 "cooldown_minutes": 1380,
-                "notify_condition": "on_change",
-            },
-            {
-                "name": "Fine-Tune Check",
-                "check_type": "finetune",
-                "check_config": {},
-                "schedule_seconds": 604800,  # weekly
-                "cooldown_minutes": 10000,   # ~7 days
-                "notify_condition": "on_change",
-            },
-            {
-                "name": "Capability Review",
-                "check_type": "capability_review",
-                "check_config": {},
-                "schedule_seconds": 86400,   # daily
-                "cooldown_minutes": 1380,    # 23h
-                "notify_condition": "on_change",
-            },
-            {
-                "name": "Goal Derivation",
-                "check_type": "goal_derivation",
-                "check_config": {},
-                "schedule_seconds": 21600,   # every 6h — gives KAIROS a fresh queue
-                "cooldown_minutes": 300,
                 "notify_condition": "on_change",
             },
             {
@@ -791,14 +745,6 @@ class MonitorStore:
                 # installs get the new cadence via migration 32.
                 "schedule_seconds": 21600,
                 "cooldown_minutes": 300,
-                "notify_condition": "on_change",
-            },
-            {
-                "name": "Auto-Tool Synthesis",
-                "check_type": "auto_tool",
-                "check_config": {},
-                "schedule_seconds": 43200,   # every 12h — close persistent gaps
-                "cooldown_minutes": 660,
                 "notify_condition": "on_change",
             },
             {
@@ -941,46 +887,14 @@ class MonitorStore:
                 "cooldown_minutes": 1380,    # 23 hours
                 "notify_condition": "on_change",
             },
-            {
-                "name": "Prompt Optimizer",
-                "check_type": "prompt_analyzer",
-                "check_config": {},
-                "schedule_seconds": 90000,   # 25h -- runs after Quality Eval Harness
-                "cooldown_minutes": 1380,    # 23 hours
-                "notify_condition": "on_change",
-            },
             # --- KG Consistency Check (#184) ---
             # Daily batched cross-check of recent answers vs KG facts.
             # Surfaces "I told you X but my KG says Y" contradictions for
             # resolution. Inline per-response checks would tax every chat
             # call by 200-500ms — nightly batch is the right trade.
-            {
-                "name": "KG Consistency Check",
-                "check_type": "kg_consistency",
-                "check_config": {},
-                "schedule_seconds": 86400,   # daily
-                "cooldown_minutes": 1380,    # 23 hours
-                "notify_condition": "on_change",
-            },
             # --- System health monitors added alongside the cull ---
             # Detect failed fine-tune runs, unusual KG growth, and
             # whether the expected Ollama model is actually loaded.
-            {
-                "name": "Training Job Watch",
-                "check_type": "training_job",
-                "check_config": {},
-                # Daily, not hourly (2026-09-04). The weight trainer was
-                # archived 2026-06-12 and Fine-Tune Check is seeded disabled, so
-                # this returned the identical string "no training history yet"
-                # 101 times in 14 days. At hourly it demanded 168 runs a week -
-                # 10% of the whole schedule's demand, against a 37% delivery
-                # rate - and took a real slot every time it came due. A revived
-                # trainer is not something an hourly poll notices sooner in any
-                # way that matters. Existing installs get this via migration 36.
-                "schedule_seconds": 86400,
-                "cooldown_minutes": 1380,
-                "notify_condition": "on_change",
-            },
             {
                 "name": "KG Growth Rate",
                 "check_type": "kg_growth",

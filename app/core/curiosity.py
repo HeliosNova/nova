@@ -187,6 +187,16 @@ class _LazyConfigInt:
 # consolidation offers it again once the queue has drained.
 MAX_PENDING = _LazyConfigInt("MAX_CURIOSITY_PENDING")
 MAX_ATTEMPTS = _LazyConfigInt("MAX_CURIOSITY_ATTEMPTS")
+# Sources cut 2026-09-22 (owner). Over the queue's lifetime only dossier
+# questions (17 resolved) and agent failures (5) ever resolved; quiz feedback,
+# reflexion failures, chat gap detection (admission / tool_failure / hedging /
+# context_gap), zero-result searches and dossier tensions resolved nothing and
+# burned the research passes. Their call sites are gone; this refuses any
+# that come back.
+_CUT_SOURCES = frozenset({
+    "quiz_feedback", "reflexion_failure", "search_zero_result", "admission",
+    "tool_failure", "hedging", "context_gap", "dossier_tension",
+})
 
 # Starvation aging, applied at SELECT time only (see get_next).
 # 0.03/day closes the measured 0.09 gap between a 0.6 backlog item and a fresh
@@ -359,6 +369,9 @@ class CuriosityQueue:
             logger.debug(
                 "Curiosity add suppressed (ephemeral run): %r [%s]",
                 topic[:80], source)
+            return -1
+        if source in _CUT_SOURCES:
+            logger.debug("Curiosity mint refused for cut source %r: %r", source, topic[:80])
             return -1
         topic = self._sanitize_topic(topic)[:500]
         if not topic:

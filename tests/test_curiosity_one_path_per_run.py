@@ -24,7 +24,7 @@ EV = hb._EVIDENCE_FIRST_SOURCES
 def test_get_next_can_be_held_to_a_source_group(db):
     q = CuriosityQueue(db)
     a = q.add("What did the Fed decide at its September meeting?", source="dossier_open_question", urgency=0.6)
-    b = q.add("Re-research and verify: rate limiter design", source="quiz_feedback", urgency=0.7)
+    b = q.add("Re-research and verify: rate limiter design", source="agent_failure", urgency=0.7)
     assert a > 0 and b > 0
     assert q.get_next().id == b                                   # urgency wins unconstrained
     assert q.get_next(sources=EV).id == a

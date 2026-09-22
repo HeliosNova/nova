@@ -157,8 +157,15 @@ class TestCuriosityQueue:
         return CuriosityQueue(db)
 
     def test_add_item(self, queue):
-        item_id = queue.add("how does quantum computing work", source="admission", urgency=0.8)
+        item_id = queue.add("how does quantum computing work", source="agent_failure", urgency=0.8)
         assert item_id > 0
+
+    def test_cut_sources_are_refused(self, queue):
+        """2026-09-22: quiz feedback, reflexion failures, chat gap detection,
+        zero-result searches and tensions never resolved a question; refused."""
+        for src in ("quiz_feedback", "reflexion_failure", "admission", "tool_failure",
+                    "hedging", "context_gap", "search_zero_result", "dossier_tension"):
+            assert queue.add("how does quantum computing work", source=src, urgency=0.8) == -1, src
 
     def test_add_empty_rejected(self, queue):
         assert queue.add("") == -1

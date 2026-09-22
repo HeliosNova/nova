@@ -269,10 +269,6 @@ def _strip_deliberation(text: str) -> str:
 # it, cross-monitor synthesis writes themes with it. They share the digest
 # residency class so a tick never swaps 27B→9B→27B around them (2026-09-02).
 _SYNTHESIS_MODEL_TYPES = frozenset({"consolidation", "synthesis"})
-# Change-detected alerts that go through the LLM "what changed" rewrite:
-# external content only. Nova's own writers (storylines, forecasts, quiz,
-# canaries, maintenance…) deliver their result whole (2026-09-22).
-_LLM_ALERT_CHECK_TYPES = frozenset({"url", "search", "query"})
 
 
 def _batch_by_class(order: list, classify) -> list:
@@ -886,26 +882,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                     message="in cooldown")
                 return
 
-        # For "always" monitors (domain studies etc), the result IS the alert —
-        # no LLM re-summarization needed (it only mangles good content).
-        # Only use LLM analysis for change-detected alerts where we need to
-        # describe what changed.
-        # The rewrite is for EXTERNAL content whose change a reader wants
-        # described (a page, a search, a query answer). Everything Nova writes
-        # itself is already the message. Measured 2026-09-22 on deliveries
-        # since 09-01: World Awareness 22 of 23 rewritten (6,679-char briefings
-        # → 310 chars), Storyline Tracker 19 of 20 (3,636-char updates), Cross-
-        # Monitor Synthesis 11 of 13, Forecast Resolution 24 of 25, Lesson Quiz
-        # 25 of 25, Pathway Liveness 8 of 10 — the canary's dead-pathway names
-        # rewritten by a 9B from the first 800 characters. Each also cost a
-        # 27B→9B→27B swap. A digest-class monitor is never rewritten either.
-        if (change_info and monitor.check_type in _LLM_ALERT_CHECK_TYPES
-                and self._monitor_class(monitor) != "digest"):
-            analysis = await self._analyze_result(monitor, new_value, change_info)
-        else:
-            # Send the raw result directly — channel adapters handle their own
-            # message splitting (Discord splits at 2000, Telegram at 4096)
-            analysis = new_value[:12000] if new_value else ""
+        # The result is the alert. A 120-token "what changed" rewrite on the
+        # default 9B used to replace every change-detected result not on a
+        # numeric list; measured 2026-09-22 it had cut World Awareness (22 of
+        # 23 deliveries), the Storyline Tracker (19 of 20), Cross-Monitor
+        # Synthesis, forecasts, the quiz and the liveness canary to two lines
+        # each, and swapped the card to write them. Cut. The channel adapters
+        # split long messages themselves (Discord 2000, Telegram 4096).
+        analysis = new_value[:12000] if new_value else ""
 
         # Empty-body gate: if Nova returned nothing meaningful, don't broadcast
         # a silent/placeholder message to the user's alert channels. Nothing
@@ -976,32 +960,24 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         "system_health": lambda self, m, cfg: self._execute_system_health(),
         "query": lambda self, m, cfg: self._execute_query_monitor(m, cfg),
         "quiz": lambda self, m, cfg: self._execute_quiz(cfg),
-        "skill_test": lambda self, m, cfg: self._execute_skill_test(cfg),
         "curiosity": lambda self, m, cfg: self._execute_curiosity_research(cfg),
         "auto_monitor": lambda self, m, cfg: self._execute_auto_monitor_detection(cfg),
         "maintenance": lambda self, m, cfg: self._execute_maintenance(cfg),
-        "finetune": lambda self, m, cfg: self._execute_finetune_check(cfg),
         "dream_consolidation": lambda self, m, cfg: self._execute_consolidation(cfg),
-        "capability_review": lambda self, m, cfg: self._execute_capability_review(cfg),
         "eval": lambda self, m, cfg: self._execute_eval_harness(cfg),
-        "prompt_analyzer": lambda self, m, cfg: self._execute_prompt_analyzer(cfg),
         "db_size": lambda self, m, cfg: self._execute_db_size_check(),
         "feed_health": lambda self, m, cfg: self._execute_feed_health(),
-        "kg_consistency": lambda self, m, cfg: self._execute_kg_consistency(),
         "ollama_latency": lambda self, m, cfg: self._execute_ollama_latency_check(),
         "skill_quality": lambda self, m, cfg: self._execute_skill_quality_check(),
         "chromadb_integrity": lambda self, m, cfg: self._execute_chromadb_integrity_check(),
         "kg_health": lambda self, m, cfg: self._execute_kg_health_check(),
         "digest_health": lambda self, m, cfg: self._execute_digest_health(),
-        "training_job": lambda self, m, cfg: self._execute_training_job_check(),
         "kg_growth": lambda self, m, cfg: self._execute_kg_growth_check(m),
         "ollama_model": lambda self, m, cfg: self._execute_ollama_model_check(),
-        "goal_derivation": lambda self, m, cfg: self._execute_goal_derivation(),
         "synthesis": lambda self, m, cfg: self._execute_cross_synthesis(),
         "storyline": lambda self, m, cfg: self._execute_storyline_tracker(),
         "consolidation": lambda self, m, cfg: self._execute_knowledge_consolidation(),
         "forecast_resolve": lambda self, m, cfg: self._execute_forecast_resolve(),
-        "auto_tool": lambda self, m, cfg: self._execute_auto_tool_synthesis(),
         "output_eval": lambda self, m, cfg: self._execute_output_eval(),
         "pathway_liveness": lambda self, m, cfg: self._execute_pathway_liveness(),
         "engineering_report": lambda self, m, cfg: self._execute_engineering_report(),
@@ -1068,21 +1044,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         query = cfg.get("query", "")
         return await self._think_query(query)
 
-    async def _execute_kg_consistency(self) -> str:
-        from app.monitors.kg_consistency import run_kg_consistency_check
-        return await run_kg_consistency_check()
-
-    async def _execute_goal_derivation(self) -> str:
-        """Derive new goals from operational state. The KAIROS executor
-        picks them up on its next tick."""
-        from app.database import get_db
-        from app.core.goal_deriver import derive_and_log
-        try:
-            return await derive_and_log(get_db())
-        except Exception as e:
-            logger.exception("[Heartbeat] Goal derivation failed")
-            return f"GOAL DERIVATION ERROR: {e}"
-
     async def _execute_cross_synthesis(self) -> str:
         """Read recent monitor outputs across categories, surface cross-cutting
         themes, write them to the KG as cross_synthesis facts."""
@@ -1139,18 +1100,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         except Exception as e:
             logger.exception("[Heartbeat] Forecast resolution failed")
             return f"FORECAST ERROR: {e}"
-
-    async def _execute_auto_tool_synthesis(self) -> str:
-        """Mine capability_gap clusters, ask the LLM to write a tool to fix
-        each, and store passes in custom_tools — Nova literally writes its
-        own tools without needing a code rebuild."""
-        from app.database import get_db
-        from app.core.auto_tools import synthesize_and_log
-        try:
-            return await synthesize_and_log(get_db())
-        except Exception as e:
-            logger.exception("[Heartbeat] Auto-tool synthesis failed")
-            return f"AUTO-TOOL ERROR: {e}"
 
     async def _execute_output_eval(self) -> str:
         """Grade a sample of recent monitor outputs on relevance/facts/
@@ -1769,147 +1718,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
 
         return f"QUIZ FAILED | topic={lesson.topic} | q={question[:80]} | reason={fail_reason[:80]}"
 
-    async def _execute_skill_test(self, cfg: dict) -> str:
-        """Pick a random active skill, generate a test query, run through brain, assess quality."""
-        import random
-        from app.core.brain import get_services
-        from app.core import llm
-        from app.core.reflexion import assess_quality
-
-        svc = get_services()
-        if not svc.skills:
-            return "[No skill store — skill test skipped]"
-
-        skills = await asyncio.to_thread(svc.skills.get_active_skills)
-        if not skills:
-            return "[No active skills — skipped]"
-
-        skill = random.choice(skills)
-
-        # Generate a test query that matches the skill's trigger pattern.
-        # Strategy 1: Ask LLM with explicit keyword groups extracted from regex
-        # Strategy 2: Extract literal words from regex and build a query
-        # Extract keyword groups from regex alternations for the LLM prompt
-        _alt_groups = re.findall(r'\(\?[i:]*([:!])?([^)]+)\)', skill.trigger_pattern)
-        keyword_groups = []
-        for _flag, content in _alt_groups:
-            # Skip flags-only groups like (?i)
-            if "|" in content or re.match(r'^[a-zA-Z_\s]+$', content):
-                words_in_group = [re.sub(r'\\[bBdDwWsS]', '', w).strip() for w in content.split("|")]
-                words_in_group = [w for w in words_in_group if w]
-                if words_in_group:
-                    keyword_groups.append(words_in_group)
-
-        if keyword_groups:
-            keywords_desc = "\n".join(
-                f"  Group {i+1}: use one of: {', '.join(grp)}"
-                for i, grp in enumerate(keyword_groups)
-            )
-            example_words = [grp[0] for grp in keyword_groups]
-            example_query = "What is the " + " of ".join(example_words) + "?"
-        else:
-            keywords_desc = f"  (raw regex: {skill.trigger_pattern})"
-            example_query = skill.name.replace("_", " ") + "?"
-
-        gen_prompt = (
-            f"Skill: {skill.name}\n"
-            f"The query MUST contain at least one word from EACH of these groups:\n"
-            f"{keywords_desc}\n\n"
-            f"Example matching query: '{example_query}'\n\n"
-            "Write a SHORT, natural user query that includes the required keywords. "
-            "Just the query, nothing else:"
-        )
-        test_query = None
-        temperatures = [0.3, 0.5, 0.7, 0.9]
-        for attempt, temp in enumerate(temperatures):
-            try:
-                candidate = await llm.invoke_nothink(
-                    [{"role": "user", "content": gen_prompt}],
-                    max_tokens=80, temperature=temp,
-                )
-                # Clean up: strip quotes, whitespace, leading "Query:" etc.
-                candidate = candidate.strip().strip('"\'').strip()
-                for prefix in ("Query:", "query:", "User:", "user:"):
-                    if candidate.startswith(prefix):
-                        candidate = candidate[len(prefix):].strip()
-            except Exception as e:
-                return f"[Skill test query generation failed: {e}]"
-            if re.search(skill.trigger_pattern, candidate, re.IGNORECASE):
-                test_query = candidate
-                break
-            logger.debug(
-                "[Heartbeat] Skill test query attempt %d didn't match: '%s' vs '%s'",
-                attempt + 1, candidate[:80], skill.trigger_pattern[:60],
-            )
-        if not test_query:
-            # Fallback: extract literal words from the regex and build a test query.
-            # Find alternation groups like (?:word1|word2|word3) and pick one from each.
-            groups = re.findall(r'\(\?:([^)]+)\)', skill.trigger_pattern)
-            if len(groups) >= 2:
-                import random as _rand
-                # Use re.sub to strip \b markers — str.strip("\\b ") is wrong
-                # because it strips individual chars including 'b' from words.
-                words = [re.sub(r'\\[bBdDwWsS]', '', _rand.choice(g.split("|"))).strip() for g in groups]
-                fallback = "What is the " + " of ".join(words) + "?"
-                if re.search(skill.trigger_pattern, fallback, re.IGNORECASE):
-                    test_query = fallback
-            if not test_query:
-                # Try skill name directly
-                fallback = skill.name.replace("_", " ")
-                if re.search(skill.trigger_pattern, fallback, re.IGNORECASE):
-                    test_query = fallback
-            if not test_query:
-                # Last-resort fallback: ask the LLM to invent ONE concrete string
-                # that would match the regex. Works for skills whose regex needs
-                # a digit ("\d+ days in seconds") or specific casing ("TVL")
-                # that the keyword-group prompt above misses. We only ask for the
-                # match; we don't run brain on a synthetic query unless it does
-                # actually match the trigger.
-                regex_prompt = (
-                    "Here is a Python regular expression:\n"
-                    f"  {skill.trigger_pattern}\n\n"
-                    "Output ONE short example user query (under 10 words) that this "
-                    "regex would match. No explanation, no quotes, just the query."
-                )
-                try:
-                    candidate = await llm.invoke_nothink(
-                        [{"role": "user", "content": regex_prompt}],
-                        max_tokens=40, temperature=0.4,
-                    )
-                    candidate = candidate.strip().strip('"\'').strip()
-                    if re.search(skill.trigger_pattern, candidate, re.IGNORECASE):
-                        test_query = candidate
-                except Exception as e:
-                    logger.debug("[Heartbeat] regex-fallback skill query failed: %s", e)
-            if not test_query:
-                logger.warning(
-                    "[Heartbeat] Skill '%s' — 4 attempts + fallback failed to match trigger '%s'",
-                    skill.name, skill.trigger_pattern,
-                )
-                return f"[Skill test skipped — generated queries didn't match trigger for '{skill.name}']"
-
-        # Run through brain pipeline
-        response = await self._think_query(test_query)
-
-        # Assess quality
-        score, reason = assess_quality(
-            answer=response,
-            tool_results=[],
-            max_tool_rounds=3,
-            query=test_query,
-        )
-
-        passed = score >= 0.6
-        # to_thread (2026-08-29): record_use is a sync UPDATE on skills and this
-        # is an async monitor path — it wrote from the event-loop thread.
-        await asyncio.to_thread(svc.skills.record_use, skill.id, passed)
-        status = "PASSED" if passed else "FAILED"
-        return (
-            f"SKILL TEST {status} | skill={skill.name} | "
-            f"success_rate={skill.success_rate:.0%} | "
-            f"quality={score:.2f} | q={test_query[:60]}"
-        )
-
     def request_early_run(self, name: str) -> bool:
         """Make a monitor due on the next scan instead of running its work
         from outside the tick.
@@ -2520,20 +2328,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             return f"AUTO-MONITORS CREATED | count={len(created)} | topics={', '.join(t[:40] for t in created)}"
         return "[No new monitors needed — all candidates already covered]"
 
-    async def _execute_finetune_check(self, cfg: dict) -> str:
-        """Inert since 2026-06-12 — the weight-training stack is archived.
-
-        Fine-tuning + GRPO + RLVR-trainer (~21.7k LOC, 0 successful
-        train→A/B→deploy, ties the base per the one honest A/B) were moved to
-        `archive/training/` because the in-context memory loop is the actual
-        product. This monitor used to emit "FINETUNE READY → run
-        scripts/finetune_auto.py", but that script no longer ships. It now
-        no-ops so the (possibly still-seeded) monitor can't surface a stale
-        command. To revive training, restore `archive/training/` and remove
-        this guard. See archive/training/README.md.
-        """
-        return "FINETUNE ARCHIVED | weight training is retired; the in-context memory loop is the product"
-
     async def _execute_consolidation(self, cfg: dict) -> str:
         """Run a Dream Consolidation cycle — compacts memory, resolves contradictions, mines DPO pairs.
 
@@ -2578,214 +2372,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             return format_monitor_result(
                 "Dream Consolidation", "error", f"dream failed: {e}",
             )
-
-    async def _execute_capability_review(self, cfg: dict) -> str:
-        """Review accumulated capability gaps and suggest new tools/skills.
-
-        Reads unreviewed gaps from the capability_gaps table, groups them by
-        semantic similarity, and asks Nova to identify patterns and suggest
-        what tools or skills could be created to address them. Marks gaps as
-        reviewed after processing.
-        """
-        from app.database import get_db
-        from app.core import llm
-
-        db = get_db()
-        try:
-            rows = await asyncio.to_thread(
-                db.fetchall,
-                "SELECT id, query, reason, quality_score FROM capability_gaps "
-                "WHERE reviewed = 0 ORDER BY created_at DESC LIMIT 50"
-            )
-        except Exception as e:
-            return f"[Capability review failed: could not read gaps — {e}]"
-
-        if not rows:
-            return "[Capability review: no unreviewed gaps found]"
-
-        gap_count = len(rows)
-        gap_summaries = "\n".join(
-            f"- [{row['id']}] quality={(row['quality_score'] or 0.0):.2f}: {(row['query'] or '')[:120]}"
-            for row in rows
-        )
-
-        try:
-            suggestion = await llm.invoke_nothink(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are analyzing capability gaps in an AI assistant. "
-                            "You will be shown queries where the assistant failed "
-                            "(no matching skill, no tool used, low quality score). "
-                            "Identify patterns and suggest 2-3 specific tools or skills "
-                            "that could be created to address these gaps. "
-                            "Be concrete: name the tool/skill, describe what it does, "
-                            "and list which gap queries it would address."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Review these {gap_count} capability gaps:\n\n"
-                            f"{gap_summaries}\n\n"
-                            "What tools or skills should be created to address these? "
-                            "Focus on the most common patterns."
-                        ),
-                    },
-                ],
-                max_tokens=600,
-                temperature=0.3,
-            )
-        except Exception as e:
-            suggestion = f"[LLM review failed: {e}]"
-
-        # Take ACTION on the suggestions: enqueue gaps as goals so KAIROS picks
-        # them up. Without this hook the suggestions just sit in the alert
-        # text and never drive any work.
-        #
-        # ORDER MATTERS (fixed 2026-08-29). This ran AFTER the "mark reviewed"
-        # block below, but derive_goals() selects `WHERE reviewed = 0` — so the
-        # review consumed every gap and then asked the deriver to derive from
-        # them, guaranteeing an empty input. The capability_gap source could
-        # therefore never mint a goal. Live evidence: 18 gaps, ALL reviewed=1,
-        # 9 of them created in the last 7 days, 0 unreviewed — and no goal
-        # created in 12 days, with the only capability-gap goals dating from
-        # 2026-06-20. Derive first, then mark.
-        actions_taken = []
-        try:
-            from app.core.goal_deriver import derive_goals
-            new_goals = await derive_goals(db, max_new_goals=3)
-            actions_taken.extend(f"goal #{g['id']} ({g['source_kind']})" for g in new_goals)
-        except Exception as e:
-            logger.warning("[Heartbeat] Capability review goal-derivation failed: %s", e)
-
-        # Mark the gaps reviewed only AFTER derivation has had its chance.
-        try:
-            gap_ids = [row["id"] for row in rows]
-            await asyncio.to_thread(
-                db.execute,
-                f"UPDATE capability_gaps SET reviewed = 1 WHERE id IN ({','.join('?' * len(gap_ids))})",
-                tuple(gap_ids),
-            )
-        except Exception as e:
-            logger.warning("[Heartbeat] Failed to mark gaps reviewed: %s", e)
-
-        action_summary = (
-            "\n\nActions taken: " + "; ".join(actions_taken)
-            if actions_taken
-            else "\n\nActions taken: none (no goal patterns met threshold)"
-        )
-
-        return (
-            f"CAPABILITY REVIEW | gaps_reviewed={gap_count}\n\n"
-            f"Suggestions:\n{suggestion}{action_summary}"
-        )
-
-    # Numeric/health monitors produce structured key=value output (e.g. KG
-    # Growth Rate's "kg growth drop (-33.0%) | last_6h: 65 | prev_6h: 97").
-    # Asking the LLM to "summarize" them produces hallucinated math like
-    # "$35tn occurred in 2024" or "-156.66%, shifting the metric value down
-    # by 209 units" when neither figure is in the source. Trust the raw line
-    # for these check types and skip the LLM rephrasing pass.
-    _RAW_RESULT_CHECK_TYPES: frozenset[str] = frozenset({
-        "kg_growth", "kg_health", "ollama_latency", "ollama_model",
-        "system_health", "db_size", "chromadb_integrity", "skill_quality",
-        "training_job",
-        # Curiosity's result is already a status line ("CURIOSITY BATCH |
-        # 1/3 resolved this run ..."); the answers themselves go out as
-        # follow-ups. Rewriting the line cost a 9B load after every hourly
-        # run whose items had held the 27B (measured 2026-09-22 10:05 UTC).
-        "curiosity",
-        # capability_review's output already has its own structured "CAPABILITY
-        # REVIEW | gaps=N\n\nSuggestions:\n..." shape; the alert summarizer
-        # mis-detects its long-form suggestion as off-format and falls back to
-        # a [:250]-char raw truncation that cuts mid-sentence (observed
-        # 2026-05-08 — "...issues reg." dangling). Treat as raw to preserve
-        # the full text.
-        "capability_review",
-        "consolidation",         # knowledge/dossier digests are already structured
-        "dream_consolidation",   # dream digests are already concise
-        "eval",           # eval reports are already structured
-    })
-
-    async def _analyze_result(
-        self,
-        monitor: Monitor,
-        new_value: str,
-        change_info: dict | None,
-    ) -> str:
-        """Ask Nova to analyze a monitor result intelligently."""
-        from app.core import llm
-
-        # Numeric/health monitors: skip LLM rephrasing — see comment above.
-        if monitor.check_type in self._RAW_RESULT_CHECK_TYPES:
-            return new_value[:600] if new_value else ""
-
-        # Build a concise analysis prompt
-        parts = [f"Monitor '{monitor.name}' ({monitor.check_type}) just ran."]
-
-        if change_info:
-            if change_info.get("type") == "numeric":
-                parts.append(
-                    f"Value changed {change_info['direction']} by {change_info['pct_change']}% "
-                    f"(from {change_info['old']} to {change_info['new']})."
-                )
-            else:
-                parts.append("The result changed since last check.")
-
-        parts.append(f"Result:\n{new_value[:800]}")
-
-        if change_info and monitor.last_result:
-            parts.append(f"Previous result:\n{monitor.last_result[:400]}")
-            parts.append(
-                "Write a short, structured alert in this EXACT format:\n"
-                "**What changed:** <one sentence>\n"
-                "**Key detail:** <the most important number, name, or fact>\n"
-                "No other text. No preamble. No filler. No repetition."
-            )
-        else:
-            parts.append(
-                "Write a short, structured summary in this EXACT format:\n"
-                "**Summary:** <one sentence describing the result>\n"
-                "**Key detail:** <the most important number, name, or fact>\n"
-                "No other text. No preamble. No filler. No repetition."
-            )
-
-        # Fallback: first 250 chars of the raw result, cleaned up
-        _raw_fallback = new_value[:250].rsplit(".", 1)[0] + "." if new_value else ""
-
-        try:
-            analysis = await llm.invoke_nothink(
-                [{"role": "user", "content": "\n\n".join(parts)}],
-                max_tokens=120,
-                temperature=0.2,
-            )
-            # Truncate any runaway generation at first obvious repetition
-            result = analysis.strip()
-            if len(result) > 300:
-                result = result[:300].rsplit(".", 1)[0] + "."
-
-            # If the LLM ignored the format or generated refusals, use the raw result
-            _has_format = "**" in result
-            _is_refusal = any(p in result.lower() for p in (
-                "i cannot", "i can't", "i don't have", "as an ai",
-                "i'm unable", "no such", "in the future",
-            ))
-            if _is_refusal or (not _has_format and len(result) > 100):
-                logger.info("[Heartbeat] LLM alert was off-format, using raw fallback")
-                return _raw_fallback
-
-            return result
-        except Exception as e:
-            logger.warning("[Heartbeat] Analysis generation failed: %s", e)
-            # Fallback to raw summary
-            if change_info and change_info.get("type") == "numeric":
-                return (
-                    f"Monitor '{monitor.name}': value moved {change_info['direction']} "
-                    f"by {change_info['pct_change']}%"
-                )
-            return f"Monitor '{monitor.name}' update: {new_value[:200]}"
 
     async def _execute_eval_harness(self, cfg: dict) -> str:
         """Run the automated eval suite and return a summary string for the monitor result."""
@@ -2841,15 +2427,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             f"{reg_str} | "
             f"report={json_path.name}"
         )
-
-    async def _execute_prompt_analyzer(self, cfg: dict) -> str:
-        """Run the PromptOptimizerAnalyzer: drift detection + candidate proposals."""
-        from app.monitors.prompt_optimizer_monitor import run_prompt_analyzer
-        try:
-            return await run_prompt_analyzer(cfg)
-        except Exception as e:
-            logger.error("[Heartbeat] Prompt analyzer failed: %s", e, exc_info=True)
-            return f"[Prompt analyzer failed: {e}]"
 
     async def trigger_monitor(self, monitor_id: int) -> dict:
         """Manually trigger a monitor check. Returns result info."""

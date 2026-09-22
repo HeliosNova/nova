@@ -519,64 +519,6 @@ class HealthChecksMixin:
                 "KG Health Monitor", "error", f"kg health error: {e}",
             )
 
-    async def _execute_training_job_check(self) -> str:
-        """Detect a failed or stale fine-tune run.
-
-        Reads the last entry from scripts/run_history.json (written by
-        finetune_auto.py). Flags runs with status='failed' or 'rejected'.
-        """
-        import json as _json
-        from pathlib import Path
-
-        # Check both the in-container data path AND the host-mounted finetune_output
-        # path (where finetune_oneclick.py writes). One-click writes to the host
-        # repo dir, so we need to fall back to it when the data-side file is missing.
-        candidate_paths = [
-            Path(config.FINETUNE_OUTPUT_DIR) / "run_history.json",
-            Path("/repo/finetune_output/run_history.json"),  # host bind-mount, if present
-            Path("/data/finetune_output/run_history.json"),  # alt data location
-        ]
-        history_path = next((p for p in candidate_paths if p.exists()), None)
-        if history_path is None:
-            return format_monitor_result(
-                "Training Job Watch", "info", "no training history yet",
-            )
-
-        try:
-            with open(history_path, encoding="utf-8") as f:
-                history = _json.load(f)
-        except Exception as e:
-            return format_monitor_result(
-                "Training Job Watch", "error", f"history unreadable: {e}",
-            )
-
-        if not history:
-            return format_monitor_result(
-                "Training Job Watch", "info", "no training runs",
-            )
-
-        last = history[-1]
-        status_field = (last.get("status") or "").lower()
-        started = last.get("started_at") or last.get("timestamp") or ""
-        pairs = last.get("training_pairs", 0)
-        fields = {"last_run": started[:19], "pairs": pairs}
-
-        if status_field in ("failed", "error"):
-            return format_monitor_result(
-                "Training Job Watch", "error",
-                f"last fine-tune failed ({last.get('reason', 'unknown')})",
-                fields,
-            )
-        if status_field in ("rejected",):
-            return format_monitor_result(
-                "Training Job Watch", "warning",
-                "candidate rejected by A/B eval", fields,
-            )
-        return format_monitor_result(
-            "Training Job Watch", "ok",
-            f"last run {status_field or 'ok'}", fields,
-        )
-
     async def _execute_kg_growth_check(self, monitor: Monitor) -> str:
         """Detect unusual spikes in KG growth over the last 6 hours."""
         from app.core.brain import get_services

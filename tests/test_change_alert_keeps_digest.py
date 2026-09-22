@@ -42,12 +42,10 @@ async def test_digest_class_on_change_delivers_the_digest_itself(db, no_kg):
                                  "## briefing\n" + "Yesterday's grounded analysis. " * 60)
     new = "## briefing\n" + "A new paragraph of grounded analysis. " * 120
     with patch.object(loop, "_execute_check", new_callable=AsyncMock) as mock_exec, \
-         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send, \
-         patch.object(loop, "_analyze_result", new_callable=AsyncMock) as mock_analyze:
+         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send:
         mock_exec.return_value = new
         mock_send.return_value = True
         await loop._check_monitor(monitor)
-    mock_analyze.assert_not_called()
     mock_send.assert_called_once()
     sent = mock_send.call_args.args[1]
     assert sent.strip() == new.strip()          # the briefing itself, whole
@@ -56,19 +54,18 @@ async def test_digest_class_on_change_delivers_the_digest_itself(db, no_kg):
 
 
 @pytest.mark.asyncio
-async def test_short_monitor_on_change_still_gets_the_rewrite(db, no_kg):
+async def test_a_short_monitor_on_change_is_delivered_raw_too(db, no_kg):
+    """The rewrite path itself was cut 2026-09-22; every change-detected
+    result is delivered as written."""
     store = MonitorStore(db)
     loop = HeartbeatLoop(store)
     monitor = _on_change_monitor(db, store, "Price watch", "url", "price 40")
     with patch.object(loop, "_execute_check", new_callable=AsyncMock) as mock_exec, \
-         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send, \
-         patch.object(loop, "_analyze_result", new_callable=AsyncMock) as mock_analyze:
+         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send:
         mock_exec.return_value = "price 42 after the announcement"
-        mock_analyze.return_value = "**What changed:** price rose. **Key detail:** 42"
         mock_send.return_value = True
         await loop._check_monitor(monitor)
-    mock_analyze.assert_called_once()
-    assert mock_send.call_args.args[1].startswith("**What changed:**")
+    assert mock_send.call_args.args[1] == "price 42 after the announcement"
 
 
 @pytest.mark.parametrize("name,check_type", [
@@ -92,10 +89,8 @@ async def test_novas_own_writers_are_delivered_whole(db, no_kg, name, check_type
     monitor = store.get(mid)
     new = "## update\n" + "A dated development the reader needs whole. " * 70
     with patch.object(loop, "_execute_check", new_callable=AsyncMock) as mock_exec, \
-         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send, \
-         patch.object(loop, "_analyze_result", new_callable=AsyncMock) as mock_analyze:
+         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send:
         mock_exec.return_value = new
         mock_send.return_value = True
         await loop._check_monitor(monitor)
-    mock_analyze.assert_not_called()
     assert mock_send.call_args.args[1].strip() == new.strip()

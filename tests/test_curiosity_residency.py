@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import ast
 from pathlib import Path
-from unittest.mock import AsyncMock
 
 import pytest
 
@@ -36,17 +35,3 @@ def test_every_kg_banking_call_in_the_loop_names_its_model():
                 bare.append(node.lineno)
     assert bare == [], f"_extract_kg_triples without model= at lines {bare}"
 
-
-@pytest.mark.asyncio
-async def test_curiosity_result_is_delivered_as_its_own_line(monkeypatch):
-    assert "curiosity" in HeartbeatLoop._RAW_RESULT_CHECK_TYPES
-    from app.core import llm
-    monkeypatch.setattr(llm, "invoke_nothink", AsyncMock(side_effect=AssertionError("LLM must not run")))
-    lp = object.__new__(HeartbeatLoop)
-    mon = Monitor(id=1, name="Curiosity Research", check_type="curiosity", check_config={},
-                  schedule_seconds=3600, enabled=True, cooldown_minutes=0,
-                  notify_condition="on_change", last_check_at=None, last_alert_at=None,
-                  last_result="CURIOSITY BATCH | 0/3 resolved this run", created_at="2026-01-01T00:00:00")
-    line = "CURIOSITY BATCH | 1/3 resolved this run\nCURIOSITY RESOLVED | topic=x"
-    out = await lp._analyze_result(mon, line, {"type": "text"})
-    assert out == line

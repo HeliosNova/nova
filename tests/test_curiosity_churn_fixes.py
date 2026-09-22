@@ -80,17 +80,18 @@ def _run_handle_failed(db, items):
 # ---------------------------------------------------------------------------
 
 class TestDreamResetOnce:
-    def test_first_failure_gets_reset_with_marker(self):
+    def test_a_failed_question_stays_failed(self):
+        """The one-time reset was cut 2026-09-22: it re-opened a question that
+        had already failed three ways that morning."""
         db = _FakeAsyncDB()
         item_id = db.seed(topic="What powers the Fed's new framework?")
         result = _run_handle_failed(
             db, [{"id": item_id, "topic": "What powers the Fed's new framework?",
                   "resolution": None}])
         row = db.row(item_id)
-        assert result.curiosity_reset == 1
-        assert row["status"] == "pending"
-        assert row["attempts"] == 0
-        assert (row["resolution"] or "").startswith("[dream-reset")
+        assert result.curiosity_reset == 0
+        assert row["status"] == "failed"
+        assert row["resolution"] is None
 
     def test_second_failure_stays_failed(self):
         db = _FakeAsyncDB()

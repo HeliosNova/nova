@@ -3780,41 +3780,10 @@ async def _run_post_processing(
         _background_tasks.add(_task)
         _task.add_done_callback(_background_tasks.discard)
 
-    # --- Curiosity: detect gaps and queue for research ---
-    # Skip when ephemeral=True — those are tests/probes, not real user gaps.
-    # Without this gate, every probe query gets queued and the daemon retries
-    # them forever (we hit this in the v9 e2e session).
-    if config.ENABLE_CURIOSITY and svc.curiosity and intent == "general" and not is_error and not ephemeral:
-        try:
-            from app.core.curiosity import detect_gaps
-            gaps = detect_gaps(
-                query=query,
-                answer=final_content,
-                tool_results=tool_results,
-                had_lessons=bool(used_lesson_ids),
-                had_kg=had_kg,
-                had_docs=had_docs,
-            )
-            for gap in gaps:
-                await asyncio.to_thread(
-                    lambda _g=gap: svc.curiosity.add(_g["topic"], source=_g["source"], urgency=_g["urgency"])
-                )
-        except Exception as e:
-            logger.warning("Curiosity gap detection failed: %s", e)
-
-    # --- Curiosity: queue failed responses for research ---
-    # Same ephemeral gate as above.
-    if config.ENABLE_CURIOSITY and svc.curiosity and intent == "general" and not ephemeral:
-        try:
-            if reflexion_quality is not None and reflexion_quality < 0.5:
-                from app.core.curiosity import TopicTracker
-                topic = TopicTracker._extract_topic(query[:200])
-                if topic:
-                    await asyncio.to_thread(
-                        lambda _t=topic: svc.curiosity.add(_t, source="reflexion_failure", urgency=0.7)
-                    )
-        except Exception as e:
-            logger.warning("Curiosity failure queueing failed: %s", e)
+    # Curiosity mints from chat (gap detection, low-reflexion failures) were
+    # cut 2026-09-22: 0 resolved across every such source over the queue's
+    # lifetime. Questions come from dossiers and agent failures now
+    # (app/core/curiosity.py _CUT_SOURCES).
 
     # --- Reflexion-to-Action: promote recurring failures to lessons ---
     if svc.reflexions and svc.learning and intent == "general" and final_content:

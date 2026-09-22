@@ -220,33 +220,3 @@ class TestHeartbeatExecution:
         assert len(results) >= 1
         latest = results[0]
         assert "cooldown" in (latest.message or "").lower()
-
-
-# ---------------------------------------------------------------------------
-# Auto-finetune capability detection + safe-guard tests
-# ---------------------------------------------------------------------------
-
-
-class TestFinetuneArchived:
-    """Weight training was archived 2026-06-12 (archive/training/). The finetune
-    heartbeat handler is now inert — it must never spawn a trainer or emit a
-    "FINETUNE READY → run scripts/finetune_auto.py" command pointing at a script
-    that no longer ships.
-    """
-
-    @pytest.fixture
-    def loop(self, tmp_path):
-        from app.database import SafeDB
-        db = SafeDB(str(tmp_path / "test.db"))
-        db.init_schema()
-        return HeartbeatLoop(MonitorStore(db))
-
-    @pytest.mark.asyncio
-    async def test_finetune_check_is_inert(self, loop):
-        # Even with a Popen mock available, the handler must not attempt to
-        # launch training — it short-circuits to the archived sentinel.
-        with patch("subprocess.Popen") as mock_popen:
-            result = await loop._execute_finetune_check({})
-        mock_popen.assert_not_called()
-        assert "ARCHIVED" in result
-        assert "finetune_auto.py" not in result  # no stale command surfaced

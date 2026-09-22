@@ -24,17 +24,13 @@ from app.monitors.monitor_store import MonitorStore
 RETIRED_MONITORS = ("Skill Validation", "Capability Review", "Goal Derivation", "Auto-Tool Synthesis")
 
 
-def test_retired_loops_are_seeded_disabled(db):
-    store = MonitorStore(db)
-    store.seed_defaults()
-    for name in RETIRED_MONITORS:
-        row = db.fetchone("SELECT enabled FROM monitors WHERE name = ?", (name,))
-        assert row is not None, f"{name} should stay in the catalog (disabled), not vanish"
-        assert int(row["enabled"]) == 0, f"{name} must be seeded disabled"
-    # the loops that DO close feed the product and stay on
-    for name in ("Knowledge Consolidation", "Forecast Resolution", "Storyline Tracker", "Curiosity Research"):
-        row = db.fetchone("SELECT enabled FROM monitors WHERE name = ?", (name,))
-        assert row is not None and int(row["enabled"]) == 1, name
+def test_retired_loops_are_not_seeded_at_all(db):
+    """Seeded disabled from 2026-09-01; removed from the catalog 2026-09-22
+    (owner: cut what is carried but inert)."""
+    MonitorStore(db).seed_defaults()
+    for name in RETIRED_MONITORS + ("Fine-Tune Check", "Prompt Optimizer",
+                                    "KG Consistency Check", "Training Job Watch"):
+        assert db.fetchone("SELECT id FROM monitors WHERE name = ?", (name,)) is None, name
 
 
 def test_quiz_pass_no_longer_credits_the_lesson():
