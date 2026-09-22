@@ -18,6 +18,8 @@ from __future__ import annotations
 import logging
 import os
 import threading
+import time
+from contextlib import asynccontextmanager
 
 
 def _cpu_quota() -> int:
@@ -62,7 +64,13 @@ from pydantic import BaseModel, Field
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("minicheck")
 
-app = FastAPI()
+@asynccontextmanager
+async def _lifespan(_app):
+    _start_warm_up()        # defined below; load + one inference off the request path
+    yield
+
+
+app = FastAPI(lifespan=_lifespan)
 _scorer = None
 _lock = threading.Lock()
 
@@ -91,6 +99,38 @@ def _score_serialized(scorer, docs: list[str], claims: list[str]):
         labels_all.extend(out[0])
         probs_all.extend(out[1])
     return labels_all, probs_all
+
+
+_warm = False
+
+
+def warm_up() -> bool:
+    """Load the model and run one inference before the first real request.
+
+    Measured 2026-09-22 07:40-07:48 UTC: the container idled for 6.5 minutes,
+    then the first /check_batch paid the 6 s load AND a 73 s first inference
+    (every later pair 1-2 s). nova-app's gate read that as "sidecar
+    unavailable" and deferred the question — after every restart, and an
+    outage restarts everything. Runs on the scoring lock so a real request
+    queues behind it instead of interleaving with it. A failure here changes
+    nothing: the first request still loads lazily.
+    """
+    global _warm
+    try:
+        scorer = _get_scorer()
+        t = time.monotonic()
+        _score_serialized(scorer,
+                          ["Water boils at 100 degrees Celsius at sea level."],
+                          ["Water boils at 100 C at sea level."])
+        _warm = True
+        logger.info("MiniCheck warm (first inference %.1f s)", time.monotonic() - t)
+    except Exception as e:
+        logger.warning("MiniCheck warm-up failed (%s) — loading on first request instead", e)
+    return _warm
+
+
+def _start_warm_up() -> None:
+    threading.Thread(target=warm_up, name="minicheck-warm", daemon=True).start()
 
 
 def _get_scorer():
@@ -145,7 +185,7 @@ class Batch(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "loaded": _scorer is not None, "threads": _THREADS}
+    return {"ok": True, "loaded": _scorer is not None, "warm": _warm, "threads": _THREADS}
 
 
 @app.post("/check_batch")
