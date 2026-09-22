@@ -69,3 +69,33 @@ async def test_short_monitor_on_change_still_gets_the_rewrite(db, no_kg):
         await loop._check_monitor(monitor)
     mock_analyze.assert_called_once()
     assert mock_send.call_args.args[1].startswith("**What changed:**")
+
+
+@pytest.mark.parametrize("name,check_type", [
+    ("Storyline Tracker", "storyline"),
+    ("Forecast Resolution", "forecast_resolve"),
+    ("Lesson Quiz", "quiz"),
+    ("Pathway Liveness", "pathway_liveness"),
+    ("Cross-Monitor Synthesis", "synthesis"),
+])
+@pytest.mark.asyncio
+async def test_novas_own_writers_are_delivered_whole(db, no_kg, name, check_type):
+    """Measured on deliveries since 2026-09-01: Storyline Tracker 19 of 20
+    rewritten (3,636-char updates), Forecast Resolution 24 of 25, Lesson Quiz
+    25 of 25, Pathway Liveness 8 of 10 — the canary's dead-pathway names
+    rewritten by the 9B from the first 800 characters."""
+    store = MonitorStore(db)
+    loop = HeartbeatLoop(store)
+    mid = store.create(name, check_type, {}, schedule_seconds=3600, cooldown_minutes=0,
+                       notify_condition="on_change")
+    db.execute("UPDATE monitors SET last_result = ? WHERE id = ?", ("old state " * 40, mid))
+    monitor = store.get(mid)
+    new = "## update\n" + "A dated development the reader needs whole. " * 70
+    with patch.object(loop, "_execute_check", new_callable=AsyncMock) as mock_exec, \
+         patch.object(loop, "_send_alert", new_callable=AsyncMock) as mock_send, \
+         patch.object(loop, "_analyze_result", new_callable=AsyncMock) as mock_analyze:
+        mock_exec.return_value = new
+        mock_send.return_value = True
+        await loop._check_monitor(monitor)
+    mock_analyze.assert_not_called()
+    assert mock_send.call_args.args[1].strip() == new.strip()

@@ -269,6 +269,10 @@ def _strip_deliberation(text: str) -> str:
 # it, cross-monitor synthesis writes themes with it. They share the digest
 # residency class so a tick never swaps 27B→9B→27B around them (2026-09-02).
 _SYNTHESIS_MODEL_TYPES = frozenset({"consolidation", "synthesis"})
+# Change-detected alerts that go through the LLM "what changed" rewrite:
+# external content only. Nova's own writers (storylines, forecasts, quiz,
+# canaries, maintenance…) deliver their result whole (2026-09-22).
+_LLM_ALERT_CHECK_TYPES = frozenset({"url", "search", "query"})
 
 
 def _batch_by_class(order: list, classify) -> list:
@@ -886,14 +890,17 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # no LLM re-summarization needed (it only mangles good content).
         # Only use LLM analysis for change-detected alerts where we need to
         # describe what changed.
-        # A digest-class monitor on on_change is the exception to the
-        # exception: World Awareness (the one query digest seeded on_change)
-        # finished a 50-minute 27B chain on 2026-09-22 09:42 UTC, stored 9,011
-        # characters, and the change path handed it to _analyze_result — a
-        # 120-token rewrite on the default 9B — so Telegram received 310
-        # characters and the card swapped 27B→9B→27B to write them. A
-        # briefing describes itself; the rewrite is for short results.
-        if change_info and self._monitor_class(monitor) != "digest":
+        # The rewrite is for EXTERNAL content whose change a reader wants
+        # described (a page, a search, a query answer). Everything Nova writes
+        # itself is already the message. Measured 2026-09-22 on deliveries
+        # since 09-01: World Awareness 22 of 23 rewritten (6,679-char briefings
+        # → 310 chars), Storyline Tracker 19 of 20 (3,636-char updates), Cross-
+        # Monitor Synthesis 11 of 13, Forecast Resolution 24 of 25, Lesson Quiz
+        # 25 of 25, Pathway Liveness 8 of 10 — the canary's dead-pathway names
+        # rewritten by a 9B from the first 800 characters. Each also cost a
+        # 27B→9B→27B swap. A digest-class monitor is never rewritten either.
+        if (change_info and monitor.check_type in _LLM_ALERT_CHECK_TYPES
+                and self._monitor_class(monitor) != "digest"):
             analysis = await self._analyze_result(monitor, new_value, change_info)
         else:
             # Send the raw result directly — channel adapters handle their own
