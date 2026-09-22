@@ -80,3 +80,18 @@ def test_no_heartbeat_means_not_busy(monkeypatch):
     monkeypatch.setattr(brain, "get_services", lambda: _Svc())
     d = daemon_mod.DaemonOrchestrator.__new__(daemon_mod.DaemonOrchestrator)
     assert d._lane_busy() is False
+
+
+def test_request_early_run_makes_the_monitor_due(db):
+    from datetime import datetime
+    from app.monitors.monitor_store import MonitorStore
+    store = MonitorStore(db)
+    store.seed_defaults()
+    lp = object.__new__(hb.HeartbeatLoop)
+    lp.store = store
+    mon = store.get_by_name("Curiosity Research")
+    store.update(mon.id, last_check_at=datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S"))
+    assert mon.id not in {m.id for m in store.get_due()}
+    assert lp.request_early_run("Curiosity Research") is True
+    assert mon.id in {m.id for m in store.get_due()}
+    assert lp.request_early_run("No Such Monitor") is False

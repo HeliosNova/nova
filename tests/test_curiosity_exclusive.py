@@ -74,13 +74,19 @@ async def test_two_scheduled_runs_serialize(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_daemon_marks_its_run_opportunistic(monkeypatch):
-    seen: list = []
+async def test_daemon_hands_curiosity_to_the_lane_instead_of_running_it(monkeypatch):
+    """Even an opportunistic run that skips when research is active cannot see
+    a batch fifteen seconds from dispatch (live 16:13 UTC). The daemon no
+    longer runs research at all; it makes the monitor due."""
+    requested: list = []
 
     class _HB:
+        def request_early_run(self, name):
+            requested.append(name)
+            return True
+
         async def _execute_curiosity_research(self, cfg):
-            seen.append(dict(cfg))
-            return "ok"
+            raise AssertionError("the daemon must not run research outside the gate")
 
     class _Svc:
         curiosity = object()
@@ -92,4 +98,5 @@ async def test_daemon_marks_its_run_opportunistic(monkeypatch):
     d._last_curiosity_research = None
     d._log = lambda *a, **k: None
     await d._research_curiosity()
-    assert seen == [{"opportunistic": True}]
+    assert requested == ["Curiosity Research"]
+    assert d._last_curiosity_research is not None          # cooldown still applies

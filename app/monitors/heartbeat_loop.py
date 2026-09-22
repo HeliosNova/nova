@@ -1894,6 +1894,27 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             f"quality={score:.2f} | q={test_query[:60]}"
         )
 
+    def request_early_run(self, name: str) -> bool:
+        """Make a monitor due on the next scan instead of running its work
+        from outside the tick.
+
+        The residency gate lives inside the tick; work started from outside
+        (the daemon) cannot hold it, and lane_busy() cannot see a batch that
+        is fifteen seconds from dispatch. Live 2026-09-22 16:13 UTC: the
+        daemon's curiosity think() started in exactly that gap, eight digests
+        followed, and the card swapped six times in seven minutes for one item
+        that produced nothing. Rewinding last_check_at by two schedules makes
+        the monitor overdue; the tick dispatches it under the gate, in class
+        order, like every other monitor.
+        """
+        mon = self.store.get_by_name(name)
+        if mon is None or not mon.enabled:
+            return False
+        past = (datetime.now(timezone.utc).replace(tzinfo=None)
+                - timedelta(seconds=2 * max(int(mon.schedule_seconds or 0), 60)))
+        self.store.update(mon.id, last_check_at=past.strftime("%Y-%m-%d %H:%M:%S"))
+        return True
+
     def lane_busy(self) -> bool:
         """True while any LLM-lane monitor holds the residency gate.
 

@@ -522,23 +522,29 @@ class DaemonOrchestrator:
         )
 
     async def _research_curiosity(self):
-        """Research top critical curiosity items."""
+        """Ask the heartbeat to run Curiosity Research early.
+
+        The daemon used to run the research itself, from outside the tick's
+        residency gate: it fired into 27B digest batches three times on
+        2026-09-22 (07:48, 08:35, 16:13), five or six model swaps each, once
+        for a single item that produced nothing. It now only makes the
+        monitor due; the tick runs it under the gate in class order.
+        """
         from app.core.brain import get_services
         svc = get_services()
         if not svc.curiosity or not svc.heartbeat:
             return
 
         self._last_curiosity_research = time.monotonic()
-        self._log("decision", "Researching critical curiosity items", "daemon")
         try:
-            # Delegate to the existing curiosity research monitor handler
-            # Opportunistic: yields to a monitor run already in progress
-            # instead of racing it for the card (2026-09-22).
-            result = await svc.heartbeat._execute_curiosity_research({"opportunistic": True})
-            self._log("action", f"Curiosity research: {result[:200]}", "daemon")
+            ok = await asyncio.to_thread(svc.heartbeat.request_early_run, "Curiosity Research")
+            self._log("decision",
+                      "Curiosity Research made due for the heartbeat lane" if ok
+                      else "Curiosity Research monitor unavailable — nothing requested",
+                      "daemon")
         except Exception as e:
-            self._log("error", f"Curiosity research failed: {e}", "daemon")
-            logger.warning("[Daemon] Curiosity research failed: %s", e)
+            self._log("error", f"Curiosity hand-off failed: {e}", "daemon")
+            logger.warning("[Daemon] Curiosity hand-off failed: %s", e)
 
     async def _process_events(self):
         """Process pending events from the queue."""
