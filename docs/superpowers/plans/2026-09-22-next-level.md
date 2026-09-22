@@ -74,6 +74,20 @@ research on what we need to move to the next level."
 5. **Memory against the field**: a LongMemEval-style subset through the KG +
    dossiers, so "Zep-shaped" becomes a number.
 
+## Status
+
+- Step 1 shipped 2026-09-22 (`5c490d4`): validator + criterion + regime
+  `2026-09-22-criterion`; record reset to zero; migration 38.
+- Steps 2 and 3 scheduled for a 3-hour quiet window at 02:07 local
+  2026-09-23: `scripts/forecast_bakeoff.py` (27B vs OpenForecaster-8B on the
+  144 resolved claims of the dumped record) then `scripts/ceiling_ab.py
+  --replay --model gemma4:26b-a4b-it-q4_K_M` on 8 frozen topics against the
+  `prime_off_n16` baseline arm. Pre-registered rules: adopt Gemma only if fact
+  support holds within 0.02 and fabricated stays 0; adopt OpenForecaster only
+  if its Brier beats the 27B on ≥60 % of paired claims.
+- Cuts landed (`7b8d97c`): the curiosity queue now has two sources; step 4's
+  measurement starts from here.
+
 ## Sources
 
 - OpenForecaster / OpenForesight: https://openforecaster.github.io/scaling-data/ ; paper https://arxiv.org/pdf/2512.25070
