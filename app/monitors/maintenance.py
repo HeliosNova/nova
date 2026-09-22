@@ -534,7 +534,7 @@ class MaintenanceMixin:
         try:
             import shutil
             from pathlib import Path
-            from app.core.backup import verify_snapshot
+            from app.core.backup import verify_snapshot, write_dr_extras
 
             backup_dir = Path("/data/backups")
             backup_dir.mkdir(exist_ok=True)
@@ -561,6 +561,12 @@ class MaintenanceMixin:
                         pass
                 else:
                     parts.append(f"backup created+verified: {target.name}")
+                    # DR extras live beside the snapshot in the volume; the
+                    # backup sidecar carries them to the legs (2026-09-22 —
+                    # they had been frozen on both legs since the 09-01 split).
+                    _extras = await write_dr_extras(backup_dir, config.OLLAMA_URL)
+                    if _extras:
+                        parts.append("dr extras: " + ", ".join(_extras))
                     # Off-volume copy — plain file copy of the just-verified
                     # snapshot (cheaper than a second VACUUM INTO and
                     # byte-identical), then verify the COPY independently:
@@ -581,33 +587,19 @@ class MaintenanceMixin:
                             # Disaster-recovery extras (2026-07-08): 30GB of
                             # model weights are re-pullable — a MANIFEST is the
                             # backup. Config overrides are tiny and essential.
-                            try:
-                                import httpx as _httpx
-                                async with _httpx.AsyncClient(timeout=10) as _c:
-                                    _tags = (await _c.get(f"{config.OLLAMA_URL}/api/tags")).json()
-                                _names = [m.get("name", "?") for m in _tags.get("models", [])]
-                                (off_dir / "models_manifest.txt").write_text(
-                                    "\n".join(sorted(_names)) + "\n", encoding="utf-8")
-                            except Exception as _e:
-                                logger.warning("[Heartbeat] models manifest failed: %s", _e)
-                            try:
-                                _ov = Path("/data/config_overrides.json")
-                                if _ov.exists():
-                                    await asyncio.to_thread(
-                                        shutil.copyfile, _ov, off_dir / "config_overrides.json")
-                            except Exception as _e:
-                                logger.warning("[Heartbeat] config override copy failed: %s", _e)
+                            await write_dr_extras(off_dir, config.OLLAMA_URL)
                         else:
                             logger.error(
                                 "[Heartbeat] Off-volume backup verification FAILED: %s", off_detail)
                             parts.append(f"OFF-VOLUME BACKUP VERIFY FAILED: {off_detail}")
                     else:
-                        logger.warning(
-                            "[Heartbeat] Off-volume backup dir %r not mounted — "
-                            "snapshots only exist inside the volume they protect",
-                            str(off_dir),
-                        )
-                        parts.append("off-volume backup SKIPPED (dir not mounted)")
+                        # Since 2026-09-01 nova-app holds neither leg; the
+                        # backup sidecar copies the newest verified snapshot
+                        # and the extras to /backups and /offsite hourly.
+                        logger.info(
+                            "[Heartbeat] Off-volume dir %r not mounted here — "
+                            "the backup sidecar carries the legs", str(off_dir))
+                        parts.append("off-volume legs: backup sidecar")
                     # True OFFSITE leg (2026-08-14): E:\nova-offsite was fed by
                     # a MANUAL robocopy that was never scheduled — the daily leg
                     # silently didn't exist (found one snapshot behind). The

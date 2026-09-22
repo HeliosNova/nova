@@ -96,3 +96,23 @@ def test_prune_keeps_the_newest_by_mtime(world):
     bs.sync_once(src, [leg], keep=2)
     kept = sorted(p.name for p in leg.glob("nova-*.db"))
     assert kept == ["nova-20260803.db", "nova-20260902.db"]
+
+
+def test_dr_extras_ride_along_with_the_snapshot(world):
+    """The models manifest and config overrides were written only onto the
+    off-volume mount by the maintenance monitor; the 2026-09-01 sidecar split
+    left both legs' copies frozen at that day. They live in the source dir now
+    and the sidecar carries them."""
+    src, leg = world
+    (src / "models_manifest.txt").write_text("qwen3.8:27b\n", encoding="utf-8")
+    (src / "config_overrides.json").write_text('{"ENABLE_MINICHECK": true}', encoding="utf-8")
+    report = bs.sync_once(src, [leg], keep=7)
+    assert (leg / "models_manifest.txt").read_text(encoding="utf-8") == "qwen3.8:27b\n"
+    assert (leg / "config_overrides.json").exists()
+    assert len(report["extras"]) == 2 and not report["failed"]
+
+
+def test_missing_extras_are_not_a_failure(world):
+    src, leg = world
+    report = bs.sync_once(src, [leg], keep=7)
+    assert report["extras"] == [] and not report["failed"]

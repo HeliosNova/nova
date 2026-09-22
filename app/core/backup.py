@@ -26,8 +26,13 @@ Restore procedure (documented here so it lives next to the verifier):
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from pathlib import Path
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 # Tables whose loss would be unrecoverable — all must be readable in a
 # verified snapshot. (Row counts are informational except the all-empty
@@ -88,6 +93,49 @@ def verify_snapshot(path: str | Path) -> tuple[bool, str]:
         return True, detail
     finally:
         conn.close()
+
+
+DR_EXTRAS = ("models_manifest.txt", "config_overrides.json")
+
+
+async def write_dr_extras(dest: str | Path, ollama_url: str,
+                          overrides: str | Path = "/data/config_overrides.json") -> list[str]:
+    """Write the disaster-recovery extras beside the snapshots in `dest`.
+
+    Thirty gigabytes of model weights are re-pullable, so a MANIFEST of what
+    is installed is their backup; the config overrides are tiny and essential
+    (a stale LLM_MODEL there once 404'd every generation). The maintenance
+    monitor used to write these straight onto the off-volume mount, and when
+    the backup sidecar took the legs over on 2026-09-01 they froze at that
+    day's copy for three weeks. Written into the volume now, where the sidecar
+    picks them up with the snapshot. Never raises; returns what it wrote.
+    """
+    import asyncio
+    import shutil
+
+    dest = Path(dest)
+    written: list[str] = []
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        logger.warning("[Backup] extras dir %s unavailable: %s", dest, e)
+        return written
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            tags = (await client.get(f"{ollama_url.rstrip('/')}/api/tags")).json()
+        names = sorted(m.get("name", "?") for m in tags.get("models", []))
+        (dest / "models_manifest.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
+        written.append("models_manifest.txt")
+    except Exception as e:
+        logger.warning("[Backup] models manifest failed: %s", e)
+    try:
+        ov = Path(overrides)
+        if ov.is_file():
+            await asyncio.to_thread(shutil.copyfile, ov, dest / "config_overrides.json")
+            written.append("config_overrides.json")
+    except Exception as e:
+        logger.warning("[Backup] config override copy failed: %s", e)
+    return written
 
 
 def _main() -> int:

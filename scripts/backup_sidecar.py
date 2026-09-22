@@ -25,6 +25,9 @@ from pathlib import Path
 SRC = Path(os.environ.get("BACKUP_SRC_DIR", "/data/backups"))
 LEGS = [Path(p) for p in os.environ.get("BACKUP_LEGS", "/backups,/offsite").split(",") if p]
 KEEP = int(os.environ.get("BACKUP_KEEP", "7"))
+# DR extras written into SRC by the maintenance monitor (2026-09-22): the
+# models manifest and the config overrides ride along with the snapshot.
+EXTRAS = ("models_manifest.txt", "config_overrides.json")
 INTERVAL = int(os.environ.get("BACKUP_INTERVAL_SECONDS", "3600"))
 
 
@@ -44,7 +47,7 @@ def verify(path: Path) -> bool:
 def sync_once(src: Path = SRC, legs: list[Path] | None = None, keep: int = KEEP) -> dict:
     """Copy the newest verified snapshot to every mounted leg; prune to `keep`."""
     legs = LEGS if legs is None else legs
-    report: dict = {"copied": [], "skipped": [], "failed": []}
+    report: dict = {"copied": [], "skipped": [], "failed": [], "extras": []}
     # Newest by mtime, not by name: a lexicographic sort put the stale
     # `nova-premove.db` (Aug 28) after every dated `nova-2026*.db`, and its
     # failed verification blocked the whole sync on the first live run
@@ -88,6 +91,14 @@ def sync_once(src: Path = SRC, legs: list[Path] | None = None, keep: int = KEEP)
                 old.unlink()
             except OSError:
                 pass
+        for extra in EXTRAS:
+            s = src / extra
+            if s.is_file():
+                try:
+                    shutil.copyfile(s, leg / extra)
+                    report["extras"].append(str(leg / extra))
+                except Exception as e:
+                    report["failed"].append(f"{leg / extra}: {e}")
     return report
 
 
