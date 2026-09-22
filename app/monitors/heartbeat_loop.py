@@ -2102,7 +2102,8 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                             from app.core.brain import _extract_kg_triples
                             try:
                                 await _extract_kg_triples(svc.kg, item.topic, result, trust=0.5,
-                                                          source_name="Curiosity Research")
+                                                          source_name="Curiosity Research",
+                                                          model=_judge_model)
                             except Exception:
                                 pass
                         await asyncio.to_thread(
@@ -2144,8 +2145,12 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 if svc.kg and len(result) > 50:
                     from app.core.brain import _extract_kg_triples
                     try:
+                        # On the model this item's path already holds (27B for
+                        # evidence-first, default 9B for think) — model-less it
+                        # pulled the 9B in after every 27B research (2026-09-22).
                         await _extract_kg_triples(svc.kg, item.topic, result, trust=0.55,
-                                                  source_name="Curiosity Research")
+                                                  source_name="Curiosity Research",
+                                                  model=_judge_model)
                     except Exception:
                         pass
 
@@ -2604,6 +2609,11 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         "kg_growth", "kg_health", "ollama_latency", "ollama_model",
         "system_health", "db_size", "chromadb_integrity", "skill_quality",
         "training_job",
+        # Curiosity's result is already a status line ("CURIOSITY BATCH |
+        # 1/3 resolved this run ..."); the answers themselves go out as
+        # follow-ups. Rewriting the line cost a 9B load after every hourly
+        # run whose items had held the 27B (measured 2026-09-22 10:05 UTC).
+        "curiosity",
         # capability_review's output already has its own structured "CAPABILITY
         # REVIEW | gaps=N\n\nSuggestions:\n..." shape; the alert summarizer
         # mis-detects its long-form suggestion as off-format and falls back to
