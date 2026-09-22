@@ -668,6 +668,20 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
     async def _check_monitor(self, monitor: Monitor) -> None:
         """Execute a single monitor check."""
         logger.info("[Heartbeat] Checking '%s' (type=%s)", monitor.name, monitor.check_type)
+        # Liveness for the watchdog (2026-09-22): its staleness rule read only
+        # COMPLETIONS (monitors.last_check_at). After a deploy restart killed
+        # the running batch, the replacement batch of three ~50-minute digests
+        # had produced no completion 90 minutes after the last one, and the
+        # watchdog restarted a healthy loop mid-batch. A dispatch is proof the
+        # loop is alive and working; the watchdog now takes the newer of the two.
+        try:
+            await asyncio.to_thread(
+                self.store._db.execute,
+                "INSERT OR REPLACE INTO system_state (key, value, updated_at) "
+                "VALUES ('last_dispatch_at', ?, ?)",
+                (datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),) * 2)
+        except Exception as e:
+            logger.debug("[Heartbeat] dispatch stamp failed: %s", e)
 
         # Execute the check
         new_value = await self._execute_check(monitor)

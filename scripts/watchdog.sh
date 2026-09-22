@@ -72,11 +72,20 @@ health() {
 }
 
 hb_stale_minutes() {
-    # Minutes since the heartbeat last checked ANY monitor (WAL read, concurrent-
-    # safe). Non-numeric/empty output is treated as "can't tell" by the caller.
+    # Minutes since the heartbeat last COMPLETED any monitor or DISPATCHED one
+    # (WAL read, concurrent-safe). Completions alone misfired on 2026-09-22:
+    # a deploy restart killed the running batch and the replacement batch of
+    # three ~50-minute digests had no completion 90 minutes after the last
+    # one, so a healthy loop was restarted mid-batch. The loop stamps
+    # system_state.last_dispatch_at when a monitor starts (heartbeat_loop
+    # _check_monitor); a loop that neither dispatches nor completes is the
+    # freeze this rule exists for. Non-numeric/empty output is treated as
+    # "can't tell" by the caller.
     sqlite3 -cmd '.timeout 3000' "$DB" \
-        "SELECT CAST((julianday('now') - julianday(MAX(last_check_at)))*1440 AS INTEGER) \
-         FROM monitors WHERE enabled=1 AND last_check_at IS NOT NULL;" 2>/dev/null
+        "SELECT CAST((julianday('now') - julianday(MAX(t)))*1440 AS INTEGER) FROM ( \
+           SELECT MAX(last_check_at) AS t FROM monitors WHERE enabled=1 AND last_check_at IS NOT NULL \
+           UNION ALL \
+           SELECT value AS t FROM system_state WHERE key='last_dispatch_at');" 2>/dev/null
 }
 
 quiet_window_active() {

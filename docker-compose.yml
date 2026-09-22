@@ -383,6 +383,12 @@ services:
     # watchdog NOVA_API_KEY + TELEGRAM_TOKEN + ~30 other vars (2026-08-14 audit).
     environment:
       WATCHDOG_DOCKER_API: http://socket-proxy:2375
+      # Staleness thresholds sized for the digest chain (2026-09-22): three
+      # concurrent ~50-60 min digests can legitimately produce no completion
+      # for well over 90 minutes after a restart. The loop also stamps every
+      # dispatch (system_state.last_dispatch_at) and the rule reads both.
+      WATCHDOG_HB_STALE_MIN: "150"
+      WATCHDOG_GRACE_SEC: "3600"
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
     networks:
