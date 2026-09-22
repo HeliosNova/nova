@@ -494,8 +494,12 @@ class CuriosityQueue:
         _dm.record_decision("curiosity", max_jaccard, 0.6, "inserted_new")
         return cursor.lastrowid
 
-    def get_next(self, exclude_ids=()) -> CuriosityItem | None:
+    def get_next(self, exclude_ids=(), sources=None, exclude_sources=None) -> CuriosityItem | None:
         """Highest-urgency pending item, with the wait counted as urgency.
+
+        `sources` / `exclude_sources` keep a run on ONE research path
+        (2026-09-22): evidence-first items hold the 27B and think() items the
+        9B, and a run that alternated them cost a model reload per item.
 
         `exclude_ids` are rows the caller has already tried in THIS run. A
         failed attempt changes neither urgency nor age, so without it the same
@@ -538,6 +542,14 @@ class CuriosityQueue:
         if excluded:
             not_in = " AND id NOT IN (" + ",".join("?" * len(excluded)) + ")"
             params.extend(excluded)
+        if sources:
+            srcs = sorted({str(s) for s in sources})
+            not_in += " AND source IN (" + ",".join("?" * len(srcs)) + ")"
+            params.extend(srcs)
+        if exclude_sources:
+            srcs = sorted({str(s) for s in exclude_sources})
+            not_in += " AND source NOT IN (" + ",".join("?" * len(srcs)) + ")"
+            params.extend(srcs)
         params.extend([AGING_CAP, AGING_PER_DAY])
         row = self._db.fetchone(
             "SELECT * FROM curiosity_queue "

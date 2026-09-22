@@ -533,6 +533,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         # LLM monitors with bounded, model-aware concurrency:
                         # digest-class monitors overlap each other (width 2);
                         # everything else is exclusive, and classes never mix.
+                        self._curiosity_class_hint = await self._peek_curiosity_class(slow)
                         # Starved non-digest monitors jump the queue first.
                         slow = _class_floor_order(
                             slow, self._monitor_class,
@@ -646,6 +647,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             return "digest"          # 27B via MONITOR_SYNTHESIS_MODEL
         if monitor.check_type == "output_eval":
             return "judge"           # JUDGE_MODEL (gemma) — a third residency
+        if monitor.check_type == "curiosity":
+            # A run is one research path (see _execute_curiosity_research):
+            # evidence-first questions are small 27B digests and belong in
+            # the digest lane; think() questions are 9B. The tick peeks at
+            # the queue before batching and leaves the answer here.
+            hint = getattr(self, "_curiosity_class_hint", None)
+            if hint in ("digest", "other"):
+                return hint
         if monitor.check_type != "query":
             return "other"
         try:
@@ -1915,6 +1924,25 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         self.store.update(mon.id, last_check_at=past.strftime("%Y-%m-%d %H:%M:%S"))
         return True
 
+    async def _peek_curiosity_class(self, slow) -> str | None:
+        """Residency class for a due Curiosity Research run: the path of the
+        item it will pick first. None when curiosity is not due, the queue is
+        empty or unreadable — the class rule then falls back to "other"."""
+        if not any(getattr(m, "check_type", None) == "curiosity" for m in slow):
+            return None
+        try:
+            from app.core.brain import get_services
+            q = get_services().curiosity
+            if q is None:
+                return None
+            item = await asyncio.to_thread(q.get_next)
+        except Exception as e:
+            logger.debug("[Heartbeat] curiosity peek failed: %s", e)
+            return None
+        if item is None:
+            return None
+        return "digest" if item.source in _EVIDENCE_FIRST_SOURCES else "other"
+
     def lane_busy(self) -> bool:
         """True while any LLM-lane monitor holds the residency gate.
 
@@ -1977,15 +2005,30 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # just failed (measured 2026-09-07: one question, three picks, three
         # minutes, attempts 0 -> 1 -> 2). Three slots, three questions.
         tried: set[int] = set()
+        # One research path per run (2026-09-22). Evidence-first items hold
+        # the 27B and think() items the 9B; a run that alternated them cost a
+        # model reload per item (measured 18:04 UTC: four loads inside a batch
+        # that had budgeted one). The first pick sets the path, later picks
+        # stay on it, and the other path runs next hour.
+        path_filter: dict = {}
         for i in range(batch):
             if i and (time.monotonic() - started) > budget:
                 logger.info("[Curiosity] run budget spent after %d item(s)", i)
                 break
-            out = await self._research_one_curiosity(svc, tried)
+            out = await self._research_one_curiosity(svc, tried, **path_filter)
+            if i and out.startswith("[No pending"):
+                logger.info("[Curiosity] %s", out.strip("[]"))
+                break
             lines.append(out)
             # Nothing left, or the machinery is down: stop asking.
             if out.startswith("[No pending") or "LLM unavailable" in out:
                 break
+            if not path_filter:
+                src = getattr(self, "_last_curiosity_source", None)
+                if src in _EVIDENCE_FIRST_SOURCES:
+                    path_filter = {"sources": _EVIDENCE_FIRST_SOURCES}
+                elif src is not None:
+                    path_filter = {"exclude_sources": _EVIDENCE_FIRST_SOURCES}
         if not lines:
             return "[No pending curiosity items — skipped]"
         if len(lines) == 1:
@@ -1995,20 +2038,32 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         return (f"CURIOSITY BATCH | {done}/{len(lines)} resolved this run\n"
                 + "\n".join(lines))
 
-    async def _research_one_curiosity(self, svc, tried: set[int] | None = None) -> str:
+    async def _research_one_curiosity(self, svc, tried: set[int] | None = None, *,
+                                      sources=None, exclude_sources=None) -> str:
         """Take the top queued question, research it, store what it found.
 
         `tried` is the run's set of ids already researched; the pick skips
         them and the chosen id is added, so one run never asks twice.
+        `sources` / `exclude_sources` keep the pick on the run's research
+        path; the chosen item's source is left in `_last_curiosity_source`
+        for the runner to read.
         """
+        kwargs: dict = {}
         if tried:
-            item = await asyncio.to_thread(svc.curiosity.get_next, exclude_ids=set(tried))
-        else:
-            item = await asyncio.to_thread(svc.curiosity.get_next)
+            kwargs["exclude_ids"] = set(tried)
+        if sources:
+            kwargs["sources"] = tuple(sources)
+        if exclude_sources:
+            kwargs["exclude_sources"] = tuple(exclude_sources)
+        item = await asyncio.to_thread(svc.curiosity.get_next, **kwargs)
         if not item:
+            if sources or exclude_sources:
+                return ("[No pending curiosity items on this run's research path — "
+                        "the other path runs next time]")
             return "[No pending curiosity items — skipped]"
         if tried is not None:
             tried.add(item.id)
+        self._last_curiosity_source = item.source
 
         # Research via think() — memory-first, web only for public/external facts.
         research_query = (
