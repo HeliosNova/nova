@@ -877,7 +877,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # no LLM re-summarization needed (it only mangles good content).
         # Only use LLM analysis for change-detected alerts where we need to
         # describe what changed.
-        if change_info:
+        # A digest-class monitor on on_change is the exception to the
+        # exception: World Awareness (the one query digest seeded on_change)
+        # finished a 50-minute 27B chain on 2026-09-22 09:42 UTC, stored 9,011
+        # characters, and the change path handed it to _analyze_result — a
+        # 120-token rewrite on the default 9B — so Telegram received 310
+        # characters and the card swapped 27B→9B→27B to write them. A
+        # briefing describes itself; the rewrite is for short results.
+        if change_info and self._monitor_class(monitor) != "digest":
             analysis = await self._analyze_result(monitor, new_value, change_info)
         else:
             # Send the raw result directly — channel adapters handle their own
