@@ -157,14 +157,18 @@ async def test_hit_without_date_when_dated_evidence_exists_is_rejected(db):
 @pytest.mark.asyncio
 async def test_hit_with_in_window_date_is_accepted_and_stamped(db):
     fid = _due(db)
-    evidence = "- The merger closed (2026-08-28) [reuters.com]: closed"
-    verdict = {"verdict": "hit", "evidence_date": "2026-08-28", "reason": "closed on the 28th"}
+    # Inside the window: after the forecast was made (20 days ago), before it
+    # resolved (an hour ago). A date written out here rotted out of the window
+    # on 2026-09-17 and failed the suite for a rule that was working.
+    day = (datetime.utcnow() - timedelta(days=5)).strftime("%Y-%m-%d")
+    evidence = f"- The merger closed ({day}) [reuters.com]: closed"
+    verdict = {"verdict": "hit", "evidence_date": day, "reason": "closed"}
     with patch("app.core.forecasts._gather_evidence", AsyncMock(return_value=evidence)), \
          patch("app.core.forecasts.llm.invoke_nothink", AsyncMock(return_value="{}")), \
          patch("app.core.forecasts.llm.extract_json_object", return_value=verdict):
         await forecasts.resolve_due(db)
     row = db.fetchone("SELECT status, resolution FROM forecasts WHERE id=?", (fid,))
-    assert row["status"] == "hit" and row["resolution"].startswith("[2026-08-28]")
+    assert row["status"] == "hit" and row["resolution"].startswith(f"[{day}]")
 
 
 @pytest.mark.asyncio
