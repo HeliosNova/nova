@@ -408,6 +408,10 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # age flusher. row_id None = ledger write failed, in-memory-only fallback.
         self._digest_buffer: list[tuple[frozenset, str, str, str, int | None, float]] = []
         self._flush_lock = asyncio.Lock()
+        # One curiosity researcher at a time: the hourly monitor and the
+        # daemon's opportunistic run share this (2026-09-22, see
+        # _execute_curiosity_research).
+        self._curiosity_lock = asyncio.Lock()
         self._flusher_task: asyncio.Task | None = None
         # Per-monitor delivery-failure retry counts: a digest whose broadcast
         # failed on EVERY channel is re-buffered for the next flush instead of
@@ -1883,6 +1887,27 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         )
 
     async def _execute_curiosity_research(self, cfg: dict) -> str:
+        """One curiosity researcher at a time.
+
+        The hourly monitor and the daemon's opportunistic run both land here.
+        Live 2026-09-22 07:46-08:03 UTC the daemon fired 46 s into the
+        monitor's run; the two wanted different residency classes (the daemon's
+        think() the 9B, the monitor's evidence-first pass the 27B), Ollama
+        evicted one for the other five times in fifteen minutes, and the
+        monitor's research timed out at 900 s having lost the card for four of
+        them. An opportunistic run that finds research in progress skips - the
+        queue is being drained; a scheduled run waits its turn.
+        """
+        lock = getattr(self, "_curiosity_lock", None)
+        if lock is None:
+            lock = self._curiosity_lock = asyncio.Lock()
+        if cfg.get("opportunistic") and lock.locked():
+            logger.info("[Curiosity] research already running — opportunistic run skipped")
+            return "[Curiosity research already running — skipped]"
+        async with lock:
+            return await self._execute_curiosity_research_unlocked(cfg)
+
+    async def _execute_curiosity_research_unlocked(self, cfg: dict) -> str:
         """Drain several queued questions per run, not one.
 
         One item per run was the whole bottleneck. Measured 2026-09-04: 50

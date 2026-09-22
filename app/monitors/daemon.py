@@ -517,7 +517,9 @@ class DaemonOrchestrator:
         self._log("decision", "Researching critical curiosity items", "daemon")
         try:
             # Delegate to the existing curiosity research monitor handler
-            result = await svc.heartbeat._execute_curiosity_research({})
+            # Opportunistic: yields to a monitor run already in progress
+            # instead of racing it for the card (2026-09-22).
+            result = await svc.heartbeat._execute_curiosity_research({"opportunistic": True})
             self._log("action", f"Curiosity research: {result[:200]}", "daemon")
         except Exception as e:
             self._log("error", f"Curiosity research failed: {e}", "daemon")
