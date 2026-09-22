@@ -114,15 +114,20 @@ async def main() -> int:
     if stated:
         hit_rate = statistics.mean(o for _, o in stated)
         base = hit_rate * (1 - hit_rate)
+
+        def _skill(b: float) -> str:
+            # all outcomes equal → the base rate is a perfect predictor; skill undefined
+            return f"skill {1 - b / base:+.3f}" if base > 0 else "skill n/a (one outcome)"
+
         print(f"n={len(stated)} hit rate {hit_rate:.3f} base-rate Brier {base:.4f}")
-        print(f"stated (as minted)         Brier {_brier(stated):.4f}  skill {1 - _brier(stated) / base:+.3f}")
+        print(f"stated (as minted)         Brier {_brier(stated):.4f}  {_skill(_brier(stated))}")
         for m in models:
             pairs = est[m]
             if not pairs:
                 print(f"{m:<28} no estimates")
                 continue
             b = _brier(pairs)
-            print(f"{m:<28} Brier {b:.4f}  skill {1 - b / base:+.3f}  n={len(pairs)}  "
+            print(f"{m:<28} Brier {b:.4f}  {_skill(b)}  n={len(pairs)}  "
                   f"mean conf {statistics.mean(p for p, _ in pairs):.3f}")
             for lo, hi, n, mp, mo in _bands(pairs):
                 print(f"    [{lo:.2f},{hi:.2f}) n={n:<3} said {mp:.2f} happened {mo:.2f}")
