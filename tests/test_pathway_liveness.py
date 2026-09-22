@@ -251,3 +251,88 @@ def test_status_schema_accepts_the_snapshot(seeded):
     resp = StatusResponse(pathways=snap)
     assert {r["name"] for r in resp.pathways} == {p.name for p in pathways.PATHWAYS}
     assert StatusResponse().pathways == []
+
+
+# ---------------------------------------------------------------- restart
+
+def test_silence_after_a_restart_is_warming_until_a_window_has_elapsed(seeded):
+    """2026-09-22: Nova came back after twelve days off. Every writer had been
+    silent for twelve days because the PROCESS was off, not because the writer
+    was broken, and the first liveness run would have called all of them dead
+    and delivered it. A pathway cannot be judged until the app has been up for
+    its window, exactly as a fresh install cannot."""
+    db, _ = seeded
+    pathways.record_boot(db, now=NOW - timedelta(hours=1))
+    rows = _by_name(pathways.snapshot(db, cfg=_cfg(), now=NOW))
+    assert rows["storylines"]["verdict"] == "warming"
+    assert rows["dossiers"]["verdict"] == "warming"
+    # A full window of uptime later, silence is a fault again.
+    pathways.record_boot(db, now=NOW - timedelta(days=10))
+    rows = _by_name(pathways.snapshot(db, cfg=_cfg(), now=NOW))
+    assert rows["storylines"]["verdict"] == "dead"
+    assert rows["dossiers"]["verdict"] == "dead"
+
+
+def test_a_write_since_the_restart_is_alive_not_warming(seeded):
+    db, _ = seeded
+    pathways.record_boot(db, now=NOW - timedelta(hours=1))
+    db.execute("INSERT INTO storylines (story_key, title, summary, monitors_csv, update_count, last_updated) "
+               "VALUES ('k', 'T', 's', 'm', 1, ?)", (NOW.strftime("%Y-%m-%d %H:%M:%S"),))
+    db.execute("INSERT INTO storyline_events (storyline_id, summary, source_monitor, is_new, created_at) "
+               "VALUES (1, 'moved', 'm', 1, ?)", ((NOW - timedelta(minutes=30)).strftime("%Y-%m-%d %H:%M:%S"),))
+    row = _by_name(pathways.snapshot(db, cfg=_cfg(), now=NOW))["storylines"]
+    assert row["verdict"] == "alive"
+
+
+def test_boot_marker_is_a_timestamp_the_probe_can_read(db):
+    pathways.record_boot(db, now=NOW - timedelta(hours=3))
+    assert pathways._boot_age_hours(db, NOW) == 3.0
+    assert pathways._boot_age_hours(db, NOW - timedelta(hours=3)) == 0.0
+
+
+def test_no_boot_marker_keeps_the_old_verdict_rule(seeded):
+    db, _ = seeded
+    assert pathways._boot_age_hours(db, NOW) is None
+    rows = _by_name(pathways.snapshot(db, cfg=_cfg(), now=NOW))
+    assert rows["storylines"]["verdict"] == "dead"
+
+
+def test_schedule_pressure_reports_no_ratio_in_the_first_day_after_a_restart(seeded):
+    db, _ = seeded
+    pathways.record_boot(db, now=datetime.utcnow() - timedelta(hours=2))
+    press = pathways.schedule_pressure(db)
+    assert press["ratio"] is None
+    assert press["starved"] == []
+    assert "restart" in press.get("note", "")
+
+
+def test_boot_is_recorded_at_startup():
+    src = (ROOT / "app" / "main.py").read_text(encoding="utf-8")
+    assert "record_boot(" in src, "lifespan must stamp app_started_at or the restart rule never fires"
+
+
+def test_schedule_pressure_ignores_a_quick_restart(seeded):
+    """A deploy restart minutes after the last result subtracts nothing: the
+    history before it is real and the ratio must keep reading it."""
+    db, store = seeded
+    now = datetime.utcnow()
+    mon = store.get_by_name("Pathway Liveness")
+    for h in range(1, 48):
+        db.execute("INSERT INTO monitor_results (monitor_id, status, value, message, created_at) "
+                   "VALUES (?, 'info', '', '', ?)",
+                   (mon.id, (now - timedelta(hours=h)).strftime("%Y-%m-%d %H:%M:%S")))
+    pathways.record_boot(db, now=now - timedelta(minutes=5))
+    press = pathways.schedule_pressure(db)
+    assert press["ratio"] is not None
+    assert "note" not in press
+
+
+def test_outage_inside_the_window_is_subtracted_from_demand(seeded):
+    db, _ = seeded
+    now = datetime.utcnow()
+    # up until 5 days ago, off until 2 days ago, up since: 2 of 7 days down
+    pathways.record_boot(db, now=now - timedelta(days=2))
+    db.execute("INSERT INTO monitor_results (monitor_id, status, value, message, created_at) "
+               "VALUES (1, 'info', '', '', ?)", ((now - timedelta(days=5)).strftime("%Y-%m-%d %H:%M:%S"),))
+    assert pathways._downtime_days_in_window(db, now, 7.0) == pytest.approx(3.0, abs=0.01)
+    assert pathways._downtime_days_in_window(db, now, 1.0) == pytest.approx(0.0, abs=0.01)

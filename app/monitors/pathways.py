@@ -21,8 +21,8 @@ long it may go quiet before that silence is a fault. Two consumers:
 Verdicts: alive (wrote inside its window), dead (silent past the window),
 idle (usage-gated — only writes when the owner talks to Nova — so silence is
 not a fault), off (flag false or driving monitor disabled), warming (the
-install is younger than the window), unknown (probe failed — missing table,
-treated as dead).
+install — or the process since its last boot — is younger than the window),
+unknown (probe failed — missing table, treated as dead).
 """
 from __future__ import annotations
 
@@ -228,6 +228,62 @@ def _install_age_hours(db, now: datetime) -> float | None:
     return (now - t).total_seconds() / 3600 if t else None
 
 
+BOOT_KEY = "app_started_at"
+
+
+def record_boot(db, now: datetime | None = None) -> None:
+    """Stamp the moment this process came up.
+
+    Silence is only a fault once the app has been running for a pathway's
+    window. After the twelve days off in September 2026 every writer had been
+    silent because the PROCESS was off, and the first liveness run would have
+    declared all of them dead and delivered it. Never raises: a marker must not
+    block a boot.
+    """
+    now = now or datetime.now(timezone.utc).replace(tzinfo=None)
+    try:
+        db.execute(
+            "INSERT OR REPLACE INTO system_state (key, value, updated_at) VALUES (?, ?, ?)",
+            (BOOT_KEY, now.strftime(_TS), now.strftime(_TS)))
+    except Exception as e:
+        logger.warning("[Pathways] could not record boot time: %s", e)
+
+
+def _boot_age_hours(db, now: datetime) -> float | None:
+    """Hours since the current process came up, or None when no boot was
+    recorded (older installs, bare test databases): the calendar rule applies."""
+    try:
+        row = db.fetchone("SELECT value FROM system_state WHERE key = ?", (BOOT_KEY,))
+    except Exception:
+        return None
+    t = _parse_ts(row["value"] if row else None)
+    return max(0.0, (now - t).total_seconds() / 3600) if t else None
+
+
+def _downtime_days_in_window(db, now: datetime, window_days: float) -> float:
+    """Days of the trailing window during which the app was down.
+
+    Bounded by the most recent outage only — from the last result written
+    before the current boot to the boot itself — which is the one a restart
+    can see. A deploy restart minutes after the last result subtracts nothing;
+    twelve days off subtracts the whole window. Unknown boot → 0.
+    """
+    boot_h = _boot_age_hours(db, now)
+    if boot_h is None:
+        return 0.0
+    boot = now - timedelta(hours=boot_h)
+    try:
+        row = db.fetchone(
+            "SELECT MAX(created_at) AS t FROM monitor_results WHERE created_at < ?",
+            (boot.strftime(_TS),))
+    except Exception:
+        return 0.0
+    start = now - timedelta(days=window_days)
+    last_before = _parse_ts(row["t"] if row else None) or start
+    gap_start, gap_end = max(last_before, start), min(boot, now)
+    return max(0.0, (gap_end - gap_start).total_seconds() / 86400.0)
+
+
 def _probe_table(db, p: Pathway, cutoff: str) -> tuple[str | None, int]:
     sql = (f"SELECT MAX({p.time_col}) AS last_at, "
            f"SUM(CASE WHEN {p.time_col} > ? THEN 1 ELSE 0 END) AS recent "
@@ -276,6 +332,7 @@ def snapshot(db, *, cfg=None, now: datetime | None = None) -> list[dict]:
     now = now or datetime.now(timezone.utc).replace(tzinfo=None)
     monitors = _monitor_index(db)
     install_age = _install_age_hours(db, now)
+    boot_age = _boot_age_hours(db, now)
     out: list[dict] = []
     for p in PATHWAYS:
         window = effective_window_hours(p, monitors)
@@ -316,6 +373,11 @@ def snapshot(db, *, cfg=None, now: datetime | None = None) -> list[dict]:
         elif p.usage_gated:
             verdict = "idle"
         elif install_age is not None and install_age < window:
+            verdict = "warming"
+        elif boot_age is not None and boot_age < window:
+            # Up for less than a window since the last boot: the writer has
+            # not yet had the time it is allowed. Silence after an outage is
+            # the outage's, not the writer's (2026-09-22).
             verdict = "warming"
         else:
             verdict = "dead"
@@ -364,19 +426,28 @@ def schedule_pressure(db, *, days: int = 7) -> dict:
         logger.warning("[Pathways] schedule pressure unreadable: %s", e)
         return {"demanded": 0, "delivered": 0, "ratio": None, "starved": []}
 
-    age_h = _install_age_hours(db, datetime.now(timezone.utc).replace(tzinfo=None))
+    now = datetime.now(timezone.utc).replace(tzinfo=None)
+    age_h = _install_age_hours(db, now)
     window = float(days) if age_h is None else max(0.0, min(float(days), age_h / 24.0))
     if window < 1.0:
         return {"demanded": 0, "delivered": 0, "ratio": None, "starved": [],
                 "note": "install younger than a day — no schedule history yet"}
+    # Demand only accrues while the app is up. The part of the most recent
+    # outage that falls inside the window is subtracted, so twelve days off
+    # (2026-09-22) read as "no ratio yet" rather than as 2% of a week's runs
+    # delivered — and escalated. A quick deploy restart subtracts minutes.
+    up_days = window - _downtime_days_in_window(db, now, window)
+    if up_days < 1.0:
+        return {"demanded": 0, "delivered": 0, "ratio": None, "starved": [],
+                "note": "less than a day of uptime since the restart — no schedule ratio yet"}
 
     demanded = delivered = 0.0
     per: list[tuple[float, str, int, float]] = []
     for m in monitors:
         sched = max(int(m["schedule_seconds"] or 0), 1)
-        want = window * 86400.0 / sched
+        want = up_days * 86400.0 / sched
         if "anchor_hour" in (m["check_config"] or ""):
-            want = min(want, window)          # anchored dailies run once a day
+            want = min(want, up_days)         # anchored dailies run once a day
         got = counts.get(m["id"], 0)
         demanded += want
         delivered += min(got, want)           # a monitor cannot bank credit

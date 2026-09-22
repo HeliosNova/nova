@@ -132,6 +132,10 @@ async def lifespan(app: FastAPI):
     db = get_db()
     db.init_schema()
     logger.info("Database initialized at %s", config.DB_PATH)
+    # Liveness judges a writer's silence against uptime, not the calendar:
+    # after an outage every pathway is silent for the outage's length.
+    from app.monitors.pathways import record_boot
+    record_boot(db)
 
     # Seed prompt-module baselines (idempotent; no-op if already seeded)
     from app.core.prompt_optimizer import init_prompt_optimizer
