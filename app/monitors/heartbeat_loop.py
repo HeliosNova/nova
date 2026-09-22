@@ -562,6 +562,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         if slow:
                             gate = _ClassGate({"digest": _MAX_CONCURRENT_DIGEST_MONITORS},
                                               default=_MAX_CONCURRENT_LLM_MONITORS)
+                            self._lane_gate = gate      # read by lane_busy() (daemon defers)
 
                             async def _limited_check(monitor):
                                 await gate.acquire(self._monitor_class(monitor))
@@ -1885,6 +1886,18 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             f"success_rate={skill.success_rate:.0%} | "
             f"quality={score:.2f} | q={test_query[:60]}"
         )
+
+    def lane_busy(self) -> bool:
+        """True while any LLM-lane monitor holds the residency gate.
+
+        The gate keeps the card on one model class at a time; work that enters
+        from outside the tick cannot see it. Live 2026-09-22 08:35 UTC the
+        daemon's curiosity think() (9B) fired twenty seconds into a three-wide
+        27B digest batch and the card swapped six times in five minutes. The
+        daemon reads this before any opportunistic LLM action.
+        """
+        gate = getattr(self, "_lane_gate", None)
+        return bool(gate is not None and gate._n > 0)
 
     async def _execute_curiosity_research(self, cfg: dict) -> str:
         """One curiosity researcher at a time.

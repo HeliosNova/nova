@@ -98,6 +98,19 @@ class DaemonOrchestrator:
         last = getattr(self, "_last_curiosity_research", None)
         return last is None or time.monotonic() - last >= 1800
 
+    def _lane_busy(self) -> bool:
+        """The heartbeat's LLM lane holds the card for one residency class; an
+        opportunistic run of the other class evicts it. Live 2026-09-22 08:35
+        UTC: curiosity think() (9B) fired twenty seconds into a three-wide 27B
+        digest batch and the card swapped six times in five minutes. The
+        monitors are class-gated; the daemon supplements, so it defers."""
+        try:
+            from app.core.brain import get_services
+            hb = get_services().heartbeat
+            return bool(hb is not None and hb.lane_busy())
+        except Exception:
+            return False
+
     # ── Lifecycle ─────────────────────────────────────────────────────────
 
     def start(self):
@@ -294,14 +307,16 @@ class DaemonOrchestrator:
         if (budget == BUDGET_FULL
                 and (hours_since_dream is None or hours_since_dream >= 12)
                 and idle >= 30
-                and not self._dream_running):
+                and not self._dream_running
+                and not self._lane_busy()):
             return {"action": "dream"}
 
         # Critical curiosity research — idle and have urgent items. 30-min
         # cooldown between daemon-initiated runs (see __init__ note).
         if (budget in (BUDGET_LIGHT, BUDGET_FULL)
                 and context["critical_curiosity"] > 0
-                and self._curiosity_cooldown_elapsed()):
+                and self._curiosity_cooldown_elapsed()
+                and not self._lane_busy()):
             return {"action": "research_curiosity"}
 
         # Process pending events
