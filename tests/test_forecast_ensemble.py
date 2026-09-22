@@ -21,9 +21,13 @@ from app.core import forecasts as fc
 LINE = ("Nvidia ships Rubin to three Azure regions | resolves 2026-12-31 | 0.8")
 
 
+ACCEPT = '{"accept": true, "reason": "ok", "criterion": "Settles TRUE if Microsoft or Nvidia announce Rubin availability in three Azure regions by 2026-12-31"}'
+
+
 def _samples(*values):
-    """Fake the model returning a given probability on each call."""
-    return AsyncMock(side_effect=[f'{{"probability": {v}}}' for v in values])
+    """Fake the model: the mint-time validator (2026-09-22) answers first, then
+    one probability per confidence sample."""
+    return AsyncMock(side_effect=[ACCEPT] + [f'{{"probability": {v}}}' for v in values])
 
 
 @pytest.mark.asyncio
@@ -59,7 +63,7 @@ async def test_an_unreachable_model_keeps_the_stated_confidence(db):
 @pytest.mark.asyncio
 async def test_garbage_samples_are_ignored_not_averaged(db):
     with patch.object(fc.llm, "invoke_nothink",
-                      AsyncMock(side_effect=['{"probability": 1.7}', "not json",
+                      AsyncMock(side_effect=[ACCEPT, '{"probability": 1.7}', "not json",
                                              '{"probability": 0.6}'])):
         fid = await fc.parse_and_store_forecast_ensembled(db, f"FORECAST: {LINE}", k=3)
     row = db.fetchone("SELECT confidence FROM forecasts WHERE id = ?", (fid,))
@@ -85,7 +89,7 @@ async def test_the_claim_and_its_date_still_come_from_the_line(db):
 
 
 def test_the_regime_bumped_and_keeps_its_history():
-    assert fc.REGIME == "2026-09-04-ensembled"
+    assert fc.REGIME == "2026-09-22-criterion"     # validator + criterion regime
     assert fc.REGIME in fc.REGIME_HISTORY and fc.REGIME_LEGACY in fc.REGIME_HISTORY
     assert fc.REGIME_HISTORY[0] == fc.REGIME, "newest first"
 

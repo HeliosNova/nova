@@ -107,7 +107,7 @@ class TestCuriosityEphemeralGate:
 
         q = cur.CuriosityQueue(db)
         q.add(topic="real organic curiosity topic",
-              source="search_zero_result", urgency=0.4)
+              source="agent_failure", urgency=0.4)   # search_zero_result was cut 2026-09-22
         row = db.fetchone(
             "SELECT COUNT(*) AS c FROM curiosity_queue WHERE topic LIKE '%organic%'")
         assert row["c"] == 1

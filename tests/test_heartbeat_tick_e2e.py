@@ -135,6 +135,12 @@ class FakeProvider:
         if "title" in props and "items" in props:
             n = len(re.findall(r"(?m)^\d+\. \[", prompt))
             return [{"title": "Nvidia Rubin platform rollout", "items": list(range(n))}]
+        if "accept" in props and "criterion" in props:
+            # The mint-time validator (2026-09-22): accept, keep the claim, name what settles it.
+            return {"accept": True, "claim": "",
+                    "criterion": "Settles TRUE if Nvidia or Microsoft publish Rubin availability "
+                                 "in three Azure regions by the resolution date; FALSE otherwise",
+                    "reason": "one binary, publicly settleable outcome"}
         if "verdict" in props:
             return {"verdict": "miss", "evidence_date": "2026-08-30",
                     "reason": "shipments slipped past the stated deadline"}

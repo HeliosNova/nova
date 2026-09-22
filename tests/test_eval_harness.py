@@ -1045,7 +1045,8 @@ class TestHeartbeatSeedCount:
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        assert len(all_monitors) == 77
+        # 77 until 2026-09-22, when the owner cut eight inert catalog monitors.
+        assert len(all_monitors) == 69
 
 
 class TestMemoryLearningEval:

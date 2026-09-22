@@ -169,8 +169,9 @@ class TestCuriosityChurn:
         q = CuriosityQueue(db)
         topic = "what are the current cost dynamics of grid-scale battery storage in europe"
         db.execute("INSERT INTO curiosity_queue (topic, source, urgency, status, created_at) "
-                   "VALUES (?, 'dossier_tension', 0.7, 'failed', datetime('now','-30 days'))", (topic,))
-        assert q.add(topic, source="dossier_tension", urgency=0.7) > 0
+                   "VALUES (?, 'dossier_open_question', 0.7, 'failed', datetime('now','-30 days'))", (topic,))
+        # (source changed 2026-09-22: dossier_tension is a cut source and is refused)
+        assert q.add(topic, source="dossier_open_question", urgency=0.7) > 0
 
 
 # --- kg dead-alias prune ---

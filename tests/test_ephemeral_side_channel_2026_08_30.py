@@ -57,10 +57,10 @@ class TestEphemeralSuppressesCuriosityMint:
             )
 
     @pytest.mark.asyncio
-    async def test_real_zero_result_still_mints(self, zero_result_search):
-        """The mint is a FEATURE for real traffic — ambient-awareness gaps
-        should still be queued. Suppressing it everywhere would quietly kill
-        the search_zero_result curiosity source (7 live rows use it)."""
+    async def test_real_zero_result_no_longer_mints(self, zero_result_search):
+        """The zero-result mint was cut 2026-09-22: none of its topics ever
+        resolved, and it queued eval fiction as research. Real traffic no
+        longer mints from an empty search either."""
         EPHEMERAL_REQUEST.set(False)
         added = MagicMock()
         with patch("app.core.curiosity.CuriosityQueue") as cq_cls:
@@ -68,9 +68,7 @@ class TestEphemeralSuppressesCuriosityMint:
             tool = WebSearchTool()
             result = await tool.execute(query="obscure real topic with no hits")
             assert not result.success
-            added.assert_called_once()
-            kw = added.call_args.kwargs
-            assert kw.get("source") == "search_zero_result"
+            added.assert_not_called()
 
     def test_default_is_not_ephemeral(self):
         """Fail-open in the right direction: code that never touches the var

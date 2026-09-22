@@ -333,6 +333,10 @@ async def validate_candidate(claim: str, resolves_on: str | None, context: str, 
             json_schema=_VALIDATE_SCHEMA, max_tokens=220, temperature=0.1,
             model=model, num_ctx=4096)
         data = llm.extract_json_object(raw) if isinstance(raw, str) else (raw or {})
+        if not isinstance(data, dict) or "accept" not in data:
+            # No verdict is not a rejection: mint as written, unvalidated.
+            logger.warning("[Forecast] validator gave no verdict — minting unvalidated")
+            return True, claim, "", "validator gave no verdict"
         accept = bool(data.get("accept"))
         reason = str(data.get("reason") or "").strip()[:200]
         if not accept:
