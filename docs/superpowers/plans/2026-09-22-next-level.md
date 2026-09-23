@@ -101,8 +101,27 @@ research on what we need to move to the next level."
   Cold loads measured from the T7 once the page cache is gone: 9B 4 min,
   27B 7 min; warm 27B 17 s. Each swap is therefore minutes, not seconds, and
   the quiet-window jobs must be the only thing touching the card.
-- Deploy of `63cbedb`/`1abb198` is deferred to the quiet window (01:02
-  local) so no digest is killed mid-run; the bake-offs follow at 02:07.
+- Deployed `1abb198` at 09:02 UTC 2026-09-23 inside the quiet window;
+  startup evicted nothing.
+- **Step 2 result — OpenForecaster-8B REJECTED** (2026-09-23 09:17 UTC,
+  `scripts/forecast_bakeoff.py`, n=144 resolved claims of the dumped record,
+  claim text only, k=3, rows in `/data/ceiling/forecast_bakeoff_2026-09-23.rows.jsonl`):
+
+  | arm | Brier | skill | mean conf | closer (paired) |
+  |---|---|---|---|---|
+  | base rate (hit rate 0.653) | 0.2267 | 0 | — | — |
+  | stated as minted (saw the digest) | 0.2287 | −0.009 | — | — |
+  | qwen3.8:27b, claim only | 0.3061 | −0.350 | 0.475 | 77/144 |
+  | OpenForecaster-8B Q8, claim only | 0.3285 | −0.450 | 0.373 | 67/144 (47 %) |
+
+  The rule was ≥60 % of paired claims; it reached 47 %. Its low band
+  (n=112) said 0.28 and happened 0.63 — it answers "no" on a record that
+  resolved 65 % "yes". Caveats apply to both arms equally (self-graded
+  outcomes, no digest, JSON-mode answer without its reasoning). The finding
+  that matters more: the stated number, written with the digest in context,
+  beats both blind re-estimators by 0.08 Brier. Context is the lever, not
+  the model — which is what HINDCAST and the evidence-summary averaging
+  papers say, and what the validator + criterion step already builds on.
 
 ## Sources
 
