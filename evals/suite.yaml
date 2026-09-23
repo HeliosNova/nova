@@ -1,5 +1,6 @@
-# Nova automated evaluation suite — 51 tasks across 12 categories (2026-09-01:
-# 16 saturated chat tasks retired, 7 deterministic research-quality probes added).
+# Nova automated evaluation suite — 56 tasks across 13 categories (2026-09-01:
+# 16 saturated chat tasks retired, 7 deterministic research-quality probes added;
+# 2026-09-23: 5 long-memory tasks, LongMemEval-shaped).
 # (multi-agent category archived 2026-08-25 with the decomposition capability;
 # the deliberation probe moved to `reasoning`.)
 #
@@ -736,3 +737,78 @@ tasks:
     timeout: 30
     check: tool_scoping
     assertions: []
+
+  # =========================================================================
+  # long-memory (2026-09-23) — LongMemEval's abilities on Nova's own memory:
+  # knowledge update, temporal recall, multi-session aggregation, multi-valued
+  # recall, abstention. seed_facts go in IN ORDER between the before/after
+  # runs of the kg-retrieval runner, so a pass means the seeds CAUSED the
+  # answer, and every seed is retired afterwards. Fictional entities only.
+  # The temporal task is EXPECTED to fail until chat retrieval reads the
+  # KG's history — that gap is what the category exists to measure.
+  # =========================================================================
+
+  - id: longmem_update_latest_wins
+    category: long-memory
+    query: "Where does Ilse Varga live now?"
+    timeout: 120
+    seed_facts:
+      - {subject: "Ilse Varga", predicate: "lives_in", object: "Tromso", valid_from: "2026-03-01", confidence: 0.95}
+      - {subject: "Ilse Varga", predicate: "lives_in", object: "Valletta", valid_from: "2026-08-01", confidence: 0.95}
+    assertions:
+      - type: answer_contains
+        value: "Valletta"
+
+  - id: longmem_temporal_previous
+    category: long-memory
+    # The superseded fact: answering needs the KG's history, not its current state.
+    query: "Where did Ilse Varga live before she moved to Valletta?"
+    timeout: 120
+    seed_facts:
+      - {subject: "Ilse Varga", predicate: "lives_in", object: "Tromso", valid_from: "2026-03-01", confidence: 0.95}
+      - {subject: "Ilse Varga", predicate: "lives_in", object: "Valletta", valid_from: "2026-08-01", confidence: 0.95}
+    assertions:
+      - type: answer_contains
+        value: "Tromso"
+
+  - id: longmem_multi_session_aggregate
+    category: long-memory
+    query: "What do you know about Corvin Ashlake: his employer, the project he leads, and the city he is based in?"
+    timeout: 120
+    seed_facts:
+      - {subject: "Corvin Ashlake", predicate: "works_at", object: "Pelagic Dynamics", confidence: 0.95}
+      - {subject: "Corvin Ashlake", predicate: "leads", object: "the Halyard project", confidence: 0.95}
+      - {subject: "Corvin Ashlake", predicate: "based_in", object: "Porto", confidence: 0.95}
+    assertions:
+      - type: answer_contains
+        value: "Pelagic"
+      - type: answer_contains
+        value: "Halyard"
+      - type: answer_contains
+        value: "Porto"
+
+  - id: longmem_multi_valued_recall
+    category: long-memory
+    query: "Which cities has Odalys Ferrante given talks in?"
+    timeout: 120
+    seed_facts:
+      - {subject: "Odalys Ferrante", predicate: "spoke_in", object: "Lima", confidence: 0.95}
+      - {subject: "Odalys Ferrante", predicate: "spoke_in", object: "Oslo", confidence: 0.95}
+      - {subject: "Odalys Ferrante", predicate: "spoke_in", object: "Kyoto", confidence: 0.95}
+    assertions:
+      - type: answer_contains
+        value: "Lima"
+      - type: answer_contains
+        value: "Oslo"
+      - type: answer_contains
+        value: "Kyoto"
+
+  - id: longmem_abstention
+    category: long-memory
+    # Nothing is seeded and the entity does not exist: the only correct
+    # answer says so. A number here is a fabrication.
+    query: "What is the annual budget of the Quennsbury Tidal Authority?"
+    timeout: 120
+    assertions:
+      - type: answer_matches
+        value: '(?i)(do not|don.t|cannot|can.t|couldn.t|unable to)\s+(have|find|know|locate|verify|confirm)|not (aware|familiar|available|found)|no (information|record|data|public)|unknown|not able to'

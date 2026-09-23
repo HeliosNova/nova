@@ -57,6 +57,12 @@ class EvalTask:
     # the fix. Auto-cleaned after the task (context-marker scoped).
     seed_lesson: dict | None = None
     seed_fact: dict | None = None  # {subject, predicate, object} — KG analogue (wired in WS2C)
+    # Several triples seeded IN ORDER between the before/after runs — the
+    # long-memory category (2026-09-23, LongMemEval-shaped): a later fact on
+    # a functional predicate supersedes an earlier one (knowledge update),
+    # several facts on one subject must be aggregated (multi-session), and
+    # `valid_from` on a seed dates it for temporal questions.
+    seed_facts: list[dict] = field(default_factory=list)
     # {title, body} — a standing dossier seeded BETWEEN the before/after runs of
     # a knowing task to prove the dossier CAUSES the correct answer (2026-08-12).
     seed_dossier: dict | None = None
@@ -736,6 +742,7 @@ class EvalHarness:
                 seed_document=raw.get("seed_document"),
                 seed_lesson=raw.get("seed_lesson"),
                 seed_fact=raw.get("seed_fact"),
+                seed_facts=raw.get("seed_facts", []) or [],
                 seed_dossier=raw.get("seed_dossier"),
                 paraphrase_of=raw.get("paraphrase_of"),
                 tags=raw.get("tags", []),
@@ -1195,7 +1202,7 @@ class EvalHarness:
             return await self._run_check_task(task)
         # memory-learning / kg-retrieval / knowing tasks use dedicated
         # before/seed/after paths
-        if task.category == "kg-retrieval" and task.seed_fact:
+        if task.category in ("kg-retrieval", "long-memory") and (task.seed_fact or task.seed_facts):
             return await self._run_kg_task(task)
         if task.category == "memory-learning" and task.seed_lesson:
             return await self._run_memory_task(task)
@@ -1421,24 +1428,30 @@ class EvalHarness:
 
         svc = get_services()
         kg = getattr(svc, "kg", None) if svc else None
-        seed = task.seed_fact or {}
-        s, p, o = seed.get("subject"), seed.get("predicate"), seed.get("object")
+        # One triple (kg-retrieval) or several IN ORDER (long-memory): a later
+        # seed on a functional predicate supersedes an earlier one, which is
+        # the knowledge-update case; the order is the "session" order.
+        seeds = [dict(x) for x in (task.seed_facts or ([task.seed_fact] if task.seed_fact else []))]
+        triples = [(x.get("subject"), x.get("predicate"), x.get("object")) for x in seeds]
         start = time.monotonic()
 
-        if not kg or not (s and p and o):
+        if not kg or not triples or not all(s and p and o for s, p, o in triples):
             return TaskResult(
                 task_id=task.id, category=task.category, query=task.query,
                 passed=False, response_text="", tools_invoked=[], skill_used=None,
                 reflexion_score=None, latency_seconds=0.0,
-                failed_assertions=["kg-retrieval: kg engine or seed_fact (subject/predicate/object) missing"],
+                failed_assertions=[f"{task.category}: kg engine or seed fact (subject/predicate/object) missing"],
                 error="setup_error",
             )
 
         async def _clean():
-            try:
-                await kg.delete_fact(s, p, o)
-            except Exception as e:
-                logger.warning("[EvalHarness] kg cleanup failed for %s: %s", task.id, e)
+            # Newest first, so a superseding seed is retired before the one it
+            # replaced; every seed is retired regardless.
+            for s, p, o in reversed(triples):
+                try:
+                    await kg.delete_fact(s, p, o)
+                except Exception as e:
+                    logger.warning("[EvalHarness] kg cleanup failed for %s: %s", task.id, e)
 
         await _clean()  # defensive pre-clean
 
@@ -1448,12 +1461,14 @@ class EvalHarness:
             before_failed = self._evaluate_assertions(task.assertions, before)
             before_correct = bool(before.response_text) and not before_failed
 
-            # 2. SEED the KG triple
-            try:
-                await kg.add_fact(s, p, o, confidence=float(seed.get("confidence", 0.95)),
-                                  source="eval", provenance="eval-kg")
-            except Exception as e:
-                logger.warning("[EvalHarness] kg seed failed for %s: %s", task.id, e)
+            # 2. SEED the KG triple(s), in order
+            for seed, (s, p, o) in zip(seeds, triples):
+                try:
+                    await kg.add_fact(s, p, o, confidence=float(seed.get("confidence", 0.95)),
+                                      source="eval", provenance="eval-kg",
+                                      valid_from=seed.get("valid_from"))
+                except Exception as e:
+                    logger.warning("[EvalHarness] kg seed failed for %s: %s", task.id, e)
 
             # 3. AFTER — fact present
             after = await self._invoke_brain(task.query, task.timeout)
@@ -1482,7 +1497,7 @@ class EvalHarness:
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=[
-                    "kg-retrieval: after run timed out — pair untestable"
+                    f"{task.category}: after run timed out — pair untestable"
                 ],
                 error=after.error or before.error,
                 decomposed=after.decomposed,
