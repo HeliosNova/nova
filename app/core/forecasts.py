@@ -400,6 +400,15 @@ async def _ensemble_confidence(claim: str, context: str, *, k: int = _CONF_SAMPL
     return mean, spread
 
 
+# What the ensembled minter returns when the validator refused a candidate it
+# DID parse. Falsy, so `if fid:` still means "minted", but distinct from None
+# ("no forecast line, or one that did not parse") so the callers' format-drift
+# warning — the 2026-09-07 instrument for parser losses — stays quiet on a
+# refusal. The first consolidation under the validator (2026-09-23 01:46 UTC)
+# refused 6 of 7 candidates and logged every one as "mint format drift?".
+REJECTED = 0
+
+
 async def parse_and_store_forecast_ensembled(
         db, text: str, *, storyline_key: str = "", source_monitor: str = "",
         model: str | None = None, k: int = _CONF_SAMPLES):
@@ -410,6 +419,9 @@ async def parse_and_store_forecast_ensembled(
     written with the full analysis in context; the samples are what stop one
     generation's number standing alone. The spread is recorded so a later
     question — does disagreement predict error? — has data to answer it.
+
+    Returns the new forecast id, REJECTED (0) when the validator refused the
+    candidate, or None when the text carried no parseable FORECAST line.
     """
     parsed = _parse_forecast_line(text)
     if parsed is None:
@@ -418,7 +430,7 @@ async def parse_and_store_forecast_ensembled(
     ok, claim, criterion, reason = await validate_candidate(claim, date, text, model=model)
     if not ok:
         logger.info("[Forecast] rejected at mint (%s): %s", reason, claim[:80])
-        return None
+        return REJECTED
     # The samples see the criterion too: a probability for "X happens" and one
     # for "source S reports X by D" are different questions.
     ctx = (f"RESOLUTION CRITERION: {criterion}\n\n" if criterion else "") + (text or "")

@@ -814,9 +814,11 @@ async def _update_dossier(db, cand: dict, sources: str, syn_model: str | None,
                 source_monitor="Knowledge Consolidation", model=syn_model)
             if fid:
                 logger.info("[Knowing] forecast minted (#%s) from %r", fid, cand["title"])
-            elif "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
+            elif fid is None and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
                 # a FORECAST line was emitted but didn't parse/store — the exact
                 # silent seam that zeroed minting for weeks pre-2026-08-13.
+                # (A validator refusal returns forecasts.REJECTED, not None, and
+                # is logged by the minter itself — it is not drift.)
                 from app.core.forecasts import forecast_line_excerpt
                 logger.warning("[Knowing] FORECAST line present but not stored for %r "
                                "— mint format drift? line=%r",

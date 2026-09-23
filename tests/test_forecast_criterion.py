@@ -60,7 +60,9 @@ async def test_a_rejected_candidate_mints_nothing(db):
 
     with patch("app.core.forecasts.llm.invoke_nothink", AsyncMock(side_effect=fake)):
         fid = await forecasts.parse_and_store_forecast_ensembled(db, LINE, source_monitor="t")
-    assert fid is None
+    # A refusal is not "nothing parsed": the callers' format-drift warning keys
+    # on None, and a validator refusal must not count as a parser loss.
+    assert fid == forecasts.REJECTED and not fid and fid is not None
     assert db.fetchone("SELECT count(*) AS c FROM forecasts")["c"] == 0
 
 

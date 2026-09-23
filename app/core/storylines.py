@@ -440,7 +440,9 @@ async def _update_story(db, story: dict, kg=None) -> dict | None:
             # tripwire on loop writes).
             _fid = await parse_and_store_forecast_ensembled(
                 db, out, storyline_key=eff_key, source_monitor="Storyline Tracker")
-            if not _fid and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
+            # None = nothing parsed (drift); forecasts.REJECTED = the validator
+            # refused a parsed candidate, which the minter logs itself.
+            if _fid is None and "FORECAST:" in out.upper() and "FORECAST: NONE" not in out.upper():
                 from app.core.forecasts import forecast_line_excerpt
                 logger.warning("[Storyline] FORECAST line present but not stored for %r "
                                "— mint format drift? line=%r",
