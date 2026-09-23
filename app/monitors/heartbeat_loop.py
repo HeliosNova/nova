@@ -397,6 +397,9 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # so the GC can't cancel them mid-flight; the done_callback discards
         # the entry and surfaces any exception at WARNING.
         self._kg_bg_tasks: set[asyncio.Task] = set()
+        # The extraction a monitor left running, by monitor id, so the gated
+        # check can wait for it before releasing the residency slot (2026-09-23).
+        self._kg_task_by_monitor: dict[int, asyncio.Task] = {}
         # Per-cycle alert batching. When enabled, _send_alert buffers each
         # monitor's alert (after dedup/routing) and the loop flushes ONE digest
         # per channel-group at the end of the tick — so 80 due monitors post a
@@ -607,6 +610,14 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                                             message=f"Exception — retry in ~{_retry_delay // 60} min: {e}",
                                         )
                                 finally:
+                                    # The digest's KG extraction is 27B work that
+                                    # used to outlive the gate: at 01:59 UTC on
+                                    # 2026-09-23 the judge (gemma) took the card the
+                                    # second the last digest released it, while that
+                                    # digest's extraction was still queued on the 27B
+                                    # — six reloads in half an hour. Hold the slot
+                                    # until the extraction is done.
+                                    await self._await_kg_extraction(monitor.id)
                                     await gate.release()
                                 # Progressive flush (OUTSIDE the gate — Discord I/O must
                                 # not hold a monitor concurrency slot): post as soon as a few
@@ -811,6 +822,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                                             model=_syn, trust=0.7)
                     )
                     self._kg_bg_tasks.add(_kg_task)
+                    self._kg_task_by_monitor[monitor.id] = _kg_task
 
                     def _on_kg_done(t: asyncio.Task, _name: str = monitor.name) -> None:
                         self._kg_bg_tasks.discard(t)
@@ -1771,6 +1783,19 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         if item is None:
             return None
         return "digest" if item.source in _EVIDENCE_FIRST_SOURCES else "other"
+
+    async def _await_kg_extraction(self, monitor_id: int, timeout: float = 600.0) -> None:
+        """Wait (bounded) for the KG extraction a monitor left running, so the
+        residency slot is released only when its model work is truly over. A
+        timeout leaves the task running — it is still tracked by
+        `_kg_bg_tasks` — and just stops holding the slot."""
+        task = getattr(self, "_kg_task_by_monitor", {}).pop(monitor_id, None)
+        if task is None or task.done():
+            return
+        try:
+            await asyncio.wait({task}, timeout=timeout)
+        except Exception as e:
+            logger.debug("[Heartbeat] waiting for KG extraction of monitor %s: %s", monitor_id, e)
 
     def lane_busy(self) -> bool:
         """True while any LLM-lane monitor holds the residency gate.
