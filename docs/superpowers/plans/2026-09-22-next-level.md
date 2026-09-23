@@ -87,6 +87,22 @@ research on what we need to move to the next level."
   if its Brier beats the 27B on ≥60 % of paired claims.
 - Cuts landed (`7b8d97c`): the curiosity queue now has two sources; step 4's
   measurement starts from here.
+- Step 1 verified on its first live consolidation (2026-09-23 01:46 UTC):
+  7 candidates, 1 minted with a stored criterion, 6 refused for stated
+  reasons (a restated consensus, a two-outcome bundle, an outcome already
+  under way, an undefined term, an action already taken). Acceptance 14 %
+  against OpenForecaster's 7 %. Expect roughly one mint per consolidation;
+  the record grows slowly by design. A refusal used to trip the parser-drift
+  warning; fixed (`1abb198`, `forecasts.REJECTED`).
+- Residency, the precondition for every bake-off number meaning anything:
+  two more leaks closed the same night — the digest's detached KG extraction
+  outliving the class gate (`bbcba3d`) and startup's own KG LLM curation and
+  chat-model warmup evicting the resident 27B on every restart (`63cbedb`).
+  Cold loads measured from the T7 once the page cache is gone: 9B 4 min,
+  27B 7 min; warm 27B 17 s. Each swap is therefore minutes, not seconds, and
+  the quiet-window jobs must be the only thing touching the card.
+- Deploy of `63cbedb`/`1abb198` is deferred to the quiet window (01:02
+  local) so no digest is killed mid-run; the bake-offs follow at 02:07.
 
 ## Sources
 
