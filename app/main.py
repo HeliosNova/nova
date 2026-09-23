@@ -172,7 +172,13 @@ async def lifespan(app: FastAPI):
     reflexions = await asyncio.to_thread(ReflexionStore, db)
     logger.info("Reflexion store initialized")
 
-    # KG auto-curation (heuristic pass runs inline, LLM pass runs in background)
+    # KG auto-curation: the heuristic pass runs inline (deterministic, fast).
+    # The LLM pass used to start here as a background task on the chat model
+    # and was a residency leak: on the 2026-09-23 02:41 UTC restart it asked
+    # for the 9B while the 27B was resident for the digest batch, the 9B
+    # cold-loaded for 4m09s, and eight digests waited behind it. Nothing
+    # outside the heartbeat tick may hold the card, so the LLM pass now runs
+    # inside the KG Health Monitor under the class gate (health_checks.py).
     # Note: KG/reflexion decay is handled by the daily maintenance monitor
     kg_curation_task = None
     try:
@@ -180,17 +186,6 @@ async def lifespan(app: FastAPI):
         heuristic_cleaned = curation.get("heuristic", 0)
         if heuristic_cleaned:
             logger.info("KG curation: removed %d garbage facts (heuristic)", heuristic_cleaned)
-
-        async def _bg_kg_curate():
-            try:
-                result = await kg.curate(sample_size=20, heuristic=False)  # LLM only
-                llm_cleaned = result.get("llm", 0)
-                if llm_cleaned:
-                    logger.info("KG LLM curation: removed %d additional facts", llm_cleaned)
-            except Exception as e:
-                logger.warning("KG LLM curation failed (non-blocking): %s", e)
-
-        kg_curation_task = asyncio.create_task(_bg_kg_curate())
     except Exception as e:
         logger.warning("KG curation failed: %s", e)
 
@@ -549,6 +544,14 @@ async def lifespan(app: FastAPI):
     # first user query. Cuts first-query latency from ~30-60s to <1s.
     async def _warmup():
         try:
+            if heartbeat_loop is not None:
+                # The tick loads whichever model its next batch needs within
+                # a minute of startup, so a chat-model warmup here is either
+                # redundant (a 9B batch) or evicted at once (a 27B batch) —
+                # and on 2026-09-23 it cold-loaded the 9B for 249 s while
+                # eight digests queued behind it. The tick owns the card.
+                logger.info("Model warmup skipped: the heartbeat tick owns the card")
+                return
             from app.core import llm
             t0 = time.monotonic()
             # max_tokens=16 + a prompt with a natural 1-word answer (was "ok"

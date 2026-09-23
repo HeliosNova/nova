@@ -498,6 +498,20 @@ class HealthChecksMixin:
             """)
             if orphans_row:
                 fields["orphans"] = orphans_row["c"]
+            # LLM garbage retirement (20 low-confidence facts through the
+            # chat model). It ran at startup as a detached task until
+            # 2026-09-23, when it evicted the resident 27B under a digest
+            # batch; this monitor is slow-lane class "other", so here the
+            # same call runs on the model the gate already holds. Never
+            # fatal: the health verdict does not depend on it.
+            try:
+                curated = await svc.kg.curate(sample_size=20, heuristic=False)
+                fields["llm_retired"] = int(curated.get("llm", 0) or 0)
+                if fields["llm_retired"]:
+                    logger.info("[Heartbeat] KG Health: LLM curation retired %d fact(s)",
+                                fields["llm_retired"])
+            except Exception as e:
+                logger.warning("[Heartbeat] KG Health: LLM curation failed (non-blocking): %s", e)
             active = fields.get("active", 0)
             orphans = fields.get("orphans", 0)
             if isinstance(active, int) and active == 0:
