@@ -122,6 +122,36 @@ research on what we need to move to the next level."
   beats both blind re-estimators by 0.08 Brier. Context is the lever, not
   the model — which is what HINDCAST and the evidence-summary averaging
   papers say, and what the validator + criterion step already builds on.
+- Harness rule learned on step 3 (2026-09-23 09:59 UTC): a replay with a
+  non-config model must also pass `--set MONITOR_SYNTHESIS_MODEL=<model>`.
+  `deep_research._verify_lead_claims` reads the config model instead of the
+  chain's `syn_model`, so the Gemma arm pulled the 27B onto the card
+  mid-topic — a third residency per topic, each a cold load. Harmless in
+  production (same model), invisible in the baseline arm (same model), and
+  it cost the first Gemma run its second topic.
+- **Step 3 result — Gemma 4 26B-A4B REJECTED as synthesis model**
+  (2026-09-23 11:35 UTC, `ceiling_ab.py --replay`, 8 frozen topics, same
+  evidence in both arms, judge gemma4:e4b, `/data/ceiling/results/gemma4_n8.rows.jsonl`
+  vs `prime_off_n16`, exact sign-flip p):
+
+  | metric | Gemma 26B-A4B | Qwen3.8-27B | delta | won | p |
+  |---|---|---|---|---|---|
+  | fact support | 0.645 | 0.751 | −0.105 | 3/8 | 0.16 |
+  | fabricated | 0.000 | 0.000 | 0 | — | — |
+  | core coverage | 0.627 | 0.690 | −0.062 | 2/6 | 0.28 |
+  | judge (RACE) | 4.53 | 4.63 | −0.09 | 0/3 | 0.25 |
+  | overall | 0.828 | 0.873 | −0.045 | 3/8 | 0.09 |
+  | chars | 5,363 | 7,859 | −2,496 | 0/8 | 0.008 |
+
+  The rule was support within 0.02 and fabrication 0; fabrication held,
+  support did not. Gemma won China tech, economics and finance by a hair
+  and lost cybersecurity by 0.14 and AI/ML by 0.11. The one significant
+  difference is length: Gemma writes a third less on identical evidence.
+  It is 2.3× faster on generation (118.8 vs 51.3 tok/s, clean probe on an
+  idle card; prompt 422 vs 136) and loads warm in 8 s — a real throughput
+  lever if grounding were equal. It is not, and grounding is the product.
+  Keep the tag pulled for a future quantization or prompt retest; do not
+  retest without a change that could plausibly move support by 0.1.
 
 ## Sources
 
