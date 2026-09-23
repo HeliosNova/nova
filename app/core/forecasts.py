@@ -652,6 +652,122 @@ async def _gather_evidence(claim: str, *, created_at=None, max_results: int = 8)
     return "\n".join(lines)
 
 
+async def gather_prior_evidence(claim: str, *, as_of=None, max_results: int = 8,
+                                strict_dates: bool = False) -> str:
+    """Evidence for MINTING a forecast: what was knowable when the claim was
+    made. The mirror of _gather_evidence, which grades and therefore drops
+    anything published BEFORE the forecast — this keeps only what was
+    published on or before `as_of`, minus low-credibility hosts.
+
+    strict_dates=True also drops undated results: the leak-free replay
+    setting (HINDCAST), because an undated page found today may describe the
+    outcome. Live minting passes as_of=None — everything found is prior by
+    definition — so only the credibility filter applies. Returns the same
+    titled-snippet block _gather_evidence returns, or '' when nothing usable
+    was found (the caller then estimates from the claim alone).
+    """
+    try:
+        from app.tools import native_search
+        results = list(await native_search.search(claim, max_results=max_results, mode="news"))
+        # News engines surface what is recent. A replay asks for what was
+        # published months ago, so in strict mode the general index is always
+        # searched too; live minting only falls back to it when news is thin.
+        if strict_dates or len(results) < 3:
+            results += await native_search.search(claim, max_results=max_results, mode="general")
+    except Exception as e:
+        logger.debug("[Forecast] prior-evidence search failed: %s", e)
+        return ""
+    cutoff = _parse_ts(as_of)
+    try:
+        from app.core.source_authority import authority
+    except Exception:  # pragma: no cover
+        authority = None
+    seen: set[str] = set()
+    lines: list[str] = []
+    later = undated = junk = 0
+    for r in results:
+        url = (getattr(r, "url", "") or "").strip()
+        if not url or url in seen:
+            continue
+        seen.add(url)
+        host = (urlparse(url).netloc or "").replace("www.", "")
+        if authority is not None and host and authority(host) < 0.3:
+            junk += 1
+            continue
+        pub = _parse_evidence_date(getattr(r, "published_date", "") or "")
+        if cutoff is not None:
+            if pub is None:
+                if strict_dates:
+                    undated += 1
+                    continue
+            elif pub.date() > cutoff.date():
+                later += 1
+                continue
+        title = (getattr(r, "title", "") or "").strip()
+        snippet = (getattr(r, "snippet", "") or "").strip()
+        date = pub.date().isoformat() if pub else "undated"
+        entry = f"- {title} ({date})" + (f" [{host}]" if host else "")
+        if snippet:
+            entry += f": {snippet[:300]}"
+        lines.append(entry)
+        if len(lines) >= 8:
+            break
+    if later or undated or junk:
+        logger.info("[Forecast] prior-evidence filter: kept %d, dropped %d after the claim, "
+                    "%d undated, %d low-credibility", len(lines), later, undated, junk)
+    return "\n".join(lines)
+
+
+_REFERENCE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "reference_class": {"type": "string"},
+        "base_rate": {"type": "number"},
+    },
+    "required": ["reference_class", "base_rate"],
+}
+_REFERENCE_PROMPT = (
+    "Before estimating this claim, name the reference class it belongs to — the "
+    "kind of event it is, stated so that its historical frequency is meaningful "
+    "(for example: a central bank delivering a move most of its members projected "
+    "one meeting ahead; a bill passing one chamber within a month of introduction; "
+    "a company shipping a product on the quarter it guided) — and the base rate: "
+    "the fraction of events in that class that happen within the same horizon.\n\n"
+    "CLAIM: {claim}\nRESOLVES: {resolves}\n\n"
+    'Reply JSON only: {{"reference_class": "<one line>", "base_rate": <number between 0 and 1>}}'
+)
+
+
+async def reference_class(claim: str, resolves_on: str | None = None, *,
+                          model: str | None = None) -> tuple[str, float] | None:
+    """One call naming the claim's reference class and its base rate — the
+    outside view the confidence samples are then anchored on (the plan's
+    'base rate step before the probability'). None when the model gives
+    nothing usable; the caller then estimates without it."""
+    prompt = _REFERENCE_PROMPT.format(claim=claim[:400], resolves=resolves_on or "unstated")
+    try:
+        raw = await llm.invoke_nothink(
+            [{"role": "user", "content": prompt}], json_mode=True,
+            json_schema=_REFERENCE_SCHEMA, max_tokens=120, temperature=0.2,
+            model=model, num_ctx=4096)
+        data = llm.extract_json_object(raw) if isinstance(raw, str) else (raw or {})
+        cls = str(data.get("reference_class") or "").strip()
+        rate = float(data.get("base_rate"))
+        if cls and 0.0 <= rate <= 1.0:
+            return cls, rate
+    except Exception as e:
+        logger.debug("[Forecast] reference class failed: %s", e)
+    return None
+
+
+def outside_view_block(ref: tuple[str, float] | None) -> str:
+    """The lines the confidence samples see when a reference class is known."""
+    if not ref:
+        return ""
+    cls, rate = ref
+    return f"REFERENCE CLASS: {cls}\nBASE RATE for that class: {rate:.2f}\n\n"
+
+
 _MAX_RESOLVE_ATTEMPTS = 3
 
 
