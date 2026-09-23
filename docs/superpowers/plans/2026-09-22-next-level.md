@@ -152,6 +152,48 @@ research on what we need to move to the next level."
   lever if grounding were equal. It is not, and grounding is the product.
   Keep the tag pulled for a future quantization or prompt retest; do not
   retest without a change that could plausibly move support by 0.1.
+- **Step 1 follow-up in flight (2026-09-23 17:2x UTC):** because the
+  bake-off said context is the lever, two mint-time context levers were
+  built unwired and are being measured leak-free on the same 144 claims
+  (`scripts/forecast_context_backtest.py`, `4b7502a`): web evidence dated
+  on or before the claim (undated dropped, the HINDCAST rule) and an
+  explicit reference-class + base-rate step. Adoption rules are in the
+  script's docstring.
+- **Step 1 follow-up result — both levers refused, mint unchanged**
+  (2026-09-23 18:46 UTC, n=144, 27B, k=3,
+  `/data/ceiling/forecast_context_2026-09-23.rows.jsonl`):
+
+  | arm | Brier | closer than claim-only |
+  |---|---|---|
+  | stated as minted (saw the digest) | 0.2287 | — |
+  | claim only | 0.3172 | — |
+  | + prior-dated evidence | 0.3217 | 69/144 (48 %) |
+  | + reference class / base rate | 0.3190 | 59/144 (41 %) |
+  | + both | 0.3220 | 61/144 |
+
+  Evidence: strictly prior-dated pages were findable for **1 claim in
+  144** — today's index does not carry dated pre-claim reporting for
+  Nova's claims, so the arm is claim-only plus noise and the lever cannot
+  be measured leak-free this way. At live mint time the evidence is the
+  digest itself, which is already in the samples' context. Reference
+  class: the model produced a base rate for every claim (mean 0.47), the
+  samples then sat within 0.05 of it, and the base rate alone scores
+  0.3363 — the outside view anchors the estimate on an uninformative
+  number. Rule was ≥60 % closer; it reached 41 %.
+
+  **Noise floor, measured and worth keeping:** 143 pairs with identical
+  context (the evidence arm where no evidence was found, against
+  claim-only) differ by a mean |0.115| per claim at k=3, T=0.7. A paired
+  count near 72/144 is a coin flip, and Brier differences under ~0.02 are
+  unreadable at this n. Any future estimator comparison needs either k≥8
+  or a larger record.
+- **Step 5 shipped as an instrument (`92b89ed`):** eval category
+  `long-memory`, five LongMemEval-shaped tasks (knowledge update, temporal
+  recall, multi-session aggregation, multi-valued recall, abstention) on
+  fictional entities through the before/seed/after runner. The temporal
+  task is expected to fail until chat retrieval reads the KG's history;
+  it ships failing so the gap has a number. First live numbers below once
+  the image is deployed and the category has run.
 
 ## Sources
 
