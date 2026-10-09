@@ -59,6 +59,14 @@ services:
     volumes:
       - ollama_data:/root/.ollama
       # - C:/data/finetune/merged:/finetune-model:ro  # Temp mount for model import
+      - ./scripts/ollama_entrypoint.sh:/usr/local/bin/ollama_entrypoint.sh:ro
+    # Boot fix (2026-10-08): Ollama's 30 s GPU discovery times out on a cold
+    # external disk (the CUDA runner libs are ~2 GB) and the container then
+    # runs every model on the CPU for its whole life while `ollama list` stays
+    # green. The wrapper pre-reads the runner libs, watches the discovery
+    # verdict, and exits 1 on "cpu while nvidia-smi sees a card" so the
+    # restart policy retries with the libs cached. tests/test_ollama_entrypoint_gpu_check.py
+    entrypoint: ["/bin/bash", "/usr/local/bin/ollama_entrypoint.sh"]
     healthcheck:
       # `ollama list` alone passes whenever the CLI responds, even if the
       # production model failed to register or was deleted. Grep for the
@@ -71,6 +79,11 @@ services:
       interval: 30s
       timeout: 10s
       retries: 3
+      # The entrypoint pre-reads ~2 GB of runner libs before `ollama serve`
+      # starts (about 50 s cold from the external disk, 2026-10-09); failures
+      # inside the start period do not count, so a cold boot cannot read as
+      # unhealthy and trip the watchdog's aux rule mid-pre-read.
+      start_period: 180s
     logging:
       driver: json-file
       options:
@@ -389,6 +402,11 @@ services:
       # dispatch (system_state.last_dispatch_at) and the rule reads both.
       WATCHDOG_HB_STALE_MIN: "150"
       WATCHDOG_GRACE_SEC: "3600"
+      # Escalation (2026-10-08): the N-th consecutive staleness restart with
+      # no fresh heartbeat in between restarts nova-ollama/nova-embed first.
+      # Six nova-app restarts in a row changed nothing when the fault was a
+      # CPU-placed Ollama. tests/test_watchdog_escalates.py
+      WATCHDOG_STALE_ESCALATE: "2"
       DISCORD_TOKEN: ${DISCORD_TOKEN:-}
       DISCORD_CHANNEL_ID: ${DISCORD_CHANNEL_ID:-}
     networks:

@@ -273,10 +273,33 @@ class HealthChecksMixin:
                 status, summary = "warning", f"ollama slow ({elapsed_ms:.0f}ms)"
             else:
                 status, summary = "ok", f"ollama healthy ({elapsed_ms:.0f}ms)"
-            return format_monitor_result(
-                "Ollama Latency Monitor", status, summary,
-                {"latency": f"{elapsed_ms:.0f}ms"},
-            )
+            fields: dict[str, str | int | float] = {"latency": f"{elapsed_ms:.0f}ms"}
+            # Placement (2026-10-08): a reachable Ollama running the 9B on the
+            # CPU answered this probe "healthy (12ms)" every two hours for 16
+            # hours while every real call timed out. /api/ps says where each
+            # loaded model lives; no VRAM at all is the failure, named.
+            on_cpu: list[str] = []
+            loaded = getattr(provider, "loaded_models", None)
+            if callable(loaded):
+                try:
+                    models = await loaded()
+                except Exception:
+                    models = []
+                for m in models or []:
+                    size, vram = int(m.get("size") or 0), int(m.get("size_vram") or 0)
+                    name = str(m.get("name", "?")).split(":")[0]
+                    if size <= 0:
+                        continue
+                    if vram <= 0:
+                        on_cpu.append(name)
+                        fields[f"model {name}"] = "100% CPU"
+                    else:
+                        share = min(100, round(100 * vram / size))
+                        fields[f"model {name}"] = f"{share}% GPU"
+            if on_cpu and status != "error":
+                status = "error"
+                summary = f"ollama running {', '.join(on_cpu)} on CPU (no VRAM) — restart nova-ollama"
+            return format_monitor_result("Ollama Latency Monitor", status, summary, fields)
         except Exception as e:
             return format_monitor_result(
                 "Ollama Latency Monitor", "error", f"ollama error: {e}",

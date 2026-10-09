@@ -138,6 +138,31 @@ class OllamaProvider:
         except Exception:
             return False
 
+    async def loaded_models(self) -> list[dict]:
+        """The models Ollama currently holds, with where they live.
+
+        ``/api/ps`` reports ``size`` and ``size_vram`` per loaded model; a
+        model with ``size_vram == 0`` is running on the CPU. That is the one
+        signal that distinguishes a healthy Ollama from the 2026-10-08 state
+        (GPU discovery timed out at container start, 9B on CPU for 16 hours,
+        every ``/api/tags`` probe green). Empty on any error.
+        """
+        try:
+            client = self._get_client()
+            resp = await client.get("/api/ps", timeout=10.0)
+            if resp.status_code != 200:
+                return []
+            out: list[dict] = []
+            for m in (resp.json() or {}).get("models", []) or []:
+                out.append({
+                    "name": str(m.get("name") or m.get("model") or "?"),
+                    "size": int(m.get("size") or 0),
+                    "size_vram": int(m.get("size_vram") or 0),
+                })
+            return out
+        except Exception:
+            return []
+
     async def invoke_nothink(
         self,
         messages: list[dict],

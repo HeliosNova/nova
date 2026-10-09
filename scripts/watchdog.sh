@@ -141,6 +141,28 @@ restart_aux() {
     docker_api 90 "/containers/$1/restart?t=30" -X POST >/dev/null 2>&1
 }
 
+# Escalation (2026-10-08): six times in sixteen hours the staleness rule
+# restarted nova-app and six times the heartbeat stayed dead, because the
+# container that was wrong was nova-ollama (9B on the CPU after a timed-out
+# GPU discovery at boot). Consecutive staleness restarts with no fresh
+# heartbeat in between mean the restart is not reaching the fault: on the
+# STALE_ESCALATE-th one the aux targets are restarted first, then nova-app.
+STALE_ESCALATE=${WATCHDOG_STALE_ESCALATE:-2}
+STALE_STREAK=0
+
+escalate_aux() {
+    # $1 = reason
+    if [ "$DRY_RUN" = "1" ]; then
+        log "DRY RUN — would restart [${AUX_TARGETS}]: $1"
+        return
+    fi
+    log "escalating: $1 — restarting [${AUX_TARGETS}] before ${TARGET}"
+    alert "nova-app restart did not revive the heartbeat ($1) — restarting ${AUX_TARGETS} first, then nova-app. If this repeats, check 'docker exec nova-ollama ollama ps' for a CPU-placed model."
+    for c in $AUX_TARGETS; do
+        docker_api 90 "/containers/$c/restart?t=30" -X POST >/dev/null 2>&1
+    done
+}
+
 check_aux_targets() {
     now=$(date +%s)
     for c in $AUX_TARGETS; do
@@ -214,9 +236,19 @@ while true; do
                        # same task with the same stale clock — the death spiral.
                        log "heartbeat stale ${stale}m but within post-restart grace (${since_restart}/${GRACE_SEC}s) — deferring"
                    else
-                       restart_target "heartbeat stale ${stale}m — loop alive but monitors dead"
+                       STALE_STREAK=$((STALE_STREAK + 1))
+                       if [ "$STALE_STREAK" -ge "$STALE_ESCALATE" ]; then
+                           escalate_aux "${STALE_STREAK} staleness restarts of ${TARGET} in a row did not revive the loop"
+                           restart_target "heartbeat stale ${stale}m after ${STALE_STREAK} restarts — model containers restarted first"
+                           STALE_STREAK=0
+                       else
+                           restart_target "heartbeat stale ${stale}m — loop alive but monitors dead"
+                       fi
                        continue
                    fi
+               else
+                   # a fresh reading: whatever we restarted last time worked
+                   STALE_STREAK=0
                fi ;;
         esac
     fi
