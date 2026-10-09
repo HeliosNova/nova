@@ -48,10 +48,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcomposite1 libxdamage1 libxfixes3 libxrandr2 libgbm1 \
     libpango-1.0-0 libcairo2 libasound2 libwayland-client0 \
     fonts-liberation fonts-noto-color-emoji \
-    # Voice transcription (Whisper needs ffmpeg for audio decoding)
-    ffmpeg \
-    # Desktop automation deps (PyAutoGUI — optional, used with ENABLE_DESKTOP_AUTOMATION)
-    xvfb scrot x11-utils python3-tk python3-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Python deps
@@ -88,7 +84,7 @@ RUN echo "cachebust=${CACHEBUST}" > /tmp/.cachebust
 COPY app/ app/
 
 # Data directory + non-root user
-RUN mkdir -p /data /data/screenshots /data/mcp && \
+RUN mkdir -p /data /data/screenshots && \
     useradd -m -u 1000 nova && \
     chown -R nova:nova /app /data /home/nova
 

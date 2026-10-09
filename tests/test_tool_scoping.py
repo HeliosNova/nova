@@ -23,8 +23,8 @@ from app.tools.base import BaseTool, ToolRegistry, ToolResult
 def test_research_whitelist_has_no_side_effect_tools():
     wl = access_tiers.RESEARCH_TOOLS
     assert {"web_search", "http_fetch", "browser", "knowledge_search", "memory_search"} <= wl
-    assert not (wl & {"shell_exec", "file_ops", "desktop", "tool_create", "email_send",
-                      "webhook", "integration", "background_task", "delegate"})
+    assert not (wl & {"shell_exec", "file_ops", "tool_create", "email_send",
+                      "webhook", "integration", "delegate"})
 
 
 def test_research_scope_intersects_an_existing_whitelist_and_restores():
@@ -90,7 +90,7 @@ class _Shell(BaseTool):
 
 def test_taint_sets_are_sane():
     assert {"web_search", "http_fetch", "browser", "deep_research", "knowledge_search"} <= _WEB_INGEST_TOOLS
-    assert {"shell_exec", "file_ops", "desktop", "tool_create"} <= _TAINT_STRIPPED_TOOLS
+    assert {"shell_exec", "file_ops", "tool_create"} <= _TAINT_STRIPPED_TOOLS
     assert "calculator" not in _TAINT_STRIPPED_TOOLS and "code_exec" not in _TAINT_STRIPPED_TOOLS
 
 

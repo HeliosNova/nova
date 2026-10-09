@@ -1,9 +1,0 @@
-{
-  "//": "Nova's live DB is inside the 'nova_data' Docker volume — unreachable from any host path (the old Desktop paths here served an empty ghost DB; the runner now refuses to start on one). Run the MCP server INSIDE the container via docker exec.",
-  "mcpServers": {
-    "nova": {
-      "command": "docker",
-      "args": ["exec", "-i", "nova-app", "python", "scripts/mcp_server_runner.py"]
-    }
-  }
-}

@@ -30,16 +30,12 @@ class DailyDigest:
         *,
         discord_bot: Any = None,
         telegram_bot: Any = None,
-        whatsapp_bot: Any = None,
-        signal_bot: Any = None,
         learning_engine: Any = None,
         db: Any = None,
     ):
         self._store = monitor_store
         self._discord = discord_bot
         self._telegram = telegram_bot
-        self._whatsapp = whatsapp_bot
-        self._signal = signal_bot
         self._learning = learning_engine
         self._db = db
         self._task: asyncio.Task | None = None
@@ -286,13 +282,3 @@ class DailyDigest:
                 await self._telegram.send_alert(message)
             except Exception as e:
                 logger.error("[Digest] Telegram send failed: %s", e)
-        if self._whatsapp:
-            try:
-                await self._whatsapp.send_alert(message)
-            except Exception as e:
-                logger.error("[Digest] WhatsApp send failed: %s", e)
-        if self._signal:
-            try:
-                await self._signal.send_alert(message)
-            except Exception as e:
-                logger.error("[Digest] Signal send failed: %s", e)

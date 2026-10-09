@@ -359,22 +359,16 @@ class TestMonitorRouting:
 
         discord_bot = AsyncMock()
         telegram_bot = AsyncMock()
-        whatsapp_bot = AsyncMock()
-        signal_bot = AsyncMock()
 
         loop = HeartbeatLoop(
             store,
             discord_bot=discord_bot,
             telegram_bot=telegram_bot,
-            whatsapp_bot=whatsapp_bot,
-            signal_bot=signal_bot,
         )
         loop._digest_enabled = False  # test immediate-send routing (digest batches separately)
         await loop._send_alert(m, "db healthy")
 
         discord_bot.send_alert.assert_not_called()
-        whatsapp_bot.send_alert.assert_not_called()
-        signal_bot.send_alert.assert_not_called()
         telegram_bot.send_alert.assert_called_once()
         # Must carry the name prefix so Telegram users still see which monitor
         sent_msg = telegram_bot.send_alert.call_args[0][0]
@@ -392,23 +386,17 @@ class TestMonitorRouting:
 
         discord_bot = AsyncMock()
         telegram_bot = AsyncMock()
-        whatsapp_bot = AsyncMock()
-        signal_bot = AsyncMock()
 
         loop = HeartbeatLoop(
             store,
             discord_bot=discord_bot,
             telegram_bot=telegram_bot,
-            whatsapp_bot=whatsapp_bot,
-            signal_bot=signal_bot,
         )
         loop._digest_enabled = False  # test immediate-send routing (digest batches separately)
         await loop._send_alert(m, "major news")
 
         discord_bot.send_alert.assert_called_once()
         telegram_bot.send_alert.assert_called_once()
-        whatsapp_bot.send_alert.assert_called_once()
-        signal_bot.send_alert.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_system_monitor_without_telegram_is_suppressed(self, store):

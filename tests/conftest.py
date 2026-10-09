@@ -55,9 +55,7 @@ def _test_env(tmp_path, monkeypatch):
     # Isolate from the container's ambient production ENABLE_* overrides so
     # default-config tests are deterministic regardless of the runtime env (the
     # container bakes these true; tests assert the code defaults).
-    monkeypatch.setenv("ENABLE_VOICE", "false")
     monkeypatch.setenv("ENABLE_TWO_PHASE_DREAM", "false")
-    monkeypatch.setenv("ENABLE_DESKTOP_AUTOMATION", "false")
     monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
     # (multi-agent decomposition env vars removed 2026-08-25 — archived)

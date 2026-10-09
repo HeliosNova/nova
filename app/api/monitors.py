@@ -80,7 +80,7 @@ class MonitorUpdate(BaseModel):
     def validate_channels(cls, v: str | None) -> str | None:
         if v is None:
             return v
-        valid = {"discord", "telegram", "whatsapp", "signal"}
+        valid = {"discord", "telegram"}
         if v.strip() == "":
             return ""  # explicit empty = clear override
         parts = [p.strip().lower() for p in v.split(",") if p.strip()]
@@ -371,7 +371,7 @@ async def get_monitor_channels(monitor_id: int):
         "effective": (
             [c.strip() for c in monitor.channels.split(",") if c.strip()]
             if monitor.channels
-            else (["telegram"] if monitor.category == "system" else ["discord", "telegram", "whatsapp", "signal"])
+            else (["telegram"] if monitor.category == "system" else ["discord", "telegram"])
         ),
     }
 
@@ -400,7 +400,7 @@ async def bulk_set_channels(body: dict):
     Or by-pattern: {"name_match": "Domain Study:", "channels": "discord"}
     """
     store = _get_store()
-    valid = {"discord", "telegram", "whatsapp", "signal"}
+    valid = {"discord", "telegram"}
     updated = []
     if "updates" in body:
         for u in body["updates"]:

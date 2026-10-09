@@ -301,11 +301,6 @@ class TestModuleImports:
         assert Fact is not None
         assert callable(normalize_predicate)
 
-    def test_import_core_task_manager(self):
-        from app.core.task_manager import TaskManager, BackgroundTask
-        assert TaskManager is not None
-        assert BackgroundTask is not None
-
     def test_import_schema(self):
         from app.schema import ChatRequest, ChatResponse, StreamEvent, EventType
         assert ChatRequest is not None

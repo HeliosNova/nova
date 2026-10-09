@@ -92,7 +92,7 @@ async def test_a_tick_dispatches_only_the_most_overdue_few(monkeypatch):
     loop._digest_enabled = False
     loop._digest_buffer = []
     loop._kg_bg_tasks = set()
-    loop._discord = loop._telegram = loop._whatsapp = loop._signal = None
+    loop._discord = loop._telegram = None
     monkeypatch.setattr(hb, "asyncio", _Shim(asyncio, lambda: setattr(loop, "_running", False)))
     loop._running = True
 

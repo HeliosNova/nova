@@ -1,7 +1,7 @@
 """HeartbeatLoop — the background scheduling engine.
 
 Checks monitors on schedule, executes them, and delivers alerts via
-Discord, Telegram, WhatsApp, and Signal channel bots.
+Discord and Telegram channel bots.
 
 Extracted from heartbeat.py for maintainability.
 """
@@ -383,14 +383,10 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         *,
         discord_bot: Any = None,
         telegram_bot: Any = None,
-        whatsapp_bot: Any = None,
-        signal_bot: Any = None,
     ):
         self.store = store
         self._discord = discord_bot
         self._telegram = telegram_bot
-        self._whatsapp = whatsapp_bot
-        self._signal = signal_bot
         self._task: asyncio.Task | None = None
         self._running = False
         # Strong-ref set for fire-and-forget background tasks (KG extraction)
@@ -1480,18 +1476,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 sent = True
             except Exception as e:
                 logger.warning("[Heartbeat] Instruction Telegram send failed: %s", e)
-        if "whatsapp" in channels and self._whatsapp:
-            try:
-                await self._whatsapp.send_alert(message)
-                sent = True
-            except Exception as e:
-                logger.warning("[Heartbeat] Instruction WhatsApp send failed: %s", e)
-        if "signal" in channels and self._signal:
-            try:
-                await self._signal.send_alert(message)
-                sent = True
-            except Exception as e:
-                logger.warning("[Heartbeat] Instruction Signal send failed: %s", e)
         if sent:
             logger.info("[Heartbeat] Instruction #%d result delivered", inst.id)
 
@@ -2261,18 +2245,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 sent = True
             except Exception as e:
                 logger.error("[Heartbeat] Curiosity follow-up Telegram failed: %s", e)
-        if self._whatsapp:
-            try:
-                await self._whatsapp.send_alert(followup)
-                sent = True
-            except Exception as e:
-                logger.error("[Heartbeat] Curiosity follow-up WhatsApp failed: %s", e)
-        if self._signal:
-            try:
-                await self._signal.send_alert(followup)
-                sent = True
-            except Exception as e:
-                logger.error("[Heartbeat] Curiosity follow-up Signal failed: %s", e)
 
         if sent:
             logger.info("[Heartbeat] Curiosity follow-up sent for '%s'", topic[:60])

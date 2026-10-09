@@ -38,10 +38,3 @@ def test_record_turn_is_a_noop_without_a_chat_id(db):
     loop = HeartbeatLoop.__new__(HeartbeatLoop)
     loop._record_channel_turn("telegram", None, "x")
     assert db.fetchone("SELECT COUNT(*) AS c FROM channel_conversations")["c"] == 0
-
-
-def test_telegram_chat_replies_are_html():
-    from app.channels.telegram import TelegramBot
-    chunks = TelegramBot._reply_chunks("**Bold** and *italic* with `code` https://example.com/x")
-    assert chunks and "<b>Bold</b>" in chunks[0]
-    assert "**" not in chunks[0]

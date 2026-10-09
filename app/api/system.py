@@ -236,7 +236,6 @@ async def get_config_summary():
     return {
         "LLM_PROVIDER": config.LLM_PROVIDER,
         "LLM_MODEL": config.LLM_MODEL,
-        "ENABLE_MCP": config.ENABLE_MCP,
         "ENABLE_DELEGATION": config.ENABLE_DELEGATION,
         "MAX_DELEGATION_DEPTH": config.MAX_DELEGATION_DEPTH,
         "ENABLE_AUTO_SKILL_CREATION": config.ENABLE_AUTO_SKILL_CREATION,
@@ -293,16 +292,13 @@ class ConfigUpdateRequest(BaseModel):
     ENABLE_EXTENDED_THINKING: bool | None = None
     ENABLE_DELEGATION: bool | None = None
     ENABLE_CURIOSITY: bool | None = None
-    ENABLE_VOICE: bool | None = None
     ENABLE_MODEL_ROUTING: bool | None = None
     ENABLE_HEARTBEAT: bool | None = None
     HEARTBEAT_INTERVAL: int | None = Field(None, ge=1)
     ENABLE_PROACTIVE: bool | None = None
     ENABLE_SHELL_EXEC: bool | None = None
-    ENABLE_MCP: bool | None = None
     ENABLE_AUTO_SKILL_CREATION: bool | None = None
     ENABLE_INJECTION_DETECTION: bool | None = None
-    ENABLE_DESKTOP_AUTOMATION: bool | None = None
     ENABLE_WEBHOOKS: bool | None = None
     ENABLE_EMAIL_SEND: bool | None = None
     ENABLE_INTEGRATIONS: bool | None = None

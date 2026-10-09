@@ -1465,7 +1465,7 @@ _FALLBACK_TOOL_NAMES = frozenset({
     "web_search", "calculator", "http_fetch", "knowledge_search",
     "code_exec", "memory_search", "file_ops", "shell_exec", "browser",
     "integration", "screenshot", "monitor", "email_send", "calendar",
-    "reminder", "webhook", "delegate", "desktop", "background_task",
+    "reminder", "webhook", "delegate",
 })
 
 

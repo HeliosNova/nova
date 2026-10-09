@@ -3,31 +3,28 @@
 from __future__ import annotations
 
 import asyncio
-import collections
 import logging
 
 import discord
 
 from app.config import config
-from app.schema import EventType
 
 logger = logging.getLogger(__name__)
 
 
 class DiscordBot:
-    """Discord bot that calls think() directly for each user message."""
+    """Discord delivery adapter: posts Nova's briefings to the configured channel.
+
+    Inbound chat was removed 2026-10-09 (40 user messages ever, all in August;
+    the brain stays reachable through the HTTP chat API). This client only
+    sends; it registers no message handler and needs no message-content intent."""
 
     def __init__(self):
         self.token = config.DISCORD_TOKEN
         self.default_channel_id = config.DISCORD_CHANNEL_ID
 
-        intents = discord.Intents.default()
-        intents.message_content = True
-        self._client = discord.Client(intents=intents)
+        self._client = discord.Client(intents=discord.Intents.default())
         self._shutdown = False  # set by close(); distinguishes app shutdown from a dead client
-        self._conversations: collections.OrderedDict[int, str] = collections.OrderedDict()  # discord user_id → conv_id
-        self._conv_store = None  # lazy-init DB store
-        self._conv_lock = asyncio.Lock()
         # Serializes ALL multi-chunk sends. Slow monitors run concurrently
         # (heartbeat gather), so two alerts that each split into several 2000-char
         # Discord messages used to interleave their chunks ("crossing paths").
@@ -35,29 +32,7 @@ class DiscordBot:
         # before the next begins; a tiny inter-chunk delay also respects Discord's
         # per-channel rate limit.
         self._send_lock = asyncio.Lock()
-        self._allowed_users = self._parse_allowed_users()
-        if not self._allowed_users:
-            logger.warning(
-                "[Discord] DISCORD_ALLOWED_USERS is empty — ALL users are denied "
-                "(fail-closed). Set your Discord user ID to use the bot."
-            )
         self._setup_events()
-
-    @staticmethod
-    def _parse_allowed_users() -> set[int]:
-        """Parse comma-separated user IDs from config."""
-        raw = config.DISCORD_ALLOWED_USERS
-        if not raw:
-            return set()
-        try:
-            return {int(uid.strip()) for uid in raw.split(",") if uid.strip()}
-        except ValueError:
-            logger.warning("[Discord] Invalid DISCORD_ALLOWED_USERS: %s", raw)
-            return set()
-
-    def _is_allowed(self, user_id: int) -> bool:
-        """Check if user is in the allowlist. Empty list = deny all (fail-closed)."""
-        return user_id in self._allowed_users
 
     def _setup_events(self):
         @self._client.event
@@ -67,138 +42,6 @@ class DiscordBot:
                 "[Discord] Connected as %s to %d guild(s): %s",
                 self._client.user, len(guilds), ", ".join(guilds),
             )
-
-        @self._client.event
-        async def on_message(message: discord.Message):
-            if message.author.bot:
-                return
-
-            # Respond to DMs or when mentioned
-            is_dm = isinstance(message.channel, discord.DMChannel)
-            is_mentioned = self._client.user in message.mentions if self._client.user else False
-
-            if not is_dm and not is_mentioned:
-                logger.debug("[Discord] Ignoring message — not a DM and bot not mentioned (requires either)")
-                return
-
-            # Strip bot mention from content
-            content = message.content
-            if self._client.user:
-                content = content.replace(f"<@{self._client.user.id}>", "").strip()
-                content = content.replace(f"<@!{self._client.user.id}>", "").strip()
-
-            if not content:
-                return
-
-            if not self._is_allowed(message.author.id):
-                await message.reply("Sorry, you're not authorized to use this bot.")
-                return
-
-            async with message.channel.typing():
-                await self._stream_reply(message, content)
-
-    async def _get_conversation_id(self, user_id: int) -> str:
-        """Get or create the conversation for this user (memory cache + DB fallback)."""
-        from app.core.brain import get_services
-
-        async with self._conv_lock:
-            conv_id = self._conversations.get(user_id)
-            if conv_id:
-                self._conversations.move_to_end(user_id)
-            else:
-                # Try DB recovery
-                if self._conv_store is None:
-                    from app.database import get_db, ChannelConversationStore
-                    self._conv_store = ChannelConversationStore(get_db())
-                conv_id = self._conv_store.get("discord", str(user_id))
-                if not conv_id:
-                    svc = get_services()
-                    conv_id = svc.conversations.create_conversation()
-                    self._conv_store.set("discord", str(user_id), conv_id)
-                self._conversations[user_id] = conv_id
-                while len(self._conversations) > 1000:  # LRU cap for personal bot
-                    self._conversations.popitem(last=False)
-        return conv_id
-
-    async def _stream_reply(self, message: "discord.Message", query: str) -> None:
-        """Stream-first delivery (#47): send the DRAFT the moment it's complete
-        (the 'refining' stage signal), then EDIT it in place when the refine
-        chain's REVISION lands — the reader gets an answer in generation time,
-        not generation+refine time. Long multi-chunk drafts fall back to a
-        single send at the end (editing a chunk train isn't worth the states)."""
-        from app.core.brain import think
-
-        conv_id = await self._get_conversation_id(message.author.id)
-        _REFINING = "\n\n-# refining…"
-        tokens: list[str] = []
-        draft_msg = None
-        final: str | None = None
-        error: str | None = None
-        try:
-            async for event in think(query=query, conversation_id=conv_id, channel="discord"):
-                if event.type == EventType.TOKEN:
-                    text = event.data.get("text", "")
-                    if text:
-                        tokens.append(text)
-                elif (event.type == EventType.THINKING
-                      and event.data.get("stage") == "refining" and draft_msg is None):
-                    draft = "".join(tokens).strip()
-                    if draft and len(draft) + len(_REFINING) <= 2000:
-                        try:
-                            async with self._send_lock:
-                                draft_msg = await message.reply(draft + _REFINING)
-                        except Exception as e:
-                            logger.warning("[Discord] draft send failed: %s — deliver at end", e)
-                            draft_msg = None
-                elif event.type == EventType.REVISION:
-                    final = event.data.get("text", "")
-                elif event.type == EventType.ERROR:
-                    error = f"Error: {event.data.get('message', 'unknown error')}"
-        except Exception as e:
-            logger.error("[Discord] Query failed: %s", e, exc_info=True)
-            error = "Sorry, something went wrong while processing your message."
-
-        answer = (error or (final if final is not None else "".join(tokens))).strip()
-        if not answer:
-            answer = "I processed your message but had no response."
-        chunks = self._split_message(answer)
-        async with self._send_lock:
-            if draft_msg is not None:
-                try:
-                    await draft_msg.edit(content=chunks[0])
-                    chunks = chunks[1:]
-                except Exception as e:
-                    logger.warning("[Discord] draft edit failed (%s) — sending fresh", e)
-            for i, chunk in enumerate(chunks):
-                await message.reply(chunk)
-                if i + 1 < len(chunks):
-                    await asyncio.sleep(0.3)
-
-    async def _handle_query(self, query: str, user_id: int) -> str:
-        """Run query through think() and collect the final response (non-streaming
-        fallback; on_message uses _stream_reply for live draft delivery)."""
-        from app.core.brain import think
-
-        conv_id = await self._get_conversation_id(user_id)
-        try:
-            tokens = []
-            async for event in think(query=query, conversation_id=conv_id, channel="discord"):
-                if event.type == EventType.REVISION:
-                    # stream-first refine: the final answer replaces the draft
-                    tokens = [event.data.get("text", "")]
-                elif event.type == EventType.TOKEN:
-                    text = event.data.get("text", "")
-                    if text:
-                        tokens.append(text)
-                elif event.type == EventType.ERROR:
-                    return f"Error: {event.data.get('message', 'unknown error')}"
-
-            answer = "".join(tokens).strip()
-            return answer if answer else "I processed your message but had no response."
-
-        except Exception as e:
-            logger.error("[Discord] Query failed: %s", e, exc_info=True)
-            return "Sorry, something went wrong while processing your message."
 
     @staticmethod
     def _split_message(text: str, limit: int = 2000) -> list[str]:
@@ -287,9 +130,7 @@ class DiscordBot:
             # restart (audit 2026-08-19). Rebuild client + handlers per retry,
             # the way the telegram adapter does.
             if self._client.is_closed():
-                intents = discord.Intents.default()
-                intents.message_content = True
-                self._client = discord.Client(intents=intents)
+                self._client = discord.Client(intents=discord.Intents.default())
                 self._setup_events()
             connect_started = time.monotonic()
             try:

@@ -32,7 +32,7 @@ class TestConfigDefaults:
         from app.config import Config
         cfg = Config()
         assert cfg.ENABLE_HEARTBEAT is True
-        assert cfg.ENABLE_VOICE is False
+        assert cfg.ENABLE_TWO_PHASE_DREAM is False
         assert cfg.ENABLE_SHELL_EXEC is False
 
 
@@ -49,12 +49,12 @@ class TestConfigUpdate:
     def test_update_bool_from_string(self):
         from app.config import Config
         cfg = Config()
-        cfg.update(ENABLE_VOICE="true")
-        assert cfg.ENABLE_VOICE is True
-        cfg.update(ENABLE_VOICE="false")
-        assert cfg.ENABLE_VOICE is False
-        cfg.update(ENABLE_VOICE="1")
-        assert cfg.ENABLE_VOICE is True
+        cfg.update(ENABLE_SHELL_EXEC="true")
+        assert cfg.ENABLE_SHELL_EXEC is True
+        cfg.update(ENABLE_SHELL_EXEC="false")
+        assert cfg.ENABLE_SHELL_EXEC is False
+        cfg.update(ENABLE_SHELL_EXEC="1")
+        assert cfg.ENABLE_SHELL_EXEC is True
 
     def test_update_int_from_string(self):
         from app.config import Config

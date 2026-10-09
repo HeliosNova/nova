@@ -732,7 +732,7 @@ class TestSecurityResponseBodies:
 
 class TestUserActivityMiddleware:
     """UserActivityMiddleware writes last_user_activity to system_state for
-    /api/chat, /api/voice, and /api/actions paths; skips all others."""
+    /api/chat and /api/actions paths; skips all others."""
 
     @pytest.fixture
     def activity_client(self, db):

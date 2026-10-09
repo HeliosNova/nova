@@ -33,9 +33,7 @@ def _get_all_tools() -> list[BaseTool]:
     from app.tools.action_calendar import CalendarTool
     from app.tools.action_reminder import ReminderTool
     from app.tools.action_webhook import WebhookTool
-    from app.tools.background_task import BackgroundTaskTool
     from app.tools.monitor_tool import MonitorTool
-    from app.tools.desktop import DesktopTool
     from app.tools.integration import IntegrationTool
     from app.tools.screenshot import ScreenshotTool
 
@@ -54,9 +52,7 @@ def _get_all_tools() -> list[BaseTool]:
         CalendarTool(),
         ReminderTool(),
         WebhookTool(),
-        BackgroundTaskTool(),
         MonitorTool(),
-        DesktopTool(),
         IntegrationTool(),
         ScreenshotTool(),
     ]
@@ -285,30 +281,3 @@ class TestTrimOutput:
 # Phase 4: MCP Server
 # ---------------------------------------------------------------------------
 
-class TestMCPServer:
-    """Verify MCP server structural requirements."""
-
-    def test_mcp_tools_have_long_descriptions(self):
-        """All 5 MCP tools have descriptions > 200 chars."""
-        from app.mcp_server import _TOOLS
-        short = [(t.name, len(t.description)) for t in _TOOLS if len(t.description) < 200]
-        assert not short, f"MCP tools with short descriptions: {short}"
-
-    def test_mcp_error_helper_format(self):
-        """_mcp_error returns CallToolResult with isError=True and structured JSON."""
-        from app.mcp_server import _mcp_error
-        result = _mcp_error("test error", "validation", False)
-        assert result.isError is True
-        assert len(result.content) == 1
-        data = json.loads(result.content[0].text)
-        assert data["error"] == "test error"
-        assert data["error_category"] == "validation"
-        assert data["is_retryable"] is False
-
-    def test_mcp_error_retryable(self):
-        from app.mcp_server import _mcp_error
-        result = _mcp_error("timeout", "transient", True)
-        assert result.isError is True
-        data = json.loads(result.content[0].text)
-        assert data["is_retryable"] is True
-        assert data["error_category"] == "transient"

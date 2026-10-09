@@ -28,9 +28,9 @@ _TOOL_TIERS: dict[str, int] = {
     # Tier 3 (threshold: 60) — external communication + code
     "email_send": 60, "webhook": 60, "integration": 60, "code_exec": 60,
     # Tier 4 (threshold: 80) — system access
-    "shell_exec": 80, "desktop": 80,
+    "shell_exec": 80,
     # Meta — low threshold (orchestration, not direct action)
-    "delegate": 20, "background_task": 20,
+    "delegate": 20,
 }
 
 # Default thresholds — start low, earn access

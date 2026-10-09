@@ -171,8 +171,8 @@ PATHWAYS: tuple[Pathway, ...] = (
 #                      three days before anyone noticed.
 #   user_facts         Zero by design.
 #   verifiable_signals RLVR was archived 2026-09-01.
-#   auth_lockouts, system_state, background_tasks, conversation_summaries,
-#   goals, prompt_modules, custom_tools, documents, event_queue,
+#   auth_lockouts, system_state, conversation_summaries,
+#   prompt_modules, custom_tools, documents, event_queue,
 #   heartbeat_instructions, salience_weights, active_memories
 #                      Event-driven or configuration, not background writers
 #                      that fail by silence.

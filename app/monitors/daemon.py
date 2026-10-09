@@ -28,53 +28,6 @@ BUDGET_FULL = "full"       # Dream mode, heavy research, bulk operations
 DAEMON_TICK = 300  # 5 minutes
 
 
-def _snapshot_goal_metric(db, ctx: dict) -> tuple[int | None, str]:
-    """Read the underlying metric a goal is supposed to fix.
-
-    Returns (count_or_none, human_label). count=None means we don't know how
-    to verify this goal kind — caller will fall back to the old behavior
-    (any non-empty output = success).
-
-    Verifiable goal kinds today:
-      - capability_gap_cluster: count unreviewed capability_gaps for the keyword
-      - skill_repair: count of consecutive_failures on the named skill
-      - tool_trust_regression: trust score (negative = bad) for the tool
-      - recurring_curiosity: count of pending curiosity items for the topic
-    """
-    if not isinstance(ctx, dict):
-        return None, ""
-    src = ctx.get("source") or ""
-    try:
-        if src == "capability_gap_cluster":
-            kw = (ctx.get("keyword") or "").strip().lower()
-            if not kw:
-                return None, ""
-            row = db.fetchone(
-                "SELECT COUNT(*) AS c FROM capability_gaps "
-                "WHERE LOWER(query) LIKE ? AND reviewed = 0",
-                (f"%{kw}%",),
-            )
-            return (int(row["c"]) if row else 0), f"unreviewed capability_gaps matching '{kw}'"
-        if src == "skill_repair":
-            sn = ctx.get("skill_name") or ""
-            row = db.fetchone(
-                "SELECT consecutive_failures FROM skills WHERE name = ?", (sn,)
-            )
-            return (int(row["consecutive_failures"]) if row else 0), f"consecutive_failures for skill '{sn}'"
-        if src == "recurring_curiosity":
-            topic = ctx.get("topic") or ""
-            row = db.fetchone(
-                "SELECT COUNT(*) AS c FROM curiosity_queue "
-                "WHERE topic = ? AND status = 'pending'",
-                (topic,),
-            )
-            return (int(row["c"]) if row else 0), f"pending curiosity items for '{topic[:40]}'"
-        # tool_trust_regression: hard to verify quickly (trust scores update lazily) — skip.
-    except Exception as e:
-        logger.debug("[Goals] _snapshot_goal_metric failed: %s", e)
-    return None, ""
-
-
 class DaemonOrchestrator:
     """Proactive daemon that decides what to do on each tick."""
 
@@ -247,12 +200,6 @@ class DaemonOrchestrator:
         )
         critical_curiosity = row["c"] if row else 0
 
-        # Pending goals (will-module)
-        row = self._db.fetchone(
-            "SELECT COUNT(*) as c FROM goals WHERE status='pending'"
-        )
-        pending_goals = row["c"] if row else 0
-
         # Unsent alerts (events with high priority)
         alerts_unsent = 0
         if pending_events:
@@ -269,7 +216,6 @@ class DaemonOrchestrator:
             "recent_log": recent_log,
             "recent_failures": recent_failures,
             "critical_curiosity": critical_curiosity,
-            "pending_goals": pending_goals,
             "now": now.isoformat(),
         }
 
@@ -323,10 +269,6 @@ class DaemonOrchestrator:
         if context["pending_events"] > 0 and budget != BUDGET_BRIEF:
             return {"action": "process_events"}
 
-        # Goal pursuit retired 2026-09-01 (capability-gap chain had no inputs;
-        # 7 of 8 goals failed with garbage titles). _pursue_goal is kept for
-        # explicit API use only.
-
         # Monitor degradation — log observation
         if context["recent_failures"] >= 3:
             return {
@@ -355,9 +297,6 @@ class DaemonOrchestrator:
 
         elif action == "process_events":
             await self._process_events()
-
-        elif action == "pursue_goal":
-            await self._pursue_goal()
 
         elif action == "observe":
             self._log("observation", decision.get("content", ""), "daemon")
@@ -430,96 +369,6 @@ class DaemonOrchestrator:
                     row["event_type"], row["id"],
                 )
                 self._log("error", f"Alert delivery failed: {row['event_type']}", "daemon")
-
-    async def _pursue_goal(self):
-        """Pick the next pending goal and execute it via the will-module."""
-        from app.core.goals import GoalStore, execute_goal
-
-        store = GoalStore(self._db)
-        goal = await asyncio.to_thread(store.get_next_pending)
-        if not goal:
-            return
-
-        self._log("decision", f"Pursuing goal #{goal.id}: {goal.goal[:120]}", "daemon")
-        await asyncio.to_thread(store.mark_in_progress, goal.id)
-
-        # Snapshot the underlying metric so we can verify the goal actually
-        # moved the needle — not just produced text. Without this, every goal
-        # was being marked "completed" because Nova returned >40 chars,
-        # regardless of whether the gap/skill/tool problem was actually fixed.
-        ctx = goal.context if isinstance(goal.context, dict) else {}
-        before_metric, metric_query = await asyncio.to_thread(
-            _snapshot_goal_metric, self._db, ctx)
-
-        try:
-            ok, output = await execute_goal(goal)
-        except Exception as e:
-            await asyncio.to_thread(store.mark_failed, goal.id, f"unhandled: {e}")
-            self._log("error", f"Goal #{goal.id} crashed: {e}", "daemon")
-            return
-
-        await asyncio.to_thread(store.attach_output, goal.id, output)
-
-        if not ok:
-            await asyncio.to_thread(store.mark_failed, goal.id, output[:200])
-            self._log(
-                "goal_execution",
-                f"Goal #{goal.id} failed: {output[:400]}",
-                "will_module",
-            )
-            return
-
-        # A capability-gap goal's job is to INVESTIGATE the failing-query batch —
-        # the (successful) investigation IS the review. Mark the matching gaps
-        # reviewed so (a) the metric below can actually improve (execute_goal runs
-        # ephemerally and writes nothing, so NOTHING marked them reviewed → every
-        # gap goal failed 'no metric improvement' by construction) and (b) the same
-        # batch stops re-clustering into a new goal forever. A still-missing
-        # capability re-surfaces as fresh unreviewed gaps on the next failure
-        # (audit 2026-08-23).
-        if ctx.get("source") == "capability_gap_cluster":
-            kw = (ctx.get("keyword") or "").strip().lower()
-            if kw:
-                await asyncio.to_thread(
-                    self._db.execute,
-                    "UPDATE capability_gaps SET reviewed = 1 "
-                    "WHERE reviewed = 0 AND LOWER(query) LIKE ?",
-                    (f"%{kw}%",),
-                )
-
-        # Verify the action actually moved the underlying metric. If the goal
-        # was about a capability gap and the gap count didn't decrease, this
-        # was cosmetic — mark failed so it doesn't pollute the "completed"
-        # bucket and so the deriver can re-attempt with a better strategy.
-        # before_metric > 0: a zero baseline cannot regress and must not fail —
-        # every recurring_curiosity goal was failed by construction on 0 >= 0
-        # (the hourly Curiosity Research monitor drains the pending items long
-        # before the daemon's pursue tick, so the baseline was already zero;
-        # the work the goal was minted for is done — a successful execution
-        # completes). Audit 2026-08-23.
-        after_metric, _ = await asyncio.to_thread(_snapshot_goal_metric, self._db, ctx)
-        if before_metric is not None and after_metric is not None and before_metric > 0 and after_metric >= before_metric:
-            reason = (
-                f"verification: {metric_query} did not improve "
-                f"(before={before_metric} after={after_metric})"
-            )
-            await asyncio.to_thread(store.mark_failed, goal.id, reason)
-            self._log(
-                "goal_execution",
-                f"Goal #{goal.id} produced output but no metric improvement. {reason}",
-                "will_module",
-            )
-            return
-
-        await asyncio.to_thread(store.mark_completed, goal.id)
-        improvement = ""
-        if before_metric is not None and after_metric is not None:
-            improvement = f" (metric: {before_metric} → {after_metric})"
-        self._log(
-            "goal_execution",
-            f"Goal #{goal.id} completed{improvement}. Output: {output[:300]}",
-            "will_module",
-        )
 
     async def _research_curiosity(self):
         """Ask the heartbeat to run Curiosity Research early.

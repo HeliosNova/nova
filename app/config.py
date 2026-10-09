@@ -46,12 +46,12 @@ _MUTABLE_FIELDS = {
     "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
     "ENABLE_PLANNING", "ENABLE_CRITIQUE", "ENABLE_CUSTOM_TOOLS",
     "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
-    "ENABLE_VOICE", "ENABLE_TTS", "TTS_MODEL_PATH", "ENABLE_MODEL_ROUTING",
+    "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
-    "ENABLE_SHELL_EXEC", "ENABLE_MCP",
+    "ENABLE_SHELL_EXEC",
     "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
     "AUTO_TOOL_CREATION_THRESHOLD", "ENABLE_INJECTION_DETECTION",
-    "ENABLE_DESKTOP_AUTOMATION", "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
+    "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
     "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
     "WEB_SEARCH_TIMEOUT", "WEB_SEARCH_ENGINES", "WEB_SEARCH_MAX_RESULTS",
@@ -111,13 +111,6 @@ class Config:
     # OLLAMA_URL if the embed instance is unreachable (embedding.py probes both).
     EMBED_OLLAMA_URL: str = field(default_factory=lambda: _env("EMBED_OLLAMA_URL", "http://embed:11434"))
 
-    # MCP (Model Context Protocol) — client (consume external MCP tools)
-    ENABLE_MCP: bool = field(default_factory=lambda: _env("ENABLE_MCP", "true").lower() == "true")
-    MCP_CONFIG_DIR: str = field(default_factory=lambda: _env("MCP_CONFIG_DIR", "/data/mcp"))
-
-    # MCP Server (expose Nova as MCP server). Runs OUT of process via
-    # scripts/mcp_server_runner.py; the old ENABLE_MCP_SERVER flag had no
-    # reader anywhere and was dropped 2026-09-02 (invariant: every flag is read).
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
     # External skills (AgentSkills format)
@@ -270,9 +263,7 @@ class Config:
     INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 60))
     ENABLE_SHELL_EXEC: bool = field(default_factory=lambda: _env("ENABLE_SHELL_EXEC", "false").lower() == "true")
 
-    # Desktop automation (requires display server + PyAutoGUI)
-    ENABLE_DESKTOP_AUTOMATION: bool = field(default_factory=lambda: _env("ENABLE_DESKTOP_AUTOMATION", "false").lower() == "true")
-    DESKTOP_CLICK_DELAY: float = field(default_factory=lambda: _env_float("DESKTOP_CLICK_DELAY", 0.5))
+    # Screenshot tool output directory
     SCREENSHOT_DIR: str = field(default_factory=lambda: _env("SCREENSHOT_DIR", "/tmp/nova_screenshots"))
 
     # Heartbeat / Proactive
@@ -371,10 +362,6 @@ class Config:
     # prompt without a quality label so the model can't echo "low relevance".
     RETRIEVAL_HARD_FLOOR: float = field(default_factory=lambda: _env_float("RETRIEVAL_HARD_FLOOR", 0.30))
 
-    # Background tasks
-    MAX_BACKGROUND_TASKS: int = field(default_factory=lambda: _env_int("MAX_BACKGROUND_TASKS", 5))
-    BACKGROUND_TASK_TIMEOUT: int = field(default_factory=lambda: _env_int("BACKGROUND_TASK_TIMEOUT", 300))
-
     # Auto skill creation
     ENABLE_AUTO_SKILL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTO_SKILL_CREATION", "true").lower() == "true")
 
@@ -393,15 +380,6 @@ class Config:
 
     # Curiosity / autonomy
     ENABLE_CURIOSITY: bool = field(default_factory=lambda: _env("ENABLE_CURIOSITY", "true").lower() == "true")
-
-    # Voice (local Whisper speech-to-text)
-    ENABLE_VOICE: bool = field(default_factory=lambda: _env("ENABLE_VOICE", "false").lower() == "true")
-    WHISPER_MODEL_SIZE: str = field(default_factory=lambda: _env("WHISPER_MODEL_SIZE", "base"))
-    # INERT (audit 2026-07-08): no runtime reader — setting this is a no-op. Enforcement never wired; the 25MB upload cap is the real limit.
-    VOICE_MAX_DURATION: int = field(default_factory=lambda: _env_int("VOICE_MAX_DURATION", 300))
-    # Text-to-speech (Piper, sovereign/local)
-    ENABLE_TTS: bool = field(default_factory=lambda: _env("ENABLE_TTS", "false").lower() == "true")
-    TTS_MODEL_PATH: str = field(default_factory=lambda: _env("TTS_MODEL_PATH", "/data/tts/en_US-amy-medium.onnx"))
 
     # Limits
     # Sized against the REAL context window, with honest token math
@@ -543,26 +521,8 @@ class Config:
     # Channels
     DISCORD_TOKEN: str = field(default_factory=lambda: _env("DISCORD_TOKEN"))
     DISCORD_CHANNEL_ID: str = field(default_factory=lambda: _env("DISCORD_CHANNEL_ID"))
-    DISCORD_ALLOWED_USERS: str = field(default_factory=lambda: _env("DISCORD_ALLOWED_USERS"))
     TELEGRAM_TOKEN: str = field(default_factory=lambda: _env("TELEGRAM_TOKEN"))
     TELEGRAM_CHAT_ID: str = field(default_factory=lambda: _env("TELEGRAM_CHAT_ID"))
-    TELEGRAM_ALLOWED_USERS: str = field(default_factory=lambda: _env("TELEGRAM_ALLOWED_USERS"))
-
-    # Channel: WhatsApp (Business API or bridge)
-    WHATSAPP_API_URL: str = field(default_factory=lambda: _env("WHATSAPP_API_URL"))
-    WHATSAPP_API_TOKEN: str = field(default_factory=lambda: _env("WHATSAPP_API_TOKEN"))
-    WHATSAPP_VERIFY_TOKEN: str = field(default_factory=lambda: _env("WHATSAPP_VERIFY_TOKEN"))
-    WHATSAPP_PHONE_ID: str = field(default_factory=lambda: _env("WHATSAPP_PHONE_ID"))
-    WHATSAPP_CHAT_ID: str = field(default_factory=lambda: _env("WHATSAPP_CHAT_ID"))
-    WHATSAPP_ALLOWED_USERS: str = field(default_factory=lambda: _env("WHATSAPP_ALLOWED_USERS"))
-    WHATSAPP_APP_SECRET: str = field(default_factory=lambda: _env("WHATSAPP_APP_SECRET"))
-
-    # Channel: Signal (via signal-cli REST API)
-    SIGNAL_API_URL: str = field(default_factory=lambda: _env("SIGNAL_API_URL"))
-    SIGNAL_PHONE_NUMBER: str = field(default_factory=lambda: _env("SIGNAL_PHONE_NUMBER"))
-    SIGNAL_CHAT_ID: str = field(default_factory=lambda: _env("SIGNAL_CHAT_ID"))
-    SIGNAL_ALLOWED_USERS: str = field(default_factory=lambda: _env("SIGNAL_ALLOWED_USERS"))
-    SIGNAL_POLL_INTERVAL: int = field(default_factory=lambda: _env_int("SIGNAL_POLL_INTERVAL", 2))
 
     # Auth
     API_KEY: str = field(default_factory=lambda: _env("NOVA_API_KEY"))
@@ -583,7 +543,6 @@ class Config:
     # Sensitive field names — redacted in __repr__/__str__ to prevent secret leakage
     _SENSITIVE_FIELDS = frozenset({
         "EMAIL_SMTP_PASS", "DISCORD_TOKEN", "TELEGRAM_TOKEN",
-        "WHATSAPP_API_TOKEN", "WHATSAPP_VERIFY_TOKEN", "WHATSAPP_APP_SECRET",
         "API_KEY",
     })
 

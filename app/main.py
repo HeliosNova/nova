@@ -54,8 +54,6 @@ from app.tools.action_calendar import CalendarTool
 from app.tools.action_reminder import ReminderTool
 from app.tools.action_webhook import WebhookTool
 from app.tools.delegate import DelegateTool
-from app.tools.background_task import BackgroundTaskTool
-from app.core.task_manager import TaskManager
 
 class _CorrelationIDFormatter(logging.Formatter):
     """Formatter that injects request_id from context var, defaulting to empty."""
@@ -224,32 +222,11 @@ async def lifespan(app: FastAPI):
     from app.tools.context_detail import ContextDetailTool
     _tool_instances.append(("ContextDetailTool", lambda: ContextDetailTool()))
 
-    # Background task manager — persists to SQLite so restarts leave an audit trail.
-    # to_thread: first construction runs persist-table DDL + interrupted-task
-    # hydration (write lock) — keep it off the event-loop thread.
-    from app.database import get_db as _get_db
-    task_manager = await asyncio.to_thread(
-        TaskManager,
-        max_concurrent=config.MAX_BACKGROUND_TASKS,
-        task_timeout=config.BACKGROUND_TASK_TIMEOUT,
-        db=_get_db(),
-    )
-    _tool_instances.append(("BackgroundTaskTool", lambda: BackgroundTaskTool()))
-
     for tool_name, tool_factory in _tool_instances:
         try:
             registry.register(tool_factory())
         except Exception as e:
             logger.warning("Failed to register %s: %s", tool_name, e)
-
-    # Desktop automation (optional — requires display server + PyAutoGUI)
-    if config.ENABLE_DESKTOP_AUTOMATION:
-        from app.tools.desktop import DesktopTool
-        try:
-            registry.register(DesktopTool())
-            logger.info("Desktop automation tool registered")
-        except Exception as e:
-            logger.warning("Desktop automation tool registration failed: %s", e)
 
     # Integration templates
     integration_registry = None
@@ -264,21 +241,6 @@ async def lifespan(app: FastAPI):
             logger.info("Integrations configured: %s", ", ".join(i.name for i in configured))
         else:
             logger.info("Integration templates loaded, none configured (no env tokens set)")
-
-    # MCP tools (external tool servers via Model Context Protocol)
-    mcp_manager = None
-    if config.ENABLE_MCP:
-        from app.tools.mcp import MCPManager
-        mcp_manager = MCPManager()
-        try:
-            mcp_count = await mcp_manager.discover_and_register(registry)
-            if mcp_count:
-                logger.info("MCP: registered %d external tools", mcp_count)
-            else:
-                logger.info("MCP enabled, no tools discovered")
-        except Exception as e:
-            logger.warning("MCP discovery failed: %s", e)
-            mcp_manager = None
 
     logger.info("Tools registered: %s", ", ".join(registry.tool_names))
 
@@ -360,7 +322,6 @@ async def lifespan(app: FastAPI):
         curiosity=curiosity_queue,
         topic_tracker=topic_tracker,
         external_skills=external_skills,
-        task_manager=task_manager,
     )
     set_services(svc)
 
@@ -445,8 +406,6 @@ async def lifespan(app: FastAPI):
     channel_tasks = []
     discord_bot = None
     telegram_bot = None
-    whatsapp_bot = None
-    signal_bot = None
 
     if config.DISCORD_TOKEN:
         from app.channels.discord import DiscordBot
@@ -459,19 +418,6 @@ async def lifespan(app: FastAPI):
         telegram_bot = TelegramBot()
         channel_tasks.append(asyncio.create_task(telegram_bot.start()))
         logger.info("Telegram bot starting...")
-
-    if config.WHATSAPP_API_TOKEN:
-        from app.channels.whatsapp import WhatsAppBot
-        whatsapp_bot = WhatsAppBot()
-        app.include_router(whatsapp_bot.get_router())
-        channel_tasks.append(asyncio.create_task(whatsapp_bot.start()))
-        logger.info("WhatsApp bot starting (webhook mode)...")
-
-    if config.SIGNAL_API_URL and config.SIGNAL_PHONE_NUMBER:
-        from app.channels.signal import SignalBot
-        signal_bot = SignalBot()
-        channel_tasks.append(asyncio.create_task(signal_bot.start()))
-        logger.info("Signal bot starting (polling mode)...")
 
     # Start heartbeat + proactive engines
     def _on_bg_task_done(task: asyncio.Task) -> None:
@@ -499,8 +445,6 @@ async def lifespan(app: FastAPI):
                 monitor_store,
                 discord_bot=discord_bot,
                 telegram_bot=telegram_bot,
-                whatsapp_bot=whatsapp_bot,
-                signal_bot=signal_bot,
             )
             task = heartbeat_loop.start()
             task.add_done_callback(_on_bg_task_done)
@@ -512,8 +456,6 @@ async def lifespan(app: FastAPI):
                     monitor_store,
                     discord_bot=discord_bot,
                     telegram_bot=telegram_bot,
-                    whatsapp_bot=whatsapp_bot,
-                    signal_bot=signal_bot,
                     learning_engine=learning,
                     db=db,  # without this _save/_load_last_digest silently no-op:
                             # no durable liveness record + restart double-send/skip
@@ -612,26 +554,10 @@ async def lifespan(app: FastAPI):
         await discord_bot.close()
     if telegram_bot:
         await telegram_bot.close()
-    if whatsapp_bot:
-        await whatsapp_bot.close()
-    if signal_bot:
-        await signal_bot.close()
     for task in channel_tasks:
         task.cancel()
     if channel_tasks:
         await asyncio.gather(*channel_tasks, return_exceptions=True)
-
-    # Unload the voice models. BOTH of them: shutdown released Whisper and left
-    # Piper resident, even though the TTS endpoint loads it lazily on first use
-    # and unload_synthesizer() was written for exactly this (2026-09-04). Found
-    # while auditing dead code — the function was not dead, it was unwired.
-    if config.ENABLE_VOICE:
-        from app.core.voice import unload_synthesizer, unload_transcriber
-        unload_transcriber()
-        unload_synthesizer()
-
-    # Cancel background tasks
-    await task_manager.cancel_all()
 
     # Cancel the model-warmup task if still running — it was the one startup
     # background task without a shutdown handler, so close_all() below could
@@ -642,10 +568,6 @@ async def lifespan(app: FastAPI):
             await _warm_task
         except (asyncio.CancelledError, Exception):
             pass
-
-    # Close MCP sessions
-    if mcp_manager:
-        await mcp_manager.close()
 
     # Close retriever (ChromaDB client cleanup)
     if retriever:
@@ -779,9 +701,9 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
     """Track last user activity for idle detection (dream mode trigger)."""
 
     async def dispatch(self, request: Request, call_next):
-        # Only track user-facing endpoints (chat, voice, actions)
+        # Only track user-facing endpoints (chat, actions)
         path = request.url.path
-        if any(path.startswith(p) for p in ("/api/chat", "/api/voice", "/api/actions")):
+        if any(path.startswith(p) for p in ("/api/chat", "/api/actions")):
             from app.core.brain import get_services
             try:
                 svc = get_services()
@@ -789,7 +711,7 @@ class UserActivityMiddleware(BaseHTTPMiddleware):
                     ts = datetime.now(timezone.utc).isoformat()
                     db = svc.monitor_store._db
                     # Strong ref + log-on-failure (2026-08-31): the bare
-                    # create_task on EVERY chat/voice/actions request held no
+                    # create_task on EVERY chat/actions request held no
                     # reference (GC could collect the task mid-write) and a
                     # failed INSERT died silently — idle detection would
                     # quietly stop seeing user activity.
@@ -881,31 +803,3 @@ app.include_router(agent_router, prefix="/api")
 
 from app.api.events import router as events_router
 app.include_router(events_router, prefix="/api")
-
-if config.ENABLE_VOICE or getattr(config, "ENABLE_TTS", False):
-    from app.api.voice import router as voice_router
-    app.include_router(voice_router, prefix="/api")
-    # Liveness, not just the flag (2026-08-19): TTS was announced "on" while
-    # piper wasn't installed AND the voice model file was missing — every
-    # synthesize call 503'd. Optional pathways must verify they can actually run.
-    _tts_state = "off"
-    if getattr(config, "ENABLE_TTS", False):
-        try:
-            from app.core.voice import _HAS_PIPER
-            from pathlib import Path as _P
-            _model_ok = _P(getattr(config, "TTS_MODEL_PATH", "") or "").exists()
-            if _HAS_PIPER and _model_ok:
-                _tts_state = "on"
-            else:
-                _tts_state = (f"BROKEN (piper installed: {_HAS_PIPER}, "
-                              f"model file exists: {_model_ok}) — synthesize will 503; "
-                              "install piper-tts + model or set ENABLE_TTS=false")
-        except Exception as _e:
-            _tts_state = f"BROKEN ({_e})"
-    logger.info(
-        "Voice API enabled (STT model: %s, TTS: %s)",
-        config.WHISPER_MODEL_SIZE,
-        _tts_state,
-    )
-    if _tts_state.startswith("BROKEN"):
-        logger.warning("TTS liveness check failed: %s", _tts_state)

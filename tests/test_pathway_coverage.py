@@ -71,7 +71,6 @@ def test_deliberation_scratchpads_are_usage_gated():
      "its writer, Auto-Tool Synthesis, was cut from the catalog 2026-09-22"),
     ("auth_lockouts", "a security event, not a background writer"),
     ("system_state", "key-value configuration"),
-    ("goals", "event-driven"),
     ("monitor_dedup_log", "already covered by the dedup_decisions pathway"),
 ])
 def test_these_tables_are_deliberately_unwatched(table, why):

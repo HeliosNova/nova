@@ -42,10 +42,9 @@ Nova is a sovereign personal AI that runs entirely on your hardware with zero cl
 | Hybrid retrieval | **Vector + BM25 + RRF** | Vector only | Vector only |
 | Zero cloud dependency | **Yes (bundled Ollama)** | Partial | Partial |
 | Prompt injection defense | **4-category detection** | No | No |
-| Messaging channels | **4 (all with allowlisting)** | 3 | 0 |
+| Delivery channels | **Discord + Telegram** | 3 | 0 |
 | Proactive monitors | **70+ across 35+ domains** | Automations | No |
 | Builds its own understanding | **Living dossiers + forecasts** | No | No |
-| MCP (client + server) | **Both** | No | Client only |
 | Self fine-tune (DPO) | Experimental¹ | No | No |
 
 ¹ Optional and **off by default**. In honest, independently-judged A/B evals our local fine-tunes have **not** beaten the base model — so Nova's learning comes from the memory loop above, not from weight updates. See [The Learning Loop](#the-learning-loop).
@@ -155,25 +154,20 @@ Chat is the surface where you interrogate all of this: relevant dossier prose is
 | `reminder` | Schedule reminders via heartbeat system |
 | `monitor` | Create/manage proactive heartbeat monitors |
 | `delegate` | Delegate subtasks to parallel sub-agents |
-| `background_task` | Submit/track long-running background work |
 | `integration` | Connect to GitHub, Slack, Notion, etc. (10 templates) |
-| `desktop` | GUI automation via PyAutoGUI (optional, gated) |
-| `voice` | Local Whisper speech-to-text (optional, gated) |
 
-Plus dynamically created custom tools and MCP-discovered external tools.
+Plus dynamically created custom tools.
 
 ## Channels
 
-Talk to Nova where you already are:
+Nova delivers its briefings where you already are:
 
 | Channel | Type | Config |
 |---------|------|--------|
 | **Discord** | Bot (websocket) | `DISCORD_TOKEN`, `DISCORD_CHANNEL_ID` |
 | **Telegram** | Bot (polling) | `TELEGRAM_TOKEN`, `TELEGRAM_CHAT_ID` |
-| **WhatsApp** | Webhook (Business API) | `WHATSAPP_API_URL`, `WHATSAPP_API_TOKEN` |
-| **Signal** | Polling (signal-cli) | `SIGNAL_API_URL`, `SIGNAL_PHONE_NUMBER` |
 
-All channels support phone-number allowlisting, message splitting, and graceful reconnection.
+Both channels split long posts and reconnect on failure. Inbound chat on channels was removed 2026-10-09; the HTTP chat API remains.
 
 ## Heartbeat Monitors
 
@@ -204,22 +198,6 @@ Temporal knowledge graph that grows autonomously from the scheduled monitors:
 - `query_at(entity, timestamp)` — what was true at a specific time
 - Auto-curation: heuristic + LLM pass removes garbage triples
 - Facts are used in chat: relevant KG triples are injected into the system prompt for contextual answers
-
-## MCP Integration
-
-Nova is both an MCP **client** and **server** — unique in the landscape:
-
-**As client:** Drop MCP tool configs in `/data/mcp/` and Nova discovers and uses them.
-
-**As server:** Exposes 8 tools for any MCP client (Cursor, VS Code, and others):
-- `nova_memory_query` — search user facts and conversations
-- `nova_knowledge_graph` — query the KG
-- `nova_lessons` — retrieve learned lessons
-- `nova_document_search` — search indexed documents
-- `nova_facts_about` — get user profile facts
-- `nova_dossiers` — Nova's standing understanding of a topic, with its open questions
-- `nova_storylines` — the story threads it is tracking and their current state
-- `nova_forecasts` — its falsifiable forecasts with the self-graded track record
 
 ## LLM Provider
 

@@ -168,7 +168,7 @@ def check_tool_scoping() -> tuple[bool, str]:
     from app.core.brain import _TAINT_STRIPPED_TOOLS, _WEB_INGEST_TOOLS
     fails: list[str] = []
     wl = access_tiers.RESEARCH_TOOLS
-    _ok(not (wl & {"shell_exec", "file_ops", "desktop", "tool_create"}), "research whitelist leaks side-effect tools", fails)
+    _ok(not (wl & {"shell_exec", "file_ops", "tool_create"}), "research whitelist leaks side-effect tools", fails)
     access_tiers.set_tool_whitelist(None)
     with access_tiers.research_scope():
         _ok(not access_tiers.is_tool_allowed("shell_exec"), "research scope allows shell_exec", fails)

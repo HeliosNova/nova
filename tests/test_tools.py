@@ -417,14 +417,6 @@ class TestAutoDisableNotification:
 # MCP Refresh (from test_audit_consolidated)
 # ===========================================================================
 
-class TestMCPRefresh:
-
-    def test_mcp_manager_has_refresh(self):
-        from app.tools.mcp import MCPManager
-        manager = MCPManager()
-        assert hasattr(manager, "refresh")
-
-
 # ===========================================================================
 # Browser Interactive Elements
 # ===========================================================================

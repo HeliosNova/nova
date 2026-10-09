@@ -123,10 +123,6 @@ def to_telegram_html(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# WhatsApp (uses *bold*, _italic_, ~strike~, no links)
-# ---------------------------------------------------------------------------
-
-# ---------------------------------------------------------------------------
 # Discord (the canonical dialect — only the link text needs compacting)
 # ---------------------------------------------------------------------------
 
@@ -168,31 +164,3 @@ def to_discord(text: str) -> str:
         return f"[{host or 'link'} ↗]({url})"
 
     return _DISCORD_URL_BRACKETED.sub(_mask, text)
-
-
-def to_whatsapp(text: str) -> str:
-    """Convert Discord markdown to WhatsApp's variant."""
-    if not text:
-        return text
-    text = re.sub(r"\*\*(.+?)\*\*", r"*\1*", text, flags=re.DOTALL)
-    text = _DISCORD_URL_BRACKETED.sub(r"\1", text)
-    text = _DISCORD_URL_SQ_BRACKETED.sub(r"\1", text)
-    text = _HEADING_HASH.sub(lambda m: f"*{m.group(2)}*", text)
-    return text
-
-
-# ---------------------------------------------------------------------------
-# Signal (limited markdown — strip formatting, preserve URLs)
-# ---------------------------------------------------------------------------
-
-def to_signal(text: str) -> str:
-    """Strip Discord markdown for Signal — Signal doesn't reliably render it."""
-    if not text:
-        return text
-    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text, flags=re.DOTALL)
-    text = _DISCORD_ITALIC.sub(r"\1", text)
-    text = _DISCORD_CODE_INLINE.sub(r"\1", text)
-    text = _DISCORD_URL_BRACKETED.sub(r"\1", text)
-    text = _DISCORD_URL_SQ_BRACKETED.sub(r"\1", text)
-    text = _HEADING_HASH.sub(lambda m: m.group(2).upper(), text)
-    return text

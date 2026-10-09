@@ -18,12 +18,10 @@ import pytest
 from app.monitors.heartbeat_loop import HeartbeatLoop
 
 
-def _loop(*, discord=True, telegram=True, whatsapp=False, signal=False):
+def _loop(*, discord=True, telegram=True):
     lp = HeartbeatLoop.__new__(HeartbeatLoop)
     lp._discord = AsyncMock() if discord else None
     lp._telegram = AsyncMock() if telegram else None
-    lp._whatsapp = AsyncMock() if whatsapp else None
-    lp._signal = AsyncMock() if signal else None
     lp._digest_enabled = True
     lp._digest_buffer = []
     lp._flush_lock = asyncio.Lock()

@@ -149,22 +149,10 @@ services:
       CHROMADB_PATH: /data/chromadb
       ANONYMIZED_TELEMETRY: "false"
       TRAINING_DATA_PATH: /data/training_data.jsonl
-      MCP_CONFIG_DIR: /data/mcp
       ENABLE_SHELL_EXEC: "true"
       XDG_CACHE_HOME: /tmp/.cache
-      DISPLAY: ":99"  # Xvfb virtual display for desktop automation
-      XAUTHORITY: /tmp/.Xauthority
-      ENABLE_DESKTOP_AUTOMATION: "true"
       ENABLE_PLANNING: "true"
       ENABLE_CRITIQUE: "true"
-      # MCP: consume external MCP tools. (The MCP *server* runs out of process
-      # via scripts/mcp_server_runner.py; its ENABLE_MCP_SERVER flag had no
-      # reader and was dropped 2026-09-02. Auto-finetune text removed
-      # 2026-08-25: the training stack was archived 2026-06-12.)
-      ENABLE_MCP: "true"
-      # Voice: Whisper STT + Piper TTS (both already installed in image).
-      ENABLE_VOICE: "true"
-      ENABLE_TTS: "true"
       # Eval-suite per-task timeouts were sized for the 9B base. Production
       # runs the 9B nova-ft, so 1.5× is enough headroom (nova-ft + tool calls
       # run a bit slower than the bare 9B). Raise to 2.5 only when a 27B base
@@ -172,7 +160,6 @@ services:
       EVAL_TIMEOUT_MULTIPLIER: "1.5"
     volumes:
       - nova_data:/data
-      - ./mcp:/data/mcp:ro
       # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
       # container that runs LLM-authored `sh -c` must not hold both DR legs
       # read-write. Maintenance still writes verified snapshots to /data/backups.
@@ -187,8 +174,6 @@ services:
         tmpfs:
           size: 536870912
           mode: 1023  # 01777 octal = 1023 decimal (world-writable + sticky)
-      # Uncomment for desktop automation (requires X11 on host):
-      # - /tmp/.X11-unix:/tmp/.X11-unix:ro
     read_only: true
     tmpfs:
       - /tmp
@@ -201,7 +186,7 @@ services:
     # Fork-bomb backstop (audit 2026-08-22): custom_tools can exec model-authored
     # code in-process here (code_exec/code_verify route to the network-isolated
     # sidecar, but custom_tools does not). Steady state is ~186 tasks; 4096 leaves
-    # ample room for the chromium/Xvfb process tree while capping a runaway fork.
+    # ample room for the chromium process tree while capping a runaway fork.
     pids_limit: 4096
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]

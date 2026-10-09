@@ -64,8 +64,6 @@ class TestDailyDigestInit:
         assert digest._store is store
         assert digest._discord is None
         assert digest._telegram is None
-        assert digest._whatsapp is None
-        assert digest._signal is None
         assert digest._learning is None
         assert digest._last_digest is None
         assert digest._running is False
@@ -75,22 +73,16 @@ class TestDailyDigestInit:
         store = _make_monitor_store()
         discord = MagicMock()
         telegram = MagicMock()
-        whatsapp = MagicMock()
-        signal = MagicMock()
         learning = MagicMock()
 
         digest = DailyDigest(
             store,
             discord_bot=discord,
             telegram_bot=telegram,
-            whatsapp_bot=whatsapp,
-            signal_bot=signal,
             learning_engine=learning,
         )
         assert digest._discord is discord
         assert digest._telegram is telegram
-        assert digest._whatsapp is whatsapp
-        assert digest._signal is signal
         assert digest._learning is learning
 
     def test_stop_cancels_task(self):
@@ -368,44 +360,6 @@ class TestChannelDelivery:
         telegram.send_alert.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_sends_to_whatsapp(self):
-        """Digest should be sent to WhatsApp when whatsapp_bot is provided."""
-        monitors = [_make_monitor(1, "Health")]
-        results = [_make_result(1, 1, status="ok", message="OK")]
-        store = _make_monitor_store(monitors=monitors, results=results)
-
-        whatsapp = MagicMock()
-        whatsapp.send_alert = AsyncMock()
-
-        digest = DailyDigest(store, whatsapp_bot=whatsapp)
-
-        with patch("app.monitors.proactive.llm") as mock_llm:
-            mock_llm.invoke_nothink = AsyncMock(return_value="**Monitors:** 1 passed")
-
-            await digest.send_digest()
-
-        whatsapp.send_alert.assert_called_once()
-
-    @pytest.mark.asyncio
-    async def test_sends_to_signal(self):
-        """Digest should be sent to Signal when signal_bot is provided."""
-        monitors = [_make_monitor(1, "Health")]
-        results = [_make_result(1, 1, status="ok", message="OK")]
-        store = _make_monitor_store(monitors=monitors, results=results)
-
-        signal = MagicMock()
-        signal.send_alert = AsyncMock()
-
-        digest = DailyDigest(store, signal_bot=signal)
-
-        with patch("app.monitors.proactive.llm") as mock_llm:
-            mock_llm.invoke_nothink = AsyncMock(return_value="**Monitors:** 1 passed")
-
-            await digest.send_digest()
-
-        signal.send_alert.assert_called_once()
-
-    @pytest.mark.asyncio
     async def test_sends_to_all_channels(self):
         """Digest should be sent to ALL configured channels."""
         monitors = [_make_monitor(1, "Health")]
@@ -416,17 +370,11 @@ class TestChannelDelivery:
         discord.send_alert = AsyncMock()
         telegram = MagicMock()
         telegram.send_alert = AsyncMock()
-        whatsapp = MagicMock()
-        whatsapp.send_alert = AsyncMock()
-        signal = MagicMock()
-        signal.send_alert = AsyncMock()
 
         digest = DailyDigest(
             store,
             discord_bot=discord,
             telegram_bot=telegram,
-            whatsapp_bot=whatsapp,
-            signal_bot=signal,
         )
 
         with patch("app.monitors.proactive.llm") as mock_llm:
@@ -436,8 +384,6 @@ class TestChannelDelivery:
 
         discord.send_alert.assert_called_once()
         telegram.send_alert.assert_called_once()
-        whatsapp.send_alert.assert_called_once()
-        signal.send_alert.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_channel_failure_does_not_crash(self):

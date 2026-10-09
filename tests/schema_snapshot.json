@@ -183,17 +183,6 @@
   "conf_spread",
   "criterion"
  ],
- "goals": [
-  "id",
-  "goal",
-  "priority",
-  "status",
-  "source",
-  "context",
-  "created_at",
-  "updated_at",
-  "completed_at"
- ],
  "heartbeat_instructions": [
   "id",
   "instruction",

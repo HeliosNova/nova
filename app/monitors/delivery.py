@@ -69,7 +69,7 @@ class DeliveryMixin:
              routes ONLY to those channels. Overrides everything else.
           2. Category default fallback if `channels` is NULL/empty:
              - system  → Telegram ONLY (internal health/meta)
-             - content → Discord + Telegram + WhatsApp + Signal (all configured)
+             - content → Discord + Telegram (all configured)
 
         Cross-monitor dedup: content monitors that produce the same salient
         claims as another recent monitor get suppressed. Prevents the same
@@ -103,7 +103,7 @@ class DeliveryMixin:
                     "[Heartbeat] system-category monitor '%s' has no Telegram channel — suppressed",
                     monitor.name,
                 )
-            elif not (self._discord or self._telegram or self._whatsapp or self._signal):
+            elif not (self._discord or self._telegram):
                 logger.warning("[Heartbeat] No channels configured for alert '%s'", monitor.name)
             return False
 
@@ -155,8 +155,7 @@ class DeliveryMixin:
             allowed = None
         is_system = monitor.category == "system"
         out: set[str] = set()
-        for ch, bot in (("discord", self._discord), ("telegram", self._telegram),
-                        ("whatsapp", self._whatsapp), ("signal", self._signal)):
+        for ch, bot in (("discord", self._discord), ("telegram", self._telegram)):
             if not bot:
                 continue
             ok = (ch in allowed) if allowed is not None else (ch == "telegram" or not is_system)
@@ -166,10 +165,9 @@ class DeliveryMixin:
 
     async def _broadcast(self, text: str, targets: set[str]) -> bool:
         """Send one message to each target channel. Returns True if any sent."""
-        bots = {"discord": self._discord, "telegram": self._telegram,
-                "whatsapp": self._whatsapp, "signal": self._signal}
+        bots = {"discord": self._discord, "telegram": self._telegram}
         sent = False
-        for ch in ("discord", "telegram", "whatsapp", "signal"):
+        for ch in ("discord", "telegram"):
             if ch in targets and bots[ch]:
                 try:
                     # send_alert returns True only on actual delivery; adapters
