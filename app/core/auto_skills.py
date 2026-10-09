@@ -426,7 +426,7 @@ async def induce_procedure_skills(db, skills: SkillStore, *, max_new: int = 2) -
     from app.core.principles import _topic_keywords
 
     # --- Gather the proven substrate (each source isolated — a missing table
-    # must not kill the pass; same hardening as goal_deriver) ---
+    # must not kill the pass; same hardening as the retired goal deriver) ---
     items: list[dict] = []  # {key_text, evidence, weight}
     try:
         for r in db.fetchall(

@@ -25,7 +25,7 @@ from dataclasses import dataclass
 logger = logging.getLogger(__name__)
 
 
-# Stopwords for clustering — same flavor as goal_deriver
+# Stopwords for clustering
 _CLUSTER_STOPWORDS = frozenset({
     "what", "where", "when", "which", "show", "tell", "find", "search",
     "calculate", "compute", "the", "a", "an", "and", "or", "is", "are",
