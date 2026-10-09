@@ -2164,6 +2164,50 @@ class KnowledgeGraph:
         rows = self._db.fetchall(sql, tuple(params))
         return [dict(r) for r in rows]
 
+    def format_history_for_prompt(self, facts: list[Fact], max_lines: int = 8) -> str:
+        """The superseded versions of the given facts, as a prompt block.
+
+        `format_for_prompt` shows the present and skips every superseded
+        row — right for "where does she live", wrong for "where did she
+        live before". The bitemporal store has kept the trail since
+        2026-05-16 (valid_from, valid_to, superseded_by); this renders it,
+        dated and naming the replacement, for the (subject, predicate)
+        pairs chat already retrieved. Empty when nothing was ever revised,
+        so a question about the present never pays for it (the priming A/B
+        measured unasked-for prior context as a grounding cost).
+        """
+        if not facts:
+            return ""
+        lines: list[str] = []
+        seen: set[tuple[str, str]] = set()
+        for f in facts:
+            key = (f.subject, f.predicate)
+            if key in seen:
+                continue
+            seen.add(key)
+            try:
+                history = self.get_fact_history(f.subject, f.predicate)
+            except Exception as e:
+                logger.debug("[kg] history lookup failed for %r/%r: %s", f.subject, f.predicate, e)
+                continue
+            by_id = {h.get("id"): h for h in history}
+            pred = f.predicate.replace("_", " ")
+            for h in history:  # valid_from DESC: most recent revision first
+                if h.get("superseded_by") is None and not h.get("valid_to"):
+                    continue
+                since = (h.get("valid_from") or h.get("created_at") or "")[:10]
+                until = (h.get("valid_to") or "")[:10] or "revised"
+                replacement = by_id.get(h.get("superseded_by"), {}).get("object")
+                tail = f"; now {replacement}" if replacement else ""
+                lines.append(f"- {h['subject']} {pred} {h['object']} ({since} → {until}{tail})")
+                if len(lines) >= max_lines:
+                    break
+            if len(lines) >= max_lines:
+                break
+        if not lines:
+            return ""
+        return "History (superseded facts, for questions about the past):\n" + "\n".join(lines)
+
     def get_fact_history(self, subject: str, predicate: str) -> list[dict]:
         """Return all versions of a fact over time (current + superseded).
 

@@ -82,7 +82,7 @@ async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
 _SIDE_EFFECT_TOOLS = frozenset({
     "file_ops", "email_send", "webhook", "calendar", "reminder",
     "shell_exec", "code_exec", "integration", "delegate", "browser",
-    "desktop", "background_task", "tool_create", "monitor",
+    "tool_create", "monitor",
 })
 
 # Taint tracking (2026-09-01). Once a turn has ingested web-derived text the
@@ -93,8 +93,8 @@ _WEB_INGEST_TOOLS = frozenset({
     "web_search", "http_fetch", "browser", "deep_research", "knowledge_search",
 })
 _TAINT_STRIPPED_TOOLS = frozenset({
-    "shell_exec", "file_ops", "desktop", "tool_create", "email_send", "webhook",
-    "integration", "background_task", "delegate",
+    "shell_exec", "file_ops", "tool_create", "email_send", "webhook",
+    "integration", "delegate",
 })
 
 # Per-query pivot tracking — one backtrack pivot allowed per conversation per query.
@@ -463,7 +463,6 @@ class Services:
     curiosity: CuriosityQueue | None = None
     topic_tracker: TopicTracker | None = None
     external_skills: list | None = None  # list[ExternalSkill]
-    task_manager: Any = None
 
 
 # Module-level services ref (set during startup)
@@ -863,6 +862,19 @@ async def _run_context_io(name: str, awaitable, default):
         return default
 
 
+# A question about the past (2026-10-09). The KG's prompt block shows only
+# current facts; when the query asks what WAS true, the superseded versions
+# of the retrieved facts are appended (kg.format_history_for_prompt). Kept
+# narrow on purpose: the priming A/B measured unasked-for prior context as a
+# grounding cost, so present-tense questions must not trip it.
+_TEMPORAL_QUERY_RE = re.compile(
+    r"\b(?:before|previously|prior to|formerly|used to|earlier|back then|"
+    r"history|changed|moved (?:from|out|away)|no longer|at the time|"
+    r"as of (?:19|20)\d\d|in (?:19|20)\d\d)\b",
+    re.IGNORECASE,
+)
+
+
 async def _gather_context(
     svc: Services,
     query: str,
@@ -1032,6 +1044,18 @@ async def _gather_context(
                                 len(_sub), _entity)
             ctx.kg_facts_text = svc.kg.format_for_prompt(kg_facts)
             ctx.kg_facts_count = len(kg_facts)
+            # A question about the past gets the superseded versions of the
+            # same facts, dated and naming the replacement. Present-tense
+            # questions never pay for it (see _TEMPORAL_QUERY_RE).
+            if _TEMPORAL_QUERY_RE.search(query):
+                try:
+                    _hist = await asyncio.to_thread(svc.kg.format_history_for_prompt, kg_facts)
+                except Exception as _e:
+                    logger.debug("[context] kg history failed: %s", _e)
+                    _hist = ""
+                if isinstance(_hist, str) and _hist:
+                    ctx.kg_facts_text = f"{ctx.kg_facts_text}\n{_hist}"
+                    logger.info("[context] temporal query — KG history appended (%d chars)", len(_hist))
         # Context visibility: silent knowledge loss cost a full debugging day
         # (2026-07-07: embedder starvation → empty context → "I don't know"
         # answers with the facts sitting in the DB). One line per query keeps
