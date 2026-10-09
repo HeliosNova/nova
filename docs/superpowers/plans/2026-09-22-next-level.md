@@ -195,6 +195,38 @@ research on what we need to move to the next level."
   it ships failing so the gap has a number. First live numbers below once
   the image is deployed and the category has run.
 
+- **2026-10-09 — twelve more days down, then the boot path fixed and the
+  interactive stack cut.** Nova ran 09-22..09-26 (90/153/161/164/155
+  results per day), stopped at an unexpected shutdown on 09-26 13:56, and
+  was not started again until 10-08 07:23 (four more unclean shutdowns on
+  10-04). The first 16 hours back produced 23 results: Ollama 0.32.15's
+  30-second GPU discovery timed out on the cold external disk for cuda_v12
+  AND cuda_v13, the 9B ran 100% CPU for the container's life, every call
+  timed out, and the watchdog restarted nova-app every 150 minutes (six
+  times) without touching nova-ollama. `ollama list` and the latency probe
+  were green throughout. Shipped `6834c1d`: an entrypoint that pre-reads
+  the runner libs and exits 1 on a CPU verdict with a GPU present (live:
+  discovery 3 s, pre-read 14 s warm), placement in the Ollama Latency
+  Monitor via `/api/ps`, and watchdog escalation to the aux containers on
+  the second consecutive stale restart.
+  **Step 5 follow-up (`afdb491`):** chat reads the KG's history on temporal
+  cues (`format_history_for_prompt`, `_TEMPORAL_QUERY_RE`); the
+  long-memory temporal task now has what it needs. First live numbers
+  pending a harness run on the deployed image.
+  **Owner decision: not a v2 — cut v1 down to what works (`41ac1cc`).**
+  Removed voice, desktop automation + Xvfb, MCP client and server, the
+  background task manager, goals (+ migration 15), WhatsApp and Signal,
+  and inbound chat on Discord/Telegram (delivery untouched; chat API and
+  brain stay). Basis: 40 user chat messages ever, all in August; zero
+  voice/desktop/MCP use; WhatsApp/Signal never configured. Entangled and
+  deferred to a measured pass: exec sidecar (`custom_tools`/`code_verify`
+  import `code_exec`; the `command` check_type), agent loop (`brain.py`
+  imports `_is_hard_reasoning_query` for the thinking and best-of-N
+  gates), skills (`skill_quality` is `_CORE_ENABLED`; maintenance induces
+  procedure skills), custom/auto tools (maintenance prunes them).
+  Curiosity is decided on its own number next: lifetime 16 resolved
+  against 38 failed.
+
 ## Sources
 
 - OpenForecaster / OpenForesight: https://openforecaster.github.io/scaling-data/ ; paper https://arxiv.org/pdf/2512.25070
