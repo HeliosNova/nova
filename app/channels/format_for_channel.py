@@ -161,6 +161,11 @@ def to_discord(text: str) -> str:
             host = (urlparse(url).hostname or "").removeprefix("www.")
         except Exception:
             host = ""
-        return f"[{host or 'link'} ↗]({url})"
+        # The target stays inside <>: in Discord that is what suppresses the
+        # link-preview card. The first version of this label dropped the
+        # brackets and every feed item unfurled a card (three per chunk on the
+        # FDA digest, measured 2026-10-09) — the seventh "feeds show
+        # hyperlinks instead of the report".
+        return f"[{host or 'link'} ↗](<{url}>)"
 
     return _DISCORD_URL_BRACKETED.sub(_mask, text)

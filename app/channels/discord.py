@@ -101,7 +101,11 @@ class DiscordBot:
                     for i, chunk in enumerate(chunks):
                         if n > 1 and i > 0:
                             chunk = f"_(cont. {i + 1}/{n})_\n{chunk}"
-                        await channel.send(chunk)
+                        # suppress_embeds: a URL the model wrote into prose
+                        # (no <>, no label) would otherwise unfurl a preview
+                        # card; the converter covers the authored links, this
+                        # covers the rest (2026-10-09).
+                        await channel.send(chunk, suppress_embeds=True)
                         if i + 1 < n:
                             await asyncio.sleep(0.3)  # pace multi-part posts
                 return True

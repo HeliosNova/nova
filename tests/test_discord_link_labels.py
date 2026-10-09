@@ -39,14 +39,16 @@ SEC_ROW = (
 
 def _visible(text: str) -> str:
     """What a reader actually sees: a masked link shows only its label."""
-    text = re.sub(r"\[([^\]]*)\]\((https?://[^)]+)\)", r"\1", text)
+    text = re.sub(r"\[([^\]]*)\]\(<?(https?://[^)>]+)>?\)", r"\1", text)
     return re.sub(r"<(https?://[^\s>]+)>", r"\1", text)
 
 
 def test_a_long_url_is_labelled_by_its_domain():
     out = to_discord(SEC_ROW)
-    assert f"[sec.gov ↗]({EDGAR})" in out
-    assert "<" + EDGAR + ">" not in out
+    # the target stays wrapped in <> INSIDE the masked link: that is what keeps
+    # Discord from unfurling a preview card per link (2026-10-09)
+    assert f"[sec.gov ↗](<{EDGAR}>)" in out
+    assert "·  <" + EDGAR + ">" not in out
 
 
 def test_the_reader_sees_a_third_less_of_a_filing_row():
@@ -93,7 +95,7 @@ async def test_the_discord_adapter_actually_applies_it():
     sent: list[str] = []
 
     class _Chan:
-        async def send(self, text):
+        async def send(self, text, **_kw):
             sent.append(text)
 
     class _Client:
@@ -111,4 +113,4 @@ async def test_the_discord_adapter_actually_applies_it():
 
     assert await bot.send_alert(SEC_ROW) is True
     assert sent and "[sec.gov ↗]" in sent[0]
-    assert "<" + EDGAR + ">" not in sent[0]
+    assert "·  <" + EDGAR + ">" not in sent[0]

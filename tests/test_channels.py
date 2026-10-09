@@ -76,7 +76,7 @@ class TestSendSerialization:
         sent: list[str] = []
 
         class _Chan:
-            async def send(self, chunk):
+            async def send(self, chunk, **_kw):
                 # Yield mid-send so a competing sender could interleave if unlocked.
                 await asyncio.sleep(0)
                 sent.append(chunk)
