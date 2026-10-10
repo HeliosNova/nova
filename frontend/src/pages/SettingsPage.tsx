@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import {
   Settings, Moon, Sun, Monitor, Key, Download, Upload,
-  Server, ToggleLeft, ToggleRight, Clock, Shield, Wrench, Trash2,
+  Server, ToggleLeft, ToggleRight, Clock, Shield,
   AlertTriangle, CheckCircle, Loader2,
 } from "lucide-react";
 import { toast } from "sonner";
@@ -19,13 +19,11 @@ import {
   getConfigSummary,
   getFullConfig,
   updateConfig,
-  getCustomTools,
-  deleteCustomTool,
   getProviderHealth,
 } from "../lib/api";
 import type {
   StatusResponse, UserFact, IntegrationInfo, AccessTierInfo,
-  FullConfig, CustomToolInfo, ProviderHealthResult,
+  FullConfig, ProviderHealthResult,
 } from "../lib/types";
 import {
   PageHeader,
@@ -181,9 +179,6 @@ export default function SettingsPage() {
   const [tierSaving, setTierSaving] = useState(false);
 
   // Custom tools state
-  const [customTools, setCustomTools] = useState<CustomToolInfo[]>([]);
-  const [customToolsLoading, setCustomToolsLoading] = useState(false);
-  const [deletingTool, setDeletingTool] = useState<string | null>(null);
 
   // Load all data on mount
   useEffect(() => {
@@ -193,7 +188,6 @@ export default function SettingsPage() {
     getIntegrations().then((v) => setIntegrations(Array.isArray(v) ? v : [])).catch(() => setIntegrations([]));
     getAccessTier().then(setAccessTier).catch(() => {});
     loadFullConfig();
-    loadCustomTools();
   }, [apiKey, setHealth]);
 
   const loadFullConfig = useCallback(async () => {
@@ -222,18 +216,6 @@ export default function SettingsPage() {
       toast.error("Failed to load full config");
     } finally {
       setConfigLoading(false);
-    }
-  }, []);
-
-  const loadCustomTools = useCallback(async () => {
-    setCustomToolsLoading(true);
-    try {
-      const tools = await getCustomTools();
-      setCustomTools(Array.isArray(tools) ? tools : []);
-    } catch {
-      setCustomTools([]);
-    } finally {
-      setCustomToolsLoading(false);
     }
   }, []);
 
@@ -355,20 +337,6 @@ export default function SettingsPage() {
       toast.error(`Save failed: ${(err as Error).message}`);
     } finally {
       setTierSaving(false);
-    }
-  };
-
-  // ── Custom tool delete ──
-  const handleDeleteTool = async () => {
-    if (!deletingTool) return;
-    try {
-      await deleteCustomTool(deletingTool);
-      toast.success(`Tool "${deletingTool}" deleted`);
-      setDeletingTool(null);
-      loadCustomTools();
-    } catch (err) {
-      toast.error(`Delete failed: ${(err as Error).message}`);
-      setDeletingTool(null);
     }
   };
 
@@ -812,71 +780,6 @@ export default function SettingsPage() {
           </Card>
         )}
 
-        {/* ═══ Custom Tools Manager (TASK 6) ═══ */}
-        <Card>
-          <SectionHeader icon={<Wrench size={16} />} title="Custom Tools" />
-          {customToolsLoading ? (
-            <Skeleton lines={3} />
-          ) : customTools.length === 0 ? (
-            <EmptyState
-              icon={<Wrench size={40} strokeWidth={1.5} />}
-              title="No custom tools"
-              description="Custom tools are created automatically when Nova learns new tool patterns."
-            />
-          ) : (
-            <div className="overflow-x-auto rounded-lg border border-nova-border">
-              <table className="w-full text-sm">
-                <thead>
-                  <tr className="border-b border-nova-border bg-nova-surface text-left text-xs text-nova-text-dim">
-                    <th className="px-3 py-2">Name</th>
-                    <th className="px-3 py-2">Description</th>
-                    <th className="px-3 py-2 text-center">Used</th>
-                    <th className="px-3 py-2 text-center">Success</th>
-                    <th className="px-3 py-2 text-center">Status</th>
-                    <th className="px-3 py-2 text-right">Actions</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {customTools.map((tool) => (
-                    <tr
-                      key={tool.name}
-                      className="border-b border-nova-border last:border-0 hover:bg-nova-surface/50"
-                    >
-                      <td className="px-3 py-2 font-medium">{tool.name}</td>
-                      <td className="max-w-[200px] truncate px-3 py-2 text-nova-text-dim">
-                        {tool.description || "\u2014"}
-                      </td>
-                      <td className="px-3 py-2 text-center">{tool.times_used}</td>
-                      <td className="px-3 py-2 text-center">
-                        {Math.round(tool.success_rate * 100)}%
-                      </td>
-                      <td className="px-3 py-2 text-center">
-                        <span className={`rounded px-2 py-0.5 text-xs font-medium ${
-                          tool.enabled
-                            ? "bg-nova-success/20 text-nova-success"
-                            : "bg-nova-error/20 text-nova-error"
-                        }`}>
-                          {tool.enabled ? "ON" : "OFF"}
-                        </span>
-                      </td>
-                      <td className="px-3 py-2 text-right">
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => setDeletingTool(tool.name)}
-                          icon={<Trash2 size={14} />}
-                        >
-                          Delete
-                        </Button>
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </Card>
-
         {/* ═══ Integrations (existing) ═══ */}
         <Card>
           <h2 className="mb-3 text-sm font-medium text-nova-text-dim">Integrations</h2>
@@ -978,14 +881,6 @@ export default function SettingsPage() {
           </div>
         </Card>
 
-        {/* ═══ Confirm dialog for custom tool delete ═══ */}
-        {deletingTool !== null && (
-          <ConfirmDialog
-            message={`Delete custom tool "${deletingTool}"? This cannot be undone.`}
-            onConfirm={handleDeleteTool}
-            onCancel={() => setDeletingTool(null)}
-          />
-        )}
       </div>
     </div>
   );

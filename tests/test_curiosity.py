@@ -81,11 +81,11 @@ class TestGapDetection:
         )
         assert gaps == []
 
-    def test_no_gap_for_code_exec_answered_query(self):
+    def test_no_gap_for_calculator_answered_query(self):
         gaps = detect_gaps(
             query="Compute the 20th Fibonacci number and tell me the value",
             answer="The 20th Fibonacci number is 6765.",
-            tool_results=[{"tool": "code_exec", "output": "6765"}],
+            tool_results=[{"tool": "calculator", "output": "6765"}],
             had_lessons=False, had_kg=False, had_docs=False,
         )
         assert gaps == []

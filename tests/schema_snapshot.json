@@ -7,18 +7,6 @@
   "success",
   "created_at"
  ],
- "agent_workspace": [
-  "id",
-  "query_signature",
-  "last_query",
-  "findings_json",
-  "last_answer",
-  "run_count",
-  "success_count",
-  "fail_count",
-  "created_at",
-  "updated_at"
- ],
  "auth_lockouts": [
   "ip",
   "failures",
@@ -93,17 +81,6 @@
   "title",
   "created_at",
   "updated_at"
- ],
- "custom_tools": [
-  "id",
-  "name",
-  "description",
-  "parameters",
-  "code",
-  "times_used",
-  "success_rate",
-  "enabled",
-  "created_at"
  ],
  "daemon_log": [
   "id",

@@ -254,27 +254,6 @@ class MaintenanceMixin:
             except Exception as e:
                 parts.append(f"curiosity prune failed: {e}")
                 logger.warning("[Heartbeat] Curiosity prune failed: %s", e)
-        # Disable auto-tools that aren't earning their keep — unused or low success rate.
-        try:
-            from app.core.auto_tools import prune_unused_tools, get_auto_tool_health
-            from app.database import get_db
-            _db = get_db()
-            res = await asyncio.to_thread(prune_unused_tools, _db, min_age_days=3)
-            if res.get("disabled"):
-                parts.append(
-                    f"auto-tools disabled: {res['disabled']} "
-                    f"(unused={res.get('unused', 0)} bad={res.get('bad', 0)})"
-                )
-            health = await asyncio.to_thread(get_auto_tool_health, _db)
-            if health.get("total", 0) > 0:
-                parts.append(
-                    f"auto-tool health: total={health['total']} enabled={health['enabled']} "
-                    f"used={health['used']} avg_uses={health['avg_uses']:.1f} "
-                    f"avg_success={health['avg_success']:.2f}"
-                )
-        except Exception as e:
-            parts.append(f"auto-tool prune failed: {e}")
-            logger.warning("[Heartbeat] Auto-tool prune failed: %s", e)
         # Audit log retention — keep 30 days for action_log, trust_audit_log,
         # and monitor_results. Was unbounded; 20k+ rows accumulated over 6 weeks
         # (monitor_results hit 13.7k rows of multi-KB TEXT by 2026-06 and was

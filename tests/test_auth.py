@@ -188,50 +188,6 @@ class TestSSRFProtection:
 
 
 # ---------------------------------------------------------------------------
-# S4: Code exec sandbox
-# ---------------------------------------------------------------------------
-
-class TestSandboxSecurity:
-    def test_blocks_open(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("open('/etc/passwd')") is not None
-
-    def test_blocks_eval(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("eval('__import__(\"os\")')") is not None
-
-    def test_blocks_exec(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("exec('import os')") is not None
-
-    def test_blocks_import_os(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("import os") is not None
-
-    def test_blocks_getattr(self):
-        from app.tools.code_exec import _check_code_safety
-        result = _check_code_safety("x = getattr(__builtins__, 'open')")
-        assert result is not None
-        assert "blocked" in result.lower()
-
-    def test_blocks_builtins(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("print(__builtins__)") is not None
-
-    def test_blocks_compile(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("code = compile('import os', '<x>', 'exec')") is not None
-
-    def test_blocks_globals(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("print(globals())") is not None
-
-    def test_allows_safe_math(self):
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("result = 2 ** 10\nprint(result)") is None
-
-
-# ---------------------------------------------------------------------------
 # S6: Redirect SSRF
 # ---------------------------------------------------------------------------
 
@@ -256,7 +212,7 @@ class TestRedirectSSRF:
 class TestSQLWhitelist:
     def test_allowed_tables_complete(self):
         from app.api.system import _ALLOWED_TABLES
-        expected = {"conversations", "messages", "user_facts", "lessons", "skills", "documents", "kg_facts", "reflexions", "custom_tools"}
+        expected = {"conversations", "messages", "user_facts", "lessons", "skills", "documents", "kg_facts", "reflexions"}
         assert expected == _ALLOWED_TABLES
 
     def test_dangerous_tables_excluded(self):
@@ -588,55 +544,13 @@ class TestAuthFailureEviction:
 
 from pathlib import Path
 
-from app.core.access_tiers import (
-    get_blocked_builtins,
-    get_blocked_imports,
-    get_blocked_shell_commands,
-    is_path_allowed,
-)
+from app.core.access_tiers import is_path_allowed
 
 
 def _with_tier(tier: str):
     """Patch config to use a specific access tier."""
     return patch("app.core.access_tiers.config",
                  type("C", (), {"SYSTEM_ACCESS_LEVEL": tier})())
-
-
-class TestShellTiers:
-    def test_sandboxed_blocks_interpreters(self):
-        with _with_tier("sandboxed"):
-            blocked = get_blocked_shell_commands()
-            assert "python" in blocked
-            assert "python3" in blocked
-            assert "node" in blocked
-
-    def test_standard_allows_interpreters(self):
-        with _with_tier("standard"):
-            blocked = get_blocked_shell_commands()
-            assert "python" not in blocked
-            assert "python3" not in blocked
-
-    def test_standard_blocks_system(self):
-        with _with_tier("standard"):
-            blocked = get_blocked_shell_commands()
-            assert "shutdown" in blocked
-            assert "systemctl" in blocked
-
-    def test_full_only_blocks_escape(self):
-        with _with_tier("full"):
-            blocked = get_blocked_shell_commands()
-            assert "docker" in blocked
-            assert "nsenter" in blocked
-            assert "chroot" in blocked
-            assert "shutdown" not in blocked
-            assert "python" not in blocked
-
-    def test_container_escape_always_blocked(self):
-        for tier in ("sandboxed", "standard", "full"):
-            with _with_tier(tier):
-                blocked = get_blocked_shell_commands()
-                assert "docker" in blocked
-                assert "nsenter" in blocked
 
 
 class TestFilesystemTiers:
@@ -678,45 +592,6 @@ class TestFilesystemTiers:
                 assert not is_path_allowed(Path("/root/.ssh/id_rsa"), write=True)
 
 
-class TestCodeExecTiers:
-    def test_sandboxed_blocks_os(self):
-        with _with_tier("sandboxed"):
-            blocked = get_blocked_imports()
-            assert "os" in blocked
-            assert "subprocess" in blocked
-            assert "pathlib" in blocked
-
-    def test_standard_allows_os_pathlib(self):
-        with _with_tier("standard"):
-            blocked = get_blocked_imports()
-            assert "os" not in blocked
-            assert "pathlib" not in blocked
-            assert "glob" not in blocked
-            assert "sys" not in blocked
-            assert "subprocess" in blocked  # still blocked
-
-    def test_full_minimal_blocks(self):
-        with _with_tier("full"):
-            blocked = get_blocked_imports()
-            assert "ctypes" in blocked
-            assert "multiprocessing" in blocked
-            assert "os" not in blocked
-            assert "subprocess" not in blocked
-
-    def test_sandboxed_blocks_builtins(self):
-        with _with_tier("sandboxed"):
-            blocked = get_blocked_builtins()
-            assert "eval(" in blocked
-            assert "exec(" in blocked
-            assert "__import__" in blocked
-
-    def test_full_minimal_builtins(self):
-        with _with_tier("full"):
-            blocked = get_blocked_builtins()
-            assert "__import__" in blocked  # always blocked
-            assert "eval(" not in blocked   # allowed at full
-
-
 class TestAccessTierConfigValidation:
     def test_invalid_access_level_warns(self):
         from app.config import Config
@@ -732,10 +607,11 @@ class TestAccessTierConfigValidation:
             assert not any("SYSTEM_ACCESS_LEVEL" in w for w in warnings)
 
     def test_invalid_tier_falls_back_to_sandboxed(self):
+        from app.core.access_tiers import _tier
         with _with_tier("typo"):
-            blocked = get_blocked_shell_commands()
-            # Falls back to sandboxed, which blocks interpreters
-            assert "python" in blocked
+            # Falls back to sandboxed, which confines writes to /data
+            assert _tier() == "sandboxed"
+            assert is_path_allowed(Path("/home/nova/x.txt"), write=True) is False
 
 
 # ---------------------------------------------------------------------------

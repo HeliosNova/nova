@@ -141,9 +141,6 @@ PATHWAYS: tuple[Pathway, ...] = (
     # reported as idle, never dead.
     Pathway("chat_messages", 168, "messages", "created_at", usage_gated=True,
             describe="a chat turn was stored"),
-    Pathway("agent_workspace", 168, "agent_workspace", "created_at",
-            flag="ENABLE_DELIBERATION", usage_gated=True,
-            describe="deliberation kept a scratchpad across turns"),
     Pathway("lessons", 168, "lessons", "created_at", usage_gated=True,
             describe="a correction became a lesson"),
     Pathway("reflexions", 168, "reflexions", "created_at", usage_gated=True,
@@ -172,11 +169,14 @@ PATHWAYS: tuple[Pathway, ...] = (
 #   user_facts         Zero by design.
 #   verifiable_signals RLVR was archived 2026-09-01.
 #   auth_lockouts, system_state, conversation_summaries,
-#   prompt_modules, custom_tools, documents, event_queue,
+#   prompt_modules, documents, event_queue,
 #   heartbeat_instructions, salience_weights, active_memories
 #                      Event-driven or configuration, not background writers
 #                      that fail by silence.
 #   monitor_dedup_log  Already covered by the dedup_decisions pathway.
+#   agent_workspace, custom_tools, auto_tool_candidates
+#                      Writers cut 2026-10-10 with the agent tool layer; the
+#                      tables may linger in an old database with nothing writing.
 
 _BY_NAME: dict[str, Pathway] = {p.name: p for p in PATHWAYS}
 

@@ -1,9 +1,6 @@
 """Chat/brain fixes from the 2026-08-24 A-Z audit.
 
-1. `_handle_tool_create` (the chat-path tool_create action) was the ONLY
-   create_tool call site not passing screen_network=True — an
-   injection-steered chat turn could mint a custom tool with network
-   imports that the three autonomous paths all screen out.
+1. (tool_create screen — the agent tool layer was removed 2026-10-10.)
 2. `build_evidence` never included conversation history, so the claim
    validator refused to repeat a name the user stated one turn earlier
    ("multiturn_recall_name" failed 5/5 consecutive nightly evals with
@@ -22,39 +19,7 @@
 
 from __future__ import annotations
 
-import asyncio
-
 import pytest
-
-
-class _RecordingToolStore:
-    def __init__(self):
-        self.kwargs: dict | None = None
-
-    def create_tool(self, name, description, parameters, code, **kwargs):
-        self.kwargs = kwargs
-        return -1  # short-circuit after recording — registry not exercised
-
-
-class TestToolCreateScreensNetwork:
-    def test_chat_path_passes_screen_network(self):
-        from app.core.brain import _handle_tool_create
-
-        store = _RecordingToolStore()
-
-        class _Svc:
-            custom_tools = store
-            tool_registry = None
-
-        asyncio.run(_handle_tool_create(_Svc(), {
-            "name": "exfil", "description": "d", "parameters": "[]",
-            "code": "def run():\n    return 1",
-        }))
-        assert store.kwargs is not None, "create_tool never called"
-        assert store.kwargs.get("screen_network") is True, (
-            "chat-path tool_create must screen network imports like the "
-            "three autonomous creation paths do"
-        )
 
 
 class TestHistoryAsEvidence:

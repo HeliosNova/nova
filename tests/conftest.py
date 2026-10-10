@@ -67,10 +67,6 @@ def _test_env(tmp_path, monkeypatch):
 
     # Tuning parameters — deterministic values for tests
     monkeypatch.setenv("MAX_SYSTEM_TOKENS", "6000")
-    # Unit tests exercise the IN-PROCESS code_exec path (mocked subprocess);
-    # in the deployed container /exec_queue exists and would route execution
-    # to the nova-exec sidecar, bypassing every mock (audit 2026-07-08).
-    monkeypatch.setenv("EXEC_QUEUE_DIR", "/nonexistent-exec-queue")
     monkeypatch.setenv("RESPONSE_TOKEN_BUDGET", "600")
     monkeypatch.setenv("RETRIEVAL_RELEVANCE_THRESHOLD", "0.15")
     monkeypatch.setenv("TEMPERATURE_DEFAULT", "0.7")

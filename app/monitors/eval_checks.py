@@ -168,12 +168,12 @@ def check_tool_scoping() -> tuple[bool, str]:
     from app.core.brain import _TAINT_STRIPPED_TOOLS, _WEB_INGEST_TOOLS
     fails: list[str] = []
     wl = access_tiers.RESEARCH_TOOLS
-    _ok(not (wl & {"shell_exec", "file_ops", "tool_create"}), "research whitelist leaks side-effect tools", fails)
+    _ok(not (wl & {"file_ops", "email_send", "webhook"}), "research whitelist leaks side-effect tools", fails)
     access_tiers.set_tool_whitelist(None)
     with access_tiers.research_scope():
-        _ok(not access_tiers.is_tool_allowed("shell_exec"), "research scope allows shell_exec", fails)
+        _ok(not access_tiers.is_tool_allowed("file_ops"), "research scope allows file_ops", fails)
     _ok(access_tiers.get_tool_whitelist() is None, "research scope did not restore the whitelist", fails)
-    _ok({"web_search", "http_fetch", "browser"} <= _WEB_INGEST_TOOLS and "shell_exec" in _TAINT_STRIPPED_TOOLS,
+    _ok({"web_search", "http_fetch", "browser"} <= _WEB_INGEST_TOOLS and "file_ops" in _TAINT_STRIPPED_TOOLS,
         "taint sets regressed", fails)
     return (not fails, "; ".join(fails) or "research whitelist and taint sets OK")
 

@@ -25,21 +25,6 @@ logger = logging.getLogger(__name__)
 
 VALID_TIERS = {"sandboxed", "standard", "full", "none"}
 
-# ContextVar override for access tier — used by delegate to constrain sub-agents.
-# When set, _tier() returns this value instead of config.SYSTEM_ACCESS_LEVEL.
-_access_tier_override: contextvars.ContextVar[str | None] = contextvars.ContextVar(
-    "access_tier_override", default=None
-)
-
-
-def get_access_tier_override() -> str | None:
-    return _access_tier_override.get()
-
-
-def set_access_tier_override(tier: str | None) -> None:
-    _access_tier_override.set(tier)
-
-
 # ContextVar for tool whitelist — restricts which tools a sub-agent can call.
 # When set, only tools in the whitelist can execute; all others get PERMISSION error.
 _tool_whitelist: contextvars.ContextVar[frozenset[str] | None] = contextvars.ContextVar(
@@ -101,13 +86,6 @@ class research_scope:
 
 
 def _tier() -> str:
-    # Check ContextVar override first (set by delegate for sub-agents)
-    override = _access_tier_override.get()
-    if override is not None:
-        t = override.lower()
-        if t in VALID_TIERS:
-            return t
-        logger.warning("Invalid access tier override '%s', falling back to config", override)
 
     t = config.SYSTEM_ACCESS_LEVEL.lower()
     if t not in VALID_TIERS:
@@ -133,79 +111,6 @@ def requires_tier(*allowed_tiers: str):
             return await execute_method(self, **kwargs)
         return wrapper
     return decorator
-
-
-# ---------------------------------------------------------------------------
-# Shell access
-# ---------------------------------------------------------------------------
-
-# Container-escape commands blocked at ALL tiers
-_ALWAYS_BLOCKED_COMMANDS = {
-    "docker", "podman", "nsenter", "chroot", "unshare",
-}
-
-# Destructive system commands blocked at sandboxed + standard
-_SYSTEM_COMMANDS = {
-    "shutdown", "reboot", "poweroff", "halt", "init",
-    "mkfs", "fdisk", "parted",
-    "iptables", "ip6tables", "nft", "ufw",
-    "useradd", "userdel", "usermod", "passwd", "groupadd", "groupdel",
-    "systemctl", "service",
-    "mount", "umount", "swapon", "swapoff",
-}
-
-# Interpreters blocked only at sandboxed tier
-_INTERPRETER_COMMANDS = {
-    "python", "python3", "node", "ruby", "perl",
-}
-
-
-def get_blocked_shell_commands() -> set[str]:
-    """Return the set of blocked shell commands for the current tier."""
-    tier = _tier()
-
-    if tier == "none":
-        logger.warning("Shell running with NO restrictions (sandbox disabled)")
-        return set()
-
-    blocked = set(_ALWAYS_BLOCKED_COMMANDS)
-
-    if tier == "sandboxed":
-        blocked |= _SYSTEM_COMMANDS | _INTERPRETER_COMMANDS
-    elif tier == "standard":
-        blocked |= _SYSTEM_COMMANDS
-    # full: only container-escape commands blocked
-
-    if tier == "full":
-        logger.warning("Shell running at FULL access tier")
-
-    return blocked
-
-
-def is_command_blocked(base_cmd: str) -> str | None:
-    """Check if a base command is blocked, with prefix matching for interpreters.
-
-    Returns the matched blocked command name if blocked, None if allowed.
-    Handles versioned interpreters like python3.11, node18, ruby3.2, etc.
-    """
-    blocked = get_blocked_shell_commands()
-
-    # Exact match first (covers all non-interpreter commands too)
-    if base_cmd in blocked:
-        return base_cmd
-
-    # Prefix match for interpreters: e.g. python3.11 matches python3
-    # Only match if the suffix after the blocked name is digits/dots (version suffix)
-    tier = _tier()
-    if tier == "sandboxed":
-        for interp in _INTERPRETER_COMMANDS:
-            if base_cmd.startswith(interp) and len(base_cmd) > len(interp):
-                suffix = base_cmd[len(interp):]
-                # Allow only version-like suffixes (digits and dots)
-                if all(c in "0123456789." for c in suffix):
-                    return interp
-
-    return None
 
 
 # ---------------------------------------------------------------------------
@@ -286,58 +191,3 @@ def is_path_allowed(path: Path, write: bool = False) -> bool:
         if resolved == root_resolved or resolved.is_relative_to(root_resolved):
             return True
     return False
-
-
-# ---------------------------------------------------------------------------
-# Code execution
-# ---------------------------------------------------------------------------
-
-# Imports blocked at ALL tiers
-_ALWAYS_BLOCKED_IMPORTS = {"ctypes", "multiprocessing"}
-
-# Full sandboxed set (current behavior)
-_SANDBOXED_BLOCKED_IMPORTS = {
-    "os", "subprocess", "shutil", "sys", "importlib",
-    "ctypes", "socket", "http", "urllib", "requests", "httpx",
-    "pathlib", "glob", "signal", "multiprocessing",
-}
-
-# Standard: allow os.path, pathlib, glob, sys but block dangerous ones
-_STANDARD_BLOCKED_IMPORTS = {
-    "subprocess", "shutil", "importlib",
-    "ctypes", "socket", "http", "urllib", "requests", "httpx",
-    "signal", "multiprocessing",
-}
-
-
-def get_blocked_imports() -> set[str]:
-    """Return blocked imports for code_exec at the current tier."""
-    tier = _tier()
-    if tier == "none":
-        return set()
-    if tier == "sandboxed":
-        return set(_SANDBOXED_BLOCKED_IMPORTS)
-    elif tier == "standard":
-        return set(_STANDARD_BLOCKED_IMPORTS)
-    else:
-        # full: only block truly dangerous ones
-        return set(_ALWAYS_BLOCKED_IMPORTS)
-
-
-def get_blocked_builtins() -> list[str]:
-    """Return blocked builtins for code_exec at the current tier."""
-    tier = _tier()
-    if tier == "none":
-        return []
-    if tier in ("sandboxed", "standard"):
-        return [
-            "open(", "getattr(", "compile(", "globals(", "locals(",
-            "vars(", "dir(", "breakpoint(",
-            "__builtins__", "__import__", "eval(", "exec(",
-        ]
-    else:
-        # full: minimal restrictions
-        return [
-            "__builtins__", "__import__",
-            "breakpoint(",
-        ]

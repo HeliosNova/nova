@@ -307,9 +307,8 @@ class TestModuleImports:
         assert EventType.TOKEN is not None
 
     def test_import_core_access_tiers(self):
-        from app.core.access_tiers import _tier, is_command_blocked, is_path_allowed
+        from app.core.access_tiers import _tier, is_path_allowed
         assert callable(_tier)
-        assert callable(is_command_blocked)
         assert callable(is_path_allowed)
 
     def test_import_core_injection(self):

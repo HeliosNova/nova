@@ -142,10 +142,8 @@ Chat is the surface where you interrogate all of this: relevant dossier prose is
 | `calculator` | Math via SymPy — never does arithmetic in its head |
 | `http_fetch` | Fetch URLs with SSRF protection (blocks private IPs, DNS rebinding) |
 | `knowledge_search` | Hybrid retrieval: ChromaDB vectors + SQLite FTS5 + RRF fusion |
-| `code_exec` | Sandboxed Python (AST-analyzed, tier-restricted imports) |
 | `memory_search` | Search conversations and user facts |
 | `file_ops` | Read/write files (path-restricted per access tier) |
-| `shell_exec` | Shell commands (blocked patterns, tier-restricted, disabled by default) |
 | `browser` | Playwright-based web browsing with cookie clearing |
 | `screenshot` | Capture website screenshots |
 | `email_send` | SMTP email with recipient allowlist |
@@ -153,10 +151,9 @@ Chat is the surface where you interrogate all of this: relevant dossier prose is
 | `webhook` | HTTP webhooks (URL-restricted) |
 | `reminder` | Schedule reminders via heartbeat system |
 | `monitor` | Create/manage proactive heartbeat monitors |
-| `delegate` | Delegate subtasks to parallel sub-agents |
 | `integration` | Connect to GitHub, Slack, Notion, etc. (10 templates) |
 
-Plus dynamically created custom tools.
+Chat-facing tools; the monitors use the research set (web_search, deep_research, http_fetch, browser, knowledge_search).
 
 ## Channels
 

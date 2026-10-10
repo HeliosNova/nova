@@ -129,19 +129,6 @@ CREATE TABLE IF NOT EXISTS reflexions (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Custom Tools (dynamic tool creation)
-CREATE TABLE IF NOT EXISTS custom_tools (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT UNIQUE NOT NULL,
-    description TEXT NOT NULL,
-    parameters TEXT NOT NULL,
-    code TEXT NOT NULL,
-    times_used INTEGER DEFAULT 0,
-    success_rate REAL DEFAULT 1.0,
-    enabled BOOLEAN DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
 -- Monitors (heartbeat system)
 CREATE TABLE IF NOT EXISTS monitors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -742,43 +729,6 @@ class SafeDB:
                 if "channels" not in monitor_cols:
                     conn.execute("ALTER TABLE monitors ADD COLUMN channels TEXT")
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (17,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        # --- Migration 18: agent_workspace (persistent scratchpads) ---
-        # Each AgentLoop run keyed by its query signature. Future runs of
-        # similar queries inherit prior findings/answer instead of starting
-        # fresh. Lets multi-step research compound across sessions.
-        if 18 not in applied:
-            conn.execute("BEGIN")
-            try:
-                conn.execute(
-                    """
-                    CREATE TABLE IF NOT EXISTS agent_workspace (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        query_signature TEXT NOT NULL UNIQUE,
-                        last_query TEXT NOT NULL,
-                        findings_json TEXT,
-                        last_answer TEXT,
-                        run_count INTEGER NOT NULL DEFAULT 0,
-                        success_count INTEGER NOT NULL DEFAULT 0,
-                        fail_count INTEGER NOT NULL DEFAULT 0,
-                        created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_agent_workspace_sig "
-                    "ON agent_workspace(query_signature)"
-                )
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_agent_workspace_updated "
-                    "ON agent_workspace(updated_at)"
-                )
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (18,))
                 conn.commit()
             except Exception:
                 conn.rollback()

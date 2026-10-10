@@ -35,8 +35,6 @@ from app.core.skills import SkillStore
 from app.database import get_db
 from app.tools.base import ToolRegistry
 from app.tools.calculator import CalculatorTool
-from app.tools.code_exec import CodeExecTool
-from app.tools.code_verify import CodeVerifyTool
 from app.tools.code_understand import CodeUnderstandTool
 from app.tools.file_ops import FileOpsTool
 from app.tools.http_fetch import HttpFetchTool
@@ -46,14 +44,12 @@ from app.tools.browser import BrowserTool
 from app.tools.monitor_tool import MonitorTool
 from app.tools.active_memory import ActiveMemoryTool
 from app.tools.screenshot import ScreenshotTool
-from app.tools.shell_exec import ShellExecTool
 from app.tools.web_search import WebSearchTool
 from app.tools.search_agent import SearchAgentTool
 from app.tools.action_email import EmailSendTool
 from app.tools.action_calendar import CalendarTool
 from app.tools.action_reminder import ReminderTool
 from app.tools.action_webhook import WebhookTool
-from app.tools.delegate import DelegateTool
 
 class _CorrelationIDFormatter(logging.Formatter):
     """Formatter that injects request_id from context var, defaulting to empty."""
@@ -203,21 +199,15 @@ async def lifespan(app: FastAPI):
         ("CalculatorTool", lambda: CalculatorTool()),
         ("HttpFetchTool", lambda: HttpFetchTool()),
         ("KnowledgeSearchTool", lambda: KnowledgeSearchTool(retriever=retriever)),
-        ("CodeExecTool", lambda: CodeExecTool()),
-        ("CodeVerifyTool", lambda: CodeVerifyTool()),
         ("CodeUnderstandTool", lambda: CodeUnderstandTool()),
         ("MemorySearchTool", lambda: MemorySearchTool(conversations=conversations, user_facts=user_facts)),
         ("FileOpsTool", lambda: FileOpsTool()),
-        ("ShellExecTool", lambda: ShellExecTool()),
         ("BrowserTool", lambda: BrowserTool()),
         ("ScreenshotTool", lambda: ScreenshotTool()),
         ("EmailSendTool", lambda: EmailSendTool()),
         ("CalendarTool", lambda: CalendarTool()),
         ("WebhookTool", lambda: WebhookTool()),
     ]
-    if config.ENABLE_DELEGATION:
-        _tool_instances.append(("DelegateTool", lambda: DelegateTool()))
-
     # Context detail tool (lazy context retrieval — uses get_services() at call time)
     from app.tools.context_detail import ContextDetailTool
     _tool_instances.append(("ContextDetailTool", lambda: ContextDetailTool()))
@@ -243,19 +233,6 @@ async def lifespan(app: FastAPI):
             logger.info("Integration templates loaded, none configured (no env tokens set)")
 
     logger.info("Tools registered: %s", ", ".join(registry.tool_names))
-
-    # Custom tools (dynamic tool creation)
-    custom_tools = None
-    if config.ENABLE_CUSTOM_TOOLS:
-        from app.core.custom_tools import CustomToolStore, DynamicTool
-        custom_tools = CustomToolStore(db)
-        loaded = custom_tools.get_all_tools()
-        for ct in loaded:
-            registry.register(DynamicTool(ct, custom_tools))
-        if loaded:
-            logger.info("Loaded %d custom tool(s): %s", len(loaded), ", ".join(t.name for t in loaded))
-        else:
-            logger.info("Custom tools enabled (0 loaded)")
 
     # Monitor store + monitor tool
     # Active Memory Tool (AgeMem pattern — agent-managed memory)
@@ -317,7 +294,6 @@ async def lifespan(app: FastAPI):
         tool_registry=registry,
         kg=kg,
         reflexions=reflexions,
-        custom_tools=custom_tools,
         monitor_store=monitor_store,
         curiosity=curiosity_queue,
         topic_tracker=topic_tracker,
@@ -797,9 +773,6 @@ app.include_router(exports_router, prefix="/api")
 
 from app.api.dossiers import router as dossiers_router
 app.include_router(dossiers_router, prefix="/api")
-
-from app.api.agent import router as agent_router
-app.include_router(agent_router, prefix="/api")
 
 from app.api.events import router as events_router
 app.include_router(events_router, prefix="/api")

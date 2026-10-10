@@ -41,16 +41,13 @@ _MUTABLE_FIELDS = {
     "EMBEDDING_MODEL", "RETRIEVAL_TOP_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
     "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT", "MAX_SKILLS_CHECK",
     "MAX_CONTEXT_TOKENS", "RECENT_MESSAGES_KEEP",
-    "CODE_EXEC_TIMEOUT", "MAX_TOOL_ROUNDS", "MAX_SAME_TOOL_CALLS", "MAX_TOOL_CALLS_PER_QUERY",
-    "SHELL_EXEC_TIMEOUT",
+    "MAX_TOOL_ROUNDS", "MAX_SAME_TOOL_CALLS", "MAX_TOOL_CALLS_PER_QUERY",
     "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
-    "ENABLE_PLANNING", "ENABLE_CRITIQUE", "ENABLE_CUSTOM_TOOLS",
-    "ENABLE_EXTENDED_THINKING", "ENABLE_DELEGATION", "ENABLE_CURIOSITY",
+    "ENABLE_PLANNING", "ENABLE_CRITIQUE",
+    "ENABLE_EXTENDED_THINKING", "ENABLE_CURIOSITY",
     "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
-    "ENABLE_SHELL_EXEC",
-    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_AUTONOMOUS_TOOL_CREATION",
-    "AUTO_TOOL_CREATION_THRESHOLD", "ENABLE_INJECTION_DETECTION",
+    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_INJECTION_DETECTION",
     "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
     "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
@@ -77,7 +74,6 @@ _MUTABLE_FIELDS = {
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
     "ENABLE_MONITOR_DIGEST", "MONITOR_DIGEST_ITEM_MAX_CHARS",
     "ENABLE_DELIBERATION",
-    "ENABLE_TREE_OF_THOUGHT", "TOT_SAMPLE_N",
     "ENABLE_BEST_OF_N", "BEST_OF_N_SAMPLES", "BEST_OF_N_QUALITY_THRESHOLD",
     "RETRIEVAL_HARD_FLOOR",
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
@@ -244,7 +240,6 @@ class Config:
     WEB_SEARCH_TIMEOUT: float = field(default_factory=lambda: _env_float("WEB_SEARCH_TIMEOUT", 12.0))
     WEB_SEARCH_ENGINES: str = field(default_factory=lambda: _env("WEB_SEARCH_ENGINES", "bing,startpage,ecosia,yandex,yahoo"))
     WEB_SEARCH_MAX_RESULTS: int = field(default_factory=lambda: _env_int("WEB_SEARCH_MAX_RESULTS", 5))
-    CODE_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("CODE_EXEC_TIMEOUT", 15))
     # Worst-case bound on agentic tool-use rounds per query. A 2026 latency/depth
     # study (7-query mix, cap 10 vs 5) found chat uses <=3 rounds (even a fictional
     # "find the codename" query self-limited to 3), so 10 was dead headroom and the
@@ -254,14 +249,12 @@ class Config:
     MAX_TOOL_ROUNDS: int = field(default_factory=lambda: _env_int("MAX_TOOL_ROUNDS", 6))
     MAX_SAME_TOOL_CALLS: int = field(default_factory=lambda: _env_int("MAX_SAME_TOOL_CALLS", 3))
     MAX_TOOL_CALLS_PER_QUERY: int = field(default_factory=lambda: _env_int("MAX_TOOL_CALLS_PER_QUERY", 15))
-    SHELL_EXEC_TIMEOUT: int = field(default_factory=lambda: _env_int("SHELL_EXEC_TIMEOUT", 45))
     BROWSER_TIMEOUT: int = field(default_factory=lambda: _env_int("BROWSER_TIMEOUT", 60))
     BROWSER_CDP_URL: str = field(default_factory=lambda: _env("BROWSER_CDP_URL", ""))  # http:// CDP URL to connect to host browser
     TOOL_TIMEOUT: int = field(default_factory=lambda: _env_int("TOOL_TIMEOUT", 180))
     TOOL_OUTPUT_MAX_CHARS: int = field(default_factory=lambda: _env_int("TOOL_OUTPUT_MAX_CHARS", 10000))
     GENERATION_TIMEOUT: int = field(default_factory=lambda: _env_int("GENERATION_TIMEOUT", 900))
     INTERNAL_LLM_TIMEOUT: int = field(default_factory=lambda: _env_int("INTERNAL_LLM_TIMEOUT", 60))
-    ENABLE_SHELL_EXEC: bool = field(default_factory=lambda: _env("ENABLE_SHELL_EXEC", "false").lower() == "true")
 
     # Screenshot tool output directory
     SCREENSHOT_DIR: str = field(default_factory=lambda: _env("SCREENSHOT_DIR", "/tmp/nova_screenshots"))
@@ -306,7 +299,6 @@ class Config:
     # Reasoning
     ENABLE_PLANNING: bool = field(default_factory=lambda: _env("ENABLE_PLANNING", "true").lower() == "true")
     ENABLE_CRITIQUE: bool = field(default_factory=lambda: _env("ENABLE_CRITIQUE", "true").lower() == "true")
-    ENABLE_CUSTOM_TOOLS: bool = field(default_factory=lambda: _env("ENABLE_CUSTOM_TOOLS", "true").lower() == "true")
     ENABLE_EXTENDED_THINKING: bool = field(default_factory=lambda: _env("ENABLE_EXTENDED_THINKING", "true").lower() == "true")
 
     # Model routing
@@ -327,25 +319,11 @@ class Config:
     CRITIQUE_SOURCES_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_SOURCES_LIMIT", 1500))
     CRITIQUE_FACTS_LIMIT: int = field(default_factory=lambda: _env_int("CRITIQUE_FACTS_LIMIT", 2000))
 
-    # Delegation (LLM-driven, via DelegateTool)
-    ENABLE_DELEGATION: bool = field(default_factory=lambda: _env("ENABLE_DELEGATION", "true").lower() == "true")
-    MAX_DELEGATION_DEPTH: int = field(default_factory=lambda: _env_int("MAX_DELEGATION_DEPTH", 1))
-
-    # Deliberation route (AgentLoop plan→act→critique→synthesize). Own flag
-    # since 2026-08-25: it used to share ENABLE_MULTI_AGENT as a "master
-    # agentic kill switch", so disabling decomposition on 08-14 silently
-    # disabled DELIBERATION too — a kept capability dead for 10 days.
-    ENABLE_DELIBERATION: bool = field(default_factory=lambda: _env("ENABLE_DELIBERATION", "true").lower() == "true")
-
     # (Multi-agent structural decomposition flags removed 2026-08-25 —
     # the capability is archived in archive/multi_agent/; it had been
     # disabled in production since 08-14 at a measured 0.286 pass rate.
     # ENABLE_MULTI_AGENT / MULTI_AGENT_TRIGGER_THRESHOLD / MAX_AGENT_COUNT /
     # AGENT_TASK_TIMEOUT / MAX_PARALLEL_AGENTS / MAX_STRUCTURAL_DEPTH.)
-    # Tree-of-thought: when enabled, AgentLoop samples multiple action chains for hard steps
-    # and picks the most consistent one. Adds latency proportional to sample count.
-    ENABLE_TREE_OF_THOUGHT: bool = field(default_factory=lambda: _env("ENABLE_TREE_OF_THOUGHT", "true").lower() == "true")
-    TOT_SAMPLE_N: int = field(default_factory=lambda: _env_int("TOT_SAMPLE_N", 3))
     # Best-of-N for chat path: when a hard reasoning query ends with quality < threshold
     # after the full critique chain, sample N alternative responses at different temperatures
     # and pick the highest-quality one. Bounded — only fires on hard + low-quality.
@@ -364,10 +342,6 @@ class Config:
 
     # Auto skill creation
     ENABLE_AUTO_SKILL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTO_SKILL_CREATION", "true").lower() == "true")
-
-    # Autonomous tool creation (self-extending pipeline)
-    ENABLE_AUTONOMOUS_TOOL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTONOMOUS_TOOL_CREATION", "true").lower() == "true")
-    AUTO_TOOL_CREATION_THRESHOLD: int = field(default_factory=lambda: _env_int("AUTO_TOOL_CREATION_THRESHOLD", 3))
 
     # Skill import/export signing
     REQUIRE_SIGNED_SKILLS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_SKILLS", "true").lower() == "true")
@@ -399,8 +373,6 @@ class Config:
     MAX_CURIOSITY_PENDING: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_PENDING", 50))
     MAX_CURIOSITY_ATTEMPTS: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_ATTEMPTS", 3))
     MAX_CURIOSITY_QUEUE_SIZE: int = field(default_factory=lambda: _env_int("MAX_CURIOSITY_QUEUE_SIZE", 100))
-    MAX_CUSTOM_TOOL_CODE_LENGTH: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOL_CODE_LENGTH", 5000))
-    MAX_CUSTOM_TOOLS: int = field(default_factory=lambda: _env_int("MAX_CUSTOM_TOOLS", 50))
     RATE_LIMIT_RPM: int = field(default_factory=lambda: _env_int("RATE_LIMIT_RPM", 60))
 
     # Prompt context limits (how many items of each type in system prompt)

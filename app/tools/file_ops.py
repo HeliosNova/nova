@@ -39,7 +39,7 @@ class FileOpsTool(BaseTool):
         "Access level is controlled by SYSTEM_ACCESS_LEVEL tier. "
         "Reads return file content (truncated at 10,000 characters). Writes create parent directories automatically. "
         "Use for persistent data storage in /data/. "
-        "Do NOT use for executing code (use code_exec) or running commands (use shell_exec)."
+        "Not a code runner."
     )
     parameters = "action: str, path: str, content: str"
     input_schema = {

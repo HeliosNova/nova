@@ -23,12 +23,9 @@ def _get_all_tools() -> list[BaseTool]:
     from app.tools.calculator import CalculatorTool
     from app.tools.http_fetch import HttpFetchTool
     from app.tools.file_ops import FileOpsTool
-    from app.tools.code_exec import CodeExecTool
-    from app.tools.shell_exec import ShellExecTool
     from app.tools.knowledge import KnowledgeSearchTool
     from app.tools.memory_tool import MemorySearchTool
     from app.tools.browser import BrowserTool
-    from app.tools.delegate import DelegateTool
     from app.tools.action_email import EmailSendTool
     from app.tools.action_calendar import CalendarTool
     from app.tools.action_reminder import ReminderTool
@@ -42,12 +39,9 @@ def _get_all_tools() -> list[BaseTool]:
         CalculatorTool(),
         HttpFetchTool(),
         FileOpsTool(),
-        CodeExecTool(),
-        ShellExecTool(),
         KnowledgeSearchTool(),
         MemorySearchTool(),
         BrowserTool(),
-        DelegateTool(),
         EmailSendTool(),
         CalendarTool(),
         ReminderTool(),
@@ -242,15 +236,6 @@ class TestTrimOutput:
         long_text = "x" * 5000
         trimmed = tool.trim_output(long_text)
         assert len(trimmed) < 5000
-        assert "truncated" in trimmed.lower()
-
-    def test_shell_tail_strategy(self):
-        """Shell tool keeps tail of output."""
-        from app.tools.shell_exec import ShellExecTool
-        tool = ShellExecTool()
-        output = "line_start\n" + ("x" * 5000) + "\nimportant_tail"
-        trimmed = tool.trim_output(output)
-        assert "important_tail" in trimmed
         assert "truncated" in trimmed.lower()
 
     def test_browser_preserves_interactive(self):

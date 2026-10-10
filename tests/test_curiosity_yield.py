@@ -116,31 +116,6 @@ def test_quota_falls_through_when_no_tension_pending(db):
     assert [q.get_next().source for _ in range(3)] == ["dossier_open_question"] * 3
 
 
-# --- agent loop routes through the queue gate ------------------------------
-
-def test_agent_loop_failures_go_through_queue_add(db, monkeypatch):
-    from types import SimpleNamespace
-    from app.core import agent_loop as al
-
-    calls = []
-
-    def _fake_add(self, topic, source="gap_detection", urgency=0.5):
-        calls.append((topic, source, urgency))
-        return 1
-
-    monkeypatch.setattr(al.CuriosityQueue if hasattr(al, "CuriosityQueue") else CuriosityQueue, "add", _fake_add)
-    monkeypatch.setattr("app.database.get_db", lambda: db)
-    failed_step = SimpleNamespace(status=al.STEP_FAILED, action={"tool": "web_search"},
-                                  description="Find the current ECB deposit rate after the September meeting",
-                                  attempts=2, critique="")
-    plan = SimpleNamespace(steps=[failed_step])
-    result = SimpleNamespace(success=False, plan=plan, query="q", answer="", iterations=1)
-    loop = al.AgentLoop.__new__(al.AgentLoop)
-    loop._learn_from_run_sync(result)
-    assert calls and calls[0][1] == "agent_failure" and calls[0][2] < 0.7
-    assert db.fetchone("SELECT COUNT(*) AS c FROM curiosity_queue")["c"] == 0  # no raw INSERT
-
-
 def test_dossier_prompts_ask_for_researchable_questions_and_watch_for_line():
     from app.core import dossiers
     for tpl in (dossiers._UPDATE_PROMPT, dossiers._WORLD_PROMPT):

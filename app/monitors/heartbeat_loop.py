@@ -978,7 +978,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
     _CHECK_DISPATCH = {
         "url": lambda self, m, cfg: self._execute_url(cfg),
         "search": lambda self, m, cfg: self._execute_search(cfg),
-        "command": lambda self, m, cfg: self._execute_command(cfg),
         "system_health": lambda self, m, cfg: self._execute_system_health(),
         "query": lambda self, m, cfg: self._execute_query_monitor(m, cfg),
         "quiz": lambda self, m, cfg: self._execute_quiz(cfg),
@@ -1027,14 +1026,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         if svc.tool_registry:
             return await svc.tool_registry.execute("web_search", {"query": query})
         return "[No tool registry — cannot search]"
-
-    async def _execute_command(self, cfg: dict) -> str:
-        from app.core.brain import get_services
-        svc = get_services()
-        command = cfg.get("command", "")
-        if svc.tool_registry:
-            return await svc.tool_registry.execute("shell_exec", {"command": command})
-        return "[No tool registry — cannot exec]"
 
     async def _execute_query_monitor(self, monitor: Monitor, cfg: dict) -> str:
         # For Domain Study:* monitors use the direct-fetch runner that

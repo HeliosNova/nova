@@ -344,32 +344,6 @@ class TestPromptBuilder:
 class TestReasoningPatterns:
     """Pure-function regex tests for the reasoning-shape gates."""
 
-    def test_should_use_deliberation_fires_on_chain_of_reasoning(self):
-        from app.core.brain import _should_use_deliberation
-        # Long enough + matches pattern
-        assert _should_use_deliberation(
-            "Walk me through how you would design a rate limiter for a REST API"
-        )
-        assert _should_use_deliberation(
-            "Show me how to derive the formula for compound interest, step by step"
-        )
-        assert _should_use_deliberation(
-            "How would you architect a distributed event-driven microservices system"
-        )
-        assert _should_use_deliberation(
-            "Explain how this algorithm processes a large dataset in chunks"
-        )
-
-    def test_should_use_deliberation_skips_simple_queries(self):
-        from app.core.brain import _should_use_deliberation
-        assert not _should_use_deliberation("What is 2+2")
-        assert not _should_use_deliberation("Hi")
-        assert not _should_use_deliberation("What is the capital of France")
-        # Short queries (< 25 chars) skipped even if they match
-        assert not _should_use_deliberation("Walk me through OAuth")
-
-    # (decomposer gate tests removed 2026-08-25 — capability archived)
-
     def test_inherently_uncertain_query(self):
         from app.core.brain import _INHERENTLY_UNCERTAIN_RE
         assert _INHERENTLY_UNCERTAIN_RE.search(
@@ -417,7 +391,7 @@ class TestReasoningPatterns:
         assert len(result) == 2
 
     def test_hard_reasoning_query(self):
-        from app.core.agent_loop import _is_hard_reasoning_query
+        from app.core.reasoning_cues import _is_hard_reasoning_query
         assert _is_hard_reasoning_query(
             "Compare Python and JavaScript for backend development"
         )

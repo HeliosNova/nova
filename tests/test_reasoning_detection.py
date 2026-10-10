@@ -6,7 +6,7 @@ problems — so they never got extended thinking. These pin the broadened gate.
 """
 import pytest
 
-from app.core.agent_loop import _is_hard_reasoning_query, _is_math_logic_word_problem
+from app.core.reasoning_cues import _is_hard_reasoning_query, _is_math_logic_word_problem
 
 
 WORD_PROBLEMS = [

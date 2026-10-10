@@ -226,7 +226,6 @@ export interface StatusResponse {
   training_examples: number;
   kg_facts: number;
   reflexions: number;
-  custom_tools: number;
 }
 
 // ── Tool Call (UI state) ──
@@ -551,17 +550,6 @@ export interface EventQueueItem {
   priority: number;
   status: string;
   created_at: string;
-}
-
-// ── Custom Tool ──
-
-export interface CustomToolInfo {
-  name: string;
-  description: string;
-  times_used: number;
-  success_rate: number;
-  enabled: boolean;
-  created_at?: string;
 }
 
 // ── Curiosity Queue Item ──

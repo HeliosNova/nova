@@ -23,11 +23,13 @@ if TYPE_CHECKING:
     from app.core.reflexion import ReflexionStore
     from app.core.retriever import Retriever
     from app.core.kg import KnowledgeGraph
-    from app.core.custom_tools import CustomToolStore
     from app.core.curiosity import CuriosityQueue, TopicTracker
     from app.tools.base import ToolRegistry
     from app.monitors.heartbeat import MonitorStore, HeartbeatLoop
 from app.core import llm
+from app.core.reasoning_cues import (
+    _is_deliberation_query, _is_hard_reasoning_query, _is_math_logic_word_problem,
+)
 from app.core.claim_validator import build_evidence, count_claim_candidates, validate_claims
 from app.core.learning import is_likely_correction, response_pushes_back
 from app.core.llm import LLMUnavailableError, _extract_tool_calls
@@ -81,20 +83,18 @@ async def _get_conversation_lock(conv_id: str) -> asyncio.Lock:
 # Tools with side effects — skip caching for these (used in think() tool cache)
 _SIDE_EFFECT_TOOLS = frozenset({
     "file_ops", "email_send", "webhook", "calendar", "reminder",
-    "shell_exec", "code_exec", "integration", "delegate", "browser",
-    "tool_create", "monitor",
+    "integration", "browser", "monitor",
 })
 
 # Taint tracking (2026-09-01). Once a turn has ingested web-derived text the
 # model may be reading an injected instruction; side-effect tools leave its
-# tool list for the rest of that turn (sandboxed code_exec and the benign
+# tool list for the rest of that turn (the calculator and the benign
 # owner-facing tools stay). The injection detector only prefixes a banner.
 _WEB_INGEST_TOOLS = frozenset({
     "web_search", "http_fetch", "browser", "deep_research", "knowledge_search",
 })
 _TAINT_STRIPPED_TOOLS = frozenset({
-    "shell_exec", "file_ops", "tool_create", "email_send", "webhook",
-    "integration", "delegate",
+    "file_ops", "email_send", "webhook", "integration",
 })
 
 # Per-query pivot tracking — one backtrack pivot allowed per conversation per query.
@@ -227,7 +227,7 @@ _EXPLICIT_TOOL_REQUEST_RE = re.compile(
 # IMPLICIT math — model program item 2 (2026-08-24). Tool-executed arithmetic
 # beats mental arithmetic (2026 field data: tool routing lifts competition-math
 # scores double digits), so math-classified queries get a [MATH TOOL ROUTING]
-# system block in _build_messages forcing calculator/code_exec. The patterns
+# system block in _build_messages forcing the calculator. The patterns
 # stay PRECISE — dates (2026-08-24), version strings (0.32.15), year ranges
 # (2020-2026) and prose with digits must not fire:
 #   - operator expressions require SPACED operators or explicit x/× between
@@ -252,7 +252,7 @@ _VERSION_STRING_RE = re.compile(r"\d+\.\d+\.\d+")
 
 def _is_computational_query(query: str) -> bool:
     """Math-classified: an arithmetic expression, a math phrase, or a
-    constraint word problem. Used to force calculator/code_exec routing."""
+    constraint word problem. Used to force calculator routing."""
     if not query or len(query) < 8:
         return False
     if _MATH_PHRASE_RE.search(query):
@@ -260,7 +260,6 @@ def _is_computational_query(query: str) -> bool:
     stripped_versions = _VERSION_STRING_RE.sub(" ", query)
     if _ARITHMETIC_EXPR_RE.search(stripped_versions):
         return True
-    from app.core.agent_loop import _is_math_logic_word_problem
     return _is_math_logic_word_problem(query)
 
 
@@ -364,10 +363,9 @@ def _fix_calculator_transcriptions(answer: str, tool_results: list[dict]) -> str
     return answer
 
 # Time-sensitive queries (current price, latest news, today's weather) must
-# never serve from workspace cache or stale lessons — the "fact" they cached
+# never serve from stale lessons — the "fact" they cached
 # yesterday is wrong today. Used to:
-#   1. bypass workspace findings injection (load_workspace path)
-#   2. skip workspace fact extraction (don't cache today's hallucination as
+#   skip stale caches (don't keep today's hallucination as
 #      tomorrow's "fact")
 #   3. force a fresh tool call rather than answering from history
 # Conservative: only matches queries that EXPLICITLY use a time-sensitive
@@ -457,7 +455,6 @@ class Services:
     tool_registry: ToolRegistry | None = None
     kg: KnowledgeGraph | None = None
     reflexions: ReflexionStore | None = None
-    custom_tools: CustomToolStore | None = None
     monitor_store: MonitorStore | None = None
     heartbeat: HeartbeatLoop | None = None
     curiosity: CuriosityQueue | None = None
@@ -485,39 +482,6 @@ def get_services() -> Services:
 # ---------------------------------------------------------------------------
 # Tool execution — dispatches to ToolRegistry
 # ---------------------------------------------------------------------------
-
-async def _handle_tool_create(svc: Services, args: dict) -> str:
-    """Handle the tool_create virtual action."""
-    try:
-        from app.core.custom_tools import DynamicTool
-        name = args.get("name", "").strip()
-        description = args.get("description", "").strip()
-        parameters = args.get("parameters", "[]")
-        code = args.get("code", "").strip()
-
-        if not name or not code:
-            return "[Tool creation failed: name and code are required.]"
-
-        # screen_network=True (2026-08-25): this was the ONLY create_tool
-        # call site without the network screen — the code author here is
-        # the chat LLM, whose context carries retrieved web/KG content, so
-        # an injection-steered turn could mint an httpx/socket-importing
-        # tool. The three autonomous paths (agent_loop, auto_tools,
-        # tool_triggers) all screen; the chat path must too.
-        tool_id = svc.custom_tools.create_tool(
-            name, description, parameters, code, screen_network=True)
-        if tool_id == -1:
-            return "[Tool creation failed: name already exists, code blocked, or limit reached.]"
-
-        # Register in live registry
-        record = svc.custom_tools.get_tool(name)
-        if record and svc.tool_registry:
-            svc.tool_registry.register(DynamicTool(record, svc.custom_tools))
-
-        return f"[Tool '{name}' created successfully (id={tool_id}). It is now available for use.]"
-    except Exception as e:
-        logger.warning("Tool creation failed: %s", e)
-        return f"[Tool creation failed: {e}]"
 
 async def _execute_tool(tool_name: str, args: dict) -> tuple[str, "ToolResult | None"]:
     """Execute a tool via the registry. Returns (output_str, ToolResult|None).
@@ -557,13 +521,8 @@ def _get_tool_descriptions() -> str:
 calculator(expression: str) — Evaluate math expressions with SymPy. Use for ANY calculation, even simple ones.
 http_fetch(url: str) — Fetch a specific URL and return its content. Use when you have a known URL.
 knowledge_search(query: str) — Search your owner's ingested documents. Use for questions about uploaded content.
-code_exec(code: str) — Execute Python code in a sandbox. Use for data processing, complex logic, formatting.
 memory_search(query: str) — Search past conversations and archival memory.
 file_ops(action: str, path: str, content: str) — Read/write files in the /data directory."""
-    # Append tool_create if custom tools enabled
-    if config.ENABLE_CUSTOM_TOOLS and svc.custom_tools:
-        from app.core.custom_tools import TOOL_CREATE_DESCRIPTION
-        desc += "\n" + TOOL_CREATE_DESCRIPTION
     return desc
 
 
@@ -577,7 +536,6 @@ def _get_available_tools() -> list[dict]:
         {"name": "calculator"},
         {"name": "http_fetch"},
         {"name": "knowledge_search"},
-        {"name": "code_exec"},
         {"name": "memory_search"},
         {"name": "file_ops"},
     ]
@@ -804,8 +762,6 @@ class _ThinkContext:
     lessons: list = field(default_factory=list)  # raw lesson objects, for LESSON_USED events
     external_skills_text: str = ""               # summaries of loaded external skills
     matched_external_skill_text: str = ""        # full body of matched external skill
-    workspace_text: str = ""                     # prior agent_workspace findings for similar query
-    workspace_signature: str = ""                # signature used for workspace lookup (for save)
     prior_sessions_text: str = ""                # GSW: summaries of prior conversations on related topics
 
 
@@ -836,7 +792,7 @@ async def _run_context_io(name: str, awaitable, default):
     """Wrap one context-gather IO call with a hard timeout.
 
     Each subsystem (user_facts, skills, lessons, kg, reflexions, gsw,
-    workspace) calls SQLite/ChromaDB via asyncio.to_thread. Before this
+    retrieval) calls SQLite/ChromaDB via asyncio.to_thread. Before this
     wrapper, a slow query (lock contention, broken connection) would
     stall the WHOLE pipeline because the gather is sequential within
     _gather_context. Now each call has a hard per-call cap (see
@@ -985,7 +941,6 @@ async def _gather_context(
         # "this depth is correct" to the model.
         if lessons:
             try:
-                from app.core.agent_loop import _is_deliberation_query
                 if _is_deliberation_query(query) and len(lessons) > 2:
                     lessons.sort(
                         key=lambda l: getattr(l, "confidence", 0.8) or 0.8,
@@ -1180,7 +1135,7 @@ async def _gather_context(
     # of the *current* session).
     try:
         from app.core import gsw as _gsw
-        # get_db must be imported HERE: the later local import in the workspace
+        # get_db must be imported HERE: a later local import
         # block makes `get_db` function-local, so using it first without this
         # import raises UnboundLocalError — which silently killed GSW retrieval
         # for every query until 2026-06-12.
@@ -1217,58 +1172,6 @@ async def _gather_context(
             ctx.success_pattern_ids = [
                 s.id for s in successes if getattr(s, "id", None) is not None
             ]
-
-    # --- Persistent workspace (prior findings for similar query signatures) ---
-    # Lets brain.think() inherit progress from prior runs (via AgentLoop or itself)
-    # without re-deriving facts. Signature-keyed lookup; only injects when prior
-    # success_count > 0 to avoid feeding stale failures back in.
-    # Also injects FAILED APPROACHES so the model skips dead ends previously tried.
-    # Time-sensitive queries (current price, latest news, today's weather)
-    # MUST NOT serve from workspace cache. Yesterday's "$78,764.25 bitcoin
-    # price" stored as a fact poisons today's answer to "what's bitcoin
-    # currently?" — verified at runtime 2026-05-06. Skip workspace load
-    # entirely; the model will call live tools.
-    # (variable already computed earlier for the lessons gate)
-    if intent == "general" and not _is_time_sensitive_query:
-        try:
-            from app.core.agent_workspace import load_workspace, query_signature
-            from app.database import get_db
-            ctx.workspace_signature = query_signature(query)
-            if ctx.workspace_signature:
-                entry = await _run_context_io(
-                    "workspace",
-                    asyncio.to_thread(load_workspace, get_db(), query),
-                    default=None,
-                )
-                if entry:
-                    parts: list[str] = []
-                    if entry.findings and entry.success_count > 0:
-                        findings_lines = [
-                            f"  - {k}: {str(v)[:200]}"
-                            for k, v in list(entry.findings.items())[:8]
-                        ]
-                        parts.append(
-                            f"## Prior findings (from {entry.run_count} similar past runs, "
-                            f"{entry.success_count} successful):\n"
-                            + "\n".join(findings_lines)
-                            + "\n\nUse these as a starting point — verify if stale, build on them if current."
-                        )
-                    if entry.failed_approaches:
-                        fa_lines = [f"  - {fa}" for fa in entry.failed_approaches[:5]]
-                        parts.append(
-                            "## Previously failed approaches on similar queries — DO NOT REPEAT:\n"
-                            + "\n".join(fa_lines)
-                            + "\n\nPick a different angle (different tool, different query phrasing, different scope)."
-                        )
-                    if parts:
-                        ctx.workspace_text = "\n\n".join(parts)
-                        logger.info(
-                            "Workspace hydrated: sig=%s findings=%d failed_approaches=%d prior_runs=%d",
-                            ctx.workspace_signature, len(entry.findings),
-                            len(entry.failed_approaches), entry.run_count,
-                        )
-        except Exception as e:
-            logger.warning("Workspace load failed: %s", e)
 
     # --- Retrieval (with topical-relevance gate) ---
     # Two-stage filter:
@@ -1409,7 +1312,6 @@ async def _build_messages(
         success_patterns=ctx.success_patterns_text,
         external_skills_text=ctx.external_skills_text,
         matched_external_skill_text=ctx.matched_external_skill_text,
-        workspace_text=ctx.workspace_text,
         registered_tool_names=_tool_names,
         provider=config.LLM_PROVIDER,
     )
@@ -1468,8 +1370,8 @@ async def _build_messages(
     if _EXPLICIT_TOOL_REQUEST_RE.search(query):
         messages.append({"role": "system", "content": (
             "[EXPLICIT TOOL REQUEST] The user explicitly asked you to use a tool "
-            "(run code and/or use the calculator). You MUST invoke the appropriate "
-            "tool (code_exec or calculator) and base your answer on its actual "
+            "(use the calculator). You MUST invoke the calculator tool "
+            "and base your answer on its actual "
             "output — do not compute or recall the result from memory instead.")})
     elif intent == "general" and _is_computational_query(query):
         # Forced math tool-routing (model program item 2, 2026-08-24): implicit
@@ -1477,8 +1379,8 @@ async def _build_messages(
         # is deterministic; mental arithmetic on a 9B silently slips.
         messages.append({"role": "system", "content": (
             "[MATH TOOL ROUTING] This query involves arithmetic. Compute every "
-            "numeric result with the calculator tool (single expressions) or "
-            "code_exec (multi-step computations) — never do arithmetic in your "
+            "numeric result with the calculator tool, one expression at a time "
+            "for multi-step computations — never do arithmetic in your "
             "head. Base the final answer on the tool output.")})
 
     # Query Planning
@@ -1804,7 +1706,6 @@ def _auto_think_eligible(*, query: str, intent: str, image: str | None,
     if intent != "general" or channel == "monitor":
         return False
     try:
-        from app.core.agent_loop import _is_hard_reasoning_query
         return _is_hard_reasoning_query(query)
     except Exception:
         return False
@@ -2239,8 +2140,6 @@ async def _run_generation_loop(
 
             # Execute ALL tool calls concurrently (with per-conversation cache)
             async def _run_tool(tc):
-                if tc.tool == "tool_create" and svc.custom_tools:
-                    return tc, await _handle_tool_create(svc, tc.args), None
                 # Cache lookup for idempotent tools
                 if tc.tool not in _SIDE_EFFECT_TOOLS:
                     try:
@@ -2444,24 +2343,6 @@ async def _run_generation_loop(
                     for tr in gen.tool_results:
                         gen.final_content += f"- {tr['tool']}: {tr['output'][:200]}\n"
 
-        # Autonomous tool creation — detect recurring multi-step patterns
-        if (
-            len(gen.tool_results) >= 3
-            and config.ENABLE_CUSTOM_TOOLS
-            and config.ENABLE_AUTONOMOUS_TOOL_CREATION
-        ):
-            from app.core.tool_triggers import maybe_trigger_tool_creation
-
-            async def _safe_trigger(q, trs, s):
-                try:
-                    await maybe_trigger_tool_creation(q, trs, s)
-                except Exception as _e:
-                    logger.warning("Auto-tool trigger failed: %s", _e)
-
-            _task = asyncio.create_task(_safe_trigger(query, gen.tool_results, svc))
-            _background_tasks.add(_task)
-            _task.add_done_callback(_background_tasks.discard)
-
     except LLMUnavailableError as e:
         logger.error("LLM unavailable: %s", e)
         # Distinguish a transient BUSY model (timeout — the provider is up, just
@@ -2536,300 +2417,6 @@ async def _vision_describe(query: str, image: str) -> str:
 # Deliberation routing — chain-of-reasoning queries → AgentLoop.solve()
 # ---------------------------------------------------------------------------
 
-# Patterns that signal the query needs explicit plan/act/critique deliberation
-# rather than single-pass generation. Distinct from compare/multi-source
-# patterns (those go to multi-agent decomposition).
-_DELIBERATION_PATTERNS = re.compile(
-    r"\b("
-    r"step.by.step|walk\s+me\s+through|explain\s+how|"
-    r"prove\s+that|derive(?:\s+the)?|show\s+me\s+how|"
-    r"design\s+a|architect|plan\s+for\s+a|"
-    r"trade.?offs?\s+between|weigh\s+the|"
-    r"best\s+(?:approach|way|strategy)|optimal\s+way|"
-    r"how\s+would\s+you\s+(?:architect|design|approach|build|solve|tackle)|"
-    r"chain.of.thought|reason\s+through|"
-    r"why\s+(?:does|is|are|would|should)\s+\w+\s+\w+\s+\w+"  # at least 4 tokens after "why does"
-    r")\b",
-    re.IGNORECASE,
-)
-
-
-def _should_use_deliberation(query: str) -> bool:
-    """True when query benefits from AgentLoop's plan/act/critique loop.
-
-    Distinct from multi-agent decomposition (which is for compare/multi-source).
-    Deliberation = chain-of-reasoning with explicit per-step verification.
-    Cheap regex — no LLM call.
-    """
-    if not query or len(query) < 25:
-        return False
-    return bool(_DELIBERATION_PATTERNS.search(query))
-
-
-async def _run_deliberation_path(
-    svc: "Services",
-    query: str,
-    conversation_id: str,
-    intent: str,
-    ctx: "_ThinkContext",
-    is_new_conversation: bool,
-    channel: str,
-    ephemeral: bool = False,
-) -> AsyncGenerator[StreamEvent, None]:
-    """Run AgentLoop.solve() and stream its events as the response.
-
-    Bypasses brain's normal generation loop. Saves user/assistant messages
-    and runs post-processing same as the normal path.
-    """
-    from app.core.agent_loop import AgentLoop
-
-    yield StreamEvent(
-        type=EventType.THINKING,
-        data={"stage": "deliberation", "content": "Routing to deliberation engine (AgentLoop)..."},
-    )
-
-    # Capture events from AgentLoop into a queue we can yield from.
-    pending_events: list[StreamEvent] = []
-
-    def _on_agent_event(event_type: str, payload: dict) -> None:
-        # Translate AgentLoop event types into our SSE schema
-        if event_type == "plan":
-            steps = payload.get("steps", [])
-            content = "Plan: " + " | ".join(f"{i+1}. {s[:80]}" for i, s in enumerate(steps[:6]))
-            pending_events.append(
-                StreamEvent(type=EventType.THINKING, data={"stage": "plan", "content": content})
-            )
-        elif event_type == "step_start":
-            pending_events.append(
-                StreamEvent(
-                    type=EventType.THINKING,
-                    data={
-                        "stage": "step",
-                        "content": f"Step {payload.get('id', '?')}: {payload.get('description', '')[:120]}",
-                    },
-                )
-            )
-        elif event_type == "critique":
-            ok = "✓" if payload.get("satisfied") else "✗"
-            pending_events.append(
-                StreamEvent(
-                    type=EventType.THINKING,
-                    data={
-                        "stage": "critique",
-                        "content": f"{ok} {payload.get('reason', '')[:120]}",
-                    },
-                )
-            )
-        elif event_type == "workspace_hydrated":
-            n = payload.get("findings_carried", 0)
-            if n:
-                pending_events.append(
-                    StreamEvent(
-                        type=EventType.THINKING,
-                        data={"stage": "workspace", "content": f"Hydrated {n} prior findings"},
-                    )
-                )
-
-    loop = AgentLoop(tools=svc.tool_registry)
-    # Run solve() — events get queued via callback. We can't yield mid-await,
-    # so we drain pending_events at boundaries (before solve, after solve).
-    result = await loop.solve(
-        query=query,
-        max_iterations=10,
-        on_event=_on_agent_event,
-    )
-
-    # Drain queued THINKING events
-    for ev in pending_events:
-        yield ev
-
-    final_content = (result.answer or "").strip()
-    if not final_content:
-        final_content = "I worked through this but couldn't produce a final answer. Try rephrasing."
-
-    # Apply confidence/leakage hardening that the normal path would have applied
-    final_content = _sanitize_answer(final_content)
-
-    # --- Lightweight critique pass on the deliberated answer ---
-    # AgentLoop critiques per-step but doesn't holistically critique the synthesized answer.
-    # Run adversarial critique for factual errors + a tool-leakage check. Skip best-of-N
-    # (too heavy after deliberation), critique addendum (would over-pad).
-    if len(final_content) >= 200:
-        try:
-            from app.core.critique import adversarial_critique, format_adversarial_for_replan
-            adv = await adversarial_critique(
-                query, final_content,
-                sources="",
-                user_facts=ctx.user_facts_text,
-                kg_facts=ctx.kg_facts_text,
-            )
-            if adv and adv.get("verdict") == "fail":
-                logger.info("[Deliberation] adversarial critique flagged issues — generating natural refinement")
-                # Extract just the flaw descriptions — we use them as private
-                # editing instructions, NOT as user-facing "[CRITICAL ERRORS]"
-                # framing (the model used to take that framing and produce a
-                # "Correction of Logic" header which the LLM-judge then graded
-                # the whole answer down for "admitting errors").
-                blocking = adv.get("blocking_flaws") or []
-                flaws_lines: list[str] = []
-                for flaw in blocking:
-                    if isinstance(flaw, dict):
-                        d = str(flaw.get("description", "")).strip()
-                        if d:
-                            flaws_lines.append(f"- {d}")
-                if flaws_lines:
-                    flaws_block = "\n".join(flaws_lines[:5])
-                    refinement_instruction = (
-                        "Add a SHORT closing paragraph (3-5 sentences max) that "
-                        "addresses these refinements naturally:\n"
-                        f"{flaws_block}\n\n"
-                        "Hard rules:\n"
-                        "- Read as a natural continuation of the answer above. "
-                        "Do NOT use any of these section/header words: "
-                        "'Correction', 'Errata', 'Addenda', 'Note:', 'Important:', "
-                        "'Caveat', 'Disclaimer', 'Revision'.\n"
-                        "- Do NOT say 'the previous answer was wrong/flawed/contradictory'.\n"
-                        "- Do NOT preface with 'However' or 'Actually' if it implies "
-                        "the prior content was incorrect.\n"
-                        "- Stay in the SAME VOICE and detail level as the answer above.\n"
-                        "- Output ONLY the paragraph itself, no headings, no bullet "
-                        "list of corrections."
-                    )
-                    try:
-                        from app.core import llm as llm_mod
-                        refinement = await llm_mod.invoke_nothink(
-                            [
-                                {"role": "user", "content": query},
-                                {"role": "assistant", "content": final_content},
-                                {"role": "system", "content": refinement_instruction},
-                            ],
-                            max_tokens=500, temperature=0.2,
-                        )
-                        if refinement and len(refinement.strip()) >= 30:
-                            # Reject the refinement if it leaked any of the
-                            # forbidden header words anyway — better to ship
-                            # the original than a self-deprecating answer.
-                            forbidden_re = re.compile(
-                                r"(?im)^\s*(?:#+\s*)?(?:correction|errata|addenda|caveat|"
-                                r"disclaimer|revision|note|important)\b[\s:]"
-                            )
-                            if not forbidden_re.search(refinement):
-                                final_content = final_content.rstrip() + "\n\n" + refinement.strip()
-                            else:
-                                logger.info(
-                                    "[Deliberation] refinement leaked forbidden header — "
-                                    "discarding instead of degrading the answer"
-                                )
-                    except Exception as e:
-                        logger.debug("[Deliberation] refinement gen failed: %s", e)
-        except Exception as e:
-            logger.debug("[Deliberation] adversarial critique failed: %s", e)
-        # Tool leakage scrub
-        if _has_tool_leakage(final_content):
-            logger.info("[Deliberation] tool leakage detected, applying scrub")
-            for marker in _TOOL_LEAKAGE_MARKERS:
-                final_content = final_content.replace(marker, "")
-            final_content = _TOOL_CALL_JSON_RE.sub("", final_content).strip()
-
-    # Save the assistant message (skip when ephemeral — eval/preview path)
-    saved_msg_id = None
-    if not ephemeral:
-        try:
-            saved_msg_id = await asyncio.to_thread(
-                lambda: svc.conversations.add_message(
-                    conversation_id, "assistant", final_content,
-                    tool_calls=None, sources=None,
-                )
-            )
-        except Exception as e:
-            logger.warning("[Deliberation] save message failed: %s", e)
-
-    # Stream the answer in chunks
-    chunk_size = 24
-    for i in range(0, len(final_content), chunk_size):
-        yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
-
-    # Title generation if new conversation (skip on ephemeral)
-    if not ephemeral and is_new_conversation and final_content:
-        async def _safe_title():
-            try:
-                title = await _generate_title(query)
-                await asyncio.to_thread(svc.conversations.update_title, conversation_id, title)
-            except Exception as e:
-                logger.warning("[Deliberation] title gen failed: %s", e)
-        _t = asyncio.create_task(_safe_title())
-        _background_tasks.add(_t)
-        _t.add_done_callback(_background_tasks.discard)
-
-    # DONE event with deliberation marker
-    yield StreamEvent(
-        type=EventType.DONE,
-        data={
-            "conversation_id": conversation_id,
-            "intent": intent,
-            "tool_results_count": 0,
-            "lessons_used": len(ctx.used_lesson_ids),
-            "kg_facts_used": ctx.kg_facts_count,
-            "reflexions_used": ctx.reflexions_count,
-            "skill_used": None,
-            "deliberated": True,
-            "iterations": result.iterations,
-            "deliberation_success": result.success,
-        },
-    )
-
-    # Grounded reflexion critique on the deliberated answer. AgentLoop
-    # critiques per-step, but the final synthesis shipped unscored — the
-    # judge score here feeds reflexion storage and learning stats in
-    # post-processing. Runs AFTER the DONE event so it adds zero perceived
-    # latency; evidence = the steps' actual observations.
-    deliberation_quality: float | None = None
-    deliberation_reason = ""
-    if not ephemeral and final_content and intent == "general":
-        try:
-            from app.core.reflexion import critique_response, should_use_llm_critique
-            # Steps WITHOUT an observation are included as error entries —
-            # if every step failed, the judge must see "evidence was
-            # attempted but unavailable", not "(none — no tools were used)".
-            step_evidence = [
-                {
-                    "tool": str((s.action or {}).get("tool") or f"step-{s.id}"),
-                    "output": s.observation or "",
-                    "error": "" if s.observation else "step produced no observation (failed or timed out)",
-                }
-                for s in result.plan.steps
-            ]
-            if should_use_llm_critique(intent, final_content, step_evidence):
-                deliberation_quality, deliberation_reason = await critique_response(
-                    query, final_content, step_evidence,
-                    user_facts=ctx.user_facts_text,
-                    kg_facts=ctx.kg_facts_text,
-                )
-                logger.info(
-                    "[QUALITY] path=deliberation score=%.2f reason=%s",
-                    deliberation_quality, deliberation_reason[:100],
-                )
-        except Exception as e:
-            logger.debug("[Deliberation] reflexion critique failed: %s", e)
-
-    # Lightweight post-processing — fact extraction, etc. Skip on ephemeral.
-    if not ephemeral:
-        try:
-            async for event in _run_post_processing(
-                svc, query, final_content, intent, conversation_id,
-                [], None, ctx.used_lesson_ids,  # no tool_results, no skill
-                False, deliberation_quality, deliberation_reason,
-                had_kg=bool(ctx.kg_facts_text),
-                had_docs=bool(ctx.retrieved_context),
-                channel=channel,
-                saved_msg_id=saved_msg_id,
-                ephemeral=False,
-            ):
-                yield event
-        except Exception as e:
-            logger.warning("[Deliberation] post-processing failed: %s", e)
-
-
 # ---------------------------------------------------------------------------
 # Workspace fact extraction (used by the post-completion enrichment pass)
 # ---------------------------------------------------------------------------
@@ -2854,36 +2441,6 @@ Rules:
 - If the answer is purely opinion / conversation / refusal, return {{}}.
 
 JSON:"""
-
-
-async def _extract_workspace_facts(query: str, answer: str) -> dict[str, str]:
-    """Use the LLM to extract durable facts from a final answer for workspace storage.
-
-    Returns {} on parse failure or non-substantive answers. Best-effort, non-blocking.
-    """
-    if not answer or len(answer) < 100:
-        return {}
-    try:
-        prompt = _WORKSPACE_FACT_PROMPT.format(
-            query=query[:300],
-            answer=answer[:2000],
-        )
-        resp = await llm.invoke_nothink(
-            [{"role": "user", "content": prompt}],
-            max_tokens=400, json_mode=True, temperature=0.0, model=config.FAST_MODEL,
-        )
-        obj = llm.extract_json_object(resp) or {}
-        facts = obj.get("facts") if isinstance(obj, dict) else None
-        if not isinstance(facts, dict):
-            return {}
-        return {
-            str(k)[:80]: str(v)[:240]
-            for k, v in facts.items()
-            if v is not None and str(v).strip()
-        }
-    except Exception as e:
-        logger.debug("workspace fact extraction parse failed: %s", e)
-        return {}
 
 
 _UNVERIFIED_CAVEAT = (
@@ -3365,7 +2922,6 @@ async def _refine_response(
         and not _is_inherently_uncertain
     ):
         try:
-            from app.core.agent_loop import _is_hard_reasoning_query
             if _is_hard_reasoning_query(query):
                 from app.core.reflexion import assess_quality
                 logger.info(
@@ -4109,68 +3665,10 @@ async def think(
         if not ephemeral:
             await asyncio.to_thread(svc.conversations.add_message, conversation_id, "user", query)
 
-        # --- Step 6.5: AgentLoop deliberation gate (FIRST — chain-of-reasoning) ---
-        # For chain-of-reasoning queries that benefit from explicit plan/act/critique
-        # per step, route to AgentLoop.solve(). Runs BEFORE multi-agent decomposition
-        # so queries like "walk me through ... step by step" don't get split into
-        # parallel sub-agents (which loses the sequential reasoning chain).
-        # Fires for both ephemeral (eval) and non-ephemeral (chat) — ephemeral path
-        # skips post-processing inside _run_deliberation_path.
-        # `_should_use_deliberation` is already pattern-specific (only fires
-        # on "step by step | walk me through | design a | architect | how
-        # would you design/build/solve | derive | prove that | trade-offs
-        # between | etc."). It does NOT match generic "explain X" queries.
-        # The earlier `_has_lookup_signal` extra gate (audit #14, 2026-05-06)
-        # was overzealous: it excluded "Walk me through how to design a rate
-        # limiter" — exactly the query AgentLoop is best at — because that
-        # phrase has no compare/who/when/lookup keywords. Verified runtime
-        # 2026-05-07: deliberation_chain_of_reasoning timed out at structural
-        # decomposition because the deliberation gate refused to take it.
-        # Trust the deliberation regex; it's already tight enough.
-        # Own kill switch since 2026-08-25: this used to share
-        # ENABLE_MULTI_AGENT, so the 08-14 decomposition disable silently
-        # killed deliberation too — 10 days with the route dead in prod.
-        if (
-            intent == "general"
-            and config.ENABLE_DELIBERATION
-            and _should_use_deliberation(query)
-        ):
-            logger.info("[Deliberation] gate fired for query: %r (ephemeral=%s)", query[:100], ephemeral)
-            try:
-                async for event in _run_deliberation_path(
-                    svc, query, conversation_id, intent, ctx,
-                    is_new_conversation, channel, ephemeral=ephemeral,
-                ):
-                    yield event
-                return
-            except Exception as e:
-                logger.warning("[Deliberation] failed, falling through to standard generation: %s", e)
-
-        # (Step 6.6 — multi-agent structural decomposition — ARCHIVED
-        # 2026-08-25; see the archive note above _StageTimer and
-        # archive/multi_agent/.)
-
         # --- Step 7: Generate + Tool Loop ---
         yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})
 
         tools = _get_available_tools()
-        if config.ENABLE_CUSTOM_TOOLS and svc.custom_tools:
-            tools.append({
-                "name": "tool_create",
-                "description": "Create a new reusable tool. Write a Python function named 'run' that takes declared parameters and returns a string.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "name": {"type": "string", "description": "Tool name (lowercase, underscores)"},
-                        "description": {"type": "string", "description": "What the tool does"},
-                        "parameters": {"type": "string", "description": "JSON array of parameter defs"},
-                        "code": {"type": "string", "description": "Python code with a run() function"},
-                    },
-                    "required": ["name", "description", "parameters", "code"],
-                },
-            })
-        if ephemeral:
-            tools = [t for t in tools if t["name"] != "delegate"]
 
         # (Structural-depth tool restriction removed with the multi-agent
         # archive 2026-08-25 — structural depth was always 0 without the
@@ -4484,73 +3982,18 @@ async def think(
             _background_tasks.add(_t)
             _t.add_done_callback(_background_tasks.discard)
 
-        # --- Persistent workspace save (mirrors AgentLoop's path) ---
-        # Stores the final answer + extracted semantic facts so the next run on a
-        # similar query signature can hydrate prior progress instead of re-deriving.
-        # Two-phase save:
-        #   1. Inline: cheap save with tool-arg snippets (so signature is registered fast)
-        #   2. Background: LLM-extract facts from the answer and re-save (richer findings)
-        if ctx.workspace_signature and final_content and intent == "general":
+        # --- Chat -> KG bridge ---
+        # Promote a grounded chat answer to KG triples. Chat facts never fed
+        # the KG otherwise (only monitors and curiosity do). The extractor has
+        # its own gates (canonical predicates, garbage filter, contradiction
+        # resolution). Grounded = at least one substantive, non-error tool
+        # result; time-sensitive queries skip (their "facts" decay); the
+        # critique score, when present, must not have called the answer weak.
+        # (Until 2026-10-10 this sat inside the agent-workspace save block.)
+        if final_content and intent == "general" and svc.kg:
             try:
-                from app.core.agent_workspace import save_workspace
-                from app.database import get_db
-                workspace_findings: dict[str, str] = {}
-                # Phase 1: tool-arg snippets (cheap, keyed by tool+first-arg)
-                for tr in (gen.tool_results or [])[:5]:
-                    tool_name = tr.get("tool", "tool")
-                    args = tr.get("args", {})
-                    arg_key = (
-                        str(next(iter(args.values())))[:30]
-                        if isinstance(args, dict) and args else "result"
-                    )
-                    out = tr.get("output", "")
-                    if out:
-                        workspace_findings[f"{tool_name}:{arg_key}"] = str(out)[:300]
-                # Treat reflexion_quality >= 0.6 as success for workspace persistence
-                ws_success = (
-                    reflexion_quality is not None and reflexion_quality >= 0.6
-                ) if reflexion_quality is not None else (not gen.is_error)
-                # Extract failed approaches: tool calls whose output contains
-                # error markers, empty results, or known-junk patterns. These
-                # carry forward as "don't repeat" hints on similar future queries.
-                failed_approaches: list[str] = []
-                if not ws_success or (reflexion_quality is not None and reflexion_quality < 0.5):
-                    for tr in (gen.tool_results or [])[:8]:
-                        out = str(tr.get("output", ""))[:300].lower()
-                        is_failure = (
-                            out.startswith("[tool error")
-                            or out.startswith("[tool failed")
-                            or "no results" in out
-                            or "0 results" in out
-                            or "could not" in out[:80]
-                            or "not found" in out[:80]
-                        )
-                        if is_failure:
-                            tool_name = tr.get("tool", "?")
-                            args = tr.get("args", {})
-                            arg_summary = (
-                                str(next(iter(args.values())))[:60]
-                                if isinstance(args, dict) and args else "?"
-                            )
-                            failed_approaches.append(f"{tool_name}({arg_summary}) → {out[:100]}")
-                await asyncio.to_thread(
-                    save_workspace,
-                    get_db(),
-                    query=query,
-                    findings=workspace_findings,
-                    answer=final_content,
-                    success=ws_success,
-                    failed_approaches=failed_approaches if failed_approaches else None,
-                )
-
-                # Phase 2: LLM-extract semantic facts from the answer (background, non-blocking)
-                # Only fires on successful, substantive, GROUNDED answers — extraction has cost
-                # AND extracting from hallucinations poisons the workspace cache. Guard: at least
-                # one substantive tool result must exist (web_search/http_fetch/browser/code_exec/
-                # calculator/knowledge_search) AND its output must be non-empty / non-error. Time-
-                # sensitive queries also skip extraction since their "facts" decay rapidly.
                 _GROUNDING_TOOLS = {
-                    "web_search", "http_fetch", "browser", "code_exec",
+                    "web_search", "http_fetch", "browser",
                     "calculator", "knowledge_search", "memory_search",
                 }
                 _has_grounding = False
@@ -4560,68 +4003,37 @@ async def think(
                         if out and not out.startswith("[Tool error") and len(out) > 40:
                             _has_grounding = True
                             break
+                _ws_success = (
+                    reflexion_quality >= 0.6 if reflexion_quality is not None else (not gen.is_error)
+                )
                 _is_time_sensitive_query = bool(_TIME_SENSITIVE_RE.search(query))
                 if (
-                    ws_success
+                    _ws_success
                     and _has_grounding
                     and not _is_time_sensitive_query
                     and len(final_content) >= 200 and len(final_content) <= 6000
                 ):
-                    async def _extract_and_resave(_query=query, _answer=final_content, _success=ws_success):
-                        try:
-                            facts = await _extract_workspace_facts(_query, _answer)
-                            if facts:
-                                # Merge with existing tool-arg findings; semantic facts win on conflict
-                                merged = dict(workspace_findings)
-                                merged.update(facts)
-                                await asyncio.to_thread(
-                                    save_workspace,
-                                    get_db(),
-                                    query=_query,
-                                    findings=merged,
-                                    answer=_answer,
-                                    success=_success,
-                                )
-                                logger.info(
-                                    "[Workspace] enriched with %d semantic facts: %s",
-                                    len(facts), list(facts.keys())[:5],
-                                )
-                        except Exception as e:
-                            logger.warning("Workspace fact extraction failed: %s", e)
-
-                    # Bridge: also promote answer → KG triples when fully grounded.
-                    # Workspace findings live in a per-query cache; KG is the long-term
-                    # store. Without this bridge, chat answers never feed the KG —
-                    # only monitors/curiosity do. The triple extractor has its own
-                    # quality gates (canonical predicates, garbage filter, contradiction
-                    # resolution), so we trust it to drop noise.
                     async def _bridge_to_kg(_query=query, _answer=final_content):
                         try:
-                            if svc.kg:
-                                await _extract_kg_triples(
-                                    svc.kg, _query, _answer, source_name="chat",
-                                    # Owner conversation is a trusted origin —
-                                    # chat facts skip the web-content quarantine.
-                                    trust=0.85,
-                                )
+                            await _extract_kg_triples(
+                                svc.kg, _query, _answer, source_name="chat",
+                                # Owner conversation is a trusted origin —
+                                # chat facts skip the web-content quarantine.
+                                trust=0.85,
+                            )
                         except Exception as e:
                             logger.warning("KG bridge from chat failed: %s", e)
-
-                    _ext_task = asyncio.create_task(_extract_and_resave())
-                    _background_tasks.add(_ext_task)
-                    _ext_task.add_done_callback(_background_tasks.discard)
 
                     _kg_task = asyncio.create_task(_bridge_to_kg())
                     _background_tasks.add(_kg_task)
                     _kg_task.add_done_callback(_background_tasks.discard)
-
             except Exception as e:
-                logger.warning("Workspace save failed: %s", e)
+                logger.warning("KG bridge setup failed: %s", e)
 
         # GSW: update episodic summary for this conversation. Background task
         # so we don't block the response. Internal gating decides whether the
         # message count has crossed the re-summarize threshold. This used to
-        # be nested inside the workspace branch's grounded-success `if`, so it
+        # be nested inside a grounded-success `if`, so it
         # only ran for general-intent + tool-grounded + 200-6000-char answers —
         # conversation_summaries had ZERO rows ever while the read side ran on
         # every general query (found 2026-08-26). The module's own is_enabled()

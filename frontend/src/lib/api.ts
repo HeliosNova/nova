@@ -34,7 +34,6 @@ import type {
   DaemonStatus,
   DaemonLogEntry,
   EventQueueItem,
-  CustomToolInfo,
   CuriosityItem,
   FinetuneTriggerResponse,
   DossierSummary,
@@ -509,17 +508,6 @@ export async function exportBundle(): Promise<Blob> {
   });
   if (!res.ok) throw new Error(`Export failed: ${res.status}`);
   return res.blob();
-}
-
-// ── Custom Tools ──
-
-export async function getCustomTools(): Promise<CustomToolInfo[]> {
-  const res = await request("/api/custom-tools");
-  return ensureArray<CustomToolInfo>(res, "tools");
-}
-
-export async function deleteCustomTool(name: string): Promise<void> {
-  await request(`/api/custom-tools/${encodeURIComponent(name)}`, { method: "DELETE" });
 }
 
 // ── Curiosity ──

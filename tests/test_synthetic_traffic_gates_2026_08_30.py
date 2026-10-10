@@ -39,29 +39,6 @@ def reset_ephemeral():
     EPHEMERAL_REQUEST.reset(token)
 
 
-class TestToolCandidateStore:
-    def test_ephemeral_record_writes_nothing(self, db):
-        from app.core.tool_triggers import ToolCandidateStore
-        store = ToolCandidateStore(db=db)
-        before = db.fetchone("SELECT COUNT(*) c FROM auto_tool_candidates")["c"]
-        EPHEMERAL_REQUEST.set(True)
-        rid = store.record("What does codename ZQX refer to?",
-                           ["memory_search", "web_search"])
-        assert rid == 0
-        after = db.fetchone("SELECT COUNT(*) c FROM auto_tool_candidates")["c"]
-        assert after == before, "ephemeral traffic minted a tool candidate"
-
-    def test_real_record_still_writes(self, db):
-        from app.core.tool_triggers import ToolCandidateStore
-        store = ToolCandidateStore(db=db)
-        rid = store.record("compare GPU prices across vendors",
-                           ["web_search", "calculator"])
-        assert rid > 0
-        row = db.fetchone("SELECT query FROM auto_tool_candidates WHERE id=?",
-                          (rid,))
-        assert row is not None
-
-
 class TestReflexionInjectionScoping:
     def _seed(self, db):
         from app.core.reflexion import ReflexionStore
@@ -99,24 +76,9 @@ class TestReflexionInjectionScoping:
 
 
 class TestGatePresenceAtRemainingSites:
-    """agent_loop's record-keeping and brain's no-skill gap writer run deep in
+    """brain's no-skill gap writer runs deep in
     machinery a unit test can't cheaply drive; assert the wiring exists so a
     refactor can't silently drop it."""
-
-    def test_agent_loop_record_keeping_is_gated(self):
-        # 2026-08-31: the collectors moved into _learn_from_run_sync (run via
-        # asyncio.to_thread — event-loop write fix), so assert the ORDER of
-        # the only path to them: ephemeral gate, then the to_thread dispatch,
-        # then the inserts — instead of a raw char-distance window.
-        src = (REPO / "app" / "core" / "agent_loop.py").read_text(encoding="utf-8")
-        i = src.index("INSERT INTO auto_tool_candidates")
-        guard = src.rindex("EPHEMERAL_REQUEST.get()", 0, i)
-        dispatch = src.index("asyncio.to_thread(self._learn_from_run_sync")
-        assert guard < dispatch < i, (
-            "the ephemeral gate must sit above the to_thread dispatch that is "
-            "the only route into agent_loop's collector inserts "
-            "(auto_tool_candidates / capability_gaps / curiosity)"
-        )
 
     def test_brain_capability_gap_is_gated(self):
         src = (REPO / "app" / "core" / "brain.py").read_text(encoding="utf-8")

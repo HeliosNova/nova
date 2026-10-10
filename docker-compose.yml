@@ -149,7 +149,6 @@ services:
       CHROMADB_PATH: /data/chromadb
       ANONYMIZED_TELEMETRY: "false"
       TRAINING_DATA_PATH: /data/training_data.jsonl
-      ENABLE_SHELL_EXEC: "true"
       XDG_CACHE_HOME: /tmp/.cache
       ENABLE_PLANNING: "true"
       ENABLE_CRITIQUE: "true"
@@ -163,9 +162,6 @@ services:
       # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
       # container that runs LLM-authored `sh -c` must not hold both DR legs
       # read-write. Maintenance still writes verified snapshots to /data/backups.
-      # Job hand-off to the network-isolated exec sidecar (audit 2026-07-08).
-      # Presence of this mount routes code_exec through nova-exec.
-      - exec_queue:/exec_queue
       # /home/nova/.cache as tmpfs mounted with mode 1777 so nova (uid 1000)
       # can write ChromaDB's internal cache. Short-form tmpfs defaults to mode
       # 755/root — use long-form volume syntax instead.
@@ -183,10 +179,8 @@ services:
       - ALL
     mem_limit: 4g
     cpus: 4.0
-    # Fork-bomb backstop (audit 2026-08-22): custom_tools can exec model-authored
-    # code in-process here (code_exec/code_verify route to the network-isolated
-    # sidecar, but custom_tools does not). Steady state is ~186 tasks; 4096 leaves
-    # ample room for the chromium process tree while capping a runaway fork.
+    # Fork-bomb backstop (audit 2026-08-22). Steady state is ~186 tasks; 4096
+    # leaves ample room for the chromium process tree while capping a runaway fork.
     pids_limit: 4096
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
@@ -266,40 +260,6 @@ services:
         max-size: "5m"
         max-file: "2"
     restart: unless-stopped
-
-  # Network-isolated code-execution sidecar (audit 2026-07-08): model-written
-  # Python runs HERE, in a container with no network stack at all — exfiltration
-  # and SSRF against the in-network Ollama API are structurally impossible,
-  # regardless of what slips past the AST screen. 2026 consensus: static
-  # screens are pre-filters; the boundary must be structural.
-  exec-runner:
-    image: nova-app:latest
-    container_name: nova-exec
-    command: ["python", "-m", "app.exec_runner"]
-    network_mode: "none"
-    read_only: true
-    tmpfs:
-      - /tmp
-    volumes:
-      # Fresh named volumes are root-owned; the image runs as nova (uid
-      # 1000). One-time fix on a new host: docker run --rm -v
-      # nova__exec_queue:/q alpine chown 1000:1000 /q
-      - exec_queue:/exec_queue
-    security_opt:
-      - no-new-privileges:true
-    mem_limit: 512m
-    cpus: 1.0
-    pids_limit: 128
-    cap_drop:
-      - ALL
-    logging:
-      driver: json-file
-      options:
-        max-size: "5m"
-        max-file: "3"
-    restart: unless-stopped
-    depends_on:
-      - nova
 
   # Least-privilege gate in front of the docker socket (audit 2026-07-08):
   # a raw docker.sock mount is unrestricted root on the host. The proxy
@@ -449,7 +409,6 @@ services:
     restart: unless-stopped
 
 volumes:
-  exec_queue:
   ollama_data:
   embed_data:
   nova_data:

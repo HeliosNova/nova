@@ -150,28 +150,6 @@ tasks:
       - type: answer_contains
         value: "5"
 
-  - id: tool_code_sum
-    category: tool-use
-    query: "Run Python code to compute the sum of integers from 1 to 10 and print it"
-    timeout: 180
-    assertions:
-      - type: tool_invoked
-        value: code_exec
-      - type: answer_contains
-        value: "55"
-
-  - id: tool_code_primes
-    category: tool-use
-    query: "Write and run Python code to list all prime numbers less than 20"
-    timeout: 180
-    assertions:
-      - type: tool_invoked
-        value: code_exec
-      - type: answer_matches
-        value: "\\b2\\b"
-      - type: answer_matches
-        value: "\\b19\\b"
-
   - id: tool_web_search
     category: tool-use
     query: "Search the web for the current Python programming language version"
@@ -314,8 +292,7 @@ tasks:
   - id: deliberation_chain_of_reasoning
     category: reasoning
     query: "Walk me through how you would design a rate limiter for a REST API that must sustain 100,000 requests per second, step by step."
-    timeout: 1200
-    tags: [deliberation-route]
+    timeout: 300
     assertions:
       - type: response_not_empty
       - type: answer_matches

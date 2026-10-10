@@ -13,12 +13,8 @@ cases. Fix inventory (F-numbers match the sweep report):
       that ENDED with "NO CHANGE")
   F4  dossiers._wtrim/_fmt_qty — word-safe caps + unit spacing
       ("2billion" → "2 billion"; tension topics opened mid-word)
-  F5  agent_loop.sanitize_synthesis — leading-stub repair (messages rowid
-      250 opened "and my standing knowledge dossiers, …")
   F6  http_fetch binary guard (38 action_log rows of raw %PDF byte soup
       fed to the model as tool output)
-  F7  "===" scaffold-header guard on tool-demand mining (auto_tool_candidates
-      rows 21/22/89 held internal orchestration prompts verbatim)
   F8  monitor_store.get_due anchored-due ranking floor (Morning Check-in
       missed two whole days behind a ratio-2+ digest backlog)
   F10 dream._prune_reflexions chroma cleanup (54 ghost vectors)
@@ -226,40 +222,6 @@ class TestDossierTrims:
         assert _fmt_qty(2.0, "") == "2"
 
 
-# ── F5: sanitize_synthesis leading-stub repair ──────────────────────────────
-
-class TestSanitizeLeadingStub:
-    def test_msg250_reconstruction(self):
-        """The live victim: opening scaffold phrase redacted, answer shipped
-        to the owner starting 'and my standing knowledge dossiers, …'."""
-        from app.core.agent_loop import sanitize_synthesis
-        raw = ("From the search results and my standing knowledge dossiers, "
-               "here are the key developments on the topic.")
-        out, changes = sanitize_synthesis(raw)
-        assert changes >= 1
-        assert not out.lower().startswith(("and ", "but ", "or ", ", "))
-        assert out[0].isupper()
-        assert out.startswith("My standing knowledge dossiers")
-
-    def test_no_redaction_no_repair(self):
-        """A legit answer that opens with a conjunction must survive when
-        nothing was redacted."""
-        from app.core.agent_loop import sanitize_synthesis
-        raw = "And yet the market rallied. Prices rose 4% on the day."
-        out, changes = sanitize_synthesis(raw)
-        assert changes == 0
-        assert out == raw
-
-    def test_midtext_redaction_leaves_clean_opening_alone(self):
-        from app.core.agent_loop import sanitize_synthesis
-        raw = ("The rollout succeeded (based on the completed analysis plan) "
-               "and adoption doubled.")
-        out, changes = sanitize_synthesis(raw)
-        assert changes >= 1
-        assert out.startswith("The rollout succeeded")
-        assert "analysis plan" not in out
-
-
 # ── F6: http_fetch binary-content guard ─────────────────────────────────────
 
 class TestHttpFetchBinaryGuard:
@@ -302,38 +264,6 @@ class TestHttpFetchBinaryGuard:
             "portable document format.</p></body></html>", "text/html"))
         assert r.success
         assert "portable document format" in r.output
-
-
-# ── F7: scaffold-header guard on tool-demand mining ─────────────────────────
-
-class TestScaffoldQueryGuard:
-    def test_scaffold_prompt_not_recorded(self, db):
-        from app.core.tool_triggers import ToolCandidateStore
-        store = ToolCandidateStore(db=db)
-        before = db.fetchone("SELECT COUNT(*) c FROM auto_tool_candidates")["c"]
-        rid = store.record(
-            "=== AUTO-MONITOR DETECTION ===\nAnalyze recent topics and decide…",
-            ["memory_search", "web_search"])
-        assert rid == 0
-        assert db.fetchone("SELECT COUNT(*) c FROM auto_tool_candidates")["c"] == before
-
-    def test_leading_whitespace_scaffold_also_blocked(self, db):
-        from app.core.tool_triggers import ToolCandidateStore
-        assert ToolCandidateStore(db=db).record(
-            "  === WILL MODULE ===\ninternal prompt", ["web_search"]) == 0
-
-    def test_real_query_still_recorded(self, db):
-        from app.core.tool_triggers import ToolCandidateStore
-        rid = ToolCandidateStore(db=db).record(
-            "compare 3090 vs 4090 prices === include used market ===",
-            ["web_search", "calculator"])
-        assert rid > 0
-
-    def test_agent_loop_learn_has_same_guard(self):
-        src = (APP / "core" / "agent_loop.py").read_text(encoding="utf-8")
-        assert re.search(
-            r'if \(result\.query or ""\)\.lstrip\(\)\.startswith\("==="\):\s*\n\s*return',
-            src), "agent_loop._learn_from_run lost its scaffold-header guard"
 
 
 # ── F8: anchored-due ranking floor in get_due ───────────────────────────────

@@ -179,7 +179,6 @@ class StatusResponse(BaseModel):
     training_examples: int = 0
     kg_facts: int = 0
     reflexions: int = 0
-    custom_tools: int = 0
     # One entry per background pathway (app/monitors/pathways.py):
     # name, verdict (alive/dead/idle/off/warming), last_at, age_hours, window_hours.
     pathways: list[dict] = Field(default_factory=list)

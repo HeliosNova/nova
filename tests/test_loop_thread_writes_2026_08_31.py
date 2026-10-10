@@ -62,99 +62,13 @@ class LoopGuardDB:
 
 @pytest.fixture
 def guard_db(db):
-    # auto_tool_candidates / curiosity_queue are created by their stores'
-    # DDL, not init_schema — seed them before arming the loop guard.
+    # curiosity_queue is created by its store's DDL, not init_schema — seed
+    # it before arming the loop guard.
     from app.core.curiosity import CuriosityQueue
-    from app.core.tool_triggers import ToolCandidateStore
-    ToolCandidateStore(db=db)
     for stmt in CuriosityQueue._SCHEMA.strip().split(";"):
         if stmt.strip():
             db.execute(stmt)
     return LoopGuardDB(db)
-
-
-class TestLearnFromRunOffLoop:
-    def _result(self):
-        from app.core.agent_loop import (STEP_DONE, STEP_FAILED, AgentResult,
-                                         Plan, Step)
-        steps = [
-            Step(id=1, description="look up GPU prices", status=STEP_DONE,
-                 action={"tool": "web_search"}),
-            Step(id=2, description="compare with historical data", status=STEP_DONE,
-                 action={"tool": "calculator"}),
-            Step(id=3, description="fetch vendor spec sheet", status=STEP_FAILED,
-                 action={"tool": "web_search"}, attempts=2, critique="404s"),
-        ]
-        return AgentResult(query="compare GPU prices across vendors",
-                           answer="done", plan=Plan(goal="g", steps=steps),
-                           scratchpad_text="", iterations=3,
-                           duration_seconds=1.0, success=True)
-
-    def test_writes_happen_off_loop(self, guard_db, monkeypatch):
-        import app.database as database
-        from app.core.agent_loop import AgentLoop
-        monkeypatch.setattr(database, "get_db", lambda: guard_db)
-
-        loop_obj = AgentLoop.__new__(AgentLoop)  # no ctor deps needed
-        result = self._result()
-
-        async def run():
-            guard_db.loop_thread_id = threading.get_ident()
-            await loop_obj._learn_from_run(result, None)
-
-        asyncio.run(run())
-        assert guard_db.loop_thread_writes == [], \
-            f"writes ran on the event loop: {guard_db.loop_thread_writes}"
-        # Behavior preserved: candidate + gap + curiosity rows written
-        assert guard_db.fetchone(
-            "SELECT COUNT(*) c FROM auto_tool_candidates")["c"] == 1
-        assert guard_db.fetchone("SELECT COUNT(*) c FROM capability_gaps")["c"] == 1
-        assert guard_db.fetchone(
-            "SELECT COUNT(*) c FROM curiosity_queue WHERE source='agent_failure'")["c"] == 1
-
-    def test_ephemeral_and_scaffold_gates_still_hold(self, guard_db, monkeypatch):
-        import app.database as database
-        from app.core.agent_loop import AgentLoop
-        monkeypatch.setattr(database, "get_db", lambda: guard_db)
-        loop_obj = AgentLoop.__new__(AgentLoop)
-
-        async def run():
-            EPHEMERAL_REQUEST.set(True)
-            await loop_obj._learn_from_run(self._result(), None)
-            EPHEMERAL_REQUEST.set(False)
-            r2 = self._result()
-            r2.query = "=== WILL-MODULE TASK ===\ninternal"
-            await loop_obj._learn_from_run(r2, None)
-
-        asyncio.run(run())
-        assert guard_db.fetchone(
-            "SELECT COUNT(*) c FROM auto_tool_candidates")["c"] == 0
-
-
-class TestToolTriggerOffLoop:
-    def test_record_path_off_loop(self, guard_db, monkeypatch):
-        from types import SimpleNamespace
-
-        import app.database as database
-        from app.config import config
-        from app.core import tool_triggers
-        monkeypatch.setattr(database, "get_db", lambda: guard_db)
-        monkeypatch.setattr(config, "ENABLE_AUTONOMOUS_TOOL_CREATION", True,
-                            raising=False)
-        svc = SimpleNamespace(custom_tools=object(), skills=None)
-        tool_results = [{"tool": "web_search"}, {"tool": "calculator"},
-                        {"tool": "web_search"}]
-
-        async def run():
-            guard_db.loop_thread_id = threading.get_ident()
-            await tool_triggers.maybe_trigger_tool_creation(
-                "compare 3090 vs 4090 street prices", tool_results, svc)
-
-        asyncio.run(run())
-        assert guard_db.loop_thread_writes == [], \
-            f"writes ran on the event loop: {guard_db.loop_thread_writes}"
-        assert guard_db.fetchone(
-            "SELECT COUNT(*) c FROM auto_tool_candidates")["c"] == 1
 
 
 class TestStorylineForecastOffLoop:

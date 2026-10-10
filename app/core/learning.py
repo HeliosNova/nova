@@ -991,13 +991,6 @@ class LearningEngine:
             (window,),
         )
 
-        # New custom tools
-        new_tools = self._db.fetchall(
-            "SELECT name, description FROM custom_tools "
-            "WHERE created_at > datetime('now', ?) ORDER BY created_at DESC",
-            (window,),
-        )
-
         # New reflexions
         new_reflexions = self._db.fetchall(
             "SELECT task_summary, quality_score FROM reflexions "
@@ -1039,10 +1032,6 @@ class LearningEngine:
             "new_skills": [
                 {"name": r["name"], "trigger": r["trigger_pattern"]}
                 for r in new_skills
-            ],
-            "new_tools": [
-                {"name": r["name"], "description": r["description"]}
-                for r in new_tools
             ],
             "new_reflexions": [
                 {"task": r["task_summary"], "score": r["quality_score"]}

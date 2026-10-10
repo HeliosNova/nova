@@ -74,7 +74,7 @@ _TOOL_COMMAND_RE = re.compile(
 
 # A query answered by a deterministic computational tool is a computation, not a
 # knowledge gap worth researching (e.g. "17 times 4?" answered by the calculator).
-_COMPUTATIONAL_TOOLS = {"calculator", "code_exec"}
+_COMPUTATIONAL_TOOLS = {"calculator"}
 # Inline arithmetic the model computed itself (no tool) is equally not a gap.
 _ARITHMETIC_RE = re.compile(
     r"(?i)\d+\s*(?:[-+*/x×÷]|times|plus|minus|divided\s+by|multiplied\s+by)\s*\d+"

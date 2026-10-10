@@ -9,7 +9,6 @@ import pytest
 
 from app.tools.base import BaseTool, ToolRegistry, ToolResult, ErrorCategory
 from app.tools.calculator import CalculatorTool
-from app.tools.code_exec import CodeExecTool, _check_code_safety
 from app.tools.file_ops import FileOpsTool, _safe_path
 from app.tools.http_fetch import HttpFetchTool, _is_safe_url
 from app.tools.knowledge import KnowledgeSearchTool
@@ -120,55 +119,6 @@ class TestCalculator:
 
 # ===========================================================================
 # Code Execution Safety
-# ===========================================================================
-
-class TestCodeExecSafety:
-    def test_blocks_os_import(self):
-        assert _check_code_safety("import os") is not None
-
-    def test_blocks_subprocess(self):
-        assert _check_code_safety("import subprocess") is not None
-
-    def test_blocks_socket(self):
-        assert _check_code_safety("from socket import socket") is not None
-
-    def test_allows_math(self):
-        assert _check_code_safety("import math\nprint(math.pi)") is None
-
-    def test_blocks_eval(self):
-        assert _check_code_safety("eval('1+1')") is not None
-
-    def test_blocks_dunder_import(self):
-        assert _check_code_safety("__import__('os')") is not None
-
-    def test_allows_print(self):
-        assert _check_code_safety("print('hello')") is None
-
-
-class TestCodeExec:
-    @pytest.mark.asyncio
-    async def test_simple_execution(self):
-        tool = CodeExecTool()
-        result = await tool.execute(code="print(2 + 2)")
-        assert result.success
-        assert "4" in result.output
-
-    @pytest.mark.asyncio
-    async def test_blocked_import(self):
-        tool = CodeExecTool()
-        result = await tool.execute(code="import os\nprint(os.getcwd())")
-        assert not result.success
-        assert "blocked" in result.error.lower()
-
-    @pytest.mark.asyncio
-    async def test_empty_code(self):
-        tool = CodeExecTool()
-        result = await tool.execute(code="")
-        assert not result.success
-
-
-# ===========================================================================
-# HTTP Fetch Safety
 # ===========================================================================
 
 class TestHttpFetchSafety:
@@ -294,66 +244,6 @@ class TestToolParameterValidation:
 # Custom Tool Schema (from test_audit_consolidated)
 # ===========================================================================
 
-class TestCustomToolSchema:
-    """DynamicTool rejects unexpected parameters."""
-
-    @pytest.fixture(autouse=True)
-    def _set_tier(self):
-        """DynamicTool requires standard/full tier."""
-        with patch("app.core.access_tiers.config") as mock_cfg:
-            mock_cfg.SYSTEM_ACCESS_LEVEL = "standard"
-            yield
-
-    @pytest.mark.asyncio
-    async def test_unexpected_params_rejected(self):
-        from app.core.custom_tools import DynamicTool, CustomToolRecord
-
-        record = CustomToolRecord(
-            id=1, name="test_tool", description="test",
-            parameters='[{"name": "x", "type": "str"}]',
-            code="def run(x=''):\n    return x",
-        )
-        store = MagicMock()
-        tool = DynamicTool(record, store)
-        result = await tool.execute(x="hello", unexpected_param="bad")
-        assert not result.success
-        assert "Unexpected parameters" in result.error
-
-    @pytest.mark.asyncio
-    async def test_declared_params_accepted(self):
-        from app.core.custom_tools import DynamicTool, CustomToolRecord
-
-        record = CustomToolRecord(
-            id=1, name="test_tool", description="test",
-            parameters='[{"name": "x", "type": "str"}]',
-            code="def run(x=''):\n    return x",
-        )
-        store = MagicMock()
-        store.record_use = MagicMock(return_value=None)
-        tool = DynamicTool(record, store)
-        result = await tool.execute(x="hello")
-        assert "Unexpected parameters" not in (result.error or "")
-
-    @pytest.mark.asyncio
-    async def test_malformed_schema_skips_validation(self):
-        from app.core.custom_tools import DynamicTool, CustomToolRecord
-
-        record = CustomToolRecord(
-            id=1, name="test_tool", description="test",
-            parameters="not valid json",
-            code="def run(**kwargs):\n    return 'ok'",
-        )
-        store = MagicMock()
-        store.record_use = MagicMock(return_value=None)
-        tool = DynamicTool(record, store)
-        result = await tool.execute(anything="goes")
-        assert "Unexpected parameters" not in (result.error or "")
-
-
-# ===========================================================================
-# HTTP Fetch Pooling (from test_audit_consolidated)
-# ===========================================================================
-
 class TestHttpFetchPooling:
 
     def test_singleton_client_reused(self):
@@ -387,31 +277,6 @@ class TestHttpFetchPooling:
 # ===========================================================================
 # Auto-Disable Notification (from test_audit_consolidated)
 # ===========================================================================
-
-class TestAutoDisableNotification:
-
-    def test_returns_none_normally(self):
-        from app.core.custom_tools import CustomToolStore
-        db = MagicMock()
-        db.execute = MagicMock(return_value=MagicMock(lastrowid=1))
-        db.fetchone = MagicMock(return_value={"times_used": 1, "success_rate": 1.0})
-        store = CustomToolStore.__new__(CustomToolStore)
-        store._db = db
-        result = store.record_use("test_tool", success=True)
-        assert result is None
-
-    def test_returns_message_on_auto_disable(self):
-        from app.core.custom_tools import CustomToolStore
-        db = MagicMock()
-        db.execute = MagicMock(return_value=MagicMock())
-        db.fetchone = MagicMock(return_value={"times_used": 6, "success_rate": 0.2})
-        store = CustomToolStore.__new__(CustomToolStore)
-        store._db = db
-        result = store.record_use("bad_tool", success=False)
-        assert result is not None
-        assert "auto-disabled" in result
-        assert "bad_tool" in result
-
 
 # ===========================================================================
 # MCP Refresh (from test_audit_consolidated)
@@ -501,164 +366,6 @@ class TestBrowserInteractiveElements:
 # Custom Tool Limits
 # ===========================================================================
 
-class TestCustomToolLimits:
-    """Verify custom tool creation limits and auto-disable."""
-
-    def test_code_length_limit(self):
-        from app.core.custom_tools import CustomToolStore
-
-        db = _make_test_db()
-        store = CustomToolStore(db)
-        long_code = "x = 1\n" * 2000  # well over 5000 chars
-        result = store.create_tool(
-            name="too_long",
-            description="Test tool",
-            parameters="[]",
-            code=long_code,
-        )
-        assert result == -1, "Code exceeding 5000 chars should be rejected"
-
-    def test_tool_count_limit(self):
-        from app.core.custom_tools import CustomToolStore
-
-        db = _make_test_db()
-        store = CustomToolStore(db)
-        # Create MAX_TOOLS tools
-        for i in range(store.MAX_TOOLS):
-            code = f"def run(): return 'tool_{i}'"
-            store.create_tool(
-                name=f"tool_{i}",
-                description=f"Test tool {i}",
-                parameters="[]",
-                code=code,
-            )
-
-        # The 51st should fail
-        result = store.create_tool(
-            name="one_too_many",
-            description="Over limit",
-            parameters="[]",
-            code="def run(): return 'fail'",
-        )
-        assert result == -1, f"Should reject tool #{store.MAX_TOOLS + 1}"
-
-    def test_auto_disable_on_low_success(self):
-        from app.core.custom_tools import CustomToolStore
-
-        db = _make_test_db()
-        store = CustomToolStore(db)
-        code = "def run(): return 'ok'"
-        tool_id = store.create_tool(
-            name="failing_tool",
-            description="Might fail",
-            parameters="[]",
-            code=code,
-        )
-        assert tool_id > 0
-
-        # Record enough failures to trigger auto-disable (EMA alpha=0.15 from 1.0)
-        for _ in range(10):
-            store.record_use("failing_tool", success=False)
-
-        # Check if auto-disabled
-        tool = db.fetchone("SELECT enabled FROM custom_tools WHERE name = ?", ("failing_tool",))
-        assert tool["enabled"] == 0, "Tool should be auto-disabled after repeated failures"
-
-
-# ===========================================================================
-# Delegation Tool (from test_delegation)
-# ===========================================================================
-
-from app.schema import EventType, StreamEvent
-from app.tools.delegate import (
-    DelegateTool,
-    get_delegation_depth,
-    set_delegation_depth,
-)
-
-
-class TestDelegateToolBasics:
-    @pytest.fixture(autouse=True)
-    def reset_depth(self):
-        set_delegation_depth(0)
-        yield
-        set_delegation_depth(0)
-
-    @pytest.mark.asyncio
-    async def test_no_task(self):
-        r = await DelegateTool().execute()
-        assert not r.success
-        assert "No task" in r.error
-
-    @pytest.mark.asyncio
-    async def test_disabled(self):
-        with patch("app.tools.delegate.config",
-                   type("C", (), {"ENABLE_DELEGATION": False, "MAX_DELEGATION_DEPTH": 1})()):
-            r = await DelegateTool().execute(task="test")
-            assert not r.success
-            assert "disabled" in r.error.lower()
-
-    @pytest.mark.asyncio
-    async def test_max_depth_reached(self):
-        set_delegation_depth(1)
-        with patch("app.tools.delegate.config",
-                   type("C", (), {"ENABLE_DELEGATION": True, "MAX_DELEGATION_DEPTH": 1})()):
-            r = await DelegateTool().execute(task="test")
-            assert not r.success
-            assert "depth" in r.error.lower()
-
-    @pytest.mark.asyncio
-    async def test_successful_delegation(self):
-        async def fake_think(**kwargs):
-            yield StreamEvent(type=EventType.THINKING, data={"stage": "generating"})
-            yield StreamEvent(type=EventType.TOKEN, data={"text": "The weather "})
-            yield StreamEvent(type=EventType.TOKEN, data={"text": "is sunny."})
-            yield StreamEvent(type=EventType.DONE, data={"conversation_id": "eph"})
-
-        with patch("app.tools.delegate.config",
-                   type("C", (), {"ENABLE_DELEGATION": True, "MAX_DELEGATION_DEPTH": 1})()):
-            with patch("app.core.brain.think", side_effect=fake_think):
-                r = await DelegateTool().execute(task="What is the weather?", role="researcher")
-
-        assert r.success
-        assert "sunny" in r.output
-
-    @pytest.mark.asyncio
-    async def test_depth_restored_after_delegation(self):
-        async def fake_think(**kwargs):
-            assert get_delegation_depth() == 1
-            yield StreamEvent(type=EventType.TOKEN, data={"text": "ok"})
-            yield StreamEvent(type=EventType.DONE, data={})
-
-        with patch("app.tools.delegate.config",
-                   type("C", (), {"ENABLE_DELEGATION": True, "MAX_DELEGATION_DEPTH": 2})()):
-            with patch("app.core.brain.think", side_effect=fake_think):
-                await DelegateTool().execute(task="test")
-
-        assert get_delegation_depth() == 0
-
-    @pytest.mark.asyncio
-    async def test_output_truncation(self):
-        long_text = "x" * 5000
-
-        async def verbose_think(**kwargs):
-            yield StreamEvent(type=EventType.TOKEN, data={"text": long_text})
-            yield StreamEvent(type=EventType.DONE, data={})
-
-        with patch("app.tools.delegate.config",
-                   type("C", (), {"ENABLE_DELEGATION": True, "MAX_DELEGATION_DEPTH": 1})()):
-            with patch("app.core.brain.think", side_effect=verbose_think):
-                r = await DelegateTool().execute(task="test")
-
-        assert r.success
-        assert len(r.output) <= 3100
-        assert "truncated" in r.output
-
-
-# ===========================================================================
-# Edge Case Tests (Phase 5 audit items 5.9, 5.10)
-# ===========================================================================
-
 class TestCalculatorEdgeCases:
     """Calculator edge cases: division by zero, empty, overflow."""
 
@@ -707,31 +414,6 @@ class TestHttpFetchEdgeCases:
         assert result.error_category == ErrorCategory.VALIDATION
 
 
-class TestShellExecEdgeCases:
-    """Shell exec edge cases: empty command, disabled."""
-
-    @pytest.mark.asyncio
-    async def test_empty_command(self):
-        from app.tools.shell_exec import ShellExecTool
-        tool = ShellExecTool()
-        result = await tool.execute(command="")
-        assert not result.success
-        assert result.error_category == ErrorCategory.VALIDATION
-
-    @pytest.mark.asyncio
-    async def test_shell_disabled(self, monkeypatch):
-        from app.tools.shell_exec import ShellExecTool
-        monkeypatch.setenv("ENABLE_SHELL_EXEC", "false")
-        from app.config import reset_config, get_config
-        reset_config()
-        # Force-override in case /data/config_overrides.json re-enabled it
-        object.__setattr__(get_config(), "ENABLE_SHELL_EXEC", False)
-        tool = ShellExecTool()
-        result = await tool.execute(command="echo hello")
-        assert not result.success
-        assert result.error_category == ErrorCategory.PERMISSION
-
-
 class TestToolErrorPaths:
     """Verify tools return specific ErrorCategory (not generic INTERNAL)."""
 
@@ -748,14 +430,6 @@ class TestToolErrorPaths:
         result = await tool.execute(url="http://127.0.0.1/admin")
         assert not result.success
         assert result.error_category == ErrorCategory.PERMISSION
-
-    @pytest.mark.asyncio
-    async def test_code_exec_permission_error(self):
-        tool = CodeExecTool()
-        result = await tool.execute(code="import os; os.system('rm -rf /')")
-        assert not result.success
-        # Should be VALIDATION (blocked code) not generic INTERNAL
-
 
 class TestCalculatorOutputFidelity:
     """Regression tests for the 2026-06-10 audit failure: the tool returned

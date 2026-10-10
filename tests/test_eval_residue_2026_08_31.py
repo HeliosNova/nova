@@ -11,9 +11,6 @@ Measured 2026-08-31 (fresh-eyes pass 5):
   * An ORPHAN chunk (parent document row long deleted) was actively serving
     an injection CONTENT-WARNING banner into live knowledge_search results
     (observed 03:55 and 05:17 the same day).
-  * agent_workspace held scratchpads for the FICTIONAL Aurora-7 plant and a
-    "codename prometheus-9" probe — workspaces persist across restarts and
-    prime future runs of "the same" query.
 """
 
 from __future__ import annotations
@@ -56,40 +53,3 @@ class TestHarnessCleansSeededDocuments:
             "document cleanup must sit beside the skills cleanup in `finally` "
             "so cancellation/crash paths are covered too"
         )
-
-
-class TestWorkspaceGate:
-    def test_ephemeral_save_writes_nothing(self, db):
-        from app.core.agent_workspace import save_workspace
-
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS agent_workspace ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, query_signature TEXT, "
-            "last_query TEXT, findings_json TEXT, last_answer TEXT, "
-            "run_count INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0, "
-            "fail_count INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT)")
-        EPHEMERAL_REQUEST.set(True)
-        rid = save_workspace(
-            db, query="What do you know about the Aurora-7 fusion pilot plant?",
-            findings={"step1": "fiction"}, answer="a confident hallucination",
-            success=True)
-        assert rid is None
-        n = db.fetchone("SELECT COUNT(*) c FROM agent_workspace")["c"]
-        assert n == 0, "ephemeral traffic persisted a scratchpad"
-
-    def test_real_save_still_writes(self, db):
-        from app.core.agent_workspace import save_workspace
-
-        db.execute(
-            "CREATE TABLE IF NOT EXISTS agent_workspace ("
-            "id INTEGER PRIMARY KEY AUTOINCREMENT, query_signature TEXT, "
-            "last_query TEXT, findings_json TEXT, last_answer TEXT, "
-            "run_count INTEGER DEFAULT 0, success_count INTEGER DEFAULT 0, "
-            "fail_count INTEGER DEFAULT 0, created_at TEXT, updated_at TEXT)")
-        rid = save_workspace(
-            db, query="compare GPU prices across the major cloud vendors",
-            findings={"step1": "real work"}, answer="a real answer",
-            success=True)
-        assert rid is not None
-        n = db.fetchone("SELECT COUNT(*) c FROM agent_workspace")["c"]
-        assert n == 1

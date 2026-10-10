@@ -101,7 +101,7 @@ def _quiet_until_str(db) -> str | None:
 
 _ALLOWED_TABLES = frozenset({
     "conversations", "messages", "user_facts", "lessons", "skills", "documents",
-    "kg_facts", "reflexions", "custom_tools",
+    "kg_facts", "reflexions",
 })
 
 # Pre-built SQL queries — no f-string interpolation
@@ -138,7 +138,6 @@ async def status() -> StatusResponse:
             training_examples=training_examples,
             kg_facts=count("kg_facts"),
             reflexions=count("reflexions"),
-            custom_tools=count("custom_tools"),
             # Liveness registry (2026-09-02): last write per background pathway.
             pathways=pathway_snapshot(db),
             quiet_until=_quiet_until_str(db),
@@ -147,19 +146,6 @@ async def status() -> StatusResponse:
 
     counts = await asyncio.to_thread(_sync_status)
     return StatusResponse(**counts)
-
-
-@router.get("/self-improvement", dependencies=[Depends(require_auth)])
-async def self_improvement_health() -> dict:
-    """Usage + quality snapshot of the self-improvement loop's output — so the
-    machinery's VALUE is visible, not just that it runs. Skills/auto-tools used
-    vs dead, lesson helpfulness, reflexion injection rate."""
-    from app.core import self_improvement as si
-
-    def _sync() -> dict:
-        return si.compute_health(get_db())
-
-    return await asyncio.to_thread(_sync)
 
 
 @router.get("/trust", dependencies=[Depends(require_auth)])
@@ -213,18 +199,14 @@ async def get_access_tier():
     from app.core import access_tiers
     tier = access_tiers._tier()
     descriptions = {
-        "sandboxed": "Restricted mode — limited shell commands, no file writes outside workspace",
-        "standard": "Standard mode — most tools available, some dangerous commands blocked",
-        "full": "Full access — all tools and commands available",
-        "none": "No restrictions — sandbox fully disabled, all commands and imports allowed",
+        "sandboxed": "Restricted mode — file writes confined to /data",
+        "standard": "Standard mode — reads anywhere, writes limited",
+        "full": "Full access — writes anywhere except credential paths",
+        "none": "No restrictions — path guard fully disabled",
     }
-    blocked = access_tiers.get_blocked_shell_commands()
-    blocked_imports = access_tiers.get_blocked_imports()
     return {
         "tier": tier,
         "description": descriptions.get(tier, "Unknown tier"),
-        "blocked_commands": len(blocked),
-        "blocked_imports": len(blocked_imports),
         "tool_timeout": config.TOOL_TIMEOUT,
         "generation_timeout": config.GENERATION_TIMEOUT,
     }
@@ -236,8 +218,6 @@ async def get_config_summary():
     return {
         "LLM_PROVIDER": config.LLM_PROVIDER,
         "LLM_MODEL": config.LLM_MODEL,
-        "ENABLE_DELEGATION": config.ENABLE_DELEGATION,
-        "MAX_DELEGATION_DEPTH": config.MAX_DELEGATION_DEPTH,
         "ENABLE_AUTO_SKILL_CREATION": config.ENABLE_AUTO_SKILL_CREATION,
         "ENABLE_MODEL_ROUTING": config.ENABLE_MODEL_ROUTING,
         "ENABLE_EXTENDED_THINKING": config.ENABLE_EXTENDED_THINKING,
@@ -279,24 +259,19 @@ class ConfigUpdateRequest(BaseModel):
     MAX_SKILLS_CHECK: int | None = Field(None, ge=0, le=50)
     MAX_CONTEXT_TOKENS: int | None = Field(None, ge=1000, le=128000)
     RECENT_MESSAGES_KEEP: int | None = Field(None, ge=1, le=100)
-    CODE_EXEC_TIMEOUT: int | None = Field(None, ge=1, le=300)
     MAX_TOOL_ROUNDS: int | None = Field(None, ge=1, le=20)
-    SHELL_EXEC_TIMEOUT: int | None = Field(None, ge=1, le=300)
     BROWSER_TIMEOUT: int | None = Field(None, ge=1, le=300)
     TOOL_TIMEOUT: int | None = Field(None, ge=10, le=600)
     GENERATION_TIMEOUT: int | None = Field(None, ge=30, le=1200)
     INTERNAL_LLM_TIMEOUT: int | None = Field(None, ge=5, le=120)
     ENABLE_PLANNING: bool | None = None
     ENABLE_CRITIQUE: bool | None = None
-    ENABLE_CUSTOM_TOOLS: bool | None = None
     ENABLE_EXTENDED_THINKING: bool | None = None
-    ENABLE_DELEGATION: bool | None = None
     ENABLE_CURIOSITY: bool | None = None
     ENABLE_MODEL_ROUTING: bool | None = None
     ENABLE_HEARTBEAT: bool | None = None
     HEARTBEAT_INTERVAL: int | None = Field(None, ge=1)
     ENABLE_PROACTIVE: bool | None = None
-    ENABLE_SHELL_EXEC: bool | None = None
     ENABLE_AUTO_SKILL_CREATION: bool | None = None
     ENABLE_INJECTION_DETECTION: bool | None = None
     ENABLE_WEBHOOKS: bool | None = None
@@ -566,43 +541,6 @@ async def delete_kg_fact(fact_id: int):
 
 
 # ---------------------------------------------------------------------------
-# Custom Tools
-# ---------------------------------------------------------------------------
-
-@router.get("/custom-tools", dependencies=[Depends(require_auth)])
-async def get_custom_tools():
-    """List all custom tools."""
-    from app.core.brain import get_services
-    svc = get_services()
-    if not svc.custom_tools:
-        return []
-    tools = await asyncio.to_thread(svc.custom_tools.get_all_tools)
-    return [{"id": t.id, "name": t.name, "description": t.description,
-             "parameters": t.parameters, "times_used": t.times_used,
-             "success_rate": t.success_rate, "enabled": t.enabled} for t in tools]
-
-
-@router.delete("/custom-tools/{name}", dependencies=[Depends(require_auth)])
-async def delete_custom_tool(name: str):
-    """Delete a custom tool by name."""
-    from app.core.brain import get_services
-    svc = get_services()
-    if not svc.custom_tools:
-        raise HTTPException(404, "Custom tools not enabled")
-    # to_thread (2026-08-31): sync DELETE on the loop (custom_tools.py:463
-    # tripwire).
-    deleted = await asyncio.to_thread(svc.custom_tools.delete_tool, name)
-    if not deleted:
-        raise HTTPException(404, f"Tool '{name}' not found")
-    # Unregister from live registry
-    if svc.tool_registry:
-        tool = svc.tool_registry.get(name)
-        if tool:
-            svc.tool_registry._tools.pop(name, None)
-    return {"deleted": name}
-
-
-# ---------------------------------------------------------------------------
 # Extensions (Nova-authored modules in /data/extensions/)
 # ---------------------------------------------------------------------------
 
@@ -794,9 +732,6 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
             for r in ref_rows
         ]
 
-        # Custom tools
-        ct_rows = db.fetchall("SELECT * FROM custom_tools ORDER BY id LIMIT ?", (limit,))
-
         return {
             "conversations": conversations,
             "user_facts": user_facts,
@@ -805,7 +740,6 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
             "training_data": training_data,
             "kg_facts": kg_facts,
             "reflexions_data": reflexions_data,
-            "ct_rows": ct_rows,
         }
 
     _data = await asyncio.to_thread(_sync_export, limit)
@@ -816,16 +750,6 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
     training_data = _data["training_data"]
     kg_facts = _data["kg_facts"]
     reflexions_data = _data["reflexions_data"]
-    ct_rows = _data["ct_rows"]
-    custom_tools_data = [
-        {
-            "name": r["name"], "description": r["description"],
-            "parameters": r["parameters"], "code": r["code"],
-            "times_used": r["times_used"], "success_rate": r["success_rate"],
-            "enabled": bool(r["enabled"]),
-        }
-        for r in ct_rows
-    ]
 
     export = {
         "version": "1.0",
@@ -837,7 +761,6 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
         "training_data": training_data,
         "kg_facts": kg_facts,
         "reflexions": reflexions_data,
-        "custom_tools": custom_tools_data,
     }
 
     return JSONResponse(
@@ -976,30 +899,6 @@ async def import_all(file: UploadFile = File(...)):
                         ),
                     )
                     stats["reflexions"] = stats.get("reflexions", 0) + 1
-
-            # Import custom tools (validate code before importing via AST analysis)
-            from app.tools.code_exec import _check_code_safety
-            for ct in data.get("custom_tools", []):
-                existing = tx.fetchone(
-                    "SELECT id FROM custom_tools WHERE name = ?", (ct["name"],)
-                )
-                if not existing:
-                    code = ct.get("code", "")
-                    # Validate code against access tier restrictions using AST-based check
-                    safety_error = _check_code_safety(code)
-                    if safety_error:
-                        logger.warning("Rejected imported custom tool '%s': %s", ct["name"], safety_error)
-                        continue
-                    tx.execute(
-                        "INSERT INTO custom_tools (name, description, parameters, code, times_used, success_rate, enabled) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            ct["name"], ct["description"], ct["parameters"], code,
-                            ct.get("times_used", 0), ct.get("success_rate", 1.0),
-                            int(ct.get("enabled", True)),
-                        ),
-                    )
-                    stats["custom_tools"] = stats.get("custom_tools", 0) + 1
 
         # Training data written to file (outside transaction) with deduplication
         # Uses atomic temp-file + os.replace to prevent corruption on crash.

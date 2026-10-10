@@ -254,10 +254,9 @@ def assess_quality(
             query_lower = query.lower()
             tool_names = {str(tr.get("tool", "")).lower() for tr in tool_results}
             alignment_pairs = [
-                ({"calculate", "compute", "how much", "how many", "total"}, {"calculator", "code_exec"}),
+                ({"calculate", "compute", "how much", "how many", "total"}, {"calculator"}),
                 ({"search", "latest", "current", "today", "news", "price"}, {"web_search", "browser", "http_fetch"}),
                 ({"remember", "recall", "what did", "what have"}, {"memory_query", "knowledge_search"}),
-                ({"code", "script", "function", "print", "run"}, {"code_exec", "shell_exec"}),
             ]
             for query_keywords, ok_tools in alignment_pairs:
                 if any(k in query_lower for k in query_keywords) and tool_names & ok_tools:

@@ -48,11 +48,11 @@ def test_a_cut_writer_leaves_the_registry_with_its_monitor():
     assert "auto_tool_candidates" not in BY_NAME
 
 
-def test_deliberation_scratchpads_are_usage_gated():
-    """They only write when the owner talks to Nova; silence is idle, not dead."""
-    p = BY_NAME["agent_workspace"]
-    assert p.usage_gated is True
-    assert p.flag == "ENABLE_DELIBERATION"
+def test_the_agent_layer_left_the_registry_with_its_writers():
+    """agent_workspace, custom_tools and auto_tool_candidates were cut 2026-10-10;
+    a pathway pointed at a writer that cannot write reads dead forever."""
+    for name in ("agent_workspace", "custom_tools", "auto_tool_candidates"):
+        assert name not in BY_NAME, name
 
 
 @pytest.mark.parametrize("table,why", [

@@ -28,8 +28,8 @@ _eval_running = {"active": False}
 # Request/Response models
 # ---------------------------------------------------------------------------
 
-_USER_CHECK_TYPES = {"url", "search", "command", "query"}
-_ALL_CHECK_TYPES = {"url", "search", "command", "query", "system_health", "quiz", "skill_validation", "kg_curate", "curiosity", "finetune_check", "auto_monitor"}
+_USER_CHECK_TYPES = {"url", "search", "query"}
+_ALL_CHECK_TYPES = {"url", "search", "query", "system_health", "quiz", "skill_validation", "kg_curate", "curiosity", "finetune_check", "auto_monitor"}
 _VALID_NOTIFY_CONDITIONS = {"on_change", "always", "on_error", "on_threshold"}
 
 
@@ -125,7 +125,6 @@ class MonitorUpdate(BaseModel):
 _ALLOWED_CONFIG_KEYS: dict[str, frozenset[str]] = {
     "search": frozenset({"query"}),
     "url": frozenset({"url", "match"}),
-    "command": frozenset({"command"}),
     "api": frozenset({"url", "method", "headers"}),
     "query": frozenset({"query"}),
 }
