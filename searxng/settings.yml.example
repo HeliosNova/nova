@@ -9,7 +9,7 @@ server:
 search:
   safe_search: 0
   autocomplete: ""
-  default_lang: "en"
+  default_lang: "en-US"
   formats:
     - html
     - json
@@ -27,11 +27,6 @@ engines:
   - name: startpage
     engine: startpage
     shortcut: sp
-    disabled: false
-    timeout: 10.0
-  - name: ecosia
-    engine: ecosia
-    shortcut: ec
     disabled: false
     timeout: 10.0
   - name: yandex
@@ -65,7 +60,7 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    disabled: true
+    disabled: false   # R2 trial (2026-10-10): rule R2 reverts this line if the 48 h non-empty rate stays at 0
     timeout: 6.0
   - name: duckduckgo news
     engine: duckduckgo_extra
@@ -77,12 +72,6 @@ engines:
   - name: brave
     engine: brave
     shortcut: br
-    disabled: false
-    timeout: 10.0
-  - name: presearch
-    engine: presearch
-    shortcut: ps
-    categories: [general, web]
     disabled: false
     timeout: 10.0
   # ---------- News ----------
@@ -118,11 +107,6 @@ engines:
   - name: wikipedia
     engine: wikipedia
     shortcut: wp
-    disabled: false
-    timeout: 10.0
-  - name: wikidata
-    engine: wikidata
-    shortcut: wd
     disabled: false
     timeout: 10.0
   - name: wikiquote
@@ -232,12 +216,6 @@ engines:
     shortcut: ho
     disabled: true   # Niche; opt-in
   # ---------- Discussion / social ----------
-  - name: reddit
-    engine: reddit
-    shortcut: re
-    categories: [social]
-    disabled: false
-    timeout: 10.0
   - name: hackernews
     engine: hackernews
     shortcut: hn
