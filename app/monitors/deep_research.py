@@ -3305,6 +3305,24 @@ def _claim_tokens(claim: str) -> set[str]:
     return toks
 
 
+def _record_gate(label: str, site: str, specs: list, docs: dict, res: list) -> None:
+    """P1 (2026-10-10): persist every scored (claim, document, verdict) so the
+    rescue can be audited by the planting probe. Never raises into the gate."""
+    try:
+        from app.monitors.gate_record import record
+        rows = []
+        for i, r in enumerate(res):
+            if r is None:
+                continue
+            d, narrow = docs.get(i, ("", False))
+            rows.append({"claim": specs[i][1], "hosts": list(specs[i][0]), "doc": d,
+                         "prob": r.get("prob"), "supported": bool(r.get("supported")),
+                         "narrow": narrow})
+        record(label or "digest", site, rows)
+    except Exception as e:
+        logger.warning("[gate-record] skipped (%s/%s): %s", label, site, e)
+
+
 async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
                            label: str = "") -> tuple[str, int]:
     """MiniCheck entailment gate (#48, gated by ENABLE_MINICHECK, fail-open).
@@ -3477,14 +3495,23 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
         """
         key = f"{label}:{site}"
         n = len(specs)
+        docs: dict[int, tuple[str, bool]] = {}   # i -> (document scored last, narrow?)
 
         def _full(idx):
-            return [{"doc": _doc_for(specs[i][0], specs[i][1]), "claim": specs[i][1]}
-                    for i in idx]
+            out = []
+            for i in idx:
+                d = _doc_for(specs[i][0], specs[i][1])
+                docs[i] = (d, False)
+                out.append({"doc": d, "claim": specs[i][1]})
+            return out
 
         def _narrow(idx):
-            return [{"doc": _doc_for(specs[i][0], specs[i][1], narrow=True),
-                     "claim": specs[i][1]} for i in idx]
+            out = []
+            for i in idx:
+                d = _doc_for(specs[i][0], specs[i][1], narrow=True)
+                docs[i] = (d, True)
+                out.append({"doc": d, "claim": specs[i][1]})
+            return out
 
         res: list[dict | None] = [None] * n
         rate = None
@@ -3516,12 +3543,14 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
             if res_full is None:
                 if not fail_open or any(res[i] is None for i in todo):
                     return None
+                _record_gate(label, site, specs, docs, res)
                 return [r for r in res]          # narrow verdicts, all accepted
             for i, r2 in zip(todo, res_full):
                 res[i] = r2
         logger.info("[entail-cascade] %s/%s: %d pair(s), %d scored narrow "
                     "(support %s), %d read at full width", label, site, n, n_narrow,
                     "unprobed" if rate is None else f"{rate:.0%}", len(todo))
+        _record_gate(label, site, specs, docs, res)
         return [r for r in res]
 
     results = await _check_cascade([(hosts, _claim_of(st)) for _, st, hosts in checks],
