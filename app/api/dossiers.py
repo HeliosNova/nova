@@ -73,6 +73,16 @@ async def list_belief_revisions(
     return {"revisions": rows}
 
 
+@router.get("/dossiers/tensions")
+async def list_tension_resolutions(limit: int = Query(50, ge=1, le=500)):
+    """Cross-dossier tensions judged from Nova's own digests (C1): verdict,
+    the spans each side was judged on, and whether the verifier agreed."""
+    import asyncio
+    from app.core.tensions import list_resolutions
+    rows = await asyncio.to_thread(list_resolutions, get_db(), limit=limit)
+    return {"resolutions": rows}
+
+
 @router.get("/dossiers/{dossier_id}")
 async def get_dossier_detail(dossier_id: int):
     """One dossier with its full body + how many prior revisions exist."""

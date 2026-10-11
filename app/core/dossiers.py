@@ -265,15 +265,22 @@ def _fmt_qty(val: float, unit: str) -> str:
 
 
 def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
+    """Tension lines for the consolidation note (see _numeric_tension_records)."""
+    return [r["text"] for r in _numeric_tension_records(db, max_report=max_report)]
+
+
+def _numeric_tension_records(db, *, max_report: int = 3) -> list[dict]:
     """Thinking rung, brick one (2026-08-14): notice when two CURRENT dossiers
     assert materially different values for what reads as the SAME quantity
     (e.g. Finance says CPI 3.4% while Economics says 2.9%). Deterministic —
     Key-facts bullets only (the factual layer), matched by rare-token context
     overlap + unit class, flagged at >5%% relative divergence. Surfaces the
-    tension for investigation; never auto-resolves."""
+    tension; resolution is app/core/tensions.py (C1, 2026-10-10), which judges
+    it from Nova's own stored digests. Returns dicts: title_a/dkey_a/val_a/
+    head_a, title_b/dkey_b/val_b/head_b, unit, text."""
     try:
         rows = db.fetchall(
-            "SELECT title, body FROM dossiers WHERE kind IN ('domain', 'meta')")
+            "SELECT dkey, title, body FROM dossiers WHERE kind IN ('domain', 'meta')")
     except Exception:
         return []
     facts = []   # (dossier_title, context_tokens, value, unit, bullet_head)
@@ -303,8 +310,8 @@ def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
                 # years and bare small ints are noise, not metrics
                 if not unit and (val > 1900 or val == int(val) and val < 32):
                     continue
-                facts.append((r["title"], toks, val, unit, _wtrim(s.lstrip("*- "), 80)))
-    tensions: list[str] = []
+                facts.append((r["title"], toks, val, unit, _wtrim(s.lstrip("*- "), 80), r["dkey"]))
+    tensions: list[dict] = []
     seen_pairs: set[frozenset] = set()
     for i in range(len(facts)):
         for j in range(i + 1, len(facts)):
@@ -338,9 +345,13 @@ def _numeric_tensions(db, *, max_report: int = 3) -> list[str]:
             if pair in seen_pairs:
                 continue
             seen_pairs.add(pair)
-            tensions.append(
-                f"{a[0]} says {_fmt_qty(a[2], a[3])} but {b[0]} says {_fmt_qty(b[2], b[3])} — "
-                f"\"{a[4]}\" vs \"{b[4]}\"")
+            tensions.append({
+                "title_a": a[0], "dkey_a": a[5], "val_a": a[2], "head_a": a[4],
+                "title_b": b[0], "dkey_b": b[5], "val_b": b[2], "head_b": b[4],
+                "unit": a[3],
+                "text": (f"{a[0]} says {_fmt_qty(a[2], a[3])} but {b[0]} says {_fmt_qty(b[2], b[3])} — "
+                         f"\"{a[4]}\" vs \"{b[4]}\""),
+            })
             if len(tensions) >= max_report:
                 return tensions
     return tensions
@@ -1013,37 +1024,48 @@ async def consolidate_dossiers(db) -> str:
 
     # Thinking rung, brick one (2026-08-14): after consolidation, look for
     # dossiers asserting materially different values for the same quantity.
-    # A noticed tension is surfaced AND becomes targeted research — the
-    # knowing tier investigating its own disagreements.
+    # C1 (2026-10-10): a noticed tension is now RESOLVED from Nova's own
+    # stored digests (app/core/tensions.py) — never by web research, which
+    # scored 0 resolved of 26 such items (2026-09-06). The judge reads only
+    # the dated sentences carrying each figure; an independent verifier must
+    # agree before the losing dossier bullet is rewritten. Open tensions stay
+    # in the note with both verdicts stored.
     tension_note = ""
     try:
-        tensions = await asyncio.to_thread(_numeric_tensions, db)
-        if tensions:
-            tension_note = "\n- ⚡ **Tension:** " + "\n- ⚡ **Tension:** ".join(tensions)
+        recs = await asyncio.to_thread(_numeric_tension_records, db)
+        if recs:
             logger.info("[Knowing] %d cross-dossier tension(s): %s",
-                        len(tensions), tensions[0][:120])
-            # NOT queued for curiosity research any more (2026-09-06). A
-            # tension is a disagreement between two of Nova's OWN stored
-            # digests — "Current Events says 209 billion but Latin America says
-            # 65 billion" — and a web research pass cannot settle which of
-            # Nova's records is right. The judge said so in as many words:
-            # "the response fails to resolve the contradiction".
-            #
-            # Measured over the queue's lifetime: source='dossier_tension'
-            # scored 0 resolved, 6 failed, 15 dismissed. Not a low rate. ZERO,
-            # across 26 items, while dossier_open_question ran 21/28 = 75%.
-            # At MAX_CURIOSITY_ATTEMPTS=3 those failures alone consumed 18
-            # research passes from a loop that answers about one question a day.
-            #
-            # The 2026-09-01 reading of this was that they were STARVED, and
-            # they were given a reserved every-third pick in get_next to fix it.
-            # Five days and a third of curiosity's throughput later the count is
-            # still zero, so starvation was not the cause and that slot is gone
-            # too. The detection stays and the tension is still written into the
-            # dossier body above: _numeric_tensions "surfaces the tension for
-            # investigation; never auto-resolves", which was always the right
-            # contract. Resolving it needs to read Nova's own records, which is
-            # a different capability from web research and does not exist yet.
+                        len(recs), recs[0]["text"][:120])
+            from app.core.tensions import Tension, resolve_tension, apply_resolution
+            from app.config import config as _tcfg
+            try:
+                from app.monitors.deep_research import _syn_model
+                _judge = _syn_model()
+            except Exception:
+                _judge = None
+            _verifier = (getattr(_tcfg, "JUDGE_MODEL", "") or "").strip() or None
+            notes: list[str] = []
+            for r in recs:
+                t = Tension(**{k: r[k] for k in ("title_a", "dkey_a", "val_a", "head_a",
+                                                 "title_b", "dkey_b", "val_b", "head_b",
+                                                 "unit", "text")})
+                try:
+                    res = await resolve_tension(db, t, judge_model=_judge, verifier_model=_verifier)
+                    changed = (await asyncio.to_thread(apply_resolution, db, t, res)
+                               if res.get("admitted") else False)
+                except Exception as e:
+                    logger.warning("[Knowing] tension resolver failed: %s", e)
+                    notes.append(f"Tension open: {r['text']} (resolver error)")
+                    continue
+                if res.get("admitted"):
+                    who = {"a": r["title_a"], "b": r["title_b"]}.get(
+                        res["verdict"], "both stand (different quantities)")
+                    notes.append(f"Tension resolved: {r['text']} → {who}"
+                                 + (" (dossier updated)" if changed else ""))
+                else:
+                    notes.append(f"Tension open: {r['text']} (judge: {res['verdict']}; "
+                                 f"verifier {'agrees' if res.get('verifier_agrees') else 'disagrees'})")
+            tension_note = "".join(f"\n- ⚡ **{n.split(': ', 1)[0]}:** {n.split(': ', 1)[1]}" for n in notes)
     except Exception as e:
         logger.debug("[Knowing] tension scan failed: %s", e)
 

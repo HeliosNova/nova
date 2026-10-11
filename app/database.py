@@ -1209,6 +1209,43 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 40 (2026-10-10): tension resolutions (plan task C1) ---
+        # Every cross-dossier tension judged from Nova's own stored digests:
+        # the spans each side was judged on, the verdict, the independent
+        # verifier's agreement. Admitted resolutions also rewrite the losing
+        # dossier bullet and land in belief_revisions.
+        if 40 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS tension_resolutions ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  tension_text TEXT NOT NULL,"
+                    "  dkey_a TEXT NOT NULL,"
+                    "  dkey_b TEXT NOT NULL,"
+                    "  figure_a TEXT,"
+                    "  figure_b TEXT,"
+                    "  span_a TEXT,"
+                    "  span_b TEXT,"
+                    "  verdict TEXT NOT NULL,"          # a | b | both | unresolvable
+                    "  reasoning TEXT,"
+                    "  judge_model TEXT,"
+                    "  verifier_model TEXT,"
+                    "  verifier_agrees INTEGER DEFAULT 0,"
+                    "  winner_date TEXT,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP"
+                    ")"
+                )
+                conn.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_tension_resolutions_created "
+                    "ON tension_resolutions (created_at)"
+                )
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (40,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

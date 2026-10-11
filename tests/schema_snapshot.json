@@ -309,6 +309,23 @@
   "value",
   "updated_at"
  ],
+ "tension_resolutions": [
+  "id",
+  "tension_text",
+  "dkey_a",
+  "dkey_b",
+  "figure_a",
+  "figure_b",
+  "span_a",
+  "span_b",
+  "verdict",
+  "reasoning",
+  "judge_model",
+  "verifier_model",
+  "verifier_agrees",
+  "winner_date",
+  "created_at"
+ ],
  "user_facts": [
   "id",
   "key",
