@@ -16,7 +16,8 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "searxng" / "settings.yml"
 EXAMPLE = ROOT / "searxng" / "settings.yml.example"
-NEVER = {"ecosia", "presearch", "reddit", "wikidata"}
+NEVER = {"ecosia", "presearch", "reddit"}
+DISABLED = {"wikidata"}   # a DEFAULT engine: only an explicit disabled entry stops it loading
 
 
 def _strip_secret(text: str) -> str:
@@ -32,6 +33,10 @@ def test_no_engine_is_listed_twice_and_none_that_fail_to_load():
     names = [e["name"] for e in doc["engines"]]
     assert len(names) == len(set(names)), [n for n in names if names.count(n) > 1]
     assert not (set(names) & NEVER), set(names) & NEVER
+    for e in doc["engines"]:
+        if e["name"] in DISABLED:
+            assert e.get("disabled") is True, e["name"]
+    assert DISABLED <= set(names)
 
 
 def test_language_and_the_ddg_trial():

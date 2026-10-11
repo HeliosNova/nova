@@ -104,6 +104,10 @@ engines:
     disabled: true   # Some Reuters layouts block scrapers; keep off until verified
     timeout: 12.0
   # ---------- Wiki / encyclopedic ----------
+  - name: wikidata
+    engine: wikidata
+    shortcut: wd
+    disabled: true   # default engine; INIT fails with HTTP 403 at every start (2026-10-10) — must be listed to be disabled
   - name: wikipedia
     engine: wikipedia
     shortcut: wp
