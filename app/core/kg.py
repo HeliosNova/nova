@@ -1073,11 +1073,34 @@ class KnowledgeGraph:
             conflicts: list = []
         else:
             conflicts = list(self._db.fetchall(
-                "SELECT id, object, confidence FROM kg_facts "
+                "SELECT id, object, confidence, COALESCE(valid_from, created_at) AS valid_from "
+                "FROM kg_facts "
                 "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) != LOWER(?) "
                 "AND valid_to IS NULL",
                 (subject, predicate, object_),
             ))
+            # Revert guard (G3, 2026-10-10; arXiv 2610.07715): a value this
+            # triple once held and that a live row has since superseded may
+            # only come back when the new evidence is dated AFTER that
+            # supersession. Re-reading an older source must not reactivate a
+            # retired value — measured 2026-10-09: 37 A-B-A chains live, every
+            # revival with evidence no newer than the supersession.
+            if conflicts:
+                retired = self._db.fetchone(
+                    "SELECT id FROM kg_facts "
+                    "WHERE LOWER(subject) = LOWER(?) AND predicate = ? AND LOWER(object) = LOWER(?) "
+                    "AND valid_to IS NOT NULL",
+                    (subject, predicate, object_),
+                )
+                if retired:
+                    newest_live = max((c["valid_from"] or "")[:10] for c in conflicts)
+                    if (fact_valid_from or "")[:10] <= newest_live:
+                        logger.info(
+                            "[kg] revert refused: %s %s %s is retired and the new evidence "
+                            "(valid_from %s) is not dated past the live value's %s",
+                            subject, predicate, object_, (fact_valid_from or "")[:10], newest_live,
+                        )
+                        return False
 
         # Inverse contradiction: a DIFFERENT subject for the same object on an
         # inverse-functional predicate (one leader per org → supersede the prior).
