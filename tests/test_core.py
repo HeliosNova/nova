@@ -111,46 +111,6 @@ class TestCorrectionBoundsCheck:
 # B4: Skill auto-disable recovery
 # ---------------------------------------------------------------------------
 
-class TestSkillRecovery:
-    def test_reenable_resets_stats(self, db):
-        from app.core.skills import SkillStore
-
-        db.init_schema()
-        store = SkillStore(db)
-
-        skill_id = db.execute(
-            """INSERT INTO skills (name, trigger_pattern, steps, times_used, success_rate, enabled)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            ("test_skill", r"\btest\b", "[]", 10, 0.2, 0),
-        ).lastrowid
-
-        store.toggle_skill(skill_id, enabled=True)
-
-        skill = store.get_skill(skill_id)
-        assert skill.enabled is True
-        assert skill.times_used == 0
-        assert skill.success_rate == 0.7
-
-    def test_disable_preserves_stats(self, db):
-        from app.core.skills import SkillStore
-
-        db.init_schema()
-        store = SkillStore(db)
-
-        skill_id = db.execute(
-            """INSERT INTO skills (name, trigger_pattern, steps, times_used, success_rate, enabled)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            ("test_skill", r"\btest\b", "[]", 10, 0.5, 1),
-        ).lastrowid
-
-        store.toggle_skill(skill_id, enabled=False)
-
-        skill = store.get_skill(skill_id)
-        assert skill.enabled is False
-        assert skill.times_used == 10
-        assert skill.success_rate == 0.5
-
-
 # ---------------------------------------------------------------------------
 # R1: Lesson dedup threshold 0.7→0.85
 # ---------------------------------------------------------------------------

@@ -407,7 +407,7 @@ export default function MonitorsPage() {
                 for (const m of monitors) {
                   let cat = "Other";
                   if (["system_health", "maintenance", "finetune"].includes(m.check_type)) cat = "Operational";
-                  else if (["quiz", "skill_test", "curiosity", "auto_monitor"].includes(m.check_type)) cat = "Self-Improvement";
+                  else if (["curiosity", "auto_monitor"].includes(m.check_type)) cat = "Self-Improvement";
                   else if (m.name.startsWith("Domain Study:")) cat = "Domain Study";
                   else if (m.name.startsWith("Local:")) cat = "Local";
                   else if (m.name.startsWith("Auto:")) cat = "Auto-Created";

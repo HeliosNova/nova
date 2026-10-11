@@ -176,16 +176,15 @@ class TestNewMonitorSeeds:
         names = {m.name for m in monitors}
         assert "DB Size Monitor" in names
         assert "Ollama Latency Monitor" in names
-        assert "Skill Quality Monitor" in names
         assert "ChromaDB Integrity" in names
         assert "KG Health Monitor" in names
 
     def test_new_monitors_are_fast_type(self, store):
         store.seed_defaults()
         monitors = store.list_all()
-        fast_types = {"db_size", "ollama_latency", "skill_quality", "chromadb_integrity", "kg_health"}
+        fast_types = {"db_size", "ollama_latency", "chromadb_integrity", "kg_health"}
         health_monitors = [m for m in monitors if m.check_type in fast_types]
-        assert len(health_monitors) == 5
+        assert len(health_monitors) == 4
 
 
 # ===========================================================================

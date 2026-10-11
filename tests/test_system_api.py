@@ -66,7 +66,7 @@ class TestStatusEndpoint:
         """Status response should have all expected count fields."""
         resp = client.get("/api/status")
         data = resp.json()
-        for field in ("conversations", "messages", "user_facts", "lessons", "skills", "documents", "training_examples"):
+        for field in ("conversations", "messages", "user_facts", "lessons", "documents", "training_examples"):
             assert field in data
             assert isinstance(data[field], int)
 
@@ -95,7 +95,7 @@ class TestExportEndpoint:
         """Export should include all data sections."""
         resp = client.get("/api/export")
         data = resp.json()
-        for section in ("conversations", "user_facts", "lessons", "skills", "training_data"):
+        for section in ("conversations", "user_facts", "lessons", "training_data"):
             assert section in data
             assert isinstance(data[section], list)
 
@@ -134,7 +134,6 @@ class TestImportEndpoint:
             "conversations": [],
             "user_facts": [],
             "lessons": [],
-            "skills": [],
             "training_data": [],
         }
         file_content = json.dumps(export_data).encode()
@@ -199,7 +198,6 @@ class TestImportEndpoint:
                     "confidence": 0.9,
                 }
             ],
-            "skills": [],
             "training_data": [],
         }
         file_content = json.dumps(export_data).encode()
@@ -223,7 +221,6 @@ class TestImportEndpoint:
             ],
             "user_facts": [],
             "lessons": [],
-            "skills": [],
             "training_data": [],
         }
         file_content = json.dumps(export_data).encode()

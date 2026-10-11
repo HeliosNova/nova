@@ -128,8 +128,6 @@ async def chat_sync(request: ChatRequest):
     sources: list[dict] = []
     lessons_used = 0
     kg_facts_used = 0
-    reflexions_used = 0
-    skill_used = None
     latency_breakdown = None
 
     try:
@@ -145,8 +143,6 @@ async def chat_sync(request: ChatRequest):
                 conversation_id = event.data.get("conversation_id", conversation_id)
                 lessons_used = event.data.get("lessons_used", 0)
                 kg_facts_used = event.data.get("kg_facts_used", 0)
-                reflexions_used = event.data.get("reflexions_used", 0)
-                skill_used = event.data.get("skill_used")
                 latency_breakdown = event.data.get("latency_breakdown")
             elif event.type == EventType.TOOL_USE and event.data.get("status") == "complete":
                 tool_results.append({
@@ -189,8 +185,6 @@ async def chat_sync(request: ChatRequest):
         tool_results=tool_results,
         lessons_used=lessons_used,
         kg_facts_used=kg_facts_used,
-        reflexions_used=reflexions_used,
-        skill_used=skill_used,
         latency_breakdown=latency_breakdown,
     )
 

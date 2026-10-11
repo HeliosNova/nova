@@ -86,8 +86,6 @@ _TOPIC_EMOJI: tuple[tuple[str, str], ...] = (
     ("system maintenance", "\U0001f527"), # 🔧
     ("fine-tune", "\U0001f3cb\ufe0f"),    # 🏋️
     ("auto-monitor", "\U0001f9ed"),       # 🧭
-    ("lesson quiz", "\U0001f9e0"),        # 🧠
-    ("skill validation", "\U0001f3af"),   # 🎯
     ("curiosity research", "\U0001f50d"), # 🔍
     ("eval harness", "\U0001f9ea"),       # 🧪
     ("prompt optimizer", "\u2699\ufe0f"), # ⚙️

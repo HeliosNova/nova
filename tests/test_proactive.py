@@ -255,35 +255,6 @@ class TestDailyDigestGeneration:
         assert "Learning Activity" in user_msg["content"]
         assert "Python" in user_msg["content"]
 
-    @pytest.mark.asyncio
-    async def test_digest_includes_teaching_section(self):
-        """When quiz/skill_test results exist, digest includes teaching section."""
-        monitors = [
-            _make_monitor(1, "Lesson Quiz", check_type="quiz"),
-            _make_monitor(2, "Skill Test", check_type="skill_test"),
-        ]
-        results = [
-            _make_result(1, 1, status="ok", value="QUIZ PASSED: score 90%"),
-            _make_result(2, 1, status="ok", value="QUIZ FAILED: score 40%"),
-            _make_result(3, 2, status="ok", value="SKILL TEST PASSED"),
-        ]
-        store = _make_monitor_store(monitors=monitors, results=results)
-
-        digest = DailyDigest(store)
-
-        captured_messages = []
-        with patch("app.monitors.proactive.llm") as mock_llm:
-            async def capture_invoke(messages, **kwargs):
-                captured_messages.extend(messages)
-                return "**Teaching:** 1/2 quizzes passed"
-
-            mock_llm.invoke_nothink = AsyncMock(side_effect=capture_invoke)
-
-            await digest.send_digest()
-
-        user_msg = next(m for m in captured_messages if m["role"] == "user")
-        assert "Teaching Activity" in user_msg["content"]
-        assert "Lesson quizzes" in user_msg["content"]
 
 
 # ===========================================================================

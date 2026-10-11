@@ -5,9 +5,7 @@
 # the deliberation probe moved to `reasoning`.)
 #
 # Each task runs through the real brain pipeline (ephemeral=True so no
-# conversation history is written).  seed_skill entries are created in the
-# SkillStore before the task runs (idempotent: if name already exists the
-# harness skips re-insertion).
+# conversation history is written).
 #
 # Assertion types:
 #   answer_contains      — case-insensitive substring present in response
@@ -15,8 +13,6 @@
 #   answer_not_contains  — substring NOT present
 #   tool_invoked         — tool name appears in TOOL_USE events
 #   no_tool_invoked      — no tools were called
-#   skill_matched        — brain reported a matched skill (skill_used != None)
-#   skill_name_matches   — matched skill name matches a regex
 #   reflexion_in_range   — heuristic quality score in [min, max]
 #   reflexion_above      — score >= value
 #   reflexion_below      — score < value
@@ -158,71 +154,6 @@ tasks:
       - type: tool_invoked
         value: web_search
       - type: response_not_empty
-
-  # =========================================================================
-  # Category: skill-match  (6 tasks)
-  # Each task seeds a deterministic eval skill before running, then asserts
-  # the skill is matched.  Patterns use an "eval-probe-" prefix so they are
-  # narrow and cannot accidentally match unrelated production queries.
-  # =========================================================================
-
-  - id: skill_match_weather
-    category: skill-match
-    query: "eval-probe: what is the weather today"
-    timeout: 300
-    seed_skill:
-      name: "Eval: Weather Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:weather|forecast|temperature)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "weather today"}
-          output_key: result
-      answer_template: "Weather based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: skill_match_news
-    category: skill-match
-    query: "eval-probe: get the latest news on AI"
-    timeout: 180
-    seed_skill:
-      name: "Eval: News Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*(?:news|latest|headlines)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "latest AI news"}
-          output_key: result
-      answer_template: "Latest news"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_weather_typo
-    category: semantic-match
-    query: "What is the wether like in San Francisco today"   # typo: "wether"
-    timeout: 120
-    paraphrase_of: skill_match_weather
-    seed_skill:
-      name: "Eval: Weather Probe"
-      trigger_pattern: "(?i)\\beval-probe[:\\s]+.*weather\\s+in\\s+(?P<location>[A-Za-z\\s]+)\\b"
-      steps:
-        - tool: web_search
-          args_template: {q: "weather {location}"}
-          output_key: result
-      answer_template: "Weather based on search"
-    assertions:
-      - type: skill_matched
-
-  - id: semantic_domain_shift_negation
-    category: semantic-match
-    # Negation handling LANDED 2026-08-18 (scoped rejection cues in
-    # _query_skill_topically_related: tokens in a rejection cue's window cannot
-    # anchor, and a skill whose domain appears ONLY under negation is rejected).
-    # Upgraded from the pinned response_not_empty to the real assertion.
-    query: "I do NOT want today's Bitcoin price — just the historical low"
-    timeout: 120
-    paraphrase_of: skill_match_stock_price
-    assertions:
-      - type: skill_not_matched
 
   - id: autonomous_compound_interest
     category: autonomous-tool

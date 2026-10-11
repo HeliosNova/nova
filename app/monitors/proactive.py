@@ -142,35 +142,17 @@ class DailyDigest:
                     for item in ls["new_lessons"][:3]:
                         learning_lines.append(f"  - {item['topic']}: {item['lesson'][:80]}")
 
-                if ls["new_skills"]:
-                    learning_lines.append(f"New skills created: {len(ls['new_skills'])}")
-                    for item in ls["new_skills"][:3]:
-                        learning_lines.append(f"  - {item['name']} (trigger: {item['trigger'][:60]})")
-
                 if ls["new_tools"]:
                     learning_lines.append(f"New custom tools: {len(ls['new_tools'])}")
                     for item in ls["new_tools"][:3]:
                         learning_lines.append(f"  - {item['name']}: {item['description'][:60]}")
 
-                if ls["new_reflexions"]:
-                    learning_lines.append(f"New reflexions: {len(ls['new_reflexions'])}")
-                    for item in ls["new_reflexions"][:3]:
-                        learning_lines.append(f"  - {item['task'][:60]} (score: {item['score']:.1f})")
-
                 if ls["new_training_pairs"]:
                     learning_lines.append(f"New training pairs: {ls['new_training_pairs']}")
-
-                if ls["degraded_skills"]:
-                    learning_lines.append(f"Degraded skills (need attention): {len(ls['degraded_skills'])}")
-                    for item in ls["degraded_skills"][:3]:
-                        learning_lines.append(
-                            f"  - {item['name']}: {item['success_rate']:.0%} success over {item['uses']} uses"
-                        )
 
                 totals = ls["totals"]
                 learning_lines.append(
                     f"Totals: {totals['total_lessons']} lessons, "
-                    f"{totals['total_skills']} skills, "
                     f"{totals['training_examples']} training pairs"
                 )
 
@@ -181,31 +163,17 @@ class DailyDigest:
 
         # --- Teaching activity section ---
         teaching_input = ""
-        quiz_pass = quiz_fail = skill_pass = skill_fail = domain_count = 0
+        domain_count = 0
         for r in results:
             m = monitors.get(r.monitor_id)
             if not m:
                 continue
             val = r.value or r.message or ""
-            if m.check_type == "quiz":
-                if "QUIZ PASSED" in val:
-                    quiz_pass += 1
-                elif "QUIZ FAILED" in val:
-                    quiz_fail += 1
-            elif m.check_type == "skill_test":
-                if "SKILL TEST PASSED" in val:
-                    skill_pass += 1
-                elif "SKILL TEST FAILED" in val:
-                    skill_fail += 1
-            elif m.name.startswith("Domain Study:"):
+            if m.name.startswith("Domain Study:"):
                 if val and not val.startswith("["):
                     domain_count += 1
 
         teaching_lines = []
-        if quiz_pass or quiz_fail:
-            teaching_lines.append(f"Lesson quizzes: {quiz_pass}/{quiz_pass + quiz_fail} passed")
-        if skill_pass or skill_fail:
-            teaching_lines.append(f"Skill tests: {skill_pass}/{skill_pass + skill_fail} passed")
         if domain_count:
             teaching_lines.append(f"Domain studies completed: {domain_count}")
         if teaching_lines:
@@ -241,8 +209,8 @@ class DailyDigest:
         system_content = (
             "You are Nova composing your evening digest. Use this format:\n\n"
             "**Monitors:** X passed, Y failed, Z changed\n"
-            "**Learning:** (new lessons, skills, training pairs — numbers + highlights)\n"
-            "**Teaching:** (quiz results, skill test results)\n"
+            "**Learning:** (new lessons, training pairs — numbers + highlights)\n"
+            "**Teaching:** (domain studies completed)\n"
             "**Issues:** (anything degraded or failing — be specific)\n\n"
             "Keep each section to 1-2 lines. Be specific with numbers. "
             "Skip sections with no activity. No filler."

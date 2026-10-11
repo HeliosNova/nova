@@ -156,13 +156,12 @@ Rules:
 #
 # NOTE the sampling limit: those trial plans came back at ~520 characters, so
 # they never approached the ceiling. The queries that truncate in production are
-# longer ones carrying reflexions_text, which this A/B did not reproduce.
+# longer ones carrying extra context, which this A/B did not reproduce.
 
 
 async def create_plan(
     query: str,
     tool_names: list[str],
-    reflexions_text: str = "",
     timeout: float | None = None,
 ) -> dict | None:
     """Create a step-by-step plan for a complex query.
@@ -170,8 +169,6 @@ async def create_plan(
     Returns: {"steps": [...], "complexity": "..."} or None on failure.
     """
     system = _PLAN_SYSTEM.format(tools=", ".join(tool_names))
-    if reflexions_text:
-        system += f"\n\nWarnings from past failures:\n{reflexions_text}"
 
     # How long a plan takes is the number that decides what to do when one
     # FAILS. Every planning failure since 2026-08-29 has been a TimeoutError

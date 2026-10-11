@@ -1,11 +1,8 @@
-"""Learning API — metrics, lessons, skills management, fine-tune readiness.
+"""Learning API — metrics, lessons, fine-tune readiness.
 
 GET  /api/learning/metrics — Learning system metrics
 GET  /api/learning/lessons — List all lessons
 DELETE /api/learning/lessons/{id} — Delete a lesson
-GET  /api/learning/skills — List all skills
-POST /api/learning/skills/{id}/toggle — Enable/disable a skill
-DELETE /api/learning/skills/{id} — Delete a skill
 GET  /api/learning/finetune/status — Fine-tuning readiness check
 POST /api/learning/finetune/trigger — Trigger automated fine-tuning
 GET  /api/learning/finetune/history — List past fine-tuning runs
@@ -44,7 +41,6 @@ async def get_metrics():
     if not svc.learning:
         return {
             "total_lessons": 0,
-            "total_skills": 0,
             "total_corrections": 0,
             "training_examples": 0,
             "last_correction_date": None,
@@ -150,72 +146,6 @@ async def bulk_delete_lessons(body: BulkDeleteRequest):
         "not_found": not_found_ids,
         "deleted_count": len(deleted_ids),
     }
-
-
-@router.get("/skills")
-async def list_skills(
-    limit: int = Query(default=500, ge=1, le=1000),
-    include_disabled: bool = Query(default=False),
-):
-    """List learned skills. By default returns only enabled skills; pass ?include_disabled=true for all."""
-    svc = get_services()
-    if not svc.skills:
-        return []
-    skills = svc.skills.get_all_skills(limit=limit, include_disabled=include_disabled)
-    return [
-        {
-            "id": s.id,
-            "name": s.name,
-            "trigger_pattern": s.trigger_pattern,
-            "steps": s.steps,
-            "answer_template": s.answer_template,
-            "times_used": s.times_used,
-            "success_rate": round(s.success_rate, 3),
-            "enabled": s.enabled,
-            "created_at": s.created_at,
-            "last_used_at": s.last_used_at,
-            "consecutive_failures": s.consecutive_failures,
-            "source": s.source,
-            "composed_of": s.composed_of,
-        }
-        for s in skills
-    ]
-
-
-@router.get("/skills/stats")
-async def skill_stats():
-    """Aggregate skill system metrics: hit rates, quality, staleness, top skills."""
-    svc = get_services()
-    if not svc.skills:
-        return {"total": 0, "enabled": 0, "disabled": 0, "total_uses": 0,
-                "avg_success_rate": 0.0, "stale_count": 0, "by_source": {}, "top_skills": []}
-    return svc.skills.get_skill_stats()
-
-
-@router.post("/skills/{skill_id}/toggle")
-async def toggle_skill(skill_id: int, enabled: bool = Query(...)):
-    """Enable or disable a skill."""
-    svc = get_services()
-    if not svc.skills:
-        raise HTTPException(status_code=503, detail="Skills not initialized")
-    toggled = svc.skills.toggle_skill(skill_id, enabled)
-    if not toggled:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    return {"status": "ok", "skill_id": skill_id, "enabled": enabled}
-
-
-@router.delete("/skills/{skill_id}")
-async def delete_skill(skill_id: int):
-    """Delete a skill."""
-    svc = get_services()
-    if not svc.skills:
-        raise HTTPException(status_code=503, detail="Skills not initialized")
-    # to_thread (2026-08-31): sync DELETE + vector cleanup on the loop
-    # (skills.py delete tripwire).
-    deleted = await asyncio.to_thread(svc.skills.delete_skill, skill_id)
-    if not deleted:
-        raise HTTPException(status_code=404, detail="Skill not found")
-    return {"status": "deleted", "skill_id": skill_id}
 
 
 # ---------------------------------------------------------------------------
@@ -540,27 +470,6 @@ async def export_training_data():
         })
 
     return {"format": "dpo", "count": len(data), "data": data}
-
-
-@router.get("/reflexions")
-async def list_reflexions(limit: int = Query(default=50, ge=1, le=200)):
-    """List recent reflexion entries."""
-    svc = get_services()
-    if not svc.reflexions:
-        return []
-    reflexions = svc.reflexions.get_recent(limit=limit)
-    return [
-        {
-            "id": r.id,
-            "task_summary": r.task_summary,
-            "outcome": r.outcome,
-            "reflection": r.reflection,
-            "quality_score": round(r.quality_score, 3),
-            "tools_used": r.tools_used,
-            "created_at": r.created_at,
-        }
-        for r in reflexions
-    ]
 
 
 @router.get("/training-data")

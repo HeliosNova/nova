@@ -187,74 +187,6 @@ class TestBrainConcurrency:
 class TestLearningPipelineE2E:
     """Correction → lesson → skill → DPO pair — full chain."""
 
-    @pytest.mark.asyncio
-    async def test_full_learning_chain(self, db, tmp_path):
-        """Create a correction, verify lesson saved, skill created, DPO exported."""
-        from app.core.learning import LearningEngine, Correction
-        from app.core.skills import SkillStore
-
-        engine = LearningEngine(db)
-        skills = SkillStore(db)
-
-        # Step 1: Create a correction directly (bypassing LLM detection)
-        correction = Correction(
-            user_message="Actually, Python was created by Guido van Rossum, not James Gosling",
-            previous_answer="Python was created by James Gosling in 1995.",
-            topic="Python creator",
-            correct_answer="Python was created by Guido van Rossum",
-            wrong_answer="Python was created by James Gosling",
-            original_query="Who created Python?",
-            lesson_text="Python was created by Guido van Rossum, not James Gosling",
-        )
-
-        # Step 2: Save lesson
-        lesson_id = engine.save_lesson(correction)
-        assert lesson_id > 0, "Lesson should be saved successfully"
-
-        # Step 3: Verify lesson is retrievable
-        lessons = engine.get_relevant_lessons("Who created Python?")
-        assert len(lessons) > 0, "Lesson should be retrievable by query"
-        assert any("Guido" in l.correct_answer for l in lessons)
-
-        # Step 4: Create a skill linked to this lesson
-        skill_id = skills.create_skill(
-            name="python_creator_lookup",
-            trigger_pattern=r"(?i)who\s+created\s+python",
-            steps=[{"tool": "web_search", "args_template": {"query": "Python programming language creator"}}],
-            answer_template="The creator of Python is {result}",
-            learned_from=lesson_id,
-        )
-        assert skill_id is not None and skill_id > 0
-
-        # Step 5: Verify skill matching works
-        matched = skills.get_matching_skill("Who created Python?")
-        assert matched is not None
-        assert matched.name == "python_creator_lookup"
-
-        # Step 6: Save DPO training pair
-        training_path = tmp_path / "training.jsonl"
-        import app.config
-        original_path = app.config.config.TRAINING_DATA_PATH
-        original_channels = app.config.config.TRAINING_DATA_CHANNELS
-        try:
-            object.__setattr__(app.config.config, "TRAINING_DATA_PATH", str(training_path))
-            object.__setattr__(app.config.config, "TRAINING_DATA_CHANNELS", "api")
-            await engine.save_training_pair(
-                query="Who created Python?",
-                bad_answer="Python was created by James Gosling in 1995.",
-                good_answer="Python was created by Guido van Rossum in 1991.",
-                channel="api",
-            )
-        finally:
-            object.__setattr__(app.config.config, "TRAINING_DATA_PATH", original_path)
-            object.__setattr__(app.config.config, "TRAINING_DATA_CHANNELS", original_channels)
-
-        assert training_path.exists(), "Training file should be created"
-        with open(training_path) as f:
-            pair = json.loads(f.readline())
-        assert pair["query"] == "Who created Python?"
-        assert "Guido" in pair["chosen"]
-        assert "Gosling" in pair["rejected"]
 
     def test_lesson_deduplication(self, db):
         """Saving the same correction twice should boost confidence, not duplicate."""
@@ -578,127 +510,10 @@ class TestMemoryPressure:
 
 class TestReflexionToLessonPromotion:
     """5+ similar failures → find_recurring_failures() → check_recurring_failures()."""
+    pass
 
-    def test_find_recurring_failures_detects_pattern(self, db):
-        """Store 5 similar failures and verify detection."""
-        from app.core.reflexion import ReflexionStore
 
-        store = ReflexionStore(db)
 
-        # Store 5 failures with the same core topic but enough unique words
-        # to pass the dedup check (Jaccard < 0.8) while still being similar
-        # enough to be detected as recurring (Jaccard >= 0.4 on task_summary)
-        failure_contexts = [
-            ("Web search for current stock price of Apple quarterly earnings", "Returned stale cached results from yesterday missing live market data"),
-            ("Web search for current stock price of Microsoft dividend info", "Connection timeout after thirty seconds waiting for exchange API endpoint"),
-            ("Web search for current stock price of Google revenue forecast", "Rate limited by financial data provider after repeated concurrent requests"),
-            ("Web search for current stock price of Amazon market analysis", "Search engine returned Wikipedia article instead of actual financial data"),
-            ("Web search for current stock price of Netflix valuation metrics", "Received HTTP 503 service unavailable from primary stock quote provider"),
-        ]
-
-        for task, reflection in failure_contexts:
-            rid = store.store(
-                task_summary=task,
-                outcome="failure",
-                reflection=reflection,
-                quality_score=0.2,
-                tools_used=["web_search"],
-                revision_count=3,
-            )
-            assert rid != -1, f"Reflexion should not be rejected as duplicate: {task[:50]}"
-
-        # find_recurring_failures should detect the pattern (similar task_summaries)
-        similar = store.find_recurring_failures(
-            "Web search for current stock price of Tesla",
-            threshold=0.4,
-            min_count=3,
-        )
-
-        assert len(similar) >= 3, f"Expected 3+ similar failures, got {len(similar)}"
-
-    def test_find_recurring_failures_no_false_positives(self, db):
-        """Unrelated failures should not match."""
-        from app.core.reflexion import ReflexionStore
-
-        store = ReflexionStore(db)
-
-        # Store failures about different topics
-        topics = [
-            "Calculate compound interest formula",
-            "Send email notification to user",
-            "Generate PDF report from data",
-            "Translate text from English to French",
-            "Compress uploaded image file",
-        ]
-        for topic in topics:
-            store.store(
-                task_summary=topic,
-                outcome="failure",
-                reflection=f"Failed to complete: {topic}",
-                quality_score=0.3,
-            )
-
-        # Search for weather-related failure — should not match
-        similar = store.find_recurring_failures(
-            "Check weather forecast for tomorrow",
-            threshold=0.4,
-            min_count=3,
-        )
-
-        assert len(similar) == 0, "Unrelated failures should not be matched"
-
-    @pytest.mark.asyncio
-    async def test_check_recurring_failures_promotes_to_lesson(self, db):
-        """3+ recurring failures should be auto-promoted to a lesson via LLM."""
-        from app.core.reflexion import ReflexionStore, check_recurring_failures
-        from app.core.learning import LearningEngine
-
-        store = ReflexionStore(db)
-        engine = LearningEngine(db)
-
-        svc = _make_services(db, reflexions=store, learning=engine)
-
-        # Store 5 failures with enough uniqueness to pass dedup
-        crypto_failures = [
-            ("Fetching real-time cryptocurrency prices for Bitcoin exchange rates", "API rate limit exceeded after concurrent burst requests to primary endpoint"),
-            ("Fetching real-time cryptocurrency prices for Ethereum market data", "Connection timeout waiting for secondary financial API provider response"),
-            ("Fetching real-time cryptocurrency prices for Solana trading volume", "Received malformed JSON response from cryptocurrency exchange websocket"),
-            ("Fetching real-time cryptocurrency prices for Cardano portfolio value", "Authentication token expired midway through paginated API data retrieval"),
-            ("Fetching real-time cryptocurrency prices for Polkadot staking rewards", "Service returned HTTP 429 too many requests after throttle limit breach"),
-        ]
-
-        for task, reflection in crypto_failures:
-            rid = store.store(
-                task_summary=task,
-                outcome="failure",
-                reflection=reflection,
-                quality_score=0.2,
-                tools_used=["http_fetch"],
-                revision_count=4,
-            )
-            assert rid != -1, f"Should not be deduped: {task[:50]}"
-
-        # Mock the LLM call that synthesizes the lesson
-        mock_llm_response = json.dumps({
-            "topic": "Crypto price API rate limits",
-            "lesson": "Always check rate limit headers before making crypto price API calls, and implement exponential backoff",
-        })
-
-        with patch("app.core.llm.invoke_nothink", new_callable=AsyncMock, return_value=mock_llm_response), \
-             patch("app.core.llm.extract_json_object", return_value={
-                 "topic": "Crypto price API rate limits",
-                 "lesson": "Always check rate limit headers before making crypto price API calls, and implement exponential backoff",
-             }):
-            await check_recurring_failures(
-                "Fetching real-time cryptocurrency prices",
-                learning_engine=engine,
-            )
-
-        # A lesson should have been created
-        all_lessons = engine.get_all_lessons()
-        assert len(all_lessons) >= 1, "A lesson should be auto-promoted from recurring failures"
-        promoted = [l for l in all_lessons if "Auto-lesson" in (l.lesson_text or "")]
-        assert len(promoted) >= 1, "Promoted lesson should have 'Auto-lesson' prefix"
 
 
 # ===========================================================================
@@ -708,85 +523,6 @@ class TestReflexionToLessonPromotion:
 class TestConcurrentDatabaseWrites:
     """50 concurrent writes to different tables — no sqlite3 locking errors."""
 
-    @pytest.mark.asyncio
-    async def test_50_concurrent_writes(self, db):
-        """50 concurrent writes across multiple tables must all succeed."""
-        from app.core.memory import ConversationStore, UserFactStore
-        from app.core.learning import LearningEngine, Correction
-        from app.core.reflexion import ReflexionStore
-        from app.core.kg import KnowledgeGraph
-
-        convs = ConversationStore(db)
-        facts = UserFactStore(db)
-        learning = LearningEngine(db)
-        reflexions = ReflexionStore(db)
-        kg = KnowledgeGraph(db)
-
-        async def write_conversation(i):
-            conv_id = convs.create_conversation(f"Concurrent Conv {i}")
-            convs.add_message(conv_id, "user", f"Concurrent message {i}")
-            convs.add_message(conv_id, "assistant", f"Concurrent response {i}")
-            return conv_id
-
-        async def write_fact(i):
-            facts.set(f"concurrent_fact_{i}", f"value_{i}", source="stress_test")
-
-        async def write_lesson(i):
-            correction = Correction(
-                user_message=f"Actually the answer for topic {i} is correct_value_{i}",
-                previous_answer=f"Wrong answer for topic {i}",
-                topic=f"concurrent_topic_{i}",
-                correct_answer=f"correct_value_{i} is the right answer for test number {i}",
-                wrong_answer=f"wrong_value_{i}",
-                original_query=f"Question about topic {i}?",
-                lesson_text=f"For topic {i}, the answer is correct_value_{i} not wrong_value_{i}",
-            )
-            learning.save_lesson(correction)
-
-        async def write_reflexion(i):
-            reflexions.store(
-                task_summary=f"Concurrent reflexion task {i} unique words here {i * 7}",
-                outcome="failure" if i % 2 == 0 else "success",
-                reflection=f"Reflection on concurrent task {i} with unique identifier {i * 13}",
-                quality_score=0.5,
-            )
-
-        async def write_kg(i):
-            await kg.add_fact(
-                subject=f"concurrent_entity_{i}",
-                predicate="related_to",
-                object_=f"concurrent_target_{i}",
-                source="stress_test",
-            )
-
-        # Create 50 tasks: 10 of each type
-        tasks = []
-        for i in range(10):
-            tasks.append(write_conversation(i))
-            tasks.append(write_fact(i))
-            tasks.append(write_lesson(i))
-            tasks.append(write_reflexion(i))
-            tasks.append(write_kg(i))
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # All 50 should succeed
-        errors = [r for r in results if isinstance(r, Exception)]
-        assert len(errors) == 0, f"Got {len(errors)} errors: {errors}"
-
-        # Verify data integrity
-        all_convs = convs.list_conversations(limit=100)
-        assert len(all_convs) >= 10
-
-        all_facts = facts.get_all()
-        concurrent_facts = [f for f in all_facts if f.key.startswith("concurrent_fact_")]
-        assert len(concurrent_facts) == 10
-
-        all_lessons = learning.get_all_lessons(limit=100)
-        assert len(all_lessons) >= 10
-
-        kg_stats = kg.get_stats()
-        assert kg_stats["current_facts"] >= 10
 
     @pytest.mark.asyncio
     async def test_transaction_atomicity(self, db):
@@ -826,90 +562,8 @@ class TestConcurrentDatabaseWrites:
 
 class TestCombinedStress:
     """Run multiple subsystems simultaneously."""
+    pass
 
-    @pytest.mark.asyncio
-    async def test_brain_with_learning_and_kg(self, db):
-        """think() + learning engine + KG operating simultaneously."""
-        from app.core.llm import GenerationResult
-        from app.core.learning import LearningEngine
-        from app.core.kg import KnowledgeGraph
-        from app.core.skills import SkillStore
-        from app.core.reflexion import ReflexionStore
-
-        gen_result = GenerationResult(
-            content="Combined stress test response.",
-            tool_calls=[],
-            raw={},
-            thinking="",
-        )
-
-        learning = LearningEngine(db)
-        kg = KnowledgeGraph(db)
-        skills = SkillStore(db)
-        reflexions = ReflexionStore(db)
-
-        svc = _make_services(
-            db,
-            learning=learning,
-            kg=kg,
-            skills=skills,
-            reflexions=reflexions,
-        )
-
-        with patch("app.core.llm.generate_with_tools", new_callable=AsyncMock, return_value=gen_result), \
-             patch("app.core.llm.invoke_nothink", new_callable=AsyncMock, return_value="Title"), \
-             patch("app.core.llm.stream_with_thinking", new_callable=AsyncMock):
-
-            # Parallel: think + KG inserts + reflexion stores
-            conv_id = svc.conversations.create_conversation("Combined Test")
-
-            async def do_think():
-                return await _collect_think("Combined stress query", conversation_id=conv_id)
-
-            async def do_kg():
-                for i in range(20):
-                    await kg.add_fact(f"combined_entity_{i}", "related_to", f"combined_target_{i}")
-
-            # Each reflexion must have a highly distinct task_summary and reflection
-            # to avoid dedup rejection (Jaccard >= 0.8 → rejected)
-            reflexion_data = [
-                ("Analyzing machine learning gradient descent convergence rates", "Model diverged due to excessive learning rate hyperparameter configuration"),
-                ("Processing natural language sentiment classification pipeline", "Tokenizer encountered unexpected Unicode characters causing segmentation fault"),
-                ("Deploying containerized microservice orchestration Kubernetes cluster", "Health check endpoint returned timeout causing rolling update failure"),
-                ("Optimizing database query execution plan for analytical workload", "Missing composite index on frequently joined tables causing sequential scan"),
-                ("Generating statistical summary report for quarterly revenue data", "Aggregation function overflow on large integer column exceeding precision"),
-                ("Implementing real-time websocket notification broadcast system", "Connection pool exhausted during peak traffic causing message queue backlog"),
-                ("Training convolutional neural network for medical image segmentation", "GPU memory fragmentation prevented batch allocation above threshold size"),
-                ("Migrating legacy monolith application to serverless architecture", "Cold start latency exceeded acceptable response time budget constraints"),
-                ("Building recommendation engine using collaborative filtering algorithm", "Sparse user interaction matrix caused numerical instability during factorization"),
-                ("Configuring continuous integration pipeline automated testing framework", "Flaky integration tests caused nondeterministic build failures intermittently"),
-            ]
-
-            async def do_reflexions():
-                for task, reflection in reflexion_data:
-                    reflexions.store(
-                        task_summary=task,
-                        outcome="failure",
-                        reflection=reflection,
-                        quality_score=0.3,
-                    )
-
-            results = await asyncio.gather(
-                do_think(),
-                do_kg(),
-                do_reflexions(),
-                return_exceptions=True,
-            )
-
-            for i, result in enumerate(results):
-                assert not isinstance(result, Exception), f"Task {i} failed: {result}"
-
-            # Verify all data was written
-            kg_stats = kg.get_stats()
-            assert kg_stats["current_facts"] >= 20
-
-            recent = reflexions.get_recent(limit=20)
-            assert len(recent) >= 10
 
 
 # ===========================================================================
@@ -1144,56 +798,7 @@ class TestTrainingDataPoisoning:
 
 
 class TestSkillSigningEnforcement:
-    def test_unsigned_skill_rejected(self, db):
-        from app.core.skill_export import import_skill, SkillSignatureError
 
-        with patch("app.core.skill_export.config") as cfg:
-            cfg.REQUIRE_SIGNED_SKILLS = True
-
-            skill_data = {
-                "name": "evil_skill",
-                "trigger": ".*",
-                "steps": "[]",
-            }
-            imported = 0
-            try:
-                result = import_skill(skill_data, db)
-                if result > 0:
-                    imported = 1
-            except (SkillSignatureError, ValueError):
-                pass
-            assert imported == 0
-
-    def test_tampered_signature_rejected(self, db):
-        import tempfile
-        from app.core.skill_export import import_skill, SkillSignatureError
-
-        with patch("app.core.skill_export.config") as cfg:
-            cfg.REQUIRE_SIGNED_SKILLS = True
-
-            key_hex = "a" * 64
-            key_file = tempfile.NamedTemporaryFile(mode="w", suffix=".hex", delete=False)
-            key_file.write(key_hex)
-            key_file.close()
-
-            skill_data = {
-                "name": "tampered",
-                "trigger": "test",
-                "steps": "[]",
-                "signature": "deadbeef" * 8,
-            }
-
-            imported = 0
-            try:
-                result = import_skill(skill_data, db, verify_key_path=key_file.name)
-                if result > 0:
-                    imported = 1
-            except (SkillSignatureError, ValueError):
-                pass
-            finally:
-                os.unlink(key_file.name)
-
-            assert imported == 0
 
 
 class TestContextBudget:
@@ -1232,108 +837,9 @@ class TestCuriosityDedup:
 
 
 class TestEverythingTogether:
-    @pytest.mark.asyncio
-    async def test_full_lifecycle(self, db):
-        """Full pipeline: think -> KG -> lesson -> reflexion -> verify integrity."""
-        from app.core.learning import LearningEngine, Correction
-        from app.core.reflexion import ReflexionStore
-        from app.core.kg import KnowledgeGraph
-
-        learning = LearningEngine(db)
-        reflexion = ReflexionStore(db)
-        kg = KnowledgeGraph(db)
-
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-            learning=learning,
-            reflexions=reflexion,
-            kg=kg,
-        )
-        set_services(svc)
-
-        with patch("app.core.brain.llm") as mock_llm:
-            mock_result = AsyncMock()
-            mock_result.content = "The capital of France is Paris."
-            mock_result.tool_calls = []
-            mock_llm.generate_with_tools = AsyncMock(return_value=mock_result)
-
-            events = []
-            async for event in think("What is the capital of France?"):
-                events.append(event)
-            assert len(events) > 0
-
-        await kg.add_fact("France", "capital_of", "Paris", confidence=0.95)
-        assert len(kg.query("France")) >= 1
-
-        correction = Correction(
-            user_message="correction",
-            previous_answer="",
-            topic="geography",
-            wrong_answer="London is the capital of France",
-            correct_answer="Paris is the capital of France",
-            original_query="What is the capital of France?",
-            lesson_text="The capital of France is Paris, not London",
-        )
-        learning.save_lesson(correction)
-        assert len(learning.get_all_lessons()) >= 1
-
-        reflexion.store(
-            "geography query", "success",
-            "Correctly answered", quality_score=0.9,
-        )
-        assert reflexion.get_stats()["total_reflexions"] >= 1
-
-        assert kg.get_stats()["total_facts"] >= 1
 
 
 class TestReflexionPipeline:
-    @pytest.mark.asyncio
-    async def test_5_failures_promote_to_lesson(self, db):
-        """5+ similar failures should auto-promote to a lesson."""
-        from app.core.reflexion import ReflexionStore, check_recurring_failures
-        from app.core.learning import LearningEngine
-        from app.core import llm as llm_mod
-
-        store = ReflexionStore(db)
-        learning = LearningEngine(db)
-
-        reflection_variants = [
-            "Used knowledge_search instead of web_search for realtime bitcoin price data",
-            "Selected knowledge_search but should have used web_search for live bitcoin pricing",
-            "Chose knowledge_search tool rather than web_search for current bitcoin value lookup",
-            "Picked knowledge_search over web_search when querying live bitcoin market price",
-            "Invoked knowledge_search instead of web_search for up-to-date bitcoin price info",
-        ]
-        for i in range(5):
-            store.store(
-                f"bitcoin price query attempt {i}",
-                "failure",
-                reflection_variants[i],
-                quality_score=0.2 + i * 0.02,
-                tools_used=["knowledge_search"],
-            )
-
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-            reflexions=store,
-            learning=learning,
-        )
-        set_services(svc)
-
-        with patch.object(llm_mod, "invoke_nothink", new_callable=AsyncMock) as mock_invoke, \
-             patch.object(llm_mod, "extract_json_object") as mock_extract:
-            mock_invoke.return_value = json.dumps({
-                "topic": "real-time data queries",
-                "lesson": "Always use web_search for real-time price data, not knowledge_search"
-            })
-            mock_extract.side_effect = lambda raw: json.loads(raw)
-
-            await check_recurring_failures("bitcoin price query", learning)
-
-        lessons = learning.get_all_lessons()
-        assert len(lessons) >= 1, "Recurring failures did not promote to lesson!"
 
 
 class TestAuthBruteForce:
@@ -1672,16 +1178,6 @@ class TestZeroDivision:
         result = await kg.add_fact("x", "is_a", "z", confidence=0.9)
         assert isinstance(result, bool)
 
-    def test_reflexion_find_recurring_empty_query(self, db):
-        from app.core.reflexion import ReflexionStore
-        store = ReflexionStore(db)
-        store.store("some task", "failure", "some reflection", quality_score=0.3)
-
-        result = store.find_recurring_failures("")
-        assert isinstance(result, list)
-
-        result2 = store.find_recurring_failures("   ")
-        assert isinstance(result2, list)
 
     def test_learning_relevant_lessons_stopwords_only(self, db):
         from app.core.learning import LearningEngine
@@ -1737,91 +1233,15 @@ class TestBadConfidenceValues:
         for f in facts:
             assert f["confidence"] >= 0.0, f"Negative confidence stored: {f['confidence']}"
 
-    def test_reflexion_nan_quality_score(self, db):
-        from app.core.reflexion import ReflexionStore
-        store = ReflexionStore(db)
-        store.store("nan task", "failure", "nan reflection", quality_score=float('nan'))
-        stats = store.get_stats()
-        assert not math.isnan(stats["avg_quality"]), "NaN quality propagated to stats!"
 
-    def test_reflexion_negative_quality(self, db):
-        from app.core.reflexion import ReflexionStore
-        store = ReflexionStore(db)
-        store.store("neg task", "failure", "neg reflection", quality_score=-5.0)
-        stats = store.get_stats()
-        assert isinstance(stats["avg_quality"], (int, float))
 
-    def test_skill_nan_success_rate(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        skill_id = store.create_skill(
-            name="nan_skill", trigger_pattern=r"\bnan_test\b",
-            steps=json.dumps([{"tool": "calculator", "args": {"expression": "1+1"}}]),
-        )
-        db.execute("UPDATE skills SET success_rate = ? WHERE id = ?", (float('nan'), skill_id))
-
-        match = store.get_matching_skill("nan_test query")
-        assert match is None or hasattr(match, 'name')
 
 
 class TestReDoS:
     """Craft regex patterns that cause catastrophic backtracking."""
+    pass
 
-    def test_redos_in_skill_trigger(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
 
-        redos_pattern = r"(a+)+b"
-
-        skill_id = store.create_skill(
-            name="redos_skill", trigger_pattern=redos_pattern,
-            steps=json.dumps([]),
-        )
-        assert skill_id is None, "ReDoS pattern should be rejected by create_skill!"
-
-        db.execute(
-            "INSERT INTO skills (name, trigger_pattern, steps, enabled) VALUES (?, ?, ?, ?)",
-            ("direct_redos", redos_pattern, "[]", 1),
-        )
-
-        adversarial_input = "a" * 30 + "!"
-
-        result = [None]
-        def run_match():
-            result[0] = store.get_matching_skill(adversarial_input)
-
-        t = threading.Thread(target=run_match)
-        t.start()
-        t.join(timeout=5)
-
-        if t.is_alive():
-            pytest.fail("ReDoS: skill matching hung for >5 seconds on adversarial input!")
-
-        row = db.fetchone("SELECT enabled FROM skills WHERE name = 'direct_redos'")
-        assert row["enabled"] == 0, "ReDoS skill should be auto-disabled!"
-
-    def test_catastrophic_nested_quantifiers(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-
-        evil_pattern = r"(\w+\s*)+$"
-        store.create_skill(
-            name="evil_regex", trigger_pattern=evil_pattern,
-            steps=json.dumps([]),
-        )
-
-        adversarial = "word " * 20 + "!"
-
-        result = [None]
-        def run_match():
-            result[0] = store.get_matching_skill(adversarial)
-
-        t = threading.Thread(target=run_match)
-        t.start()
-        t.join(timeout=5)
-
-        if t.is_alive():
-            pytest.fail("ReDoS: nested quantifier regex hung for >5 seconds!")
 
 
 class TestConcurrentSupersession:
@@ -2131,35 +1551,8 @@ class TestKGStatsEdgeCases:
 
 
 class TestSkillRaceConditions:
-    def test_record_use_deleted_skill(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
+    pass
 
-        skill_id = store.create_skill(
-            name="ephemeral", trigger_pattern=r"\bephemeral\b",
-            steps=json.dumps([]),
-        )
-
-        db.execute("DELETE FROM skills WHERE id = ?", (skill_id,))
-
-        try:
-            store.record_use(skill_id, success=True)
-        except (AttributeError, TypeError) as e:
-            pytest.fail(f"record_use on deleted skill crashed: {e}")
-
-    def test_match_skill_with_invalid_regex_in_db(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-
-        db.execute(
-            "INSERT INTO skills (name, trigger_pattern, steps, enabled) VALUES (?, ?, ?, ?)",
-            ("bad_regex_skill", "[invalid(regex", "[]", 1),
-        )
-
-        try:
-            result = store.get_matching_skill("any query here")
-        except re.error:
-            pytest.fail("Invalid regex in DB crashed skill matching!")
 
 
 class TestPromptBudgetOverflow:

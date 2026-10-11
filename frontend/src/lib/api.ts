@@ -5,7 +5,6 @@ import type {
   StatusResponse,
   LearningMetrics,
   LessonInfo,
-  SkillInfo,
   UserFact,
   UserFactCreate,
   DocumentInfo,
@@ -15,7 +14,6 @@ import type {
   MonitorResult,
   MonitorDetail,
   ActionInfo,
-  ReflexionInfo,
   TrainingDataStats,
   TrainingDataEntry,
   TrainingDataStatsDetailed,
@@ -219,19 +217,6 @@ export async function bulkDeleteLessons(ids: number[]): Promise<void> {
   });
 }
 
-export async function getSkills(limit = 50): Promise<SkillInfo[]> {
-  const res = await request(`/api/learning/skills?limit=${limit}`);
-  return ensureArray<SkillInfo>(res, "skills");
-}
-
-export async function toggleSkill(id: number, enabled: boolean): Promise<void> {
-  await request(`/api/learning/skills/${id}/toggle?enabled=${enabled}`, { method: "POST" });
-}
-
-export async function deleteSkill(id: number): Promise<void> {
-  await request(`/api/learning/skills/${id}`, { method: "DELETE" });
-}
-
 // ── Documents ──
 
 export async function getDocuments(): Promise<DocumentInfo[]> {
@@ -342,13 +327,6 @@ export async function getActions(type?: string, hours = 24, limit = 50): Promise
   if (type) path += `&action_type=${encodeURIComponent(type)}`;
   const res = await request(path);
   return ensureArray<ActionInfo>(res, "actions");
-}
-
-// ── Reflexions ──
-
-export async function getReflexions(): Promise<ReflexionInfo[]> {
-  const res = await request("/api/learning/reflexions");
-  return ensureArray<ReflexionInfo>(res, "reflexions");
 }
 
 // ── Training Data ──

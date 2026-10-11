@@ -188,8 +188,9 @@ class TestMonitorStore:
         # +1 (Engineering Report, 2026-09-05) = 77; then -8 on 2026-09-22 (owner
         # cut the inert catalog: Skill Validation, Fine-Tune Check, Capability
         # Review, Goal Derivation, Auto-Tool Synthesis, Prompt Optimizer, KG
-        # Consistency Check, Training Job Watch) = 69.
-        assert count == 69
+        # Consistency Check, Training Job Watch) = 69; -2 on 2026-10-10 (Lesson
+        # Quiz + Skill Quality Monitor cut with the self-improvement layer) = 67.
+        assert count == 67
         monitors = store.list_all()
         names = {m.name for m in monitors}
         # Core monitors (enabled by default)
@@ -208,7 +209,6 @@ class TestMonitorStore:
         assert "FOMC and Fed Watch" in names
         # Teaching/self-improvement monitors
         assert "Curiosity Research" in names
-        assert "Lesson Quiz" in names
         assert "Quality Eval Harness" in names
 
     def test_core_monitors_enabled_by_default(self, store):
@@ -246,14 +246,12 @@ class TestMonitorStore:
                 f"niche monitor '{niche}' should be disabled by default"
             )
 
-    def test_quiz_seeded_on_change(self, store):
-        """Lesson Quiz seeds with notify_condition='on_change' (Skill Validation
-        left the catalog 2026-09-22)."""
+    def test_self_improvement_monitors_left_the_catalog(self, store):
+        """Skill Validation left 2026-09-22; Lesson Quiz and Skill Quality
+        Monitor left 2026-10-10 with the self-improvement layer."""
         store.seed_defaults()
-        quiz = store.get_by_name("Lesson Quiz")
-        assert quiz is not None
-        assert quiz.notify_condition == "on_change"
-        assert store.get_by_name("Skill Validation") is None
+        for name in ("Lesson Quiz", "Skill Validation", "Skill Quality Monitor"):
+            assert store.get_by_name(name) is None, name
 
     def test_seed_defaults_idempotent(self, store):
         store.seed_defaults()

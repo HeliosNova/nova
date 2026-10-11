@@ -63,31 +63,6 @@ def test_dream_monitor_seed_uses_distinct_check_type():
     assert seen.get("Knowledge Consolidation") == "consolidation", seen
 
 
-# ---------------------------------------------------------------------------
-# MED — decay_stale_skills was dead code, defined twice, never called.
-# ---------------------------------------------------------------------------
-
-def test_skills_methods_not_duplicated():
-    src = (_APP / "core" / "skills.py").read_text(encoding="utf-8")
-    tree = ast.parse(src)
-    counts: dict[str, int] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            counts[node.name] = counts.get(node.name, 0) + 1
-    for name in ("get_composed_steps", "get_skill_stats", "decay_stale_skills"):
-        assert counts.get(name) == 1, f"{name} defined {counts.get(name)}x (duplicate shadowing)"
 
 
-def test_decay_stale_skills_is_wired_into_maintenance():
-    """It was dead code once, so the call itself is the assertion.
 
-    Read the METHOD, not the file it happens to live in: maintenance moved
-    to a mixin on 2026-09-04, and this test then failed for a reason that
-    had nothing to do with skill decay.
-    """
-    import inspect
-
-    from app.monitors.heartbeat_loop import HeartbeatLoop
-    src = inspect.getsource(HeartbeatLoop._execute_maintenance)
-    assert "svc.skills.decay_stale_skills" in src, \
-        "decay_stale_skills must be called from _execute_maintenance (it was dead code)"

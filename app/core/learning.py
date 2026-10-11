@@ -972,8 +972,7 @@ class LearningEngine:
     def get_learning_summary(self, hours: int = 24) -> dict:
         """Summarize all learning activity in the last `hours` hours.
 
-        Returns counts and sample items for lessons, skills, custom tools,
-        reflexions, training pairs, and degraded skills.
+        Returns counts and sample items for lessons and training pairs.
         """
         window = f"-{hours} hours"
 
@@ -982,26 +981,6 @@ class LearningEngine:
             "SELECT topic, lesson_text FROM lessons "
             "WHERE created_at > datetime('now', ?) ORDER BY created_at DESC",
             (window,),
-        )
-
-        # New skills
-        new_skills = self._db.fetchall(
-            "SELECT name, trigger_pattern FROM skills "
-            "WHERE created_at > datetime('now', ?) ORDER BY created_at DESC",
-            (window,),
-        )
-
-        # New reflexions
-        new_reflexions = self._db.fetchall(
-            "SELECT task_summary, quality_score FROM reflexions "
-            "WHERE created_at > datetime('now', ?) ORDER BY created_at DESC",
-            (window,),
-        )
-
-        # Degraded skills — enabled but struggling (success_rate < 0.5, 3+ uses)
-        degraded = self._db.fetchall(
-            "SELECT name, success_rate, times_used FROM skills "
-            "WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3",
         )
 
         # Training pairs added in window (count by scanning JSONL timestamps)
@@ -1029,18 +1008,6 @@ class LearningEngine:
                 {"topic": r["topic"], "lesson": _row_get(r, "lesson_text")}
                 for r in new_lessons
             ],
-            "new_skills": [
-                {"name": r["name"], "trigger": r["trigger_pattern"]}
-                for r in new_skills
-            ],
-            "new_reflexions": [
-                {"task": r["task_summary"], "score": r["quality_score"]}
-                for r in new_reflexions
-            ],
-            "degraded_skills": [
-                {"name": r["name"], "success_rate": r["success_rate"], "uses": r["times_used"]}
-                for r in degraded
-            ],
             "new_training_pairs": new_training,
             "totals": totals,
         }
@@ -1048,7 +1015,6 @@ class LearningEngine:
     def get_metrics(self) -> dict:
         """Get learning metrics."""
         lesson_count = self._db.fetchone("SELECT COUNT(*) as c FROM lessons")
-        skill_count = self._db.fetchone("SELECT COUNT(*) as c FROM skills")
         correction_count = self._db.fetchone(
             "SELECT COUNT(*) as c FROM lessons WHERE wrong_answer IS NOT NULL AND wrong_answer != ''"
         )
@@ -1064,7 +1030,6 @@ class LearningEngine:
 
         return {
             "total_lessons": lesson_count["c"] if lesson_count else 0,
-            "total_skills": skill_count["c"] if skill_count else 0,
             "total_corrections": correction_count["c"] if correction_count else 0,
             "training_examples": training_count,
             "last_correction_date": (

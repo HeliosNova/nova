@@ -70,19 +70,6 @@ CREATE TABLE IF NOT EXISTS lessons (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE TABLE IF NOT EXISTS skills (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    trigger_pattern TEXT NOT NULL,
-    steps TEXT NOT NULL,
-    answer_template TEXT,
-    learned_from INTEGER REFERENCES lessons(id),
-    times_used INTEGER DEFAULT 0,
-    success_rate REAL DEFAULT 1.0,
-    enabled BOOLEAN DEFAULT 1,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-);
-
 -- Documents
 CREATE TABLE IF NOT EXISTS documents (
     id TEXT PRIMARY KEY,
@@ -115,18 +102,6 @@ CREATE TABLE IF NOT EXISTS kg_facts (
     superseded_by INTEGER,
     times_retrieved INTEGER DEFAULT 0,
     UNIQUE(subject, predicate, object)
-);
-
--- Reflexions (experiential learning from failures)
-CREATE TABLE IF NOT EXISTS reflexions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    task_summary TEXT NOT NULL,
-    outcome TEXT NOT NULL DEFAULT 'failure',
-    reflection TEXT NOT NULL,
-    quality_score REAL DEFAULT 0.5,
-    tools_used TEXT DEFAULT '',
-    revision_count INTEGER DEFAULT 0,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
 -- Monitors (heartbeat system)
@@ -194,17 +169,6 @@ CREATE TABLE IF NOT EXISTS auth_lockouts (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
--- Capability gaps (detected when no skill/tool covers a query + low quality)
-CREATE TABLE IF NOT EXISTS capability_gaps (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    query TEXT NOT NULL,
-    reason TEXT,
-    tools_tried TEXT DEFAULT '[]',
-    quality_score REAL,
-    reviewed INTEGER DEFAULT 0,
-    created_at TEXT DEFAULT (datetime('now'))
-);
-
 -- Prompt self-modification module registry
 -- Immutable baseline rows (is_baseline=1) are never touched by the optimizer.
 -- Only module_names in _SELF_MOD_ALLOWED_MODULES (prompt_optimizer.py) are writable.
@@ -249,14 +213,11 @@ CREATE TABLE IF NOT EXISTS conversation_summaries (
 );
 
 -- Indexes
-CREATE INDEX IF NOT EXISTS idx_reflexions_outcome ON reflexions(outcome);
-CREATE INDEX IF NOT EXISTS idx_reflexions_quality ON reflexions(quality_score);
 CREATE INDEX IF NOT EXISTS idx_messages_conv ON messages(conversation_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_lessons_topic ON lessons(topic);
 -- created_at is the filter column for the lesson/KG decay + age-prune passes
 -- run in daily maintenance; without these they full-scan (audit 2026-08-22).
 CREATE INDEX IF NOT EXISTS idx_lessons_created ON lessons(created_at);
-CREATE INDEX IF NOT EXISTS idx_skills_trigger ON skills(trigger_pattern);
 CREATE INDEX IF NOT EXISTS idx_kg_subject ON kg_facts(subject);
 CREATE INDEX IF NOT EXISTS idx_kg_object ON kg_facts(object);
 CREATE INDEX IF NOT EXISTS idx_kg_valid_from ON kg_facts(valid_from);
@@ -517,74 +478,6 @@ class SafeDB:
                 conn.rollback()
                 raise
 
-        # --- Migration 9: skill quality + composition columns ---
-        if 9 not in applied:
-            conn.execute("BEGIN")
-            try:
-                skill_cols = {row[1] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
-                if "last_used_at" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN last_used_at TIMESTAMP")
-                if "consecutive_failures" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
-                if "source" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN source TEXT DEFAULT 'correction'")
-                if "composed_of" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN composed_of TEXT DEFAULT '[]'")
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at)"
-                )
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (9,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        # --- Migration 10: re-apply skill columns for DBs where migration 9 ran empty ---
-        # Migration 9 was recorded before the ALTER TABLE statements were added to the code,
-        # so existing databases have version=9 but are missing the columns. This migration
-        # unconditionally ensures the columns exist.
-        if 10 not in applied:
-            conn.execute("BEGIN")
-            try:
-                skill_cols = {row[1] for row in conn.execute("PRAGMA table_info(skills)").fetchall()}
-                if "last_used_at" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN last_used_at TIMESTAMP")
-                if "consecutive_failures" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN consecutive_failures INTEGER DEFAULT 0")
-                if "source" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN source TEXT DEFAULT 'correction'")
-                if "composed_of" not in skill_cols:
-                    conn.execute("ALTER TABLE skills ADD COLUMN composed_of TEXT DEFAULT '[]'")
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_skills_last_used ON skills(last_used_at)"
-                )
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (10,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        # --- Migration 11: capability_gaps table ---
-        if 11 not in applied:
-            conn.execute("BEGIN")
-            try:
-                conn.execute(
-                    """CREATE TABLE IF NOT EXISTS capability_gaps (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        query TEXT NOT NULL,
-                        reason TEXT,
-                        tools_tried TEXT DEFAULT '[]',
-                        quality_score REAL,
-                        reviewed INTEGER DEFAULT 0,
-                        created_at TEXT DEFAULT (datetime('now'))
-                    )"""
-                )
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (11,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
         # --- Migration 12: prompt_modules table ---
         if 12 not in applied:
             conn.execute("BEGIN")
@@ -784,29 +677,6 @@ class SafeDB:
                     "ON procedural_clusters (cluster_key)"
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (19,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        # --- Migration 20: reflexions.is_eval flag ---
-        # Stop eval-derived reflexions from being promoted to lessons. The
-        # deliberation_chain_of_reasoning task creates a reflexion every run;
-        # those got promoted by dream's _promote_reflexions and accumulated as
-        # lessons that contaminated retrieval, biasing future eval runs into
-        # summary-shaped answers (root cause of the 0.20 ↔ 0.85 bimodal pattern
-        # observed across 11 eval runs in 2026-05-09).
-        if 20 not in applied:
-            conn.execute("BEGIN")
-            try:
-                cols = {row[1] for row in conn.execute("PRAGMA table_info(reflexions)").fetchall()}
-                if "is_eval" not in cols:
-                    conn.execute("ALTER TABLE reflexions ADD COLUMN is_eval INTEGER DEFAULT 0")
-                conn.execute(
-                    "CREATE INDEX IF NOT EXISTS idx_reflexions_is_eval "
-                    "ON reflexions (is_eval, quality_score)"
-                )
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (20,))
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -1051,8 +921,8 @@ class SafeDB:
         # "Knowledge Consolidation" were seeded with check_type='consolidation',
         # and _CHECK_DISPATCH defined "consolidation" twice — the later (knowing/
         # dossier) handler won, so the Dream monitor ran the dossier cycle and the
-        # real dream pipeline (reflexion prune, KG compaction, lesson-contradiction
-        # resolution, DPO mining, procedural consolidation) never ran on schedule.
+        # real dream pipeline (KG compaction, lesson-contradiction resolution,
+        # procedural consolidation) never ran on schedule.
         # The dream handler now dispatches on 'dream_consolidation'; migrate the
         # existing row so it reaches _execute_consolidation.
         if 28 not in applied:
@@ -1081,29 +951,6 @@ class SafeDB:
                     "ON host_cooccurrence(n_cooccur)"
                 )
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (29,))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
-
-        # Migration 30 (2026-08-19): procedure skills — natural-language
-        # procedural knowledge matched semantically (no regex trigger, no
-        # mechanical steps). The 2026 field converged on NL/markdown skills
-        # (Agent Skills spec, SkillPyramid/SkillBrew); Nova's regex+steps
-        # formalism was the reason the auto-extractor produced 0 organic
-        # skills — the LLM can't reliably author brittle trigger regexes.
-        if 30 not in applied:
-            conn.execute("BEGIN")
-            try:
-                for stmt in (
-                    "ALTER TABLE skills ADD COLUMN kind TEXT DEFAULT 'exec'",
-                    "ALTER TABLE skills ADD COLUMN procedure_text TEXT",
-                ):
-                    try:
-                        conn.execute(stmt)
-                    except sqlite3.OperationalError:
-                        pass  # column already exists (fresh installs)
-                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (30,))
                 conn.commit()
             except Exception:
                 conn.rollback()
@@ -1317,6 +1164,46 @@ class SafeDB:
                 if fc_cols and "criterion" not in fc_cols:
                     conn.execute("ALTER TABLE forecasts ADD COLUMN criterion TEXT")
                 conn.execute("INSERT INTO schema_version (version) VALUES (?)", (38,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        # --- Migration 39 (2026-10-10): retire the self-improvement monitors ---
+        # Lesson Quiz, Skill Quality Monitor and Skill Validation went with the
+        # skill layer and the reflexion store (cut round 2). Their rows and
+        # results are dumped next to the DB before deletion so the history is
+        # on disk, not silently gone.
+        if 39 not in applied:
+            conn.execute("BEGIN")
+            try:
+                names = ("Lesson Quiz", "Skill Quality Monitor", "Skill Validation")
+                tables = {r[0] for r in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'")}
+                if "monitors" in tables:
+                    qn = ",".join("?" for _ in names)
+                    cur = conn.execute(f"SELECT * FROM monitors WHERE name IN ({qn})", names)
+                    cols = [c[0] for c in cur.description]
+                    mons = [dict(zip(cols, r)) for r in cur.fetchall()]
+                    ids = [m["id"] for m in mons]
+                    results: list[dict] = []
+                    if ids:
+                        qi = ",".join("?" for _ in ids)
+                        if "monitor_results" in tables:
+                            cur = conn.execute(
+                                f"SELECT * FROM monitor_results WHERE monitor_id IN ({qi})", ids)
+                            rcols = [c[0] for c in cur.description]
+                            results = [dict(zip(rcols, r)) for r in cur.fetchall()]
+                        dump = Path(self._db_path).with_name("retired_monitors_2026-10-10.json")
+                        dump.write_text(
+                            json.dumps({"monitors": mons, "results": results},
+                                       default=str, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+                        if "monitor_results" in tables:
+                            conn.execute(
+                                f"DELETE FROM monitor_results WHERE monitor_id IN ({qi})", ids)
+                        conn.execute(f"DELETE FROM monitors WHERE id IN ({qi})", ids)
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (39,))
                 conn.commit()
             except Exception:
                 conn.rollback()

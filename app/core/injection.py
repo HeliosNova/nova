@@ -1,6 +1,6 @@
 """Prompt injection detection — heuristic-based scanner for ingested content.
 
-Runs on every piece of external content (search results, fetched pages, skills).
+Runs on every piece of external content (search results, fetched pages).
 Pure regex, no LLM calls. Regexes compiled at module level for speed.
 """
 

@@ -39,15 +39,10 @@ ACCEPTED: dict[tuple[str, str], int] = {
     # catch sqlite3.OperationalError specifically rather than everything.
     ("app/core/kg.py", "__init__"): 3,
     ("app/core/output_eval.py", "_ensure_table"): 1,
-    ("app/core/reflexion.py", "__init__"): 1,
-    ("app/database.py", "_run_migrations"): 1,
 
     # Best-effort cleanup of rows nothing reads: a leftover temp row is
     # cosmetic, and failing the caller over one would be worse.
     ("app/monitors/dedup.py", "is_duplicate"): 1,
-
-    # Not a swallow at all — there is a real fallback on the next line.
-    ("app/core/dream.py", "_prune_reflexions"): 1,
 
     # Fetch ladders: each rung is ALLOWED to fail, that is what the next rung is
     # for, and the aggregate is already reported ("N item(s) had no usable body

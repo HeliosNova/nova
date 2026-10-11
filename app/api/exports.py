@@ -1,4 +1,4 @@
-"""Export/Import API — lessons, KG facts, skills, bundles with HMAC signing."""
+"""Export/Import API — lessons, KG facts, bundles with HMAC signing."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from app.auth import require_auth
 from app.database import get_db
 
 logger = logging.getLogger(__name__)
-# require_auth: exports the ENTIRE knowledge base (lessons/KG/skills) and accepts
+# require_auth: exports the ENTIRE knowledge base (lessons/KG) and accepts
 # imports — was unauthenticated (audit 2026-07-06). No-ops when REQUIRE_AUTH=false.
 router = APIRouter(prefix="/exports", tags=["exports"], dependencies=[Depends(require_auth)])
 
@@ -60,7 +60,7 @@ async def export_kg_facts(req: ExportRequest = ExportRequest()):
 
 @router.post("/bundle")
 async def export_bundle(req: ExportRequest = ExportRequest()):
-    """Export everything (skills + lessons + KG facts) in one signed envelope."""
+    """Export everything (lessons + KG facts) in one signed envelope."""
     from app.core.data_export import export_bundle as _export_bundle
     db = get_db()
     bundle = await asyncio.to_thread(_export_bundle, db, req.key_path)
@@ -105,7 +105,7 @@ async def import_kg_fact(req: ImportKGFactRequest):
 
 @router.post("/import/bundle")
 async def import_bundle(req: ImportBundleRequest):
-    """Import a full bundle (skills + lessons + KG facts)."""
+    """Import a full bundle (lessons + KG facts)."""
     from app.core.data_export import import_bundle as _import_bundle, SignatureError
     db = get_db()
     try:

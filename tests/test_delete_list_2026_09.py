@@ -33,11 +33,6 @@ def test_retired_loops_are_not_seeded_at_all(db):
         assert db.fetchone("SELECT id FROM monitors WHERE name = ?", (name,)) is None, name
 
 
-def test_quiz_pass_no_longer_credits_the_lesson():
-    from app.monitors.heartbeat_loop import HeartbeatLoop
-    src = inspect.getsource(HeartbeatLoop._execute_quiz)
-    assert "mark_lesson_helpful" not in src
-    assert "quiz_failures = 0" in src, "the closure signal (clearing quiz_failures) stays"
 
 
 def test_trust_records_in_memory_only():

@@ -22,13 +22,13 @@ class ContextDetailTool(BaseTool):
         "information than shown in the system prompt summaries. Pass the category "
         "and numeric ID from the summary prefix (e.g. [L42] → category='lesson', item_id=42)."
     )
-    parameters = "category: str (lesson|kg_fact|user_fact|document|reflexion), item_id: int"
+    parameters = "category: str (lesson|kg_fact|user_fact|document), item_id: int"
     input_schema = {
         "type": "object",
         "properties": {
             "category": {
                 "type": "string",
-                "enum": ["lesson", "kg_fact", "user_fact", "document", "reflexion"],
+                "enum": ["lesson", "kg_fact", "user_fact", "document"],
                 "description": "Type of context item to fetch details for.",
             },
             "item_id": {
@@ -65,8 +65,6 @@ class ContextDetailTool(BaseTool):
                 return await self._get_user_fact(svc, item_id)
             elif category == "document":
                 return await self._get_document(svc, item_id)
-            elif category == "reflexion":
-                return await self._get_reflexion(svc, item_id)
             else:
                 return ToolResult(
                     output="", success=False,
@@ -212,34 +210,5 @@ class ContextDetailTool(BaseTool):
             "",
             content,
         ]
-
-        return ToolResult(output="\n".join(lines), success=True)
-
-    async def _get_reflexion(self, svc, item_id: int) -> ToolResult:
-        if not svc.reflexions:
-            return ToolResult(output="No reflexion store available.", success=False, error="Not available", error_category=ErrorCategory.NOT_FOUND)
-
-        row = await asyncio.to_thread(
-            svc.reflexions._db.fetchone,
-            "SELECT id, task_summary, outcome, reflection, quality_score, "
-            "tools_used, revision_count, created_at "
-            "FROM reflexions WHERE id = ?", (item_id,)
-        )
-        if not row:
-            return ToolResult(output=f"Reflexion #{item_id} not found.", success=False, error="Not found", error_category=ErrorCategory.NOT_FOUND)
-
-        label = "FAILURE" if row["outcome"] == "failure" else "SUCCESS"
-        lines = [
-            f"## Reflexion #{row['id']} [{label}]",
-            f"**Task:** {row['task_summary']}",
-            f"**Outcome:** {row['outcome']}",
-            f"**Quality:** {row['quality_score']:.2f}",
-            "",
-            f"**Reflection:** {row['reflection']}",
-        ]
-        if row["tools_used"]:
-            lines.append(f"**Tools used:** {row['tools_used']}")
-        lines.append(f"**Tool rounds:** {row['revision_count']}")
-        lines.append(f"**Created:** {row['created_at']}")
 
         return ToolResult(output="\n".join(lines), success=True)

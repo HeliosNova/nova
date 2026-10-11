@@ -100,14 +100,12 @@ def _quiet_until_str(db) -> str | None:
 
 
 _ALLOWED_TABLES = frozenset({
-    "conversations", "messages", "user_facts", "lessons", "skills", "documents",
-    "kg_facts", "reflexions",
+    "conversations", "messages", "user_facts", "lessons", "documents",
+    "kg_facts",
 })
 
 # Pre-built SQL queries — no f-string interpolation
 _TABLE_QUERIES = {t: f"SELECT COUNT(*) as c FROM {t}" for t in _ALLOWED_TABLES}
-# Count only enabled skills to match the default /api/learning/skills response
-_TABLE_QUERIES["skills"] = "SELECT COUNT(*) as c FROM skills WHERE enabled = 1"
 
 
 @router.get("/status", response_model=StatusResponse, dependencies=[Depends(require_auth)])
@@ -133,11 +131,9 @@ async def status() -> StatusResponse:
             messages=count("messages"),
             user_facts=count("user_facts"),
             lessons=count("lessons"),
-            skills=count("skills"),
             documents=count("documents"),
             training_examples=training_examples,
             kg_facts=count("kg_facts"),
-            reflexions=count("reflexions"),
             # Liveness registry (2026-09-02): last write per background pathway.
             pathways=pathway_snapshot(db),
             quiet_until=_quiet_until_str(db),
@@ -218,7 +214,6 @@ async def get_config_summary():
     return {
         "LLM_PROVIDER": config.LLM_PROVIDER,
         "LLM_MODEL": config.LLM_MODEL,
-        "ENABLE_AUTO_SKILL_CREATION": config.ENABLE_AUTO_SKILL_CREATION,
         "ENABLE_MODEL_ROUTING": config.ENABLE_MODEL_ROUTING,
         "ENABLE_EXTENDED_THINKING": config.ENABLE_EXTENDED_THINKING,
         "TOOL_TIMEOUT": config.TOOL_TIMEOUT,
@@ -256,7 +251,6 @@ class ConfigUpdateRequest(BaseModel):
     CHUNK_OVERLAP: int | None = Field(None, ge=0, le=512)
     MAX_HISTORY_MESSAGES: int | None = Field(None, ge=1, le=100)
     MAX_LESSONS_IN_PROMPT: int | None = Field(None, ge=0, le=20)
-    MAX_SKILLS_CHECK: int | None = Field(None, ge=0, le=50)
     MAX_CONTEXT_TOKENS: int | None = Field(None, ge=1000, le=128000)
     RECENT_MESSAGES_KEEP: int | None = Field(None, ge=1, le=100)
     MAX_TOOL_ROUNDS: int | None = Field(None, ge=1, le=20)
@@ -272,7 +266,6 @@ class ConfigUpdateRequest(BaseModel):
     ENABLE_HEARTBEAT: bool | None = None
     HEARTBEAT_INTERVAL: int | None = Field(None, ge=1)
     ENABLE_PROACTIVE: bool | None = None
-    ENABLE_AUTO_SKILL_CREATION: bool | None = None
     ENABLE_INJECTION_DETECTION: bool | None = None
     ENABLE_WEBHOOKS: bool | None = None
     ENABLE_EMAIL_SEND: bool | None = None
@@ -288,9 +281,6 @@ class ConfigUpdateRequest(BaseModel):
     MAX_CUSTOM_TOOLS: int | None = Field(None, ge=1, le=200)
     RATE_LIMIT_RPM: int | None = Field(None, ge=10, le=1000)
     MAX_KG_FACTS_IN_PROMPT: int | None = Field(None, ge=1, le=50)
-    MAX_REFLEXIONS_IN_PROMPT: int | None = Field(None, ge=0, le=20)
-    MAX_SUCCESS_PATTERNS_IN_PROMPT: int | None = Field(None, ge=0, le=10)
-    MAX_REFLEXIONS: int | None = Field(None, ge=10, le=1000)
     CRITIQUE_ANSWER_LIMIT: int | None = Field(None, ge=100, le=10000)
     CRITIQUE_SOURCES_LIMIT: int | None = Field(None, ge=100, le=10000)
     CRITIQUE_FACTS_LIMIT: int | None = Field(None, ge=100, le=10000)
@@ -607,7 +597,7 @@ async def get_curiosity_queue():
 async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
     """Export all Nova data as JSON.
 
-    Includes: conversations, messages, user_facts, lessons, skills, training_data.
+    Includes: conversations, messages, user_facts, lessons, training_data.
     """
     def _sync_export(limit: int) -> dict:
         db = get_db()
@@ -664,24 +654,6 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
             for r in lesson_rows
         ]
 
-        # Skills
-        skill_rows = db.fetchall("SELECT * FROM skills ORDER BY id LIMIT ?", (limit,))
-        skills = [
-            {
-                "id": r["id"],
-                "name": r["name"],
-                "trigger_pattern": r["trigger_pattern"],
-                "steps": r["steps"],
-                "answer_template": r["answer_template"],
-                "learned_from": r["learned_from"],
-                "times_used": r["times_used"],
-                "success_rate": r["success_rate"],
-                "enabled": bool(r["enabled"]),
-                "created_at": r["created_at"],
-            }
-            for r in skill_rows
-        ]
-
         # Training data (JSONL)
         training_data = []
         p = Path(config.TRAINING_DATA_PATH)
@@ -721,35 +693,20 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
 
         kg_facts = [_kg_row(r) for r in kg_rows]
 
-        # Reflexions
-        ref_rows = db.fetchall("SELECT * FROM reflexions ORDER BY id LIMIT ?", (limit,))
-        reflexions_data = [
-            {
-                "task_summary": r["task_summary"], "outcome": r["outcome"],
-                "reflection": r["reflection"], "quality_score": r["quality_score"],
-                "tools_used": r["tools_used"], "revision_count": r["revision_count"],
-            }
-            for r in ref_rows
-        ]
-
         return {
             "conversations": conversations,
             "user_facts": user_facts,
             "lessons": lessons,
-            "skills": skills,
             "training_data": training_data,
             "kg_facts": kg_facts,
-            "reflexions_data": reflexions_data,
         }
 
     _data = await asyncio.to_thread(_sync_export, limit)
     conversations = _data["conversations"]
     user_facts = _data["user_facts"]
     lessons = _data["lessons"]
-    skills = _data["skills"]
     training_data = _data["training_data"]
     kg_facts = _data["kg_facts"]
-    reflexions_data = _data["reflexions_data"]
 
     export = {
         "version": "1.0",
@@ -757,10 +714,8 @@ async def export_all(limit: int = Query(default=10_000, ge=1, le=100_000)):
         "conversations": conversations,
         "user_facts": user_facts,
         "lessons": lessons,
-        "skills": skills,
         "training_data": training_data,
         "kg_facts": kg_facts,
-        "reflexions": reflexions_data,
     }
 
     return JSONResponse(
@@ -791,7 +746,7 @@ async def import_all(file: UploadFile = File(...)):
 
     def _sync_import(data: dict) -> dict:
         db = get_db()
-        stats = {"conversations": 0, "messages": 0, "user_facts": 0, "lessons": 0, "skills": 0, "training_data": 0, "kg_facts": 0}
+        stats = {"conversations": 0, "messages": 0, "user_facts": 0, "lessons": 0, "training_data": 0, "kg_facts": 0}
 
         with db.transaction() as tx:
             # Import conversations + messages
@@ -843,24 +798,6 @@ async def import_all(file: UploadFile = File(...)):
                     )
                     stats["lessons"] += 1
 
-            # Import skills
-            for skill in data.get("skills", []):
-                existing = tx.fetchone(
-                    "SELECT id FROM skills WHERE name = ? AND trigger_pattern = ?",
-                    (skill["name"], skill["trigger_pattern"]),
-                )
-                if not existing:
-                    steps = skill["steps"]
-                    if isinstance(steps, list):
-                        steps = json.dumps(steps)
-                    tx.execute(
-                        """INSERT INTO skills (name, trigger_pattern, steps, answer_template, learned_from)
-                           VALUES (?, ?, ?, ?, ?)""",
-                        (skill["name"], skill["trigger_pattern"], steps,
-                         skill.get("answer_template"), skill.get("learned_from")),
-                    )
-                    stats["skills"] += 1
-
             # Import KG facts
             for fact in data.get("kg_facts", []):
                 existing = tx.fetchone(
@@ -881,24 +818,6 @@ async def import_all(file: UploadFile = File(...)):
                          fact.get("trust", 0.5), fact.get("provenance", "import")),
                     )
                     stats["kg_facts"] += 1
-
-            # Import reflexions (deduplicate by task_summary + reflection)
-            for ref in data.get("reflexions", []):
-                existing = tx.fetchone(
-                    "SELECT id FROM reflexions WHERE task_summary = ? AND reflection = ?",
-                    (ref["task_summary"], ref["reflection"]),
-                )
-                if not existing:
-                    tx.execute(
-                        "INSERT INTO reflexions (task_summary, outcome, reflection, quality_score, tools_used, revision_count) "
-                        "VALUES (?, ?, ?, ?, ?, ?)",
-                        (
-                            ref["task_summary"], ref.get("outcome", "failure"),
-                            ref["reflection"], ref.get("quality_score", 0.5),
-                            ref.get("tools_used", ""), ref.get("revision_count", 0),
-                        ),
-                    )
-                    stats["reflexions"] = stats.get("reflexions", 0) + 1
 
         # Training data written to file (outside transaction) with deduplication
         # Uses atomic temp-file + os.replace to prevent corruption on crash.

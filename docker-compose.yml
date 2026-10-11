@@ -138,7 +138,7 @@ services:
       EMBED_OLLAMA_URL: http://embed:11434
       SEARXNG_URL: http://searxng:8080
       MINICHECK_URL: http://minicheck:8080
-      # Independent cross-family grounded judge (reflexion + output-eval).
+      # Independent cross-family grounded judge (chat critique + output-eval).
       # A/B 2026-07-08 (4 real digests, ref=qwen3.6:27b): gemma4:e4b was
       # schema-valid 4/4 with 0.625 mean RACE error vs the documented gemma3:4b
       # at 1/4 valid / 1.75 error — gemma3:4b silently floored 75% of grades.

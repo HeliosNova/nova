@@ -29,7 +29,7 @@ _eval_running = {"active": False}
 # ---------------------------------------------------------------------------
 
 _USER_CHECK_TYPES = {"url", "search", "query"}
-_ALL_CHECK_TYPES = {"url", "search", "query", "system_health", "quiz", "skill_validation", "kg_curate", "curiosity", "finetune_check", "auto_monitor"}
+_ALL_CHECK_TYPES = {"url", "search", "query", "system_health", "kg_curate", "curiosity", "finetune_check", "auto_monitor"}
 _VALID_NOTIFY_CONDITIONS = {"on_change", "always", "on_error", "on_threshold"}
 
 
@@ -137,7 +137,7 @@ def _validate_check_config(check_type: str, check_config: dict) -> str | None:
     """
     allowed = _ALLOWED_CONFIG_KEYS.get(check_type)
     if allowed is None:
-        # Internal check types (system_health, quiz, etc.) — no user-facing validation
+        # Internal check types (system_health, etc.) — no user-facing validation
         return None
     unknown = set(check_config.keys()) - allowed
     if unknown:

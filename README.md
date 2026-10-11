@@ -81,21 +81,21 @@ docker exec nova-ollama ollama pull qwen3.5:4b   # Fast model (greetings, simple
 
 ```
 User query -> brain.think()
-  -> load context (history + facts + lessons + skills + knowledge graph)
+  -> load context (history + facts + lessons + knowledge graph)
   -> classify intent (regex, no LLM call)
   -> retrieve documents (ChromaDB vectors + SQLite FTS5 + Reciprocal Rank Fusion)
   -> build system prompt (8 prioritized blocks with truncation budget)
   -> generate response (Ollama — local inference)
   -> tool loop if needed (max 6 rounds, 22 built-in tools)
   -> stream tokens via SSE
-  -> post-response: correction detection, fact extraction, reflexion, curiosity
+  -> post-response: correction detection, fact extraction, KG bridge
 
 Meanwhile, 70+ monitors run autonomously:
   -> deep-research each domain: multi-source gather -> synthesize a cited briefing
      (entailment-gated so every claim traces to a source) -> deliver via Discord/Telegram
   -> extract knowledge graph triples from every result
   -> consolidate briefings into living dossiers + mint self-grading forecasts
-  -> quiz itself on lessons, validate skills, research its own knowledge gaps
+  -> research its own knowledge gaps
 ```
 
 No LangChain. No LangGraph. No agent frameworks. ~129 files of async Python + httpx + FastAPI.
@@ -107,9 +107,8 @@ Nova learns by **growing an evolving memory** — not by retraining. Every corre
 1. **Correction Detection** (2-stage) — regex pre-filter + LLM confirmation extracts what was wrong and what's correct
 2. **Lesson Storage** — topic, wrong answer, correct answer, lesson text — stored in SQLite + a vector index, retrieved on future similar queries
 3. **Knowledge-Graph Fact** — the correction also lands as a temporal KG triple, injected into the system prompt when relevant
-4. **Reflexion** *(experimental)* — heuristic failure detection stored as warnings for similar future queries
+4. **Quality score** — heuristic + LLM critique on every answer gates refinement and the confidence footer
 5. **Curiosity Engine** *(experimental)* — detects knowledge gaps and queues background research
-6. **Success Patterns** — high-quality responses stored as positive reinforcement
 
 This is in-context, retrieval-based learning — the approach favored by 2026 agent-memory research (e.g. ACE, Memento): durable, inspectable, reversible, and immune to catastrophic forgetting.
 
@@ -173,7 +172,7 @@ Both channels split long posts and reconnect on failure. Inbound chat on channel
 | Category | Monitors | Schedule | What they do |
 |----------|----------|----------|-------------|
 | **Operational** | Morning Check-in, System Health, System Maintenance, Fine-Tune Check, Auto-Monitor Detector | 2h-weekly | Health checks, data hygiene, fine-tune readiness |
-| **Self-Improvement** | Lesson Quiz, Skill Validation, Curiosity Research | 1-12h | Self-tests on learned lessons, validates skills, researches knowledge gaps |
+| **Self-Improvement** | Curiosity Research | 1h | Researches its own knowledge gaps |
 | **Financial Intelligence** | Finance, Crypto & Web3, DeFi & Protocols, Whale Watch, Top Trades & Positioning, Commodities & Forex, Earnings & Corporate Events, Economics & Markets | 6-12h | Whale movements, trader positioning, commodity prices, earnings, macro data |
 | **International** | China Tech & Economy, Russia & Eastern Europe, Middle East, India, Europe & EU, Latin America, Africa & Emerging Markets | 8-24h | Regional perspectives from every major economic zone |
 | **Science & Tech** | Science, Technology, AI & ML, Space & Astronomy, Quantum Computing, Robotics & Autonomy, Physics & Mathematics, Biotech & Genetics, Semiconductors | 8-24h | Research breakthroughs, model releases, chip industry, gene therapy |
@@ -218,7 +217,7 @@ Built with [OWASP Agentic Security](https://genai.owasp.org/) in mind:
 **Defense in depth:**
 - Prompt injection detection (4 categories: role override, instruction injection, delimiter abuse, encoding tricks) with Unicode normalization and homoglyph detection
 - SSRF protection on HTTP fetch (blocks RFC 1918, loopback, link-local, IPv4-mapped IPv6, checks after redirects)
-- HMAC-SHA256 skill signing (`REQUIRE_SIGNED_SKILLS=true` by default)
+- HMAC-SHA256 signing on lesson/KG export bundles
 - Training data poisoning prevention (channel gating + confidence threshold)
 - Anti-sycophancy (refuses to override computed results)
 - Docker hardening (read-only root, no-new-privileges, all capabilities dropped)

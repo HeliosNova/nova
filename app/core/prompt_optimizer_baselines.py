@@ -20,24 +20,6 @@ def _extraction_baseline() -> str:
     return _EXTRACTION_PROMPT
 
 
-def _skill_extraction_baseline() -> str:
-    return (
-        "You extract reusable skills from corrections. A skill is a "
-        "trigger pattern (regex) and a sequence of tool calls.\n\n"
-        "Given a correction, create a skill if the user describes a "
-        "reusable procedure involving tool calls.\n\n"
-        "Respond with JSON:\n"
-        '{\"name\": \"short_name\", \"trigger_pattern\": \"regex_to_match_queries\", '
-        '\"steps\": [{\"tool\": \"tool_name\", \"args_template\": {\"key\": \"{query}\"}}], '
-        '\"answer_template\": \"Use the result to answer: {result}\"}\n\n'
-        "IMPORTANT:\n"
-        "- trigger_pattern must be a valid regex that matches similar future queries\n"
-        "- steps must reference valid registered tools\n"
-        "- Use {query} as placeholder for the user's query in args_template\n\n"
-        'If this is NOT a reusable tool procedure, respond: {"skip": true}'
-    )
-
-
 def _merge_parallel_baseline() -> str:
     return (
         "Synthesize the parallel research findings ({roles}) into a "
@@ -67,7 +49,6 @@ def _kg_extraction_baseline() -> str:
 MODULE_BASELINES: dict[str, str] = {
     "critique_prompt": _critique_baseline(),
     "extraction_prompt": _extraction_baseline(),
-    "skill_extraction_prompt": _skill_extraction_baseline(),
     "merge_instruction_parallel": _merge_parallel_baseline(),
     "merge_instruction_sequential": _merge_sequential_baseline(),
     "kg_extraction_prompt": _kg_extraction_baseline(),

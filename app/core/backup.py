@@ -42,8 +42,6 @@ KEY_TABLES = (
     "messages",
     "user_facts",
     "lessons",
-    "skills",
-    "reflexions",
     "kg_facts",
     "monitors",
 )

@@ -39,7 +39,7 @@ _MUTABLE_FIELDS = {
     "LLM_PROVIDER", "LLM_MODEL", "OLLAMA_URL",
     "VISION_MODEL",
     "EMBEDDING_MODEL", "RETRIEVAL_TOP_K", "CHUNK_SIZE", "CHUNK_OVERLAP",
-    "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT", "MAX_SKILLS_CHECK",
+    "MAX_HISTORY_MESSAGES", "MAX_LESSONS_IN_PROMPT",
     "MAX_CONTEXT_TOKENS", "RECENT_MESSAGES_KEEP",
     "MAX_TOOL_ROUNDS", "MAX_SAME_TOOL_CALLS", "MAX_TOOL_CALLS_PER_QUERY",
     "BROWSER_TIMEOUT", "TOOL_TIMEOUT", "GENERATION_TIMEOUT", "INTERNAL_LLM_TIMEOUT",
@@ -47,7 +47,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_EXTENDED_THINKING", "ENABLE_CURIOSITY",
     "ENABLE_MODEL_ROUTING",
     "ENABLE_HEARTBEAT", "HEARTBEAT_INTERVAL", "ENABLE_PROACTIVE",
-    "ENABLE_AUTO_SKILL_CREATION", "ENABLE_INJECTION_DETECTION",
+    "ENABLE_INJECTION_DETECTION",
     "ENABLE_WEBHOOKS", "ENABLE_EMAIL_SEND",
     "ENABLE_INTEGRATIONS", "ENABLE_CALENDAR",
     "MIN_MONITOR_SCHEDULE_SECONDS", "EMAIL_RATE_LIMIT",
@@ -56,8 +56,7 @@ _MUTABLE_FIELDS = {
     "MAX_SYSTEM_TOKENS", "MAX_USER_FACTS", "MAX_KG_FACTS", "MAX_LESSON_CANDIDATES",
     "MAX_CURIOSITY_PENDING", "MAX_CURIOSITY_ATTEMPTS", "MAX_CURIOSITY_QUEUE_SIZE",
     "MAX_CUSTOM_TOOL_CODE_LENGTH", "MAX_CUSTOM_TOOLS", "RATE_LIMIT_RPM",
-    "MAX_KG_FACTS_IN_PROMPT", "MAX_REFLEXIONS_IN_PROMPT", "MAX_SUCCESS_PATTERNS_IN_PROMPT",
-    "MAX_REFLEXIONS",
+    "MAX_KG_FACTS_IN_PROMPT",
     "CRITIQUE_ANSWER_LIMIT", "CRITIQUE_SOURCES_LIMIT", "CRITIQUE_FACTS_LIMIT",
     "MAX_CRITIQUE_ROUNDS", "DIGEST_HOUR", "USER_TIMEZONE",
     # Tuning parameters
@@ -65,11 +64,7 @@ _MUTABLE_FIELDS = {
     "TEMPERATURE_DEFAULT",
     "MIN_RRF_SCORE", "LESSON_VECTOR_MAX_DISTANCE", "LESSON_VECTOR_STRONG_DISTANCE",
     "KG_VECTOR_MAX_DISTANCE", "DEDUP_JACCARD_THRESHOLD",
-    "REFLEXION_DECAY_DAYS", "REFLEXION_DECAY_AMOUNT",
-    "ENABLE_SEMANTIC_SKILL_MATCHING", "SKILL_SEMANTIC_THRESHOLD",
-    "SKILL_EMA_ALPHA", "SKILL_STALE_DAYS", "SKILL_SUCCESS_QUALITY",
     "INJECTION_SUSPICIOUS_THRESHOLD",
-    "REFLEXION_FAILURE_THRESHOLD", "REFLEXION_SUCCESS_THRESHOLD",
     "KG_GRAPH_MAX_FRONTIER", "AUTH_MAX_TRACKED_IPS",
     "ENABLE_EVAL_HARNESS", "EVAL_SUITE_PATH", "EVAL_REPORT_PATH", "EVAL_REGRESSION_TOLERANCE",
     "ENABLE_MONITOR_DIGEST", "MONITOR_DIGEST_ITEM_MAX_CHARS",
@@ -77,7 +72,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_BEST_OF_N", "BEST_OF_N_SAMPLES", "BEST_OF_N_QUALITY_THRESHOLD",
     "RETRIEVAL_HARD_FLOOR",
     "ENABLE_RERANKER", "RETRIEVAL_RRF_K",
-    "ENABLE_PPR_RETRIEVAL", "ENABLE_CONFORMAL_ABSTENTION", "ENABLE_GSW_EPISODIC",
+    "ENABLE_PPR_RETRIEVAL", "ENABLE_GSW_EPISODIC",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
@@ -109,13 +104,9 @@ class Config:
 
     MCP_SERVER_NAME: str = field(default_factory=lambda: _env("MCP_SERVER_NAME", "nova"))
 
-    # External skills (AgentSkills format)
-    SKILLS_DIR: str = field(default_factory=lambda: _env("SKILLS_DIR", "/data/skills"))
-
     # Memory
     MAX_HISTORY_MESSAGES: int = field(default_factory=lambda: _env_int("MAX_HISTORY_MESSAGES", 50))
     MAX_LESSONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_LESSONS_IN_PROMPT", 5))
-    MAX_SKILLS_CHECK: int = field(default_factory=lambda: _env_int("MAX_SKILLS_CHECK", 500))
 
     # Context window management (whole-prompt summarization threshold).
     # HISTORY NOTE: the previous comment claimed the 9B "loads at num_ctx=32768
@@ -146,8 +137,6 @@ class Config:
     ENABLE_RERANKER: bool = field(default_factory=lambda: _env("ENABLE_RERANKER", "true").lower() == "true")
     # HippoRAG 2 PPR-over-KG retrieval (graph walk for multi-hop fact recall)
     ENABLE_PPR_RETRIEVAL: bool = field(default_factory=lambda: _env("ENABLE_PPR_RETRIEVAL", "true").lower() == "true")
-    # Conformal Abstention — calibrated confidence-footer thresholds
-    ENABLE_CONFORMAL_ABSTENTION: bool = field(default_factory=lambda: _env("ENABLE_CONFORMAL_ABSTENTION", "true").lower() == "true")
     # GSW (Generative Semantic Workspace) — episodic memory layer
     ENABLE_GSW_EPISODIC: bool = field(default_factory=lambda: _env("ENABLE_GSW_EPISODIC", "true").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
@@ -340,11 +329,6 @@ class Config:
     # prompt without a quality label so the model can't echo "low relevance".
     RETRIEVAL_HARD_FLOOR: float = field(default_factory=lambda: _env_float("RETRIEVAL_HARD_FLOOR", 0.30))
 
-    # Auto skill creation
-    ENABLE_AUTO_SKILL_CREATION: bool = field(default_factory=lambda: _env("ENABLE_AUTO_SKILL_CREATION", "true").lower() == "true")
-
-    # Skill import/export signing
-    REQUIRE_SIGNED_SKILLS: bool = field(default_factory=lambda: _env("REQUIRE_SIGNED_SKILLS", "true").lower() == "true")
     # Lesson/KG import signing (2026-08-19, owner-approved): data_export.py has
     # read these via getattr since the signing feature shipped, but the fields
     # never existed — setting the env vars silently did nothing. Default false
@@ -377,9 +361,6 @@ class Config:
 
     # Prompt context limits (how many items of each type in system prompt)
     MAX_KG_FACTS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_KG_FACTS_IN_PROMPT", 20))
-    MAX_REFLEXIONS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS_IN_PROMPT", 3))
-    MAX_SUCCESS_PATTERNS_IN_PROMPT: int = field(default_factory=lambda: _env_int("MAX_SUCCESS_PATTERNS_IN_PROMPT", 2))
-    MAX_REFLEXIONS: int = field(default_factory=lambda: _env_int("MAX_REFLEXIONS", 200))
 
     # Security
     ENABLE_INJECTION_DETECTION: bool = field(default_factory=lambda: _env("ENABLE_INJECTION_DETECTION", "true").lower() == "true")
@@ -429,22 +410,7 @@ class Config:
     # everything else.
     LESSON_VECTOR_STRONG_DISTANCE: float = field(default_factory=lambda: _env_float("LESSON_VECTOR_STRONG_DISTANCE", 0.55))
     DEDUP_JACCARD_THRESHOLD: float = field(default_factory=lambda: _env_float("DEDUP_JACCARD_THRESHOLD", 0.85))
-    REFLEXION_DECAY_DAYS: int = field(default_factory=lambda: _env_int("REFLEXION_DECAY_DAYS", 90))
-    REFLEXION_DECAY_AMOUNT: float = field(default_factory=lambda: _env_float("REFLEXION_DECAY_AMOUNT", 0.05))
-    ENABLE_SEMANTIC_SKILL_MATCHING: bool = field(default_factory=lambda: _env("ENABLE_SEMANTIC_SKILL_MATCHING", "true").lower() == "true")
-    SKILL_EMA_ALPHA: float = field(default_factory=lambda: _env_float("SKILL_EMA_ALPHA", 0.15))
-    # Minimum answer quality (reflexion score) for a skill execution to count as
-    # a success. Below this, the skill rendered something but it wasn't good —
-    # which feeds the EMA success_rate and the auto-disable path. 0.6 matches
-    # the "vouched-good" bar used for lesson-helpful and workspace persistence.
-    SKILL_SUCCESS_QUALITY: float = field(default_factory=lambda: _env_float("SKILL_SUCCESS_QUALITY", 0.6))
-    # Cosine similarity threshold for semantic skill matching (higher = stricter)
-    SKILL_SEMANTIC_THRESHOLD: float = field(default_factory=lambda: _env_float("SKILL_SEMANTIC_THRESHOLD", 0.55))
-    # Days without use before a skill is considered stale for decay/pruning
-    SKILL_STALE_DAYS: int = field(default_factory=lambda: _env_int("SKILL_STALE_DAYS", 30))
     INJECTION_SUSPICIOUS_THRESHOLD: float = field(default_factory=lambda: _env_float("INJECTION_SUSPICIOUS_THRESHOLD", 0.3))
-    REFLEXION_FAILURE_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_FAILURE_THRESHOLD", 0.6))
-    REFLEXION_SUCCESS_THRESHOLD: float = field(default_factory=lambda: _env_float("REFLEXION_SUCCESS_THRESHOLD", 0.8))
     KG_GRAPH_MAX_FRONTIER: int = field(default_factory=lambda: _env_int("KG_GRAPH_MAX_FRONTIER", 1000))
     AUTH_MAX_TRACKED_IPS: int = field(default_factory=lambda: _env_int("AUTH_MAX_TRACKED_IPS", 10000))
 

@@ -50,7 +50,6 @@ class EvalTask:
     query: str
     assertions: list[dict]
     timeout: int = 60
-    seed_skill: dict | None = None
     seed_document: dict | None = None  # {title, source, text} — seeded before retrieval tasks
     # {topic, correct_answer, lesson_text, confidence} — seeded BETWEEN the
     # before/after runs of a memory-learning task to prove the lesson causes
@@ -89,7 +88,6 @@ class TaskResult:
     passed: bool
     response_text: str
     tools_invoked: list[str]
-    skill_used: str | None
     reflexion_score: float | None
     latency_seconds: float
     failed_assertions: list[str]
@@ -116,7 +114,6 @@ class _Invocation:
     """Result of one brain.think() run — shared by normal + memory tasks."""
     response_text: str
     tools_invoked: list[str]
-    skill_used: str | None
     decomposed: bool
     max_decomposition_depth: int
     reflexion_score: float | None
@@ -143,10 +140,6 @@ class CategoryMetrics:
     reflexion_std: float | None = None
     reflexion_p10: float | None = None
     reflexion_p90: float | None = None
-    # skill-match specific
-    hit_rate: float | None = None
-    # semantic-match specific
-    recall_at_threshold: float | None = None
     # autonomous-tool specific
     multi_tool_rate: float | None = None
     # multi-agent specific
@@ -204,7 +197,6 @@ def check_assertion(
     assertion: dict,
     response: str,
     tools_invoked: list[str],
-    skill_used: str | None,
     reflexion_score: float | None,
     decomposed: bool = False,
     max_decomposition_depth: int = 0,
@@ -226,18 +218,6 @@ def check_assertion(
 
     if atype == "no_tool_invoked":
         return len(tools_invoked) == 0
-
-    if atype == "skill_matched":
-        return skill_used is not None
-
-    if atype == "skill_not_matched":
-        # Adversarial probes (negation / domain-shift): the skill must NOT fire.
-        return skill_used is None
-
-    if atype == "skill_name_matches":
-        return skill_used is not None and bool(
-            re.search(assertion["value"], skill_used, re.IGNORECASE)
-        )
 
     if atype == "reflexion_in_range":
         if reflexion_score is None:
@@ -286,7 +266,6 @@ def format_assertion_failure(
     assertion: dict,
     response: str,
     tools_invoked: list[str],
-    skill_used: str | None,
     reflexion_score: float | None,
 ) -> str:
     atype = assertion.get("type", "?")
@@ -298,12 +277,6 @@ def format_assertion_failure(
         return f"answer_matches({assertion['value']!r}) — got: {snippet!r}"
     if atype == "tool_invoked":
         return f"tool_invoked({assertion['value']!r}) — tools used: {tools_invoked}"
-    if atype == "skill_matched":
-        return f"skill_matched — no skill matched (skill_used={skill_used!r})"
-    if atype == "skill_not_matched":
-        return f"skill_not_matched — a skill DID fire (skill_used={skill_used!r})"
-    if atype == "skill_name_matches":
-        return f"skill_name_matches({assertion['value']!r}) — skill_used={skill_used!r}"
     if atype == "reflexion_in_range":
         return (
             f"reflexion_in_range([{assertion['min']}, {assertion['max']}])"
@@ -379,15 +352,7 @@ def compute_category_metrics(results: list[TaskResult]) -> dict[str, CategoryMet
             cm.reflexion_p90 = percentile(scores, 90)
 
         # Category-specific supplemental metrics (over completed runs — a cut-off
-        # run never received its DONE event, so skill_used/decomposed are unknown)
-        if cat == "skill-match":
-            skill_hits = sum(1 for r in completed if r.skill_used is not None)
-            cm.hit_rate = skill_hits / n_completed if n_completed else 0.0
-
-        if cat == "semantic-match":
-            skill_hits = sum(1 for r in completed if r.skill_used is not None)
-            cm.recall_at_threshold = skill_hits / n_completed if n_completed else 0.0
-
+        # run never received its DONE event, so decomposed is unknown)
         if cat == "autonomous-tool":
             # Scoped to tasks DECLARING >=2 expected tools (2026-08-25). The
             # old "any task that used >=2 tools" definition punished forced
@@ -457,8 +422,6 @@ def detect_regressions(
 
     _metric_keys = [
         ("pass_rate", "pass_rate"),
-        ("hit_rate", "hit_rate"),
-        ("recall_at_threshold", "recall_at_threshold"),
         ("multi_tool_rate", "multi_tool_rate"),
         ("decomposition_rate", "decomposition_rate"),
         ("retrieval_recall", "retrieval_recall"),
@@ -565,10 +528,6 @@ def render_markdown(report: EvalReport) -> str:
     lines.append("## Supplemental Metrics")
     for cat, cm in report.categories.items():
         extras: list[str] = []
-        if cm.hit_rate is not None:
-            extras.append(f"hit_rate={cm.hit_rate:.1%}")
-        if cm.recall_at_threshold is not None:
-            extras.append(f"semantic_recall={cm.recall_at_threshold:.1%}")
         if cm.multi_tool_rate is not None:
             extras.append(f"multi_tool_rate={cm.multi_tool_rate:.1%}")
         if cm.decomposition_rate is not None:
@@ -605,16 +564,15 @@ def render_markdown(report: EvalReport) -> str:
             lines.append("")
 
     lines.append("## All Task Results")
-    lines.append("| ID | Cat | Pass | Score | Latency | Tools | Skill |")
-    lines.append("|----|-----|------|-------|---------|-------|-------|")
+    lines.append("| ID | Cat | Pass | Score | Latency | Tools |")
+    lines.append("|----|-----|------|-------|---------|-------|")
     for r in report.task_results:
         score = f"{r.reflexion_score:.2f}" if r.reflexion_score is not None else "—"
-        skill = r.skill_used or "—"
         tools = ",".join(r.tools_invoked) or "—"
         icon = "✓" if r.passed else "✗"
         lines.append(
             f"| {r.task_id} | {r.category} | {icon}"
-            f" | {score} | {r.latency_seconds:.1f}s | {tools} | {skill} |"
+            f" | {score} | {r.latency_seconds:.1f}s | {tools} |"
         )
 
     lines.append("")
@@ -650,9 +608,6 @@ class EvalHarness:
     ) -> None:
         self.suite_path = Path(suite_path or config.EVAL_SUITE_PATH)
         self.report_dir = Path(report_dir or config.EVAL_REPORT_PATH)
-        # Similarities of semantic skill matches observed this run (margin
-        # observability, 2026-08-19).
-        self._semantic_sims: list[float] = []
         _default_tol = (
             regression_tolerance
             if regression_tolerance is not None
@@ -708,20 +663,6 @@ class EvalHarness:
 
         tasks: list[EvalTask] = []
         for raw in doc.get("tasks", []):
-            # Normalise seed_skill steps list
-            seed = raw.get("seed_skill")
-            if seed:
-                steps = seed.get("steps", [])
-                norm_steps = []
-                for step in steps:
-                    ns = {
-                        "tool": step.get("tool", ""),
-                        "args_template": step.get("args_template", {}),
-                        "output_key": step.get("output_key", "result"),
-                    }
-                    norm_steps.append(ns)
-                seed = {**seed, "steps": norm_steps}
-
             # Timeout multiplier — heavier base models (27B) need longer
             # per-task budgets than the suite was originally sized for (9B).
             # Set EVAL_TIMEOUT_MULTIPLIER=2.5 when running on Qwen 3.6:27b
@@ -738,7 +679,6 @@ class EvalHarness:
                 query=raw["query"],
                 assertions=raw.get("assertions", []),
                 timeout=_scaled_timeout,
-                seed_skill=seed,
                 seed_document=raw.get("seed_document"),
                 seed_lesson=raw.get("seed_lesson"),
                 seed_fact=raw.get("seed_fact"),
@@ -775,40 +715,6 @@ class EvalHarness:
 
     # --- Skill seeding ---
 
-    def _seed_skills(self, tasks: list[EvalTask]) -> None:
-        """Create any eval skills listed in task seed_skill fields.
-
-        Idempotent: if a skill with the same name already exists (from a
-        prior harness run) the creation is skipped because create_skill()
-        performs name-based dedup internally.
-        """
-        from app.core.brain import get_services
-
-        svc = get_services()
-        if not svc.skills:
-            logger.warning("[EvalHarness] SkillStore unavailable — skipping skill seeding")
-            return
-
-        seen_names: set[str] = set()
-        for task in tasks:
-            seed = task.seed_skill
-            if not seed or seed["name"] in seen_names:
-                continue
-            seen_names.add(seed["name"])
-            try:
-                skill_id = svc.skills.create_skill(
-                    name=seed["name"],
-                    trigger_pattern=seed["trigger_pattern"],
-                    steps=seed["steps"],
-                    answer_template=seed.get("answer_template"),
-                )
-                if skill_id:
-                    logger.debug("[EvalHarness] Seeded skill %r (id=%s)", seed["name"], skill_id)
-                else:
-                    logger.debug("[EvalHarness] Skill %r already exists (name dedup)", seed["name"])
-            except Exception as e:
-                logger.warning("[EvalHarness] Skill seed failed for %r: %s", seed["name"], e)
-
     def _cleanup_seeded_documents(self) -> None:
         """Delete every seeded eval-seed-* document from the live store.
 
@@ -817,7 +723,7 @@ class EvalHarness:
         document store's ONLY content was eval fixtures — real-chat document
         retrieval searched over nothing but test material (measured
         2026-08-31: 3 of 3 documents were source='eval-seed'). Mirrors
-        _cleanup_seeded_skills: retriever.delete_document() removes the row,
+        the retired skill cleanup once did: retriever.delete_document() removes the row,
         its chunks_fts entries AND its chroma vectors — a raw row delete
         leaves orphan chunks that knowledge_search still serves (one such
         orphan was observed injecting a CONTENT-WARNING banner into live
@@ -840,36 +746,6 @@ class EvalHarness:
                 )
         except Exception as e:
             logger.warning("[EvalHarness] eval document cleanup skipped: %s", e)
-
-    def _cleanup_seeded_skills(self) -> None:
-        """Delete every seeded "Eval: *" skill from the live store.
-
-        The "Eval: " name prefix is the seeding convention in evals/suite.yaml,
-        so the sweep also collects leftovers from previously interrupted runs.
-        Uses delete_skill() rather than raw SQL so the ChromaDB vector entry is
-        removed too — a raw row delete leaves a stale vector that semantic
-        matching still surfaces.
-        """
-        from app.core.brain import get_services
-
-        try:
-            svc = get_services()
-            skills = getattr(svc, "skills", None) if svc else None
-            if not skills:
-                return
-            rows = skills._db.fetchall(
-                "SELECT id FROM skills WHERE name LIKE 'Eval:%'"
-            )
-            for row in rows:
-                skills.delete_skill(int(row["id"]))
-            if rows:
-                logger.info(
-                    "[EvalHarness] cleaned up %d seeded eval skill(s)", len(rows)
-                )
-        except Exception as e:
-            logger.warning("[EvalHarness] eval skill cleanup skipped: %s", e)
-
-    # --- Document seeding ---
 
     async def _seed_documents(self, tasks: list[EvalTask]) -> None:
         """Ingest any eval documents listed in task seed_document fields.
@@ -929,7 +805,6 @@ class EvalHarness:
 
         tokens: list[str] = []
         tools_invoked: list[str] = []
-        skill_used: str | None = None
         decomposed: bool = False
         max_decomposition_depth: int = 0
         error: str | None = None
@@ -950,7 +825,6 @@ class EvalHarness:
                         if tool_name:
                             tools_invoked.append(tool_name)
                     elif event.type == EventType.DONE:
-                        skill_used = event.data.get("skill_used")
                         decomposed = bool(event.data.get("decomposed", False))
                         max_decomposition_depth = int(event.data.get("max_decomposition_depth", 0) or 0)
         except asyncio.TimeoutError:
@@ -968,21 +842,6 @@ class EvalHarness:
         latency = time.monotonic() - start
         response_text = "".join(tokens).strip()
 
-        # Margin observability (2026-08-19): when a semantic skill match fired,
-        # collect its similarity so the run can report the minimum margin over
-        # SKILL_SEMANTIC_THRESHOLD — embedder/quantization drift then shows as
-        # margin erosion instead of a surprise recall crash (the threshold sits
-        # 0.003 under the weakest true paraphrase).
-        if skill_used:
-            try:
-                from app.core.brain import get_services
-                _sim = getattr(get_services().skills, "last_semantic_sim", None)
-                if isinstance(_sim, float):
-                    self._semantic_sims.append(_sim)
-                    get_services().skills.last_semantic_sim = None
-            except Exception:
-                pass
-
         # Compute heuristic reflexion score (consistent, no LLM call)
         reflexion_score: float | None = None
         if response_text:
@@ -997,7 +856,6 @@ class EvalHarness:
         return _Invocation(
             response_text=response_text,
             tools_invoked=tools_invoked,
-            skill_used=skill_used,
             decomposed=decomposed,
             max_decomposition_depth=max_decomposition_depth,
             reflexion_score=reflexion_score,
@@ -1026,7 +884,6 @@ class EvalHarness:
                     return _Invocation(
                         response_text="",
                         tools_invoked=inv.tools_invoked,
-                        skill_used=None,
                         decomposed=inv.decomposed,
                         max_decomposition_depth=inv.max_decomposition_depth,
                         reflexion_score=None,
@@ -1047,14 +904,14 @@ class EvalHarness:
         failed: list[str] = []
         for a in assertions:
             if not check_assertion(
-                a, inv.response_text, inv.tools_invoked, inv.skill_used,
+                a, inv.response_text, inv.tools_invoked,
                 inv.reflexion_score,
                 decomposed=inv.decomposed,
                 max_decomposition_depth=inv.max_decomposition_depth,
             ):
                 failed.append(
                     format_assertion_failure(
-                        a, inv.response_text, inv.tools_invoked, inv.skill_used,
+                        a, inv.response_text, inv.tools_invoked,
                         inv.reflexion_score,
                     )
                 )
@@ -1077,7 +934,7 @@ class EvalHarness:
         if not (title and body):
             return TaskResult(
                 task_id=task.id, category=task.category, query=task.query,
-                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                passed=False, response_text="", tools_invoked=[],
                 reflexion_score=None, latency_seconds=0.0,
                 failed_assertions=["knowing: seed_dossier (title/body) missing"],
                 error="setup_error",
@@ -1133,7 +990,6 @@ class EvalHarness:
                 passed=False,
                 response_text=after.response_text[:2000],
                 tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-                skill_used=after.skill_used,
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=["knowing: after run timed out — pair untestable"],
@@ -1161,7 +1017,6 @@ class EvalHarness:
             passed=after_correct,
             response_text=after.response_text[:2000],
             tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-            skill_used=after.skill_used,
             reflexion_score=after.reflexion_score,
             latency_seconds=round(latency, 2),
             failed_assertions=report_failures,
@@ -1183,7 +1038,7 @@ class EvalHarness:
         if fn is None:
             return TaskResult(task_id=task.id, category=task.category, query=task.query, passed=False,
                               response_text=f"unknown check {task.check!r}", tools_invoked=[],
-                              skill_used=None, reflexion_score=None, latency_seconds=0.0,
+                              reflexion_score=None, latency_seconds=0.0,
                               failed_assertions=[f"unknown check {task.check!r}"],
                               error=f"unknown check {task.check!r}")
         try:
@@ -1192,7 +1047,7 @@ class EvalHarness:
         except Exception as e:  # a crashing probe is a failing probe
             passed, detail, err = False, f"{type(e).__name__}: {e}", f"{type(e).__name__}: {e}"
         return TaskResult(task_id=task.id, category=task.category, query=task.query, passed=passed,
-                          response_text=str(detail)[:2000], tools_invoked=[], skill_used=None,
+                          response_text=str(detail)[:2000], tools_invoked=[],
                           reflexion_score=None, latency_seconds=round(_time.monotonic() - t0, 3),
                           failed_assertions=[] if passed else [str(detail)[:400]], error=err)
 
@@ -1219,40 +1074,6 @@ class EvalHarness:
         # correctness is outcome=timeout, not a wrong answer.
         timed_out = inv.timed_out and not passed
 
-        # When an eval task fails, write a failure reflexion so the failure
-        # injection path has data to retrieve on similar future queries.
-        # Without this, the eval harness ran ephemeral=True (which skips
-        # post-processing) and failures never surfaced into reflexions —
-        # leaving the failure side of the learning loop with 0 records.
-        # (memory-learning tasks never reach here — a "before" miss is expected
-        # and must not pollute the reflexion store. Timeouts are budget
-        # exhaustion, not quality failures — they must not pollute it either.)
-        if not passed and not timed_out:
-            try:
-                from app.core.brain import get_services
-                svc = get_services()
-                if svc and svc.reflexions:
-                    reason = "; ".join(failed_assertions[:3])[:400]
-                    # is_eval=True: still retrievable by failure injection
-                    # (reads don't filter it), but excluded from dream's
-                    # lesson promotion and the training-signal export — this
-                    # write was the last unmarked eval-traffic side door.
-                    # to_thread (2026-08-31): sync INSERT + vector upsert on
-                    # the loop (reflexion.py store tripwire).
-                    await asyncio.to_thread(
-                        lambda: svc.reflexions.store(
-                            task_summary=task.query[:500],
-                            outcome="failure",
-                            reflection=f"[eval-harness:{task.id}] {reason}",
-                            quality_score=inv.reflexion_score if inv.reflexion_score is not None else 0.3,
-                            tools_used=inv.tools_invoked,
-                            revision_count=0,
-                            is_eval=True,
-                        )
-                    )
-            except Exception as _e:
-                logger.debug("[EvalHarness] failure-reflexion write skipped: %s", _e)
-
         return TaskResult(
             task_id=task.id,
             category=task.category,
@@ -1260,7 +1081,6 @@ class EvalHarness:
             passed=passed,
             response_text=inv.response_text[:2000],  # truncate for report storage
             tools_invoked=list(dict.fromkeys(inv.tools_invoked)),  # dedup, preserve order
-            skill_used=inv.skill_used,
             reflexion_score=inv.reflexion_score,
             latency_seconds=round(inv.latency_seconds, 2),
             failed_assertions=failed_assertions,
@@ -1294,7 +1114,7 @@ class EvalHarness:
         if not learning or not seed.get("correct_answer"):
             return TaskResult(
                 task_id=task.id, category=task.category, query=task.query,
-                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                passed=False, response_text="", tools_invoked=[],
                 reflexion_score=None, latency_seconds=0.0,
                 failed_assertions=[
                     "memory-learning: learning engine or seed_lesson.correct_answer missing"
@@ -1356,7 +1176,6 @@ class EvalHarness:
                 passed=False,
                 response_text=after.response_text[:2000],
                 tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-                skill_used=after.skill_used,
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=[
@@ -1387,7 +1206,6 @@ class EvalHarness:
             passed=after_correct,
             response_text=after.response_text[:2000],
             tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-            skill_used=after.skill_used,
             reflexion_score=after.reflexion_score,
             latency_seconds=round(latency, 2),
             failed_assertions=report_failures,
@@ -1438,7 +1256,7 @@ class EvalHarness:
         if not kg or not triples or not all(s and p and o for s, p, o in triples):
             return TaskResult(
                 task_id=task.id, category=task.category, query=task.query,
-                passed=False, response_text="", tools_invoked=[], skill_used=None,
+                passed=False, response_text="", tools_invoked=[],
                 reflexion_score=None, latency_seconds=0.0,
                 failed_assertions=[f"{task.category}: kg engine or seed fact (subject/predicate/object) missing"],
                 error="setup_error",
@@ -1493,7 +1311,6 @@ class EvalHarness:
                 passed=False,
                 response_text=after.response_text[:2000],
                 tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-                skill_used=after.skill_used,
                 reflexion_score=after.reflexion_score,
                 latency_seconds=round(latency, 2),
                 failed_assertions=[
@@ -1523,7 +1340,6 @@ class EvalHarness:
             passed=after_correct,
             response_text=after.response_text[:2000],
             tools_invoked=list(dict.fromkeys(after.tools_invoked)),
-            skill_used=after.skill_used,
             reflexion_score=after.reflexion_score,
             latency_seconds=round(latency, 2),
             failed_assertions=report_failures,
@@ -1597,14 +1413,10 @@ class EvalHarness:
         run_id = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         suite_ver = self.suite_version()
         start_ts = time.monotonic()
-        self._semantic_sims = []
 
         logger.info("[EvalHarness] Starting eval run %s — %d tasks", run_id, len(tasks))
 
-        # Seed eval skills and documents into live stores before testing.
-        # to_thread (2026-08-31): _seed_skills does create_skill INSERTs +
-        # vector upserts, sync, from this async runner (skills tripwire).
-        await asyncio.to_thread(self._seed_skills, tasks)
+        # Seed eval documents into the live store before testing.
         await self._seed_documents(tasks)
 
         # Run tasks sequentially to avoid confounding latency metrics
@@ -1631,12 +1443,9 @@ class EvalHarness:
                     result.reflexion_score or 0.0, result.latency_seconds,
                 )
         finally:
-            # Seeded "Eval: *" skills must never outlive the run: leftovers
-            # hijack real queries via semantic skill matching (observed live
-            # 2026-07-07 with "Eval: Crypto Price Probe"). finally covers both
-            # normal completion AND cancellation (client disconnect cancels
-            # the /api/eval/run task).
-            await asyncio.to_thread(self._cleanup_seeded_skills)
+            # Seeded eval documents must never outlive the run. finally covers
+            # both normal completion AND cancellation (client disconnect
+            # cancels the /api/eval/run task).
             self._cleanup_seeded_documents()
 
         duration = time.monotonic() - start_ts
@@ -1665,20 +1474,6 @@ class EvalHarness:
                 metric="extraction.canary_triples", baseline=1.0, current=0.0,
                 delta=-1.0, tolerance=0.0, flagged=True))
 
-        # Semantic-match margin tripwire: min observed sim vs threshold. A
-        # margin under 0.02 means one embedder/quantization shift away from a
-        # recall crash — flag it while recall still looks perfect.
-        if self._semantic_sims:
-            _thr = float(getattr(config, "SKILL_SEMANTIC_THRESHOLD", 0.65))
-            _min_margin = round(min(self._semantic_sims) - _thr, 4)
-            logger.info("[EvalHarness] semantic margin: min=%.4f over threshold %.2f "
-                        "(%d matches)", _min_margin, _thr, len(self._semantic_sims))
-            if 0 <= _min_margin < 0.02:
-                regressions.append(RegressionFlag(
-                    metric="semantic-match.min_margin", baseline=0.02,
-                    current=_min_margin, delta=_min_margin - 0.02,
-                    tolerance=0.0, flagged=True))
-
         flagged = [r for r in regressions if r.flagged]
         if flagged:
             logger.warning(
@@ -1694,8 +1489,6 @@ class EvalHarness:
         except Exception:
             _active_versions = {}
         cfg_snap = {
-            "ENABLE_SEMANTIC_SKILL_MATCHING": config.ENABLE_SEMANTIC_SKILL_MATCHING,
-            "SKILL_SEMANTIC_THRESHOLD": config.SKILL_SEMANTIC_THRESHOLD,
             "ENABLE_EVAL_HARNESS": config.ENABLE_EVAL_HARNESS,
             "EVAL_REGRESSION_TOLERANCE": config.EVAL_REGRESSION_TOLERANCE,
             "LLM_MODEL": config.LLM_MODEL,
@@ -1807,8 +1600,6 @@ class EvalHarness:
                 cat: {
                     "pass_rate": cm.pass_rate,
                     "reflexion_mean": cm.reflexion_mean,
-                    "hit_rate": cm.hit_rate,
-                    "recall_at_threshold": cm.recall_at_threshold,
                 }
                 for cat, cm in report.categories.items()
             },

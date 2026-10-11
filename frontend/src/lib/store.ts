@@ -6,7 +6,6 @@ import type {
   HealthResponse,
   LearningMetrics,
   LessonInfo,
-  SkillInfo,
 } from "./types";
 
 // ── Chat Store ──
@@ -180,35 +179,23 @@ export const useChatStore = create<ChatState>((set) => ({
 interface LearningState {
   metrics: LearningMetrics | null;
   lessons: LessonInfo[];
-  skills: SkillInfo[];
   loading: boolean;
 
   setMetrics: (m: LearningMetrics) => void;
   setLessons: (l: LessonInfo[]) => void;
-  setSkills: (s: SkillInfo[]) => void;
   removeLesson: (id: number) => void;
-  removeSkill: (id: number) => void;
-  updateSkillEnabled: (id: number, enabled: boolean) => void;
   setLoading: (l: boolean) => void;
 }
 
 export const useLearningStore = create<LearningState>((set) => ({
   metrics: null,
   lessons: [],
-  skills: [],
   loading: false,
 
   setMetrics: (metrics) => set({ metrics }),
   setLessons: (lessons) => set({ lessons }),
-  setSkills: (skills) => set({ skills }),
   removeLesson: (id) =>
     set((s) => ({ lessons: s.lessons.filter((l) => l.id !== id) })),
-  removeSkill: (id) =>
-    set((s) => ({ skills: s.skills.filter((sk) => sk.id !== id) })),
-  updateSkillEnabled: (id, enabled) =>
-    set((s) => ({
-      skills: s.skills.map((sk) => (sk.id === id ? { ...sk, enabled } : sk)),
-    })),
   setLoading: (loading) => set({ loading }),
 }));
 

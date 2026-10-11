@@ -212,7 +212,7 @@ class TestRedirectSSRF:
 class TestSQLWhitelist:
     def test_allowed_tables_complete(self):
         from app.api.system import _ALLOWED_TABLES
-        expected = {"conversations", "messages", "user_facts", "lessons", "skills", "documents", "kg_facts", "reflexions"}
+        expected = {"conversations", "messages", "user_facts", "lessons", "documents", "kg_facts"}
         assert expected == _ALLOWED_TABLES
 
     def test_dangerous_tables_excluded(self):

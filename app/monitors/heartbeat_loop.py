@@ -127,56 +127,6 @@ _CANARY_NORMAL_MARKERS: dict[str, str] = {
 }
 
 
-# Lessons whose "answer" is a process instruction, not a gradable fact —
-# the Lesson Quiz skips these (see _execute_quiz).
-#
-# WIDENED 2026-08-30. The v1 pattern (added 08-27) caught 31 of 41 malformed
-# lessons but MISSED 10, and those 10 kept the churn engine running. It failed
-# in two ways, both from being phrase-literal rather than shape-aware:
-#
-#   1. it required verb and preposition to be ADJACENT, so
-#      "verify (with|using|by)" matched "verify with a calculator" but not
-#      "Verify solutions with a calculator" or "verify your answer by checking"
-#      or "Always verify historical claims by cross-referencing" -- the real
-#      stored answers.
-#   2. it enumerated "use", missing every synonym: "Apply a calculator to
-#      solve arithmetic puzzles."
-#
-# Why this matters more than it looks: the quiz treats correct_answer as GROUND
-# TRUTH. When that field holds "Use web_search to answer factual queries", the
-# quiz asks a real art-history question, Nova answers "Leonardo da Vinci"
-# CORRECTLY, and the grader scores it a failure for not matching the
-# instruction. That false failure then (a) writes a 0.2 reflexion, and (b)
-# feeds the 3-strikes recurring-failure path, which mints ANOTHER instruction-
-# shaped lesson. Measured result: 9 near-identical art-history lessons and 4
-# calculator lessons minted June->August, and reflexion quality collapsing from
-# max 1.0 to max 0.4 over two weeks. It is a closed loop that runs on itself.
-#
-# Now shape-aware: an answer is unquizzable if it OPENS in the imperative /
-# conditional-procedural mood, or names a tool anywhere in an instructional
-# frame. Verified against the live store: catches all 41 malformed rows and
-# over-blocks 0 of the 10 genuine fact lessons.
-_UNQUIZZABLE_ANSWER_RE = re.compile(
-    r"(?i)("
-    # opens in imperative / procedural mood ("Always verify...", "When solving
-    # word problems...", "Apply a calculator...", "Focus on individual rates")
-    r"^\s*(always|never|when |whenever |if you|before |after |use |using |"
-    r"apply |verify |check |ensure |confirm |consider |remember |avoid |"
-    r"prefer |consult |search |look up|focus on|rely on|make sure|"
-    r"do not|don't|cross-?reference|double-?check)"
-    # ...or a verify/check verb reaching a tool or source across intervening
-    # words ("verify YOUR ANSWER by", "verify HISTORICAL CLAIMS by")
-    r"|\b(verify|confirm|check|validate|cross-?reference)\b[^.]{0,60}?"
-    r"\b(with|using|by|against|via)\b"
-    # ...or an explicit tool name in an instructional frame
-    r"|\b(use|using|apply|applying|invoke|call|run|employ)\b\s+"
-    r"(a |an |the |your )?(calculator|web[ _]?search|browser|tool|search)"
-    r"|\bsearch the web\b|\bperform a (web )?search\b|\blook (it )?up\b"
-    r"|\bconsult (the|a|an|current|authoritative)\b"
-    r"|\bauthoritative sources?\b|\bexternal verification\b"
-    r")")
-
-
 def _canary_should_alert(check_type: str, last_result: str | None,
                          new_value: str | None) -> bool:
     """Delivery gate for stat-line canary monitors.
@@ -851,10 +801,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         elif monitor.notify_condition in ("on_change", "on_alert"):
             if monitor.last_result:
                 threshold = monitor.check_config.get("threshold_pct", 5.0)
-                # Quiz/skill_test values contain topic text with incidental numbers
-                # (years, percentages) — skip numeric comparison, use text-only
-                if monitor.check_type in ("quiz", "skill_test"):
-                    threshold = 999999  # Force text-only comparison
                 if monitor.check_type in _CANARY_NORMAL_MARKERS:
                     # Stat-line canaries: numbers drift every run by design,
                     # so numeric detect_change re-delivered healthy readouts
@@ -980,7 +926,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         "search": lambda self, m, cfg: self._execute_search(cfg),
         "system_health": lambda self, m, cfg: self._execute_system_health(),
         "query": lambda self, m, cfg: self._execute_query_monitor(m, cfg),
-        "quiz": lambda self, m, cfg: self._execute_quiz(cfg),
         "curiosity": lambda self, m, cfg: self._execute_curiosity_research(cfg),
         "auto_monitor": lambda self, m, cfg: self._execute_auto_monitor_detection(cfg),
         "maintenance": lambda self, m, cfg: self._execute_maintenance(cfg),
@@ -989,7 +934,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         "db_size": lambda self, m, cfg: self._execute_db_size_check(),
         "feed_health": lambda self, m, cfg: self._execute_feed_health(),
         "ollama_latency": lambda self, m, cfg: self._execute_ollama_latency_check(),
-        "skill_quality": lambda self, m, cfg: self._execute_skill_quality_check(),
         "chromadb_integrity": lambda self, m, cfg: self._execute_chromadb_integrity_check(),
         "kg_health": lambda self, m, cfg: self._execute_kg_health_check(),
         "digest_health": lambda self, m, cfg: self._execute_digest_health(),
@@ -1325,16 +1269,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                         topic = les.get("topic", "?")[:60]
                         lesson_text = (les.get("lesson_text") or les.get("correct_answer", ""))[:100]
                         lines.append(f"  Lesson: {topic} — {lesson_text}")
-                if summary.get("new_skills"):
-                    parts.append(f"{len(summary['new_skills'])} new skill(s)")
-                if summary.get("degraded_skills"):
-                    parts.append(f"{len(summary['degraded_skills'])} degraded skill(s)")
-                if summary.get("new_reflexions"):
-                    parts.append(f"{len(summary['new_reflexions'])} new reflexion(s)")
-                    for ref in summary["new_reflexions"][:5]:
-                        task = ref.get("task_summary", "?")[:60]
-                        score = ref.get("quality_score", 0)
-                        lines.append(f"  Reflexion (quality={score:.1f}): {task}")
                 lines.append("Learning (24h): " + (", ".join(parts) if parts else "no activity"))
 
             # Owner facts
@@ -1469,255 +1403,6 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 logger.warning("[Heartbeat] Instruction Telegram send failed: %s", e)
         if sent:
             logger.info("[Heartbeat] Instruction #%d result delivered", inst.id)
-
-    async def _execute_quiz(self, cfg: dict) -> str:
-        """Pick a lesson using spaced repetition, quiz self, grade, and learn from failure.
-
-        Prioritizes lessons with most quiz failures + oldest quiz date.
-        """
-        import random
-        from app.core.brain import get_services
-        from app.core import llm
-
-        svc = get_services()
-        if not svc.learning:
-            return "[No learning engine — quiz skipped]"
-
-        lessons = await asyncio.to_thread(svc.learning.get_all_lessons, limit=200)
-        if not lessons:
-            return "[No lessons to quiz on — skipped]"
-
-        # Spaced repetition: skip lessons stuck in failure loops (5+ failures, quizzed < 7 days ago).
-        # Priority: lessons with PENDING failures from >7 days ago jump the queue —
-        # they've been waiting for a re-test to either close (#167) or escalate.
-        # Otherwise NULLS FIRST → unquizzed; then oldest-quizzed by failure count.
-        db = svc.learning._db
-        candidate_rows = await asyncio.to_thread(
-            db.fetchall,
-            "SELECT id FROM lessons "
-            "WHERE (quiz_failures < 5 "
-            "   OR last_quizzed_at < datetime('now', '-7 days') "
-            "   OR last_quizzed_at IS NULL) "
-            "AND correct_answer IS NOT NULL AND correct_answer != '' "
-            "ORDER BY "
-            "  (CASE WHEN quiz_failures > 0 "
-            "        AND (last_quizzed_at IS NULL OR last_quizzed_at < datetime('now','-7 days')) "
-            "        THEN 0 ELSE 1 END), "
-            "  last_quizzed_at ASC NULLS FIRST, "
-            "  quiz_failures DESC "
-            "LIMIT 10"
-        )
-        # Technique lessons are unquizzable (2026-08-27): a correct_answer
-        # that says "do a web search" / "use the calculator" is a PROCESS
-        # instruction, not a gradable fact — the generator has nothing
-        # factual to ask for, and the grader then fails whatever the student
-        # says against it. The art-history lesson looped this way for weeks:
-        # quiz fail → curiosity re-research → same lesson → fail again.
-        # 29 of 44 current lessons are this shape, so stamp EVERY gated one
-        # encountered (the spaced-repetition picker moves past them) and quiz
-        # the first factual candidate — one cycle drains gated backlog AND
-        # still runs a real quiz. Behavior-shaped lessons are covered by the
-        # nightly eval's tool-use category instead.
-        lesson = None
-        gated = 0
-        by_id = {l.id: l for l in lessons}
-        for r in candidate_rows or []:
-            cand = by_id.get(r["id"])
-            if cand is None:
-                continue
-            if _UNQUIZZABLE_ANSWER_RE.search((cand.correct_answer or "")[:200]):
-                await asyncio.to_thread(
-                    db.execute,
-                    "UPDATE lessons SET last_quizzed_at=datetime('now') WHERE id=?",
-                    (cand.id,))
-                gated += 1
-                continue
-            lesson = cand
-            break
-        if not lesson:
-            # Fallback: pick a random lesson that has usable, gradable content
-            usable = [l for l in lessons
-                      if l.correct_answer and len(l.correct_answer) > 20
-                      and not _UNQUIZZABLE_ANSWER_RE.search(l.correct_answer[:200])]
-            if not usable:
-                return (f"[No quizzable lessons — {gated} technique lesson(s) "
-                        f"stamped this cycle]")
-            lesson = random.choice(usable)
-        if gated:
-            logger.info("[Quiz] stamped %d unquizzable technique lesson(s) this cycle", gated)
-
-        # Step 1: Generate a question from the lesson.
-        # NOT lesson.context: that field holds provenance/bookkeeping text
-        # ("Promoted from success reflexion (quality 0.82)"), and max-by-
-        # length kept selecting it — a live quiz asked "what is the quality
-        # score associated with 'Promoted from success reflexion'"
-        # (2026-08-27). Ground questions in the knowledge fields only.
-        context_candidates = [lesson.lesson_text or '', lesson.correct_answer or '']
-        context_text = max(context_candidates, key=len)
-        if len(context_text.strip()) < 20:
-            return f"[Lesson '{lesson.topic}' has insufficient context for quiz — skipped]"
-        # The question MUST be answerable by the stored correct_answer — that
-        # is the only reference the grader has. The old free-form prompt let
-        # the model invent NEW problems from technique lessons ("Use
-        # calculators..." → "Calculate 12×45 + (80−67)÷9"), which the grader
-        # then failed against the UNRELATED stored answer it is ordered to
-        # treat as ground truth. Structural false failures on the whole
-        # math/tool-technique lesson family (2 of the last 3 quizzes,
-        # observed 2026-08-27), feeding false negatives into lesson
-        # confidence and curiosity re-research.
-        gen_prompt = (
-            f"Topic: {lesson.topic}\n"
-            f"The correct answer (the question must ask for THIS): {lesson.correct_answer}\n"
-            f"Additional context: {context_text[:400]}\n\n"
-            "Write a single quiz question whose correct answer is exactly the "
-            "answer given above. Do NOT invent new calculations, numbers, or "
-            "scenarios that the given answer does not cover. "
-            "Just the question, nothing else."
-        )
-        try:
-            question = await llm.invoke_nothink(
-                [{"role": "user", "content": gen_prompt}],
-                max_tokens=100, temperature=0.5,
-            )
-            question = question.strip()
-        except Exception as e:
-            return f"[Quiz question generation failed: {e}]"
-
-        # Step 2: Answer WITH lesson topic as context (the model may not know
-        # recent events from web searches, so provide grounding context)
-        answer_prompt = (
-            f"Topic context: {lesson.topic}. "
-            f"Key information: {(lesson.lesson_text or lesson.correct_answer or '')[:300]}\n\n"
-            f"Question: {question}\n\n"
-            # Concise: an unbounded ramble overran the 600-token cap and got cut
-            # mid-answer, which the grader then scored as a knowledge FAILURE
-            # (false-failure reflexion, 2026-08-15 watch). 2-3 sentences is ample
-            # for a quiz answer and keeps grading clean.
-            "Answer concisely in 2-3 sentences based on the context provided."
-        )
-        try:
-            answer = await llm.invoke_nothink(
-                [{"role": "user", "content": answer_prompt}],
-                # 900, was 600: the concise instruction alone doesn't stop the
-                # 9B from rambling past the cap (re-fired 2026-08-19), and a
-                # mid-answer cut grades as a false knowledge FAILURE.
-                max_tokens=900, temperature=0.3,
-            )
-            answer = answer.strip()
-            # Belt-and-suspenders: grade only complete sentences — drop any
-            # trailing fragment so a cut never reads as a wrong answer.
-            m = re.search(r"^(.*[.!?])(?:[^.!?]*)$", answer, re.DOTALL)
-            if m and len(m.group(1)) >= 60:
-                answer = m.group(1)
-        except Exception as e:
-            return f"[Quiz answer generation failed: {e}]"
-
-        # Step 3: Grade the answer against the correct answer.
-        # IMPORTANT: The expected answer is ground truth (may contain data
-        # beyond the model's training cutoff from web searches). The grader
-        # must compare factual alignment, NOT question whether the expected
-        # answer's facts are plausible.
-        grade_prompt = (
-            f"Question: {question}\n"
-            f"Reference answer (GROUND TRUTH — treat as authoritative): {lesson.correct_answer}\n"
-            f"Student answer: {answer}\n\n"
-            "Does the student answer align with the key facts in the reference answer? "
-            "The reference answer is verified and authoritative — do NOT question its accuracy. "
-            'Respond with JSON: {{"pass": true}} or {{"pass": false, "reason": "brief explanation"}}. Keep the reason under 20 words.'
-        )
-        try:
-            grade_raw = await llm.invoke_nothink(
-                [{"role": "user", "content": grade_prompt}],
-                max_tokens=200, temperature=0.1,
-                json_mode=True,
-            )
-            grade = llm.extract_json_object(grade_raw)
-            if not grade or not isinstance(grade, dict):
-                grade = {"pass": False, "reason": "Could not parse grade"}
-        except Exception as e:
-            logger.warning("[Heartbeat] Quiz grading failed: %s", e)
-            grade = {"pass": False, "reason": str(e)}
-
-        passed = grade.get("pass", False)
-
-        # Update quiz tracking
-        now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
-        try:
-            await asyncio.to_thread(
-                db.execute,
-                "UPDATE lessons SET last_quizzed_at = ? WHERE id = ?",
-                (now_str, lesson.id),
-            )
-        except Exception as e:
-            logger.warning("[Heartbeat] Quiz tracking update failed: %s", e)
-
-        if passed:
-            # No self-credit (2026-09-01): a quiz graded against the lesson's own
-            # answer must not raise times_helpful / retrieval_score — those
-            # counters order retrieval and qualify skill induction and principle
-            # promotion, and with chat unused they were quiz-driven entirely.
-            # CLOSURE: clear the quiz_failures counter — the lesson has been
-            # re-validated. This is the closure signal for the
-            # quiz-fail → curiosity-research → re-quiz feedback loop.
-            try:
-                cleared_row = await asyncio.to_thread(
-                    db.fetchone,
-                    "SELECT quiz_failures FROM lessons WHERE id = ?", (lesson.id,)
-                )
-                prior_failures = int(cleared_row["quiz_failures"]) if cleared_row else 0
-                if prior_failures > 0:
-                    await asyncio.to_thread(
-                        db.execute,
-                        "UPDATE lessons SET quiz_failures = 0 WHERE id = ?",
-                        (lesson.id,),
-                    )
-                    logger.info(
-                        "[Quiz] CLOSURE: cleared %d prior failures on lesson #%d (%s)",
-                        prior_failures, lesson.id, lesson.topic[:60],
-                    )
-            except Exception as e:
-                logger.warning("[Heartbeat] Quiz failure reset failed: %s", e)
-            return f"QUIZ PASSED | topic={lesson.topic} | q={question[:80]} | a={answer[:80]}"
-
-        # Failed — increment quiz_failures counter
-        try:
-            await asyncio.to_thread(
-                db.execute,
-                "UPDATE lessons SET quiz_failures = COALESCE(quiz_failures, 0) + 1 WHERE id = ?",
-                (lesson.id,),
-            )
-        except Exception as e:
-            logger.warning("[Heartbeat] Quiz failure increment failed: %s", e)
-
-        # Failed — reduce lesson confidence, create training pair, reflexion
-        fail_reason = grade.get("reason", "incorrect")
-
-        try:
-            await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, lesson.id)
-        except Exception as e:
-            logger.warning("[Heartbeat] Quiz mark_lesson_unhelpful failed: %s", e)
-
-        # NOTE: Quiz failures no longer generate DPO training pairs.
-        # Quiz questions are synthetic (not real user queries) and training on them
-        # teaches the model to respond to quiz-format prompts, not real conversations.
-        # DPO pairs should only come from real user corrections.
-
-        if svc.reflexions:
-            try:
-                # to_thread (2026-08-31): sync INSERT + vector upsert on the
-                # loop (reflexion.py store tripwire).
-                await asyncio.to_thread(
-                    lambda: svc.reflexions.store(
-                        task_summary=f"Quiz on '{lesson.topic}': {question[:100]}",
-                        outcome="failure",
-                        reflection=f"Answered incorrectly. Expected: {lesson.correct_answer[:200]}. Got: {answer[:200]}. Reason: {fail_reason}",
-                        quality_score=0.2,
-                    )
-                )
-            except Exception as e:
-                logger.warning("[Heartbeat] Quiz reflexion failed: %s", e)
-
-        return f"QUIZ FAILED | topic={lesson.topic} | q={question[:80]} | reason={fail_reason[:80]}"
 
     def request_early_run(self, name: str) -> bool:
         """Make a monitor due on the next scan instead of running its work

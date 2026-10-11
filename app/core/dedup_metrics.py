@@ -3,7 +3,7 @@
 Records every Jaccard-based dedup comparison so the operator can
 empirically revisit the hand-tuned thresholds (0.55 / 0.6 / 0.85) that
 were initially set by symptom rather than measurement. Each `add()`-style
-call in the lesson, curiosity, and reflexion stores produces ONE row:
+call in the lesson and curiosity stores produces ONE row:
 either a `merged` decision with the actual Jaccard score that triggered
 the merge, or an `inserted_new` decision with the MAX score observed
 across the candidate set (so the operator can see how close near-misses
@@ -11,7 +11,7 @@ got to the threshold).
 
 Storage: `dedup_decisions` table (migration 21). Schema:
     id INTEGER PK,
-    entity_type TEXT       -- 'lesson' | 'reflexion' | 'curiosity'
+    entity_type TEXT       -- 'lesson' | 'curiosity'
     jaccard_score REAL,
     threshold REAL,
     decision TEXT          -- 'merged' | 'inserted_new'
@@ -35,7 +35,7 @@ from app.database import get_db
 logger = logging.getLogger(__name__)
 
 
-_ALLOWED_ENTITIES = frozenset({"lesson", "reflexion", "curiosity"})
+_ALLOWED_ENTITIES = frozenset({"lesson", "curiosity"})
 _ALLOWED_DECISIONS = frozenset({"merged", "inserted_new"})
 
 

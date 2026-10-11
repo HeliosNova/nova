@@ -147,13 +147,13 @@ class TestFirewall:
         overlap = _SELF_MOD_ALLOWED_MODULES & forbidden
         assert overlap == set(), f"Safety-critical name in allow-list: {overlap}"
 
-    def test_allowed_modules_contains_expected_four(self):
-        """Exactly 4 modules are in the allow-list (design doc D1; the two
+    def test_allowed_modules_contains_expected_three(self):
+        """Exactly 3 modules are in the allow-list (design doc D1; the two
         merge_instruction_* modules left with the 2026-08-25 multi-agent
-        decomposition archive)."""
+        decomposition archive, skill_extraction_prompt with the 2026-10-10
+        skill cut)."""
         expected = {
-            "critique_prompt", "extraction_prompt", "skill_extraction_prompt",
-            "kg_extraction_prompt",
+            "critique_prompt", "extraction_prompt", "kg_extraction_prompt",
         }
         assert _SELF_MOD_ALLOWED_MODULES == expected
 

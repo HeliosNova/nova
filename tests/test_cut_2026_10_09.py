@@ -79,10 +79,10 @@ def test_compose_carries_none_of_it():
 
 
 def test_no_tool_list_names_the_cut_tools():
-    """brain/prompt/skills/trust keep name lists of registered tools; a name
+    """brain/prompt/trust keep name lists of registered tools; a name
     for a tool that no longer registers is a phantom example in the prompt."""
     hits = []
-    for rel in ("app/core/brain.py", "app/core/prompt.py", "app/core/skills.py", "app/core/trust.py"):
+    for rel in ("app/core/brain.py", "app/core/prompt.py", "app/core/trust.py"):
         src = (ROOT / rel).read_text(encoding="utf-8")
         for name in ('"desktop"', '"background_task"'):
             if name in src:

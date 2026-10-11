@@ -186,18 +186,6 @@ class MaintenanceMixin:
             except Exception as e:
                 parts.append(f"cross_synthesis decay failed: {e}")
                 logger.warning("[Heartbeat] cross_synthesis decay failed: %s", e)
-        if svc.skills:
-            # Disuse-based skill retirement (audit 2026-08-17): decay_stale_skills
-            # was defined but NEVER called — a skill created and rarely/never
-            # triggered never aged out (dream only disables skills that RAN and
-            # failed). Wired in next to the lesson/KG/reflexion decays.
-            try:
-                decayed = await asyncio.to_thread(svc.skills.decay_stale_skills)
-                if decayed:
-                    parts.append(f"stale skills decayed: {decayed}")
-            except Exception as e:
-                parts.append(f"skill decay failed: {e}")
-                logger.warning("[Heartbeat] Skill staleness decay failed: %s", e)
         # Knowing-tier retention (audit 2026-08-17): dossier_revisions and
         # storyline_events are append-only; keep a generous window so they don't
         # grow unbounded (volumes are small — keep-last-N / age prune).
@@ -220,32 +208,6 @@ class MaintenanceMixin:
                 parts.append(f"knowing-tier retention: {drev} revisions + {sev} events pruned")
         except Exception as e:
             logger.warning("[Heartbeat] knowing-tier retention failed: %s", e)
-        if svc.reflexions:
-            try:
-                decayed = await asyncio.to_thread(svc.reflexions.decay_stale, days=90)
-                if decayed:
-                    parts.append(f"reflexions decayed: {decayed}")
-            except Exception as e:
-                parts.append(f"reflexion decay failed: {e}")
-                logger.warning("[Heartbeat] Reflexion decay failed: %s", e)
-            # Demote success patterns whose injection correlates with low quality
-            # (A/B closure — useless suggestions get filtered out over time).
-            try:
-                useless_ids = await asyncio.to_thread(
-                    svc.reflexions.get_useless_success_patterns,
-                    min_uses=5, max_avg_quality=0.5,
-                )
-                if useless_ids:
-                    placeholders = ",".join("?" for _ in useless_ids)
-                    await asyncio.to_thread(
-                        svc.reflexions._db.execute,
-                        f"UPDATE reflexions SET outcome='failure' WHERE id IN ({placeholders})",
-                        tuple(useless_ids),
-                    )
-                    parts.append(f"useless success patterns demoted: {len(useless_ids)}")
-            except Exception as e:
-                parts.append(f"success pattern A/B demotion failed: {e}")
-                logger.warning("[Heartbeat] Success pattern demotion failed: %s", e)
         if svc.curiosity:
             try:
                 pruned = await asyncio.to_thread(svc.curiosity.prune, days=30)
@@ -632,31 +594,6 @@ class MaintenanceMixin:
                     parts.append(f"principles distilled: {distilled}")
         except Exception as e:
             logger.warning("[Heartbeat] Principle distillation failed: %s", e)
-        # Procedure-skill induction — distill NL procedure skills from proven
-        # memory (success reflexions + repeatedly-helpful lessons). Scheduled
-        # here, NOT in the chat path: chat-gated extraction produced 0 organic
-        # skills in Nova's lifetime because tool-using chat barely exists
-        # (audit 2026-08-23). Same decoupling that makes auto_tools work.
-        try:
-            from app.core.auto_skills import induce_procedure_skills
-            if svc.skills:
-                induced = await induce_procedure_skills(get_db(), svc.skills)
-                if induced:
-                    parts.append(f"procedure skills induced: {induced}")
-        except Exception as e:
-            logger.warning("[Heartbeat] Skill induction failed: %s", e)
-        # Recurring-failure promotion sweep — the chat-path trigger
-        # (check_recurring_failures) requires a NEW live-chat failure and so
-        # never fired under monitor-driven usage; clusters sat unpromoted
-        # (audit 2026-08-23: an n=9 quiz-failure cluster, 0 auto-lessons ever).
-        try:
-            from app.core.reflexion import sweep_recurring_failures
-            if svc.reflexions and svc.learning:
-                swept = await sweep_recurring_failures(svc.reflexions, svc.learning)
-                if swept:
-                    parts.append(f"failure clusters promoted: {swept}")
-        except Exception as e:
-            logger.warning("[Heartbeat] Failure sweep failed: %s", e)
         # Cross-monitor feedback loops
         try:
             loop_parts = await self._check_feedback_loops(svc)
@@ -735,38 +672,5 @@ class MaintenanceMixin:
         # Loop A (quiz failures → curiosity re-research) cut 2026-09-22: zero
         # of its questions ever resolved, and one of them consumed six research
         # passes in a day.
-
-        # Loop B — Skill degradation → Early validation
-        # Skills with 0.3 ≤ success_rate < 0.5 and 5+ uses → force Skill Validation next cycle
-        if svc.skills:
-            try:
-                degrading = [
-                    s for s in await asyncio.to_thread(svc.skills.get_active_skills)
-                    if 0.3 <= s.success_rate < 0.5 and s.times_used >= 5
-                ]
-                if degrading:
-                    sv_monitor = await asyncio.to_thread(self.store.get_by_name, "Skill Validation")
-                    if sv_monitor:
-                        await asyncio.to_thread(self.store.update, sv_monitor.id, last_check_at=None)
-                        parts.append(f"skill→validation: {len(degrading)} degrading skills, forced early test")
-            except Exception as e:
-                logger.warning("[Heartbeat] Loop B (skill→validation) failed: %s", e)
-
-        # Loop C — Curiosity → Quiz logging
-        # Lessons from curiosity in last 24h that haven't been quizzed yet
-        if has_db:
-            try:
-                db = svc.learning._db
-                row = await asyncio.to_thread(
-                    db.fetchone,
-                    "SELECT COUNT(*) AS c FROM lessons "
-                    "WHERE last_quizzed_at IS NULL "
-                    "AND created_at > datetime('now', '-1 day')"
-                )
-                unquizzed = row["c"] if row else 0
-                if unquizzed:
-                    parts.append(f"new lessons awaiting quiz: {unquizzed}")
-            except Exception as e:
-                logger.warning("[Heartbeat] Loop C (curiosity→quiz) failed: %s", e)
 
         return parts

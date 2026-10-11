@@ -49,16 +49,15 @@ logger = logging.getLogger(__name__)
 _SELF_MOD_ALLOWED_MODULES: frozenset[str] = frozenset({
     "critique_prompt",           # reflexion.py: _CRITIQUE_PROMPT
     "extraction_prompt",         # learning.py: _EXTRACTION_PROMPT
-    "skill_extraction_prompt",   # skills.py: inline system message
     # merge_instruction_parallel/_sequential removed 2026-08-25 with the
     # multi-agent decomposition archive (their source module is gone).
     "kg_extraction_prompt",      # brain.py: KG triple extraction template
 })
 
 # Harness-internal prompts that must NEVER be allowed (explicit block, belt-and-suspenders)
-_HARNESS_INTERNAL_MODULES: frozenset[str] = frozenset({
-    "quiz_gen", "quiz_answer", "quiz_grade",
-})
+# (The quiz prompts this once named went with the Lesson Quiz, 2026-10-10;
+# the firewall hook stays so a future harness-internal prompt has a home.)
+_HARNESS_INTERNAL_MODULES: frozenset[str] = frozenset()
 
 # ---------------------------------------------------------------------------
 # Shadow-eval ContextVars (no global mutation — safe across async coroutines)
@@ -771,9 +770,7 @@ _DRIFT_RULES: list[tuple[str, str, str, float, str, str]] = [
     ("reflexion-calibration", "reflexion_p10", "down", 3.0, "critique_prompt", "reflexion-calibration"),
     ("reasoning", "pass_rate", "down", 3.0, "extraction_prompt", "reasoning"),
     ("tool-use", "pass_rate", "down", 3.0, "extraction_prompt", "tool-use"),
-    ("skill-match", "hit_rate", "down", 3.0, "skill_extraction_prompt", "skill-match"),
     # (multi-agent rule removed 2026-08-25 — capability archived)
-    ("semantic-match", "recall_at_threshold", "down", 3.0, "kg_extraction_prompt", "semantic-match"),
 ]
 
 

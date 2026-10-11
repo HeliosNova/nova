@@ -158,7 +158,7 @@ Conversation history is in your context. Use it. Specifically:
 - When the owner refers to their own projects, preferences, or prior decisions — check `user_facts` and prior messages in this conversation. Do not start from zero every turn.
 - If a task was paused mid-flight (e.g. "resume", "continue", "where were we"), re-read the last few turns before restarting — don't duplicate work already done.
 - When uncertain which past exchange they mean, restate your best guess and ask to confirm — don't silently pick wrong.
-- **YOU HAVE PERSISTENT MEMORY.** Never say "I don't remember our previous conversations", "I don't have memory", "I don't have access to previous chats", "as an AI I don't retain information", or any variant. You DO have memory: SQLite conversation store, user_facts, KG facts, lessons, reflexions — all in `/data/nova.db`. If you can't find what they're asking about, say "I don't see that in my memory" (factual about a specific lookup) — NOT "I don't have memory" (false and forbidden).
+- **YOU HAVE PERSISTENT MEMORY.** Never say "I don't remember our previous conversations", "I don't have memory", "I don't have access to previous chats", "as an AI I don't retain information", or any variant. You DO have memory: SQLite conversation store, user_facts, KG facts, lessons — all in `/data/nova.db`. If you can't find what they're asking about, say "I don't see that in my memory" (factual about a specific lookup) — NOT "I don't have memory" (false and forbidden).
 
 ## Tool Output Synthesis (don't echo templates)
 
@@ -242,7 +242,7 @@ Rules:
 
 ## Context Detail
 
-Your context blocks show SUMMARIES of lessons, KG facts, reflexions, and documents with IDs like [L42], [K7], [R15], [D1]. If you need the full text of any item, call context_detail(category, item_id) — e.g. context_detail(category="lesson", item_id=42). This is a lightweight read-only lookup.
+Your context blocks show SUMMARIES of lessons, KG facts, and documents with IDs like [L42], [K7], [D1]. If you need the full text of any item, call context_detail(category, item_id) — e.g. context_detail(category="lesson", item_id=42). This is a lightweight read-only lookup.
 
 ## Creating Monitors
 
@@ -287,7 +287,6 @@ You are not a generic assistant. You are YOUR OWNER's assistant.
 - You remember across conversations. Reference past discussions when relevant.
 - You learn from corrections. Apply lessons your owner has taught you.
 - You know personal facts about your owner that no cloud AI does. Use them.
-- You have skills learned from past interactions. Follow them when they match.
 - Your knowledge grows every day from corrections, documents, and conversations.
 
 A cloud assistant knows a little about everyone. You know everything about ONE person. That's your edge.
@@ -390,13 +389,8 @@ def build_system_prompt(
     tool_descriptions: str = "",
     retrieved_context: str = "",
     conversation_summary: str = "",
-    skills_text: str = "",
     kg_facts: str = "",
-    reflexions: str = "",
     integrations_text: str = "",
-    success_patterns: str = "",
-    external_skills_text: str = "",
-    matched_external_skill_text: str = "",
     principles_text: str = "",
     registered_tool_names: set[str] | None = None,
     provider: str = "ollama",
@@ -489,35 +483,6 @@ def build_system_prompt(
     # Block 5c: Knowledge graph facts — appended LATER (after tools/examples) so
     # the facts sit CLOSEST to the user's question; see below.
 
-    # Block 5d: Reflexions / past failure warnings (truncate late)
-    if reflexions:
-        ref_block = (
-            "\n\n## Lessons from Past Conversations\n\n"
-            "These are patterns from PREVIOUS conversations (not this one). "
-            "Use them to avoid repeating mistakes, but do NOT apologize for them or reference them to the user:\n\n"
-        ) + reflexions
-        blocks.append(("reflexions", ref_block, True))
-
-    # Block 5e: Success patterns / what worked before (truncate late)
-    if success_patterns:
-        success_block = (
-            "\n\n## What Worked Before\n\n"
-            "These approaches worked well in previous conversations. Apply the same techniques without mentioning them:\n\n"
-        ) + success_patterns
-        blocks.append(("success_patterns", success_block, True))
-
-    # Block 5g: Matched external skill body (truncate mid-late)
-    if matched_external_skill_text:
-        blocks.append(("matched_ext_skill", "\n\n" + matched_external_skill_text, True))
-
-    # Block 5: Skills (truncate mid-late)
-    if skills_text:
-        blocks.append(("skills", "\n\n" + skills_text, True))
-
-    # Block 5f: External skills summaries (truncate mid)
-    if external_skills_text:
-        blocks.append(("external_skills", "\n\n" + external_skills_text, True))
-
     # Block 4a: Tool descriptions only (truncate mid — keep tool list even when examples cut)
     if tool_descriptions:
         tool_desc_block = (
@@ -584,7 +549,7 @@ def build_system_prompt(
         return mandatory
 
     # Second pass: add truncatable blocks in reverse priority (last added = first cut)
-    # Order: tools, skills, context, past_convos, summary
+    # Order: tools, context, past_convos, summary
     truncatable = [(name, text) for name, text, t in blocks if t]
     result = mandatory
 
@@ -785,15 +750,3 @@ def format_lessons_summary_for_prompt(lessons: list) -> str:
         "Apply these — your owner taught you these. Use context_detail(category='lesson', item_id=N) for full text.\n\n"
         + "\n".join(lines)
     )
-
-
-def format_skills_for_prompt(skills: list) -> str:
-    """Format active skills as a prompt block."""
-    if not skills:
-        return ""
-    lines = []
-    for skill in skills:
-        name = skill.name if hasattr(skill, "name") else skill.get("name", "")
-        trigger = skill.trigger_pattern if hasattr(skill, "trigger_pattern") else skill.get("trigger_pattern", "")
-        lines.append(f"- Skill \"{name}\" (trigger: {trigger}) — use this procedure when the query matches")
-    return "## Learned Skills\n\nYou learned these procedures from past corrections:\n\n" + "\n".join(lines)

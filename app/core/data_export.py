@@ -1,6 +1,6 @@
 """Unified data export/import with HMAC-SHA256 signing.
 
-Extends the skill-only signing to lessons and KG facts.
+HMAC signing for lessons and KG facts.
 Provides bundle export (all data types in one signed envelope).
 """
 
@@ -284,22 +284,14 @@ def import_kg_fact(data: dict, db, verify_key_path: str | None = None) -> int:
 # Bundle export/import
 # ---------------------------------------------------------------------------
 
-def export_bundle(db, key_path: str | None = None, *, include_skills: bool = True) -> dict:
+def export_bundle(db, key_path: str | None = None) -> dict:
     """Export all data types in a single signed envelope."""
-    from app.core.skill_export import export_all_skills
-
     bundle = {
         "format": "nova_export_v1",
         **_export_meta(),
         "lessons": export_all_lessons(db),
         "kg_facts": export_all_kg_facts(db),
     }
-    if include_skills:
-        # Sign per-item too (not just the envelope): import_skill enforces
-        # REQUIRE_SIGNED_SKILLS per item, so envelope-only signing made every
-        # bundled skill unimportable (audit 2026-08-19).
-        bundle["skills"] = export_all_skills(db, key_path)
-
     if key_path:
         key = load_key(key_path)
         bundle["signature"] = sign_data(bundle, key)
@@ -329,7 +321,7 @@ def import_bundle(data: dict, db, verify_key_path: str | None = None) -> dict:
     elif not signature:
         logger.info("Bundle is unsigned")
 
-    counts = {"lessons": 0, "kg_facts": 0, "skills": 0, "errors": 0}
+    counts = {"lessons": 0, "kg_facts": 0, "errors": 0}
 
     # Import lessons
     for item in data.get("lessons", []):
@@ -350,22 +342,6 @@ def import_bundle(data: dict, db, verify_key_path: str | None = None) -> dict:
         except (ValueError, SignatureError) as e:
             logger.warning("Skipping KG fact: %s", e)
             counts["errors"] += 1
-
-    # Import skills — a verified ENVELOPE signature covers its items, so
-    # unsigned per-item skills inside a verified bundle are acceptable even
-    # under REQUIRE_SIGNED_SKILLS (previously every bundled skill was
-    # rejected, audit 2026-08-19).
-    if "skills" in data:
-        from app.core.skill_export import import_skill
-        for item in data["skills"]:
-            try:
-                result = import_skill(item, db, verify_key_path,
-                                      envelope_verified=envelope_verified)
-                if result > 0:
-                    counts["skills"] += 1
-            except Exception as e:
-                logger.warning("Skipping skill: %s", e)
-                counts["errors"] += 1
 
     logger.info("Bundle import complete: %s", counts)
     return counts

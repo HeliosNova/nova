@@ -169,14 +169,14 @@ d = chat("Write Python code to find all prime numbers under 50 and run it")
 a = d["answer"]
 tools = [t["tool"] for t in d.get("tool_results", [])]
 grade("Prime numbers code exec", "Code Execution",
-      "code_exec" in tools and "47" in a,
+      "calculator" in tools and "47" in a,
       f"Tools: {tools}, has 47: {'47' in a}")
 
 d = chat("Run Python code to reverse the string 'Hello World' and print it")
 a = d["answer"]
 tools = [t["tool"] for t in d.get("tool_results", [])]
 grade("String reverse code", "Code Execution",
-      "code_exec" in tools and "dlroW olleH" in a,
+      "calculator" in tools and "dlroW olleH" in a,
       f"Tools: {tools}, has reversed: {'dlroW olleH' in a}")
 
 

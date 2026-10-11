@@ -30,29 +30,21 @@ class DreamInventory:
     lesson_count: int = 0
     fact_count: int = 0
     kg_fact_count: int = 0
-    reflexion_count: int = 0
     curiosity_pending: int = 0
-    skill_count: int = 0
     conversation_count_24h: int = 0
     last_dream_at: str | None = None
     # Capacity pressure
     kg_near_limit: bool = False
-    reflexions_near_limit: bool = False
 
 
 @dataclass
 class GatherSignals:
     """Phase 2 output: items flagged for consolidation."""
     stale_facts: list[dict] = field(default_factory=list)
-    low_quality_reflexions: list[dict] = field(default_factory=list)
-    high_quality_unpromoted: list[dict] = field(default_factory=list)
-    recurring_failure_clusters: list[dict] = field(default_factory=list)
     oscillating_kg_facts: list[dict] = field(default_factory=list)
     kg_chains_to_compact: list[dict] = field(default_factory=list)
     failed_curiosity: list[dict] = field(default_factory=list)
-    weak_skills: list[dict] = field(default_factory=list)
     lesson_contradictions: list[dict] = field(default_factory=list)
-    quality_extremes: list[dict] = field(default_factory=list)  # best/worst for DPO
 
 
 @dataclass
@@ -60,15 +52,11 @@ class ConsolidationResult:
     """Phase 3+4 output: what was done."""
     overlaps_merged: int = 0
     contradictions_resolved: int = 0
-    reflexions_promoted: int = 0
-    reflexions_pruned: int = 0
     lessons_pruned: int = 0
     kg_chains_compacted: int = 0
     kg_facts_archived: int = 0
-    skills_disabled: int = 0
     curiosity_dismissed: int = 0
     curiosity_reset: int = 0
-    dpo_pairs_generated: int = 0
     facts_refreshed: int = 0
     procedural_clusters_consolidated: int = 0
     procedural_lessons_subsumed: int = 0
@@ -115,18 +103,9 @@ class DreamConsolidator:
         inv.kg_fact_count = row["c"] if row else 0
         inv.kg_near_limit = inv.kg_fact_count > (config.MAX_KG_FACTS * 0.85)
 
-        # Reflexions
-        row = await self._db.fetchone("SELECT COUNT(*) as c FROM reflexions")
-        inv.reflexion_count = row["c"] if row else 0
-        inv.reflexions_near_limit = inv.reflexion_count > 170  # MAX_REFLEXIONS=200
-
         # Curiosity pending
         row = await self._db.fetchone("SELECT COUNT(*) as c FROM curiosity_queue WHERE status='pending'")
         inv.curiosity_pending = row["c"] if row else 0
-
-        # Skills
-        row = await self._db.fetchone("SELECT COUNT(*) as c FROM skills WHERE enabled=1")
-        inv.skill_count = row["c"] if row else 0
 
         # Recent conversations
         cutoff = (datetime.utcnow() - timedelta(hours=24)).isoformat()
@@ -143,10 +122,9 @@ class DreamConsolidator:
         inv.last_dream_at = row["value"] if row else None
 
         logger.info(
-            "[Dream] Orient: %d lessons, %d facts, %d KG, %d reflexions, %d curiosity, %d skills, %d convos(24h)",
+            "[Dream] Orient: %d lessons, %d facts, %d KG, %d curiosity, %d convos(24h)",
             inv.lesson_count, inv.fact_count, inv.kg_fact_count,
-            inv.reflexion_count, inv.curiosity_pending, inv.skill_count,
-            inv.conversation_count_24h,
+            inv.curiosity_pending, inv.conversation_count_24h,
         )
         return inv
 
@@ -165,37 +143,6 @@ class DreamConsolidator:
             (cutoff_60d,),
         )
         signals.stale_facts = [dict(r) for r in rows]
-
-        # 2. Low-quality reflexions (candidates for pruning)
-        rows = await self._db.fetchall(
-            "SELECT id, task_summary, outcome, quality_score, created_at "
-            "FROM reflexions WHERE quality_score < 0.2 ORDER BY quality_score ASC LIMIT 50"
-        )
-        signals.low_quality_reflexions = [dict(r) for r in rows]
-
-        # 3. High-quality reflexions never promoted to lessons.
-        # Exclude is_eval=1: eval-harness reflexions are not real-world
-        # successes — they're synthetic reproductions and promoting them
-        # creates a self-feedback loop where each eval run accumulates more
-        # near-duplicate lessons for the same query. That contamination was
-        # the root cause of the deliberation_chain_of_reasoning bimodal
-        # variance pattern (0.20 ↔ 0.85+ across runs).
-        rows = await self._db.fetchall(
-            "SELECT id, task_summary, outcome, reflection, quality_score "
-            "FROM reflexions WHERE quality_score >= 0.9 AND outcome = 'success' "
-            "AND COALESCE(is_eval, 0) = 0 "
-            # "never promoted" is now ENFORCED, not just described
-            # (2026-08-31). The comment above promised it; the query never
-            # filtered for it, so the same top reflexions re-promoted every
-            # cycle whenever lesson-dedup missed. Reflexion #7 ("who painted
-            # the Mona Lisa?", 2026-06-20, q=0.95) seeded the art-history
-            # lesson family on June 20 and was STILL re-minting it on
-            # August 31, hours after a manual family merge — the taproot of
-            # the 17-member churn family.
-            "AND promoted_at IS NULL "
-            "ORDER BY quality_score DESC LIMIT 20"
-        )
-        signals.high_quality_unpromoted = [dict(r) for r in rows]
 
         # 4. Oscillating KG facts (superseded 3+ times on same subject+predicate)
         rows = await self._db.fetchall(
@@ -226,16 +173,6 @@ class DreamConsolidator:
         )
         signals.failed_curiosity = [dict(r) for r in rows]
 
-        # 7. Weak skills (low success rate for 30+ days)
-        cutoff_30d = (datetime.utcnow() - timedelta(days=30)).isoformat()
-        rows = await self._db.fetchall(
-            "SELECT id, name, trigger_pattern, success_rate, times_used, created_at "
-            "FROM skills WHERE enabled=1 AND success_rate < 0.2 AND times_used >= 3 "
-            "AND created_at < ?",
-            (cutoff_30d,),
-        )
-        signals.weak_skills = [dict(r) for r in rows]
-
         # 8. Lesson contradictions (same topic, different correct_answer)
         rows = await self._db.fetchall(
             "SELECT a.id as id_a, b.id as id_b, a.topic, "
@@ -246,32 +183,17 @@ class DreamConsolidator:
         )
         signals.lesson_contradictions = [dict(r) for r in rows]
 
-        # 9. Quality extremes for DPO mining (best + worst from recent conversations)
-        rows = await self._db.fetchall(
-            "SELECT task_summary, reflection, quality_score, outcome "
-            "FROM reflexions WHERE created_at > ? "
-            "AND (quality_score >= 0.85 OR quality_score <= 0.3) "
-            "ORDER BY quality_score DESC",
-            (since,),
-        )
-        signals.quality_extremes = [dict(r) for r in rows]
-
         total = (
-            len(signals.stale_facts) + len(signals.low_quality_reflexions) +
-            len(signals.high_quality_unpromoted) + len(signals.oscillating_kg_facts) +
+            len(signals.stale_facts) + len(signals.oscillating_kg_facts) +
             len(signals.kg_chains_to_compact) + len(signals.failed_curiosity) +
-            len(signals.weak_skills) + len(signals.lesson_contradictions) +
-            len(signals.quality_extremes)
+            len(signals.lesson_contradictions)
         )
         logger.info(
-            "[Dream] Gather: %d targets (stale_facts=%d, low_reflexions=%d, "
-            "unpromoted=%d, osc_kg=%d, kg_chains=%d, failed_curiosity=%d, "
-            "weak_skills=%d, contradictions=%d, dpo_candidates=%d)",
-            total, len(signals.stale_facts), len(signals.low_quality_reflexions),
-            len(signals.high_quality_unpromoted), len(signals.oscillating_kg_facts),
+            "[Dream] Gather: %d targets (stale_facts=%d, osc_kg=%d, kg_chains=%d, "
+            "failed_curiosity=%d, contradictions=%d)",
+            total, len(signals.stale_facts), len(signals.oscillating_kg_facts),
             len(signals.kg_chains_to_compact), len(signals.failed_curiosity),
-            len(signals.weak_skills), len(signals.lesson_contradictions),
-            len(signals.quality_extremes),
+            len(signals.lesson_contradictions),
         )
         return signals
 
@@ -285,19 +207,12 @@ class DreamConsolidator:
     # NREM phase + SleepGate (arxiv 2603.14517) forgetting gate.
     async def consolidate_nrem(self, signals: GatherSignals, result: ConsolidationResult, svc) -> None:
         """Structural/deterministic substeps. Idempotent on partial failure."""
-        # 3a. Prune low-quality reflexions
-        await self._prune_reflexions(signals, result)
         # 3b. Compact KG chains
         await self._compact_kg_chains(signals, result)
-        # 3c. Disable broken skills
-        await self._disable_weak_skills(signals, result)
         # 3d. Handle failed curiosity
         await self._handle_failed_curiosity(signals, result)
         # 3e. Refresh critical stale facts (don't prune user-stated facts)
         await self._refresh_stale_facts(signals, result)
-        # 3h. Mine DPO pairs from quality extremes (deterministic extraction,
-        # no LLM call in the mining step itself).
-        await self._mine_dpo_pairs(signals, result)
         result.nrem_completed = True
 
     # ── Phase 3b: REM (integrative / LLM-driven consolidation) ─────────
@@ -307,8 +222,6 @@ class DreamConsolidator:
     # SCM REM phase: combines pruned memories into novel patterns.
     async def consolidate_rem(self, signals: GatherSignals, result: ConsolidationResult, svc) -> None:
         """LLM-driven integrative substeps. Failures here must not roll back NREM."""
-        # 3f. Promote high-quality reflexions to lessons (LLM)
-        await self._promote_reflexions(signals, result, svc)
         # 3g. Resolve lesson contradictions (LLM)
         await self._resolve_contradictions(signals, result, svc)
         # 3i. Procedural memory consolidation — cluster similar lessons,
@@ -359,52 +272,16 @@ class DreamConsolidator:
             set_tool_whitelist(None)
 
         logger.info(
-            "[Dream] Consolidate: merged=%d, contradictions=%d, promoted=%d, "
-            "pruned_reflexions=%d, pruned_lessons=%d, kg_compacted=%d, "
-            "skills_disabled=%d, dpo_pairs=%d, proc_clusters=%d, "
+            "[Dream] Consolidate: merged=%d, contradictions=%d, "
+            "pruned_lessons=%d, kg_compacted=%d, proc_clusters=%d, "
             "proc_subsumed=%d, errors=%d",
             result.overlaps_merged, result.contradictions_resolved,
-            result.reflexions_promoted, result.reflexions_pruned,
             result.lessons_pruned, result.kg_chains_compacted,
-            result.skills_disabled, result.dpo_pairs_generated,
             result.procedural_clusters_consolidated,
             result.procedural_lessons_subsumed,
             len(result.errors),
         )
         return result
-
-    async def _prune_reflexions(self, signals: GatherSignals, result: ConsolidationResult):
-        """Delete reflexions with quality < 0.2."""
-        ids = [r["id"] for r in signals.low_quality_reflexions]
-        if not ids:
-            return
-        placeholders = ",".join("?" for _ in ids)
-        try:
-            await self._db.execute(
-                f"DELETE FROM reflexions WHERE id IN ({placeholders})", tuple(ids)
-            )
-            result.reflexions_pruned = len(ids)
-            # Vector cleanup (2026-08-31): this was the ONE reflexion delete
-            # path that skipped ChromaDB — ReflexionStore.prune (line ~1139)
-            # calls _remove_from_vector, this daily NREM prune did not, so
-            # every cycle minted ghost vectors (measured: 192 vectors for 138
-            # rows — 54 ghosts crowding semantic retrieval's top-k).
-            try:
-                from app.core.reflexion import ReflexionStore
-                store = None
-                try:
-                    from app.core.brain import get_services
-                    store = get_services().reflexions
-                except Exception:
-                    pass
-                if store is None:
-                    store = ReflexionStore(self._db)
-                await asyncio.to_thread(store._remove_from_vector, ids)
-            except Exception as e:
-                logger.warning("[Dream] Reflexion prune vector cleanup failed: %s", e)
-        except Exception as e:
-            result.errors.append(f"reflexion prune: {e}")
-            logger.warning("[Dream] Reflexion prune failed: %s", e)
 
     async def _compact_kg_chains(self, signals: GatherSignals, result: ConsolidationResult):
         """Remove intermediate superseded KG facts, keep first and last."""
@@ -437,18 +314,6 @@ class DreamConsolidator:
             except Exception as e:
                 result.errors.append(f"KG compact: {e}")
                 logger.warning("[Dream] KG compact failed: %s", e)
-
-    async def _disable_weak_skills(self, signals: GatherSignals, result: ConsolidationResult):
-        """Disable skills with < 0.2 success rate and 3+ uses."""
-        for skill in signals.weak_skills:
-            try:
-                await self._db.execute(
-                    "UPDATE skills SET enabled=0 WHERE id=?", (skill["id"],)
-                )
-                result.skills_disabled += 1
-                logger.info("[Dream] Disabled weak skill: %s (rate=%.2f)", skill["name"], skill["success_rate"])
-            except Exception as e:
-                result.errors.append(f"disable skill {skill['name']}: {e}")
 
     async def _handle_failed_curiosity(self, signals: GatherSignals, result: ConsolidationResult):
         """Dismiss or reset failed curiosity items based on failure reason.
@@ -511,81 +376,6 @@ class DreamConsolidator:
                     result.facts_refreshed += 1
                 except Exception as e:
                     result.errors.append(f"refresh fact: {e}")
-
-    async def _promote_reflexions(self, signals: GatherSignals, result: ConsolidationResult, svc):
-        """Promote high-quality success reflexions to knowledge lessons via LLM."""
-        if not signals.high_quality_unpromoted or not svc.learning:
-            return
-
-        import asyncio
-        from app.core.llm import invoke_nothink, extract_json_object
-
-        # Batch up to 5 per dream cycle to limit LLM cost
-        candidates = signals.high_quality_unpromoted[:5]
-        for ref in candidates:
-            # Yield control between iterations — avoids burst-sending to Ollama
-            await asyncio.sleep(0)
-            try:
-                # Truncate fields to prevent Ollama 400 (context overflow) on long reflexions
-                task_summary = (ref.get("task_summary") or "")[:800]
-                reflection = (ref.get("reflection") or "")[:1200]
-                prompt = (
-                    f"Extract a reusable lesson from this successful experience.\n\n"
-                    f"Task: {task_summary}\n"
-                    f"Reflection: {reflection}\n"
-                    f"Quality: {ref['quality_score']}\n\n"
-                    f"Return JSON: {{\"topic\": \"...\", \"lesson\": \"...\"}}\n"
-                    f"Topic should be 3-5 words. Lesson should be one actionable sentence."
-                )
-                resp = await invoke_nothink(
-                    [{"role": "user", "content": prompt}],
-                    json_mode=True,
-                    max_tokens=200,
-                )
-                if not resp:
-                    continue
-                data = extract_json_object(resp)
-                if not data:
-                    continue
-                topic = str(data.get("topic", "")).strip()
-                lesson = str(data.get("lesson", "")).strip()
-                if topic and lesson and len(lesson) > 10:
-                    # to_thread (2026-08-29): add_knowledge_lesson is sync and
-                    # fans out into _find_similar_lesson (SELECT), a dedup-metrics
-                    # INSERT and an UPDATE on lessons — all landing on the
-                    # event-loop thread from this async caller.
-                    #
-                    # lesson_text carries the LESSON, not provenance
-                    # (2026-08-31). It used to say "Promoted from success
-                    # reflexion (quality=X)" — the provenance-as-content
-                    # defect class (same as the 08-26 quiz-side fix), which
-                    # ALSO blinded lesson dedup: every promoted lesson's text
-                    # was near-identical boilerplate, so family duplicates
-                    # scored jaccard ~0 against the real members and sailed
-                    # through (dedup_decisions logged 0.0 for tonight's
-                    # re-mints). Provenance lives in `context`.
-                    await asyncio.to_thread(
-                        svc.learning.add_knowledge_lesson,
-                        topic=topic,
-                        correct_answer=lesson,
-                        lesson_text=(
-                            f"{lesson} (learned from a successful approach "
-                            f"to: {task_summary[:140]})"),
-                        context="dream_consolidation",
-                        confidence=0.7,
-                    )
-                    result.reflexions_promoted += 1
-                # Mark the source CONSUMED whether or not the lesson survived
-                # dedup — a dedup-merge still means this experience is
-                # represented, and an unmarked source re-promotes forever
-                # (reflexion #7 did exactly that, June 20 -> August 31).
-                # LLM failures above skip this and retry next cycle.
-                await self._db.execute(
-                    "UPDATE reflexions SET promoted_at = datetime('now') "
-                    "WHERE id = ?", (ref["id"],))
-            except Exception as e:
-                result.errors.append(f"promote reflexion: {e}")
-                logger.warning("[Dream] Reflexion promotion failed: %s", e)
 
     async def _resolve_contradictions(self, signals: GatherSignals, result: ConsolidationResult, svc):
         """Resolve lesson contradictions via LLM arbitration."""
@@ -914,51 +704,6 @@ class DreamConsolidator:
         result.procedural_clusters_consolidated = consolidated_count
         result.procedural_lessons_subsumed = subsumed_count
 
-    async def _mine_dpo_pairs(self, signals: GatherSignals, result: ConsolidationResult):
-        """Generate DPO training pairs from quality extremes."""
-        if not signals.quality_extremes:
-            return
-
-        from app.config import config
-
-        successes = [r for r in signals.quality_extremes if r["quality_score"] >= 0.85]
-        failures = [r for r in signals.quality_extremes if r["quality_score"] <= 0.3]
-
-        if not successes or not failures:
-            return
-
-        # Pair successes with failures on similar topics (simple word overlap)
-        pairs_written = 0
-        training_path = config.TRAINING_DATA_PATH
-        try:
-            with open(training_path, "a", encoding="utf-8") as f:
-                for success in successes[:5]:
-                    s_words = set(success["task_summary"].lower().split())
-                    best_match = None
-                    best_overlap = 0
-                    for failure in failures:
-                        f_words = set(failure["task_summary"].lower().split())
-                        overlap = len(s_words & f_words) / max(len(s_words | f_words), 1)
-                        if overlap > best_overlap:
-                            best_overlap = overlap
-                            best_match = failure
-                    if best_match and best_overlap > 0.2:
-                        pair = {
-                            "query": success["task_summary"],
-                            "chosen": success["reflection"],
-                            "rejected": best_match["reflection"],
-                            "timestamp": datetime.utcnow().isoformat(),
-                            "source": "dream_consolidation",
-                        }
-                        f.write(json.dumps(pair, ensure_ascii=False) + "\n")
-                        pairs_written += 1
-            result.dpo_pairs_generated = pairs_written
-        except Exception as e:
-            result.errors.append(f"DPO mining: {e}")
-            logger.warning("[Dream] DPO mining failed: %s", e)
-
-    # ── Phase 4: REPORT ──────────────────────────────────────────────────
-
     async def report(self, inventory: DreamInventory, result: ConsolidationResult) -> str:
         """Record dream completion and generate digest."""
         now = datetime.utcnow().isoformat()
@@ -1003,22 +748,14 @@ class DreamConsolidator:
     def _format_digest(self, inv: DreamInventory, result: ConsolidationResult) -> str:
         """Format a concise dream digest."""
         parts = []
-        if result.reflexions_pruned:
-            parts.append(f"{result.reflexions_pruned} reflexions pruned")
-        if result.reflexions_promoted:
-            parts.append(f"{result.reflexions_promoted} reflexions → lessons")
         if result.contradictions_resolved:
             parts.append(f"{result.contradictions_resolved} contradictions resolved")
         if result.kg_chains_compacted:
             parts.append(f"{result.kg_chains_compacted} KG facts compacted")
-        if result.skills_disabled:
-            parts.append(f"{result.skills_disabled} skills disabled")
         if result.curiosity_dismissed:
             parts.append(f"{result.curiosity_dismissed} curiosity dismissed")
         if result.curiosity_reset:
             parts.append(f"{result.curiosity_reset} curiosity reset for retry")
-        if result.dpo_pairs_generated:
-            parts.append(f"{result.dpo_pairs_generated} DPO pairs mined")
         if result.facts_refreshed:
             parts.append(f"{result.facts_refreshed} facts refreshed")
         if result.errors:
@@ -1032,7 +769,7 @@ class DreamConsolidator:
         return (
             f"Dream cycle complete. "
             f"Memory: {inv.lesson_count} lessons, {inv.kg_fact_count} KG, "
-            f"{inv.reflexion_count} reflexions, {inv.fact_count} facts. "
+            f"{inv.fact_count} facts. "
             f"Actions: {actions}."
         )
 
@@ -1093,14 +830,11 @@ class DreamConsolidator:
                 if result.nrem_completed:
                     logger.info(
                         "[Dream] Phase 3a (NREM) completed in %.2fs — "
-                        "pruned=%d compacted=%d disabled=%d curio_reset=%d refreshed=%d dpo=%d",
+                        "compacted=%d curio_reset=%d refreshed=%d",
                         result.nrem_seconds,
-                        result.reflexions_pruned,
                         result.kg_chains_compacted,
-                        result.skills_disabled,
                         result.curiosity_reset + result.curiosity_dismissed,
                         result.facts_refreshed,
-                        result.dpo_pairs_generated,
                     )
 
                 # Phase 3b: REM — integrative/LLM-driven. Its failure does NOT
@@ -1122,9 +856,8 @@ class DreamConsolidator:
                 if result.rem_completed:
                     logger.info(
                         "[Dream] Phase 3b (REM) completed in %.2fs — "
-                        "promoted=%d resolved=%d proc_clusters=%d proc_subsumed=%d",
+                        "resolved=%d proc_clusters=%d proc_subsumed=%d",
                         result.rem_seconds,
-                        result.reflexions_promoted,
                         result.contradictions_resolved,
                         result.procedural_clusters_consolidated,
                         result.procedural_lessons_subsumed,
@@ -1137,20 +870,6 @@ class DreamConsolidator:
             except asyncio.TimeoutError:
                 logger.warning("[Dream] Phase 3 (Consolidate) timed out after %ds", PHASE_TIMEOUT * 2)
                 result = ConsolidationResult()
-
-        # Phase 3b: Principle distillation (EvolveR pattern)
-        try:
-            from app.core.brain import get_services
-            svc = get_services()
-            if svc.reflexions and svc.learning:
-                distilled = await asyncio.wait_for(
-                    svc.reflexions.distill_principles(learning_engine=svc.learning),
-                    timeout=PHASE_TIMEOUT * 2,
-                )
-                if distilled:
-                    logger.info("[Dream] Distilled %d principles from reflexion patterns", distilled)
-        except (asyncio.TimeoutError, Exception) as e:
-            logger.debug("[Dream] Principle distillation skipped: %s", e)
 
         # Phase 4: Report
         try:

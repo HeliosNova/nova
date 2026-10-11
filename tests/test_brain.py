@@ -16,7 +16,6 @@ from app.core.memory import ConversationStore, UserFactStore
 from app.core.prompt import (
     build_system_prompt,
     format_lessons_for_prompt,
-    format_skills_for_prompt,
 )
 from app.schema import EventType
 
@@ -324,18 +323,6 @@ class TestPromptBuilder:
 
     def test_format_lessons_empty(self):
         assert format_lessons_for_prompt([]) == ""
-
-    def test_format_skills(self):
-        skills = [
-            {"name": "crypto_check", "trigger_pattern": r"price of \w+"},
-        ]
-        text = format_skills_for_prompt(skills)
-        assert "Learned Skills" in text
-        assert "crypto_check" in text
-
-    def test_format_skills_empty(self):
-        assert format_skills_for_prompt([]) == ""
-
 
 # ===========================================================================
 # Reasoning Pattern Matchers (SHARP2/SHARP3)
@@ -1198,53 +1185,6 @@ class TestCritiquePassedGuard:
 # ===========================================================================
 # Quiz Max Tokens (from test_audit_consolidated)
 # ===========================================================================
-
-class TestQuizMaxTokens:
-
-    @pytest.mark.asyncio
-    async def test_quiz_max_tokens_at_least_600(self, db):
-        """Verify the quiz answer generation uses max_tokens >= 600.
-
-        We mock llm.invoke_nothink and capture the kwargs to verify the
-        answer generation call uses sufficient max_tokens.
-        """
-        from app.monitors.heartbeat import HeartbeatLoop
-        from app.core.learning import LearningEngine
-
-        db.init_schema()
-        learning = LearningEngine(db)
-
-        # Insert a lesson for the quiz to pick up
-        db.execute(
-            """INSERT INTO lessons (topic, wrong_answer, correct_answer, lesson_text, context, confidence)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            ("Python GIL", "GIL allows multithreading", "The GIL prevents true multithreading",
-             "GIL lesson", "threading", 0.8),
-        )
-
-        captured_max_tokens = []
-
-        async def capturing_invoke(messages, **kwargs):
-            if "max_tokens" in kwargs:
-                captured_max_tokens.append(kwargs["max_tokens"])
-            return '{"pass": true}'
-
-        svc = Services(
-            conversations=ConversationStore(db),
-            user_facts=UserFactStore(db),
-            learning=learning,
-        )
-        set_services(svc)
-
-        with patch("app.core.llm.invoke_nothink", new=AsyncMock(side_effect=capturing_invoke)):
-            loop = HeartbeatLoop.__new__(HeartbeatLoop)
-            result = await loop._execute_quiz({})
-
-        # The answer generation call should use max_tokens >= 600
-        assert any(mt >= 600 for mt in captured_max_tokens), (
-            f"Expected at least one invoke_nothink call with max_tokens >= 600, got {captured_max_tokens}"
-        )
-
 
 # ===========================================================================
 # Conversation Search

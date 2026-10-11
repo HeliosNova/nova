@@ -254,8 +254,7 @@ class TestSchemaCreation:
 
         expected = {
             "conversations", "messages", "user_facts",
-            "lessons", "skills", "documents", "kg_facts",
-            "reflexions", "monitors",
+            "lessons", "documents", "kg_facts", "monitors",
             "monitor_results", "action_log", "heartbeat_instructions",
         }
         for t in expected:

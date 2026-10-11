@@ -12,7 +12,6 @@ export interface ChatResponse {
   sources: Record<string, unknown>[];
   tool_results: ToolResult[];
   lessons_used: number;
-  skill_used: string | null;
 }
 
 export interface ToolResult {
@@ -87,7 +86,6 @@ export interface SSESourcesData {
 export interface SSEDoneData {
   conversation_id: string;
   lessons_used: number;
-  skill_used: string | null;
 }
 
 export interface SSEErrorData {
@@ -179,7 +177,6 @@ export interface UserFactCreate {
 
 export interface LearningMetrics {
   total_lessons: number;
-  total_skills: number;
   total_corrections: number;
   training_examples: number;
   last_correction_date: string | null;
@@ -197,18 +194,6 @@ export interface LessonInfo {
   created_at: string;
 }
 
-export interface SkillInfo {
-  id: number;
-  name: string;
-  trigger_pattern: string;
-  steps: Record<string, unknown>[];
-  answer_template?: string;
-  times_used: number;
-  success_rate: number;
-  enabled: boolean;
-  created_at?: string;
-}
-
 // ── System ──
 
 export interface HealthResponse {
@@ -221,11 +206,9 @@ export interface StatusResponse {
   messages: number;
   user_facts: number;
   lessons: number;
-  skills: number;
   documents: number;
   training_examples: number;
   kg_facts: number;
-  reflexions: number;
 }
 
 // ── Tool Call (UI state) ──
@@ -299,21 +282,6 @@ export interface ActionInfo {
   params: string | null;
   result: string | null;
   success: boolean;
-  created_at: string;
-}
-
-// ── Reflexions ──
-
-export interface ReflexionInfo {
-  id: number;
-  task_summary: string;
-  outcome: string;
-  reflection: string;
-  quality_score: number;
-  // The API returns a comma-joined STRING, not an array (2026-08-21 field
-  // audit). ReflexionsSection already splits defensively; typing it honestly
-  // stops future code from an unguarded .map() that would crash at runtime.
-  tools_used: string | string[];
   created_at: string;
 }
 
@@ -414,7 +382,6 @@ export interface ConfigSummary {
   ENABLE_MCP: boolean;
   ENABLE_DELEGATION: boolean;
   MAX_DELEGATION_DEPTH: number;
-  ENABLE_AUTO_SKILL_CREATION: boolean;
   ENABLE_MODEL_ROUTING: boolean;
   ENABLE_EXTENDED_THINKING: boolean;
   ENABLE_VOICE: boolean;

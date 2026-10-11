@@ -152,83 +152,6 @@ class TestOllamaLatencyCheck:
 # ---------------------------------------------------------------------------
 
 
-class TestSkillQualityCheck:
-    @pytest.mark.asyncio
-    async def test_happy_path_reports_all_metrics(self, loop):
-        """Returns total/enabled/disabled counts and avg success rate."""
-        mock_db = MagicMock()
-        # total=10, enabled=8, disabled=2, avg_sr=0.75, degrading=1
-        mock_db.fetchone.side_effect = [
-            {"c": 10},     # total
-            {"c": 8},      # enabled
-            {"avg_sr": 0.75},  # avg success rate
-            {"c": 1},      # degrading
-        ]
-        mock_skills = MagicMock()
-        mock_skills._db = mock_db
-
-        mock_svc = MagicMock()
-        mock_svc.skills = mock_skills
-
-        with patch("app.core.brain.get_services", return_value=mock_svc):
-            result = await loop._execute_skill_quality_check()
-
-        assert "total: 10" in result
-        assert "enabled: 8" in result
-        assert "disabled: 2" in result
-        assert "0.75" in result
-        assert "degrading: 1" in result
-
-    @pytest.mark.asyncio
-    async def test_no_skills_service(self, loop):
-        """Returns informative string when skills store is not initialised."""
-        mock_svc = MagicMock()
-        mock_svc.skills = None
-
-        with patch("app.core.brain.get_services", return_value=mock_svc):
-            result = await loop._execute_skill_quality_check()
-
-        assert "unavailable" in result.lower() or "not available" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_db_error_returns_error_string(self, loop):
-        """DB exception is caught and returned as a readable error string."""
-        mock_db = MagicMock()
-        mock_db.fetchone.side_effect = Exception("locked")
-
-        mock_skills = MagicMock()
-        mock_skills._db = mock_db
-
-        mock_svc = MagicMock()
-        mock_svc.skills = mock_skills
-
-        with patch("app.core.brain.get_services", return_value=mock_svc):
-            result = await loop._execute_skill_quality_check()
-
-        assert "error" in result.lower()
-
-    @pytest.mark.asyncio
-    async def test_null_avg_success_rate_handled(self, loop):
-        """avg_sr = NULL (no enabled skills) should yield 0.0, not crash."""
-        mock_db = MagicMock()
-        mock_db.fetchone.side_effect = [
-            {"c": 3},
-            {"c": 0},          # no enabled skills
-            {"avg_sr": None},  # SQLite AVG returns NULL on empty set
-            {"c": 0},
-        ]
-        mock_skills = MagicMock()
-        mock_skills._db = mock_db
-
-        mock_svc = MagicMock()
-        mock_svc.skills = mock_skills
-
-        with patch("app.core.brain.get_services", return_value=mock_svc):
-            result = await loop._execute_skill_quality_check()
-
-        assert "0.00" in result
-
-
 # ---------------------------------------------------------------------------
 # _execute_chromadb_integrity_check
 # ---------------------------------------------------------------------------
@@ -409,18 +332,17 @@ class TestKgHealthCheck:
 
 
 class TestSystemHealthMonitorSeeds:
-    """Verify all 5 new monitor check types are present in seed_defaults."""
+    """Verify the system-health monitor check types are present in seed_defaults."""
 
     EXPECTED = {
         "db_size": "DB Size Monitor",
         "ollama_latency": "Ollama Latency Monitor",
-        "skill_quality": "Skill Quality Monitor",
         "chromadb_integrity": "ChromaDB Integrity",
         "kg_health": "KG Health Monitor",
     }
 
-    def test_all_five_seeds_created(self, store):
-        """seed_defaults() creates all 5 new system-health monitors."""
+    def test_all_seeds_created(self, store):
+        """seed_defaults() creates the system-health monitors."""
         store.seed_defaults()
         monitors = {m.name: m for m in store.list_all()}
 
@@ -449,7 +371,7 @@ class TestSystemHealthMonitorSeeds:
         assert count_first == count_second
 
     def test_new_monitors_enabled_by_default(self, store):
-        """All 5 new monitors are enabled when first seeded."""
+        """The system-health monitors are enabled when first seeded."""
         store.seed_defaults()
         monitors = {m.name: m for m in store.list_all()}
 

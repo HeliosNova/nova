@@ -20,15 +20,6 @@
   "revised",
   "created_at"
  ],
- "capability_gaps": [
-  "id",
-  "query",
-  "reason",
-  "tools_tried",
-  "quality_score",
-  "reviewed",
-  "created_at"
- ],
  "channel_conversations": [
   "channel",
   "user_id",
@@ -282,17 +273,6 @@
   "shadow_eval_metrics",
   "created_at"
  ],
- "reflexions": [
-  "id",
-  "task_summary",
-  "outcome",
-  "reflection",
-  "quality_score",
-  "tools_used",
-  "revision_count",
-  "created_at",
-  "is_eval"
- ],
  "salience_weights": [
   "topic",
   "weight",
@@ -301,24 +281,6 @@
  "schema_version": [
   "version",
   "applied_at"
- ],
- "skills": [
-  "id",
-  "name",
-  "trigger_pattern",
-  "steps",
-  "answer_template",
-  "learned_from",
-  "times_used",
-  "success_rate",
-  "enabled",
-  "created_at",
-  "last_used_at",
-  "consecutive_failures",
-  "source",
-  "composed_of",
-  "kind",
-  "procedure_text"
  ],
  "storyline_events": [
   "id",

@@ -19,8 +19,6 @@ from app.config import config
 
 if TYPE_CHECKING:
     from app.core.learning import LearningEngine
-    from app.core.skills import SkillStore
-    from app.core.reflexion import ReflexionStore
     from app.core.retriever import Retriever
     from app.core.kg import KnowledgeGraph
     from app.core.curiosity import CuriosityQueue, TopicTracker
@@ -37,7 +35,6 @@ from app.core.memory import ConversationStore, UserFactStore
 from app.core.prompt import (
     build_system_prompt,
     format_lessons_for_prompt,
-    format_skills_for_prompt,
 )
 from app.schema import EventType, StreamEvent
 
@@ -451,15 +448,12 @@ class Services:
     user_facts: UserFactStore | None = None
     retriever: Retriever | None = None
     learning: LearningEngine | None = None
-    skills: SkillStore | None = None
     tool_registry: ToolRegistry | None = None
     kg: KnowledgeGraph | None = None
-    reflexions: ReflexionStore | None = None
     monitor_store: MonitorStore | None = None
     heartbeat: HeartbeatLoop | None = None
     curiosity: CuriosityQueue | None = None
     topic_tracker: TopicTracker | None = None
-    external_skills: list | None = None  # list[ExternalSkill]
 
 
 # Module-level services ref (set during startup)
@@ -744,24 +738,16 @@ def _guard_validated_content(pre_validate: str, validated: str) -> str:
 @dataclass
 class _ThinkContext:
     """All gathered context for a single think() call."""
-    matched_skill: object | None = None
     used_lesson_ids: list[int] = field(default_factory=list)
-    skills_text: str = ""
     user_facts_text: str = ""
     lessons_text: str = ""
     kg_facts_text: str = ""
     kg_facts_count: int = 0
     dossiers: list[dict] = field(default_factory=list)   # retrieved dossiers, with scores
-    reflexions_text: str = ""
-    reflexions_count: int = 0
     retrieved_context: str = ""
     retrieved_sources: list[dict] = field(default_factory=list)
     integrations_text: str = ""
-    success_patterns_text: str = ""
-    success_pattern_ids: list[int] = field(default_factory=list)  # ids injected, for A/B closure tracking
     lessons: list = field(default_factory=list)  # raw lesson objects, for LESSON_USED events
-    external_skills_text: str = ""               # summaries of loaded external skills
-    matched_external_skill_text: str = ""        # full body of matched external skill
     prior_sessions_text: str = ""                # GSW: summaries of prior conversations on related topics
 
 
@@ -779,7 +765,7 @@ class _GenerationResult:
 
 
 # Per-subsystem cap. 5s was tuned for healthy SQLite/ChromaDB, but the semantic
-# arms (kg/reflexions/lessons) embed the query through Ollama, and when the 27B
+# arms (kg/lessons) embed the query through Ollama, and when the 27B
 # is mid-digest those embed calls queue behind generation — chronic 5s timeouts
 # observed all day 2026-07-07/08, silently zeroing knowledge injection for any
 # chat that coincides with monitor activity (three eval after-legs lost their
@@ -791,7 +777,7 @@ _CONTEXT_GATHER_TIMEOUT_S = 15.0
 async def _run_context_io(name: str, awaitable, default):
     """Wrap one context-gather IO call with a hard timeout.
 
-    Each subsystem (user_facts, skills, lessons, kg, reflexions, gsw,
+    Each subsystem (user_facts, lessons, kg, gsw,
     retrieval) calls SQLite/ChromaDB via asyncio.to_thread. Before this
     wrapper, a slow query (lock contention, broken connection) would
     stall the WHOLE pipeline because the gather is sequential within
@@ -837,7 +823,7 @@ async def _gather_context(
     intent: str,
     conversation_id: str = "",
 ) -> _ThinkContext:
-    """Load skills, user facts, lessons, KG facts, reflexions, retrieval, integrations.
+    """Load user facts, lessons, KG facts, retrieval, integrations.
 
     This is Steps 4–7b of the original think() pipeline.
     """
@@ -856,63 +842,13 @@ async def _gather_context(
     _t_user_facts = asyncio.ensure_future(_run_context_io(
         "user_facts", asyncio.to_thread(svc.user_facts.format_for_prompt), default="",
     )) if svc.user_facts else None
-    _t_skill_match = asyncio.ensure_future(_run_context_io(
-        "skills.match", asyncio.to_thread(svc.skills.get_matching_skill, query), default=None,
-    )) if svc.skills else None
     _t_lessons = asyncio.ensure_future(_run_context_io(
         "lessons", asyncio.to_thread(svc.learning.get_relevant_lessons, query), default=[],
     )) if (svc.learning and not _is_time_sensitive_query) else None
     _t_kg = asyncio.ensure_future(_run_context_io(
         "kg", asyncio.to_thread(svc.kg.get_relevant_facts, query, config.MAX_KG_FACTS_IN_PROMPT), default=None,
     )) if svc.kg else None
-    _t_reflexions = asyncio.ensure_future(_run_context_io(
-        "reflexions", asyncio.to_thread(svc.reflexions.get_relevant, query, config.MAX_REFLEXIONS_IN_PROMPT), default=None,
-    )) if svc.reflexions else None
-    _t_success = asyncio.ensure_future(_run_context_io(
-        "reflexions.success_patterns", asyncio.to_thread(svc.reflexions.get_success_patterns, query, config.MAX_SUCCESS_PATTERNS_IN_PROMPT), default=None,
-    )) if svc.reflexions else None
-
     ctx.user_facts_text = ((await _t_user_facts) or "") if _t_user_facts else ""
-
-    # --- Skills ---
-    if svc.skills:
-        ctx.matched_skill = await _t_skill_match
-        if ctx.matched_skill:
-            logger.info("Skill matched: '%s' (id=%d)", ctx.matched_skill.name, ctx.matched_skill.id)
-            if (getattr(ctx.matched_skill, "kind", "exec") == "procedure"
-                    and getattr(ctx.matched_skill, "procedure_text", None)):
-                # Procedure skill (migration 30): NL guidance, not mechanical steps.
-                ctx.skills_text = (
-                    f"## Matched Skill: {ctx.matched_skill.name}\n\n"
-                    f"You have a learned procedure for this type of query:\n"
-                    f"{ctx.matched_skill.procedure_text}\n"
-                    f"\nFollow this procedure. If it seems wrong for this query, "
-                    f"deviate and explain why.\n"
-                )
-            else:
-                steps_desc = "\n".join(
-                    f"  {i+1}. Use {s.get('tool', '?')} with {json.dumps(s.get('args_template', {}))}"
-                    for i, s in enumerate(ctx.matched_skill.steps)
-                )
-                ctx.skills_text = (
-                    f"## Matched Skill: {ctx.matched_skill.name}\n\n"
-                    f"You have a learned procedure for this type of query. Follow these steps:\n"
-                    f"{steps_desc}\n"
-                )
-                if ctx.matched_skill.answer_template:
-                    ctx.skills_text += f"\nAnswer format: {ctx.matched_skill.answer_template}\n"
-                ctx.skills_text += "\nFollow this procedure. If the skill seems wrong for this query, deviate and explain why.\n"
-        else:
-            active_skills = await _run_context_io(
-                "skills.active",
-                asyncio.to_thread(svc.skills.get_active_skills),
-                default=[],
-            )
-            if active_skills:
-                ctx.skills_text = format_skills_for_prompt([
-                    {"name": s.name, "trigger_pattern": s.trigger_pattern}
-                    for s in active_skills[:5]
-                ])
 
     # --- Lessons ---
     # Bypass for time-sensitive queries: lessons may include stale prices /
@@ -1121,13 +1057,6 @@ async def _gather_context(
         except Exception as e:
             logger.warning("[self-state] snapshot failed — context arm LOST for this chat: %s", e)
 
-    # --- Reflexions (past failure warnings) ---
-    if svc.reflexions:
-        reflexions = await _t_reflexions
-        if reflexions:
-            ctx.reflexions_text = svc.reflexions.format_for_prompt(reflexions)
-            ctx.reflexions_count = len(reflexions)
-
     # --- GSW (Generative Semantic Workspace) — episodic memory ---
     # Retrieve summaries from prior conversations whose key entities overlap
     # with this query, so we can pick up cross-session context. Distinct from
@@ -1162,16 +1091,6 @@ async def _gather_context(
     except Exception as e:
         # warning, not debug: this swallow hid a total GSW outage for months.
         logger.warning("GSW retrieval failed: %s", e, exc_info=True)
-
-    # --- Success patterns (what worked before) ---
-    if svc.reflexions:
-        from app.core.reflexion import ReflexionStore
-        successes = await _t_success
-        if successes:
-            ctx.success_patterns_text = ReflexionStore.format_success_patterns(successes)
-            ctx.success_pattern_ids = [
-                s.id for s in successes if getattr(s, "id", None) is not None
-            ]
 
     # --- Retrieval (with topical-relevance gate) ---
     # Two-stage filter:
@@ -1269,16 +1188,6 @@ async def _gather_context(
         except Exception:
             pass
 
-    # --- External skills (AgentSkills format) ---
-    if svc.external_skills:
-        from app.core.skill_loader import match_skill, format_skill_summaries, format_skill_body
-        ctx.external_skills_text = format_skill_summaries(svc.external_skills)
-        if intent == "general":
-            matched = match_skill(query, svc.external_skills)
-            if matched:
-                ctx.matched_external_skill_text = format_skill_body(matched)
-                logger.info("External skill matched: '%s'", matched.name)
-
     return ctx
 
 
@@ -1305,13 +1214,8 @@ async def _build_messages(
         lessons_text=ctx.lessons_text,
         tool_descriptions=_get_tool_descriptions(),
         retrieved_context=ctx.retrieved_context,
-        skills_text=ctx.skills_text,
         kg_facts=ctx.kg_facts_text,
-        reflexions=ctx.reflexions_text,
         integrations_text=ctx.integrations_text,
-        success_patterns=ctx.success_patterns_text,
-        external_skills_text=ctx.external_skills_text,
-        matched_external_skill_text=ctx.matched_external_skill_text,
         registered_tool_names=_tool_names,
         provider=config.LLM_PROVIDER,
     )
@@ -1408,8 +1312,7 @@ async def _build_messages(
                 # per-call-site adjustment of the shared value, not a new flag.
                 plan_timeout = (max(float(config.INTERNAL_LLM_TIMEOUT), 120.0)
                                 if channel == "monitor" else None)
-                plan = await create_plan(query, tool_names, ctx.reflexions_text,
-                                         timeout=plan_timeout)
+                plan = await create_plan(query, tool_names, timeout=plan_timeout)
                 if plan:
                     plan_text = format_plan_for_prompt(plan)
                     messages.append({"role": "system", "content": plan_text})
@@ -2654,26 +2557,6 @@ async def _refine_response(
             except Exception as e:
                 logger.warning("Critique failed: %s", e)
 
-            # Store ONE reflexion after the critique loop ends (not per-iteration)
-            if not critique_passed and last_critique_issues:
-                _svc = get_services()
-                if _svc.reflexions:
-                    try:
-                        issues_text = "; ".join(last_critique_issues)
-                        await asyncio.to_thread(
-                            lambda: _svc.reflexions.store(
-                                task_summary=query[:500],
-                                outcome="failure",
-                                reflection=f"Critique failed: {issues_text}",
-                                quality_score=0.3,
-                            )
-                        )
-                    except Exception as e:
-                        # A dropped reflexion is a lost learning signal, and
-                        # reflexions feed lesson promotion and the failure
-                        # sweep. Rare enough to be loud (2026-09-04).
-                        logger.warning("Reflexion store failed after critique: %s", e)
-
     # --- Adversarial critique (logic/factual error hunter) ---
     if _run_adversarial:
         from app.core.critique import adversarial_critique, format_adversarial_for_replan
@@ -3017,20 +2900,10 @@ async def _refine_response(
 
             footer = None
             substantive = len(final_content) >= 100  # don't footer on trivial answers
-            # Calibrated thresholds (Conformal Abstention) — adapt to recent
-            # reflexion score distribution rather than fixed cutoffs. Falls back
-            # to historical defaults (0.40/0.60, 0.50, 0.60) when the reflexions
-            # table has fewer than 30 entries or ENABLE_CONFORMAL_ABSTENTION=false.
-            try:
-                from app.core.calibration import get_thresholds as _get_calib
-                _thr = _get_calib()
-            except Exception as e:
-                logger.debug("[CONFIDENCE] calibration lookup failed: %s", e)
-                _thr = None
-            _t1_lo = _thr.tier1_low if _thr else 0.40
-            _t1_hi = _thr.tier1_high if _thr else 0.60
-            _t2 = _thr.tier2 if _thr else 0.50
-            _t3 = _thr.tier3 if _thr else 0.60
+            # Fixed tier cutoffs. The conformal-abstention calibration that
+            # re-derived these from the reflexions table went with the
+            # reflexion store (2026-10-10); these are its historical defaults.
+            _t1_lo, _t1_hi, _t2, _t3 = 0.40, 0.60, 0.50, 0.60
             if (
                 substantive
                 and ungrounded
@@ -3075,54 +2948,6 @@ async def _refine_response(
     return final_content, reflexion_quality, reflexion_reason
 
 
-async def _detect_capability_gap(
-    svc: Services,
-    query: str,
-    matched_skill: object | None,
-    tool_results: list[dict],
-    reflexion_quality: float | None,
-) -> None:
-    """Log a capability gap when Nova demonstrably couldn't handle a query.
-
-    A gap is detected when all three conditions hold:
-    1. No skill was matched for the query
-    2. No tools were successfully used (empty tool_results = planner found nothing useful)
-    3. Response quality scored below 0.5
-
-    Gaps are stored in the capability_gaps table for periodic review by the
-    Capability Review monitor, which surfaces suggestions for new tools/skills.
-    """
-    if matched_skill is not None:
-        return
-    if tool_results:
-        return
-    if reflexion_quality is None or reflexion_quality >= 0.5:
-        return
-    # Synthetic-traffic gate (2026-08-30): capability_gaps is a persistent
-    # self-improvement input; ephemeral eval runs must not seed it (measured:
-    # eval/quiz-family queries in the newest rows, later mined into goals and
-    # auto-tool candidates).
-    if EPHEMERAL_REQUEST.get():
-        return
-
-    try:
-        from app.database import get_db
-        db = get_db()
-        await asyncio.to_thread(
-            db.execute,
-            "INSERT INTO capability_gaps (query, reason, tools_tried, quality_score) VALUES (?, ?, ?, ?)",
-            (
-                query[:500],
-                f"No skill matched, no tools used, quality={reflexion_quality:.2f}",
-                "[]",
-                reflexion_quality,
-            ),
-        )
-        logger.info("[CAPABILITY_GAP] Logged gap: %s", query[:80])
-    except Exception as e:
-        logger.warning("Capability gap logging failed: %s", e)
-
-
 async def _run_post_processing(
     svc: Services,
     query: str,
@@ -3130,7 +2955,6 @@ async def _run_post_processing(
     intent: str,
     conversation_id: str,
     tool_results: list[dict],
-    matched_skill: object | None,
     used_lesson_ids: list[int],
     is_error: bool,
     reflexion_quality: float | None,
@@ -3141,7 +2965,7 @@ async def _run_post_processing(
     saved_msg_id: str | None = None,
     ephemeral: bool = False,
 ) -> AsyncGenerator[StreamEvent, None]:
-    """Post-response processing: corrections, facts, KG, reflexion storage, auto skills.
+    """Post-response processing: corrections, facts, KG.
 
     This is Steps 13–17 of the original think() pipeline.
     Yields LESSON_LEARNED events.
@@ -3248,41 +3072,6 @@ async def _run_post_processing(
                                 channel=channel,
                             )
 
-                        degraded_skill = matched_skill
-                        if not degraded_skill and original_query and svc.skills:
-                            degraded_skill = await asyncio.to_thread(svc.skills.get_matching_skill, original_query)
-                        if degraded_skill and svc.skills:
-                            await asyncio.to_thread(svc.skills.record_use, degraded_skill.id, False)
-                            logger.info("Skill '%s' marked as failed due to correction", degraded_skill.name)
-
-                            # Attempt refinement in background instead of just degrading
-                            async def _safe_refine(skills, sid, ctx):
-                                try:
-                                    refined = await skills.refine_skill(sid, ctx)
-                                    if refined:
-                                        logger.info("Skill #%d refined after correction", sid)
-                                except Exception as e:
-                                    logger.warning("Skill refinement failed: %s", e)
-                            _task = asyncio.create_task(
-                                _safe_refine(svc.skills, degraded_skill.id, query[:300])
-                            )
-                            _background_tasks.add(_task)
-                            _task.add_done_callback(_background_tasks.discard)
-
-                        if svc.skills:
-                            from app.core.skills import extract_skill_from_correction
-                            skill_data = await extract_skill_from_correction(
-                                correction.user_message,
-                                tool_results,
-                                lesson_id,
-                            )
-                            if skill_data:
-                                skill_id = await asyncio.to_thread(lambda: svc.skills.create_skill(**skill_data))
-                                if skill_id:
-                                    logger.info("Skill extracted: '%s' (id=%d)", skill_data["name"], skill_id)
-                                else:
-                                    logger.info("Skill rejected (too broad): '%s'", skill_data["name"])
-
                         logger.info("Correction processed → lesson #%d saved", lesson_id)
                         yield StreamEvent(
                             type=EventType.LESSON_LEARNED,
@@ -3299,89 +3088,10 @@ async def _run_post_processing(
     # (e.g. "I'm Alex from Acme" → stored as truth). The active_memory tool remains
     # available for deliberate, owner-confirmed storage; passive inference is off.
 
-    # --- Reflexion — store failures AND high-quality successes ---
-    if svc.reflexions and intent == "general" and final_content:
-        try:
-            if reflexion_quality is not None:
-                quality, reason = reflexion_quality, reflexion_reason
-            else:
-                from app.core.reflexion import assess_quality
-                quality, reason = assess_quality(final_content, tool_results, config.MAX_TOOL_ROUNDS, query=query)
-            tools_used = [tr["tool"] for tr in tool_results]
-            if quality < config.REFLEXION_FAILURE_THRESHOLD and reason:
-                await asyncio.to_thread(
-                    lambda: svc.reflexions.store(
-                        task_summary=query[:500],
-                        outcome="failure",
-                        reflection=reason,
-                        quality_score=quality,
-                        tools_used=tools_used,
-                        revision_count=len(tool_results),
-                        is_eval=ephemeral,
-                    )
-                )
-            elif quality >= config.REFLEXION_SUCCESS_THRESHOLD and tool_results:
-                await asyncio.to_thread(
-                    lambda: svc.reflexions.store(
-                        task_summary=query[:500],
-                        outcome="success",
-                        reflection=f"Successful approach for '{query[:100]}': {' -> '.join(tools_used)} (quality={quality:.2f})",
-                        quality_score=quality,
-                        tools_used=tools_used,
-                        revision_count=len(tool_results),
-                        is_eval=ephemeral,
-                    )
-                )
-        except Exception as e:
-            logger.warning("Reflexion storage failed: %s", e)
-
-    # --- Auto skill creation (background) ---
-    # Fire for any tool interaction when: 2+ tools used, OR 1 tool + quality >= 0.7
-    # (quality check lets the reflexion system vouch for single-tool responses)
-    _auto_skill_quality = reflexion_quality if reflexion_quality is not None else 0.0
-    _auto_skill_eligible = (
-        config.ENABLE_AUTO_SKILL_CREATION
-        and svc.skills
-        and len(tool_results) >= 1
-        and intent == "general"
-        and (len(tool_results) >= 2 or _auto_skill_quality >= 0.7)
-    )
-    if _auto_skill_eligible:
-        from app.core.auto_skills import maybe_extract_skill
-
-        async def _safe_skill_extract(q, trs, content, skills, qs):
-            try:
-                await maybe_extract_skill(q, trs, content, skills, quality_score=qs)
-            except Exception as e:
-                logger.warning("Auto-skill extraction failed: %s", e)
-        _task = asyncio.create_task(
-            _safe_skill_extract(query, tool_results, final_content, svc.skills, _auto_skill_quality)
-        )
-        _background_tasks.add(_task)
-        _task.add_done_callback(_background_tasks.discard)
-
     # Curiosity mints from chat (gap detection, low-reflexion failures) were
     # cut 2026-09-22: 0 resolved across every such source over the queue's
     # lifetime. Questions come from dossiers and agent failures now
     # (app/core/curiosity.py _CUT_SOURCES).
-
-    # --- Reflexion-to-Action: promote recurring failures to lessons ---
-    if svc.reflexions and svc.learning and intent == "general" and final_content:
-        try:
-            if reflexion_quality is not None and reflexion_quality < 0.6:
-                async def _safe_check_recurring(task_summary, learning):
-                    try:
-                        from app.core.reflexion import check_recurring_failures
-                        await check_recurring_failures(task_summary, learning)
-                    except Exception as e:
-                        logger.warning("Recurring failure check failed: %s", e)
-                _task = asyncio.create_task(
-                    _safe_check_recurring(query[:500], svc.learning)
-                )
-                _background_tasks.add(_task)
-                _task.add_done_callback(_background_tasks.discard)
-        except Exception as e:
-            logger.warning("Reflexion-to-action setup failed: %s", e)
 
     # --- Topic tracking for auto-monitor creation ---
     # `not ephemeral` (2026-08-31): the ONE writer in this post-processing
@@ -3396,9 +3106,6 @@ async def _run_post_processing(
         except Exception as e:
             logger.debug("Topic tracking failed: %s", e)
 
-    # --- Capability gap detection ---
-    if intent == "general" and not is_error:
-        await _detect_capability_gap(svc, query, matched_skill, tool_results, reflexion_quality)
 
 
 # ---------------------------------------------------------------------------
@@ -3807,26 +3514,6 @@ async def think(
                 if stripped_reasons:
                     for r in stripped_reasons:
                         logger.warning("[claim-validator-ephemeral] %s", r)
-                # Skill scoring for EPHEMERAL traffic (2026-08-25): nearly all
-                # skill matches happen on monitor/eval runs, which exit here —
-                # before the non-ephemeral scoring block — so times_used /
-                # success_rate froze while skills matched 50×/day. Record the
-                # structural outcome (no reflexion quality on this path).
-                if ctx.matched_skill:
-                    try:
-                        _eph_ok = not gen.is_error
-                        if ctx.matched_skill.steps:
-                            _eph_ok = _eph_ok and len(gen.tool_results) > 0 and not any(
-                                isinstance(tr.get("output", ""), str)
-                                and tr["output"].startswith("[Tool") and "failed" in tr["output"]
-                                for tr in gen.tool_results
-                            )
-                        await asyncio.to_thread(
-                            svc.skills.record_use, ctx.matched_skill.id, _eph_ok,
-                            hard_failure=not _eph_ok,
-                        )
-                    except Exception as e:
-                        logger.debug("Ephemeral skill scoring failed: %s", e)
                 chunk_size = 20
                 for i in range(0, len(final_content), chunk_size):
                     yield StreamEvent(type=EventType.TOKEN, data={"text": final_content[i:i + chunk_size]})
@@ -3835,7 +3522,6 @@ async def think(
                 data={
                     "conversation_id": conversation_id,
                     "ephemeral": True,
-                    "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
                     "decomposed": False,
                     # What the entailment gate did with the answer, for the
                     # unattended callers (curiosity research) that must not
@@ -3936,38 +3622,6 @@ async def think(
             )
         )
         _timer.mark("save_msg")
-
-        if ctx.matched_skill and svc.skills:
-            # Skill success means the answer was actually GOOD, not merely that
-            # it rendered. The old `not gen.is_error` counted confidently-wrong
-            # output as success, so a skill that fed a bad expression to a tool
-            # and templated the garbage survived indefinitely (e.g. the
-            # calculator_arithmetic skill at 32.9% "success", poisoning
-            # arithmetic). When the quality judge has a verdict, it decides;
-            # the structural checks only act as a hard floor (a real tool/error
-            # failure is never a success regardless of score).
-            structural_ok = not gen.is_error
-            if ctx.matched_skill.steps:
-                structural_ok = structural_ok and len(gen.tool_results) > 0 and not any(
-                    isinstance(tr.get("output", ""), str)
-                    and tr["output"].startswith("[Tool") and "failed" in tr["output"]
-                    for tr in gen.tool_results
-                )
-            if reflexion_quality is not None:
-                skill_success = structural_ok and reflexion_quality >= config.SKILL_SUCCESS_QUALITY
-            else:
-                # No quality verdict (e.g. depth-restricted leaf): fall back to
-                # the structural check alone.
-                skill_success = structural_ok
-            # A quality-only miss (ran fine, answer just wasn't good enough) is a
-            # SOFT failure: it erodes the slow EMA but must not feed the fast
-            # 5-consecutive disable, which stays reserved for structural failures
-            # (so a long-track-record skill isn't fast-killed by a mediocre streak).
-            _hard_failure = not structural_ok
-            await asyncio.to_thread(
-                svc.skills.record_use, ctx.matched_skill.id, skill_success,
-                hard_failure=_hard_failure,
-            )
 
         if is_new_conversation and final_content:
             # Fire-and-forget. Title gen takes 5-30s on a busy Ollama; don't make
@@ -4070,8 +3724,6 @@ async def think(
                 "tool_results_count": len(gen.tool_results),
                 "lessons_used": len(ctx.used_lesson_ids),
                 "kg_facts_used": ctx.kg_facts_count,
-                "reflexions_used": ctx.reflexions_count,
-                "skill_used": ctx.matched_skill.name if ctx.matched_skill else None,
                 "latency_breakdown": _summary,
             },
         )
@@ -4079,7 +3731,7 @@ async def think(
         # --- Step 13: Post-processing ---
         async for event in _run_post_processing(
             svc, query, final_content, intent, conversation_id,
-            gen.tool_results, ctx.matched_skill, ctx.used_lesson_ids,
+            gen.tool_results, ctx.used_lesson_ids,
             gen.is_error, reflexion_quality, reflexion_reason,
             had_kg=bool(ctx.kg_facts_text),
             had_docs=bool(ctx.retrieved_context),
@@ -4099,17 +3751,6 @@ async def think(
                         await asyncio.to_thread(svc.learning.mark_lesson_unhelpful, lid)
                 except Exception as e:
                     logger.warning("Lesson feedback update failed for id=%s: %s", lid, e)
-
-        # --- Step 14b: Record post-quality for injected success patterns (A/B closure) ---
-        if ctx.success_pattern_ids and reflexion_quality is not None and svc.reflexions:
-            try:
-                await asyncio.to_thread(
-                    svc.reflexions.record_post_quality_for_injected,
-                    ctx.success_pattern_ids,
-                    reflexion_quality,
-                )
-            except Exception as e:
-                logger.debug("Success pattern A/B record failed: %s", e)
 
     finally:
         _curiosity_mod.reset_suppress_organic_minting(_curiosity_token)

@@ -31,7 +31,6 @@ from app.core.learning import LearningEngine
 from app.core.llm import close_client, create_provider, set_provider
 from app.core.memory import ConversationStore, UserFactStore
 from app.core.retriever import Retriever
-from app.core.skills import SkillStore
 from app.database import get_db
 from app.tools.base import ToolRegistry
 from app.tools.calculator import CalculatorTool
@@ -143,28 +142,12 @@ async def lifespan(app: FastAPI):
     conversations = ConversationStore(db)
     user_facts = UserFactStore(db)
     learning = LearningEngine(db)
-    skills = SkillStore(db)
-    try:
-        _disabled = skills.revalidate_enabled_skills()
-        if _disabled:
-            logger.info("Disabled %d stored skill(s) failing current guards", _disabled)
-    except Exception as _e:
-        logger.warning("Skill revalidation skipped: %s", _e)
-    try:
-        skills.sync_embeddings()
-    except Exception as _e:
-        logger.warning("Skill embedding sync failed (ChromaDB may be unavailable): %s", _e)
-
-    # Knowledge graph + reflexion store. to_thread: their first construction
+    # Knowledge graph. to_thread: its first construction
     # runs schema DDL (write lock) — keep it off the event-loop thread
     # (audit 2026-08-23; later constructions skip DDL via the SafeDB memo).
     from app.core.kg import KnowledgeGraph
     kg = await asyncio.to_thread(KnowledgeGraph, db)
     logger.info("Knowledge graph initialized")
-
-    from app.core.reflexion import ReflexionStore
-    reflexions = await asyncio.to_thread(ReflexionStore, db)
-    logger.info("Reflexion store initialized")
 
     # KG auto-curation: the heuristic pass runs inline (deterministic, fast).
     # The LLM pass used to start here as a background task on the chat model
@@ -173,7 +156,7 @@ async def lifespan(app: FastAPI):
     # cold-loaded for 4m09s, and eight digests waited behind it. Nothing
     # outside the heartbeat tick may hold the card, so the LLM pass now runs
     # inside the KG Health Monitor under the class gate (health_checks.py).
-    # Note: KG/reflexion decay is handled by the daily maintenance monitor
+    # Note: KG decay is handled by the daily maintenance monitor
     kg_curation_task = None
     try:
         curation = await kg.curate(sample_size=0)  # heuristic only — fast
@@ -274,30 +257,17 @@ async def lifespan(app: FastAPI):
         topic_tracker = await asyncio.to_thread(TopicTracker, db)
         logger.info("Curiosity engine initialized")
 
-    # External skills loader (AgentSkills format)
-    external_skills = None
-    try:
-        from app.core.skill_loader import load_skills
-        external_skills = load_skills()
-        if external_skills:
-            logger.info("Loaded %d external skill(s)", len(external_skills))
-    except Exception as e:
-        logger.warning("External skill loading failed: %s", e)
-
     # Assemble services
     svc = Services(
         conversations=conversations,
         user_facts=user_facts,
         retriever=retriever,
         learning=learning,
-        skills=skills,
         tool_registry=registry,
         kg=kg,
-        reflexions=reflexions,
         monitor_store=monitor_store,
         curiosity=curiosity_queue,
         topic_tracker=topic_tracker,
-        external_skills=external_skills,
     )
     set_services(svc)
 
@@ -339,14 +309,6 @@ async def lifespan(app: FastAPI):
             logger.info("Reindexed %d lessons into ChromaDB", reindexed)
     except Exception as e:
         logger.warning("Lesson reindex failed: %s", e)
-
-    # Reindex reflexions into ChromaDB (one-time migration)
-    try:
-        reindexed_r = reflexions.reindex_reflexions()
-        if reindexed_r:
-            logger.info("Reindexed %d reflexions into ChromaDB", reindexed_r)
-    except Exception as e:
-        logger.warning("Reflexion reindex failed: %s", e)
 
     # Reindex KG facts into ChromaDB for semantic search
     try:

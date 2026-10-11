@@ -7,9 +7,8 @@ Post num_ctx-fix rules:
   answer within the budget. Only an AFTER-leg timeout makes a pair untestable.
   (The old both-legs rule dated from when num_ctx truncation cut the tool
   block and made before-legs unrealistically fast.)
-- Seeded state (lessons / KG facts / "Eval: *" skills) must never outlive a
-  run — including a run cancelled by a client disconnect. Orphaned eval skills
-  hijack real queries via semantic skill matching (observed live 2026-07-07).
+- Seeded state (lessons / KG facts) must never outlive a run — including a
+  run cancelled by a client disconnect.
 """
 
 from __future__ import annotations
@@ -24,8 +23,7 @@ from app.monitors.eval_harness import EvalHarness, EvalTask, TaskResult, _Invoca
 
 def _inv(text: str, timed_out: bool = False) -> _Invocation:
     return _Invocation(
-        response_text=text, tools_invoked=[], skill_used=None,
-        decomposed=False, max_decomposition_depth=0,
+        response_text=text, tools_invoked=[],         decomposed=False, max_decomposition_depth=0,
         reflexion_score=0.8 if text else None,
         latency_seconds=180.0 if timed_out else 0.01,
         error="Timeout after 180s" if timed_out else None,
@@ -156,41 +154,4 @@ class TestSeededStateNeverOutlivesRun:
         # pre-clean + finally-clean both ran
         assert kg.delete_fact.await_count == 2
 
-    @pytest.mark.asyncio
-    async def test_run_all_cleans_seeded_skills_on_success(self):
-        skills = MagicMock()
-        skills._db.fetchall.return_value = [{"id": 7}, {"id": 8}]
-        harness = EvalHarness()
-        task = EvalTask(id="r1", category="reasoning", query="2+2?",
-                        assertions=[{"type": "answer_contains", "value": "4"}])
-        ok = TaskResult(
-            task_id="r1", category="reasoning", query="2+2?", passed=True,
-            response_text="4", tools_invoked=[], skill_used=None,
-            reflexion_score=0.8, latency_seconds=0.1, failed_assertions=[],
-        )
-        with patch("app.core.brain.get_services", return_value=_svc(skills=skills)):
-            with patch.object(EvalHarness, "_seed_skills"), \
-                 patch.object(EvalHarness, "_seed_documents", new=AsyncMock()), \
-                 patch.object(EvalHarness, "run_task", new=AsyncMock(return_value=ok)):
-                await harness.run_all([task])
-        skills.delete_skill.assert_any_call(7)
-        skills.delete_skill.assert_any_call(8)
-        sql = skills._db.fetchall.call_args[0][0]
-        assert "LIKE 'Eval:%'" in sql
 
-    @pytest.mark.asyncio
-    async def test_run_all_cleans_seeded_skills_on_cancellation(self):
-        """Client disconnect (task cancellation) must not orphan 'Eval: *' skills."""
-        skills = MagicMock()
-        skills._db.fetchall.return_value = [{"id": 9}]
-        harness = EvalHarness()
-        task = EvalTask(id="r1", category="reasoning", query="2+2?",
-                        assertions=[{"type": "answer_contains", "value": "4"}])
-        with patch("app.core.brain.get_services", return_value=_svc(skills=skills)):
-            with patch.object(EvalHarness, "_seed_skills"), \
-                 patch.object(EvalHarness, "_seed_documents", new=AsyncMock()), \
-                 patch.object(EvalHarness, "run_task",
-                              new=AsyncMock(side_effect=asyncio.CancelledError())):
-                with pytest.raises(asyncio.CancelledError):
-                    await harness.run_all([task])
-        skills.delete_skill.assert_any_call(9)

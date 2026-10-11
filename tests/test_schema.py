@@ -137,40 +137,6 @@ class TestLessonInfo:
         assert lesson.lesson_text is None
 
 
-class TestSkillInfo:
-    """Test SkillInfo model."""
-
-    def test_skill_info_with_all_fields(self):
-        from app.schema import SkillInfo
-        skill = SkillInfo(
-            id=1,
-            name="weather_check",
-            trigger_pattern="weather in (.*)",
-            steps=[{"action": "search", "query": "{city} weather"}],
-            answer_template="The weather in {city} is {result}.",
-            times_used=10,
-            success_rate=0.95,
-            enabled=True,
-            created_at="2026-03-19T10:00:00",
-        )
-        assert skill.answer_template == "The weather in {city} is {result}."
-        assert skill.created_at == "2026-03-19T10:00:00"
-
-    def test_skill_info_optional_fields(self):
-        from app.schema import SkillInfo
-        skill = SkillInfo(
-            id=2,
-            name="basic_skill",
-            trigger_pattern="do something",
-            steps=[],
-            times_used=0,
-            success_rate=1.0,
-            enabled=True,
-        )
-        assert skill.answer_template is None
-        assert skill.created_at is None
-
-
 class TestStreamEvent:
     """Test StreamEvent.to_sse() produces valid SSE format."""
 

@@ -45,22 +45,18 @@ def _stub_substeps(consolidator, *, nrem_counts: dict | None = None, rem_counts:
             setattr(result, field, getattr(result, field) + by)
         return _inner
 
-    # NREM substeps — _mine_dpo_pairs needs (signals, result) only; others same
+    # NREM substeps
     for name, field, by in [
-        ("_prune_reflexions", "reflexions_pruned", nrem_counts.get("_prune_reflexions", 1)),
         ("_compact_kg_chains", "kg_chains_compacted", nrem_counts.get("_compact_kg_chains", 1)),
-        ("_disable_weak_skills", "skills_disabled", nrem_counts.get("_disable_weak_skills", 1)),
         ("_handle_failed_curiosity", "curiosity_dismissed", nrem_counts.get("_handle_failed_curiosity", 1)),
         ("_refresh_stale_facts", "facts_refreshed", nrem_counts.get("_refresh_stale_facts", 1)),
-        ("_mine_dpo_pairs", "dpo_pairs_generated", nrem_counts.get("_mine_dpo_pairs", 1)),
     ]:
         m = AsyncMock(side_effect=_bumper(field, by))
         setattr(consolidator, name, m)
         mocks[name] = m
 
-    # REM substeps — _promote_reflexions and _resolve_contradictions take svc
+    # REM substeps — _resolve_contradictions takes svc
     for name, field, by in [
-        ("_promote_reflexions", "reflexions_promoted", rem_counts.get("_promote_reflexions", 1)),
         ("_resolve_contradictions", "contradictions_resolved", rem_counts.get("_resolve_contradictions", 1)),
     ]:
         async def _rem_inner(signals, result, svc, _f=field, _b=by):
@@ -92,12 +88,10 @@ class TestPhaseRouting:
         await c.consolidate_nrem(GatherSignals(), result, svc=MagicMock())
 
         nrem_steps = [
-            "_prune_reflexions", "_compact_kg_chains", "_disable_weak_skills",
-            "_handle_failed_curiosity", "_refresh_stale_facts", "_mine_dpo_pairs",
+            "_compact_kg_chains", "_handle_failed_curiosity", "_refresh_stale_facts",
         ]
         rem_steps = [
-            "_promote_reflexions", "_resolve_contradictions",
-            "_consolidate_procedural_memory",
+            "_resolve_contradictions", "_consolidate_procedural_memory",
         ]
         for s in nrem_steps:
             assert mocks[s].call_count == 1, f"NREM missed {s}"
@@ -114,12 +108,10 @@ class TestPhaseRouting:
         await c.consolidate_rem(GatherSignals(), result, svc=MagicMock())
 
         nrem_steps = [
-            "_prune_reflexions", "_compact_kg_chains", "_disable_weak_skills",
-            "_handle_failed_curiosity", "_refresh_stale_facts", "_mine_dpo_pairs",
+            "_compact_kg_chains", "_handle_failed_curiosity", "_refresh_stale_facts",
         ]
         rem_steps = [
-            "_promote_reflexions", "_resolve_contradictions",
-            "_consolidate_procedural_memory",
+            "_resolve_contradictions", "_consolidate_procedural_memory",
         ]
         for s in rem_steps:
             assert mocks[s].call_count == 1, f"REM missed {s}"
@@ -139,7 +131,6 @@ class TestPhaseRouting:
         await c.consolidate_rem(GatherSignals(), result, svc=MagicMock())
         assert mocks["_consolidate_procedural_memory"].call_count == 0
         # Other REM substeps still run
-        assert mocks["_promote_reflexions"].call_count == 1
         assert mocks["_resolve_contradictions"].call_count == 1
 
 

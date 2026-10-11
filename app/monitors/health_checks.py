@@ -162,8 +162,7 @@ class HealthChecksMixin:
         db = get_db()
 
         def _count_tables() -> None:
-            for table in ("conversations", "messages", "lessons", "reflexions",
-                          "skills", "kg_facts", "monitors"):
+            for table in ("conversations", "messages", "lessons", "kg_facts", "monitors"):
                 try:
                     row = db.fetchone(f"SELECT count(*) as c FROM {table}")
                     fields[table] = row["c"]
@@ -303,52 +302,6 @@ class HealthChecksMixin:
         except Exception as e:
             return format_monitor_result(
                 "Ollama Latency Monitor", "error", f"ollama error: {e}",
-            )
-
-    async def _execute_skill_quality_check(self) -> str:
-        """Check skill corpus quality: success rates, disabled skills, dedup guard rate."""
-        from app.core.brain import get_services
-
-        svc = get_services()
-        if not svc.skills:
-            return format_monitor_result(
-                "Skill Quality Monitor", "error", "skill store unavailable",
-            )
-
-        try:
-            db = svc.skills._db
-
-            def _skill_stats() -> tuple[int, int, float, int]:
-                t = db.fetchone("SELECT count(*) as c FROM skills")["c"]
-                en = db.fetchone("SELECT count(*) as c FROM skills WHERE enabled = 1")["c"]
-                avg_row = db.fetchone("SELECT avg(success_rate) as avg_sr FROM skills WHERE enabled = 1")
-                avg = avg_row["avg_sr"] if avg_row and avg_row["avg_sr"] is not None else 0.0
-                deg = db.fetchone(
-                    "SELECT count(*) as c FROM skills WHERE enabled = 1 AND success_rate < 0.5 AND times_used >= 3"
-                )["c"]
-                return t, en, avg, deg
-
-            total, enabled, avg_sr, degrading = await asyncio.to_thread(_skill_stats)
-            disabled = total - enabled
-            if degrading > 5 or avg_sr < 0.4:
-                status = "warning"
-                summary = f"{degrading} degrading, avg {avg_sr:.2f}"
-            else:
-                status = "info"
-                summary = f"{enabled}/{total} skills healthy"
-            return format_monitor_result(
-                "Skill Quality Monitor", status, summary,
-                {
-                    "total": total,
-                    "enabled": enabled,
-                    "disabled": disabled,
-                    "avg_sr": f"{avg_sr:.2f}",
-                    "degrading": degrading,
-                },
-            )
-        except Exception as e:
-            return format_monitor_result(
-                "Skill Quality Monitor", "error", f"skill quality error: {e}",
             )
 
     async def _execute_chromadb_integrity_check(self) -> str:

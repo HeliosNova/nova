@@ -63,32 +63,6 @@ class TestWebSearchTimeoutIsWired:
         assert native_search.DEFAULT_TIMEOUT > native_search.SEARCH_TIMEOUT
 
 
-class TestSkillEmbedUsesUpsert:
-    """_embed_skill did delete-then-add, so every NEW skill issued a delete for
-    an id that was never indexed. Chroma records the no-op delete in its log and
-    REPLAYS it on every PersistentClient open, emitting bursts of
-    "Delete of nonexisting embedding ID: skill_N" for long-dead ids (observed
-    skill_2..skill_45 on a store whose live ids are 68-99)."""
-
-    def test_embed_skill_has_no_blind_delete(self):
-        src = (APP / "core" / "skills.py").read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        fn = next(
-            (n for n in ast.walk(tree)
-             if isinstance(n, ast.FunctionDef) and n.name == "_embed_skill"),
-            None,
-        )
-        assert fn is not None, "_embed_skill disappeared"
-        body = ast.unparse(fn)
-        assert "collection.upsert(" in body, (
-            "_embed_skill must upsert; delete-then-add pollutes the chroma log"
-        )
-        assert "collection.delete(" not in body, (
-            "the unconditional delete is what logged a no-op for every new "
-            "skill — upsert already handles the replace case"
-        )
-
-
 class TestDeadCitationGateStaysDeleted:
     """_domain_study_passes_citation_gate demanded >=2 'Source:' citations.
 

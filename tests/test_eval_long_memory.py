@@ -32,7 +32,7 @@ def _task(**kw):
 
 
 def _inv(text):
-    return eh._Invocation(response_text=text, tools_invoked=[], skill_used=None, decomposed=False,
+    return eh._Invocation(response_text=text, tools_invoked=[], decomposed=False,
                           max_decomposition_depth=0, reflexion_score=None, latency_seconds=0.1,
                           error=None, timed_out=False)
 

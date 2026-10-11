@@ -337,48 +337,6 @@ class TestAnchoredDueFloor:
 
 # ── F10: NREM reflexion prune cleans chroma ─────────────────────────────────
 
-class TestDreamPruneVectors:
-    @pytest.mark.asyncio
-    async def test_prune_removes_vectors_too(self, db, monkeypatch):
-        from app.core.dream import (ConsolidationResult, DreamConsolidator,
-                                    GatherSignals)
-        from app.core.reflexion import ReflexionStore
-        from app.database import AsyncSafeDB
-        ids = []
-        for i in range(3):
-            cur = db.execute(
-                "INSERT INTO reflexions (task_summary, outcome, reflection, "
-                "quality_score) VALUES (?,?,?,?)",
-                (f"junk task {i}", "failure", "low quality", 0.1))
-            ids.append(cur.lastrowid)
-        removed: list[int] = []
-        monkeypatch.setattr(ReflexionStore, "_remove_from_vector",
-                            lambda self, rids: removed.extend(rids))
-        dc = DreamConsolidator(AsyncSafeDB(db))
-        signals = GatherSignals(low_quality_reflexions=[{"id": i} for i in ids])
-        result = ConsolidationResult()
-        await dc._prune_reflexions(signals, result)
-        assert result.reflexions_pruned == 3
-        assert sorted(removed) == sorted(ids), \
-            "SQL rows deleted but chroma vectors left as ghosts"
-        assert db.fetchone("SELECT COUNT(*) c FROM reflexions")["c"] == 0
-
-    @pytest.mark.asyncio
-    async def test_empty_prune_is_noop(self, db, monkeypatch):
-        from app.core.dream import (ConsolidationResult, DreamConsolidator,
-                                    GatherSignals)
-        from app.core.reflexion import ReflexionStore
-        from app.database import AsyncSafeDB
-        called: list[int] = []
-        monkeypatch.setattr(ReflexionStore, "_remove_from_vector",
-                            lambda self, rids: called.extend(rids))
-        await DreamConsolidator(AsyncSafeDB(db))._prune_reflexions(
-            GatherSignals(), ConsolidationResult())
-        assert called == []
-
-
-# ── F11: active_memory ephemeral gates ──────────────────────────────────────
-
 class TestActiveMemoryEphemeralGate:
     def _tool(self, db, monkeypatch):
         from app.tools.active_memory import ActiveMemoryTool

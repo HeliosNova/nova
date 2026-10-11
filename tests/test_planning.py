@@ -148,28 +148,6 @@ class TestCreatePlan:
 
         assert plan is None
 
-    @pytest.mark.asyncio
-    async def test_reflexions_injected(self):
-        mock_response = json.dumps({
-            "steps": [{"description": "use web_search", "tool": "web_search"}],
-            "complexity": "simple",
-        })
-        captured_messages = []
-
-        async def capture(msgs, **kwargs):
-            captured_messages.extend(msgs)
-            return mock_response
-
-        with patch("app.core.planning.llm") as mock_llm:
-            mock_llm.invoke_nothink = AsyncMock(side_effect=capture)
-            await create_plan(
-                "bitcoin price",
-                ["web_search"],
-                reflexions_text="Previously failed with knowledge_search",
-            )
-
-        system_msg = captured_messages[0]["content"]
-        assert "Previously failed" in system_msg
 
 
 # ===========================================================================

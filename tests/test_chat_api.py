@@ -377,7 +377,7 @@ class TestChatSyncResponseFields:
         assert data["sources"][0]["url"] == "https://example.com"
 
     def test_metadata_counts_in_response(self, client):
-        """lessons_used, kg_facts_used, reflexions_used, skill_used all forwarded."""
+        """lessons_used and kg_facts_used are forwarded."""
         with patch("app.api.chat.think") as mock_think:
             mock_think.return_value = _mock_think_rich("answer", "conv-meta")
             resp = client.post("/api/chat", json={"query": "query"})
@@ -385,8 +385,6 @@ class TestChatSyncResponseFields:
         data = resp.json()
         assert data["lessons_used"] == 2
         assert data["kg_facts_used"] == 3
-        assert data["reflexions_used"] == 1
-        assert data["skill_used"] == "my_skill"
 
     def test_defaults_when_think_yields_no_metadata(self, client):
         """When DONE event omits optional fields, defaults are zero/None."""
@@ -397,8 +395,6 @@ class TestChatSyncResponseFields:
         data = resp.json()
         assert data["lessons_used"] == 0
         assert data["kg_facts_used"] == 0
-        assert data["reflexions_used"] == 0
-        assert data["skill_used"] is None
         assert data["tool_results"] == []
         assert data["sources"] == []
 

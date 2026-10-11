@@ -36,8 +36,6 @@ class ChatResponse(BaseModel):
     tool_results: list[dict] = Field(default_factory=list)
     lessons_used: int = 0
     kg_facts_used: int = 0
-    reflexions_used: int = 0
-    skill_used: str | None = None
     # Per-stage wall-clock ("total=Xs | context=.. generation=.. refine=..").
     # Surfaced so latency is queryable from the API, not only the logs.
     latency_breakdown: str | None = None
@@ -130,7 +128,6 @@ class IngestRequest(BaseModel):
 
 class LearningMetrics(BaseModel):
     total_lessons: int = 0
-    total_skills: int = 0
     total_corrections: int = 0
     training_examples: int = 0
     last_correction_date: str | None = None
@@ -148,18 +145,6 @@ class LessonInfo(BaseModel):
     created_at: str
 
 
-class SkillInfo(BaseModel):
-    id: int
-    name: str
-    trigger_pattern: str
-    steps: list[dict]
-    answer_template: str | None = None
-    times_used: int
-    success_rate: float
-    enabled: bool
-    created_at: str | None = None
-
-
 # ---------------------------------------------------------------------------
 # System
 # ---------------------------------------------------------------------------
@@ -174,11 +159,9 @@ class StatusResponse(BaseModel):
     messages: int = 0
     user_facts: int = 0
     lessons: int = 0
-    skills: int = 0
     documents: int = 0
     training_examples: int = 0
     kg_facts: int = 0
-    reflexions: int = 0
     # One entry per background pathway (app/monitors/pathways.py):
     # name, verdict (alive/dead/idle/off/warming), last_at, age_hours, window_hours.
     pathways: list[dict] = Field(default_factory=list)

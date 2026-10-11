@@ -188,7 +188,7 @@ def test_researcher():
         r = chat("Run this Python code and tell me the result: print(sum(range(1, 101)))")
         answer = r.get("answer", "")
         tools = r.get("tool_results", [])
-        used_code = any(t.get("tool") == "code_exec" for t in tools)
+        used_code = False  # code_exec removed 2026-10-10
         has_5050 = "5050" in answer
         report("Code execution triggered",
                used_code,
@@ -292,7 +292,7 @@ def test_developer():
         )
         answer = r.get("answer", "")
         tools = r.get("tool_results", [])
-        used_code = any(t.get("tool") == "code_exec" for t in tools)
+        used_code = False  # code_exec removed 2026-10-10
         # Check for fibonacci numbers
         has_fib = all(str(n) in answer for n in [1, 1, 2, 3, 5, 8, 13, 21])
         report("Complex code execution works",
@@ -313,7 +313,7 @@ def test_developer():
         tools = r.get("tool_results", [])
         tool_names = [t.get("tool") for t in tools]
         used_search = "web_search" in tool_names
-        used_calc_or_code = "calculator" in tool_names or "code_exec" in tool_names
+        used_calc_or_code = "calculator" in tool_names
         multi_tool = len(tools) >= 2
         report("Multi-tool chain uses search",
                used_search,

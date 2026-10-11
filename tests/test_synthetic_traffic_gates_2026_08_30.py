@@ -39,55 +39,11 @@ def reset_ephemeral():
     EPHEMERAL_REQUEST.reset(token)
 
 
-class TestReflexionInjectionScoping:
-    def _seed(self, db):
-        from app.core.reflexion import ReflexionStore
-        store = ReflexionStore(db=db)
-        store.store(task_summary="lookup the Vorenza headquarters location",
-                    outcome="failure", reflection="fictional eval probe",
-                    quality_score=0.2, tools_used="web_search",
-                    is_eval=True)
-        store.store(task_summary="lookup the Anthropic headquarters location",
-                    outcome="failure", reflection="real failure",
-                    quality_score=0.3, tools_used="web_search",
-                    is_eval=False)
-        return store
-
-    def test_real_chat_excludes_eval_failures(self, db):
-        store = self._seed(db)
-        got = store.get_relevant("lookup the headquarters location", limit=5)
-        summaries = [r.task_summary for r in got]
-        assert any("Anthropic" in s for s in summaries), \
-            "the real failure must still inject"
-        assert not any("Vorenza" in s for s in summaries), (
-            "real chat injected a fictional eval probe as a 'past failure' — "
-            "the 88%-synthetic-pool leak"
-        )
-
-    def test_ephemeral_still_sees_eval_rows(self, db):
-        """The eval harness's memory-learning tasks seed failures and MUST
-        retrieve them — that is why is_eval rows are retrievable at all.
-        Scoping must not break the harness."""
-        store = self._seed(db)
-        EPHEMERAL_REQUEST.set(True)
-        got = store.get_relevant("lookup the headquarters location", limit=5)
-        assert any("Vorenza" in r.task_summary for r in got), \
-            "ephemeral (eval) requests must keep seeing seeded eval rows"
-
-
 class TestGatePresenceAtRemainingSites:
     """brain's no-skill gap writer runs deep in
     machinery a unit test can't cheaply drive; assert the wiring exists so a
     refactor can't silently drop it."""
 
-    def test_brain_capability_gap_is_gated(self):
-        src = (REPO / "app" / "core" / "brain.py").read_text(encoding="utf-8")
-        i = src.index("INSERT INTO capability_gaps")
-        guard = src.rindex("EPHEMERAL_REQUEST.get()", 0, i)
-        assert i - guard < 900, (
-            "brain's no-skill capability-gap writer must check the ephemeral "
-            "flag before inserting"
-        )
 
 
 class TestTrustRecordingScoped:

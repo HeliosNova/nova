@@ -56,7 +56,6 @@ def _test_env(tmp_path, monkeypatch):
     # default-config tests are deterministic regardless of the runtime env (the
     # container bakes these true; tests assert the code defaults).
     monkeypatch.setenv("ENABLE_TWO_PHASE_DREAM", "false")
-    monkeypatch.setenv("ENABLE_SEMANTIC_SKILL_MATCHING", "false")  # opt-in per test
     monkeypatch.setenv("ENABLE_AUTONOMOUS_TOOL_CREATION", "false")  # opt-in per test
     # (multi-agent decomposition env vars removed 2026-08-25 — archived)
     monkeypatch.setenv("ENABLE_PROMPT_SELF_MOD", "false")
@@ -72,12 +71,7 @@ def _test_env(tmp_path, monkeypatch):
     monkeypatch.setenv("TEMPERATURE_DEFAULT", "0.7")
     monkeypatch.setenv("MIN_RRF_SCORE", "0.015")
     monkeypatch.setenv("DEDUP_JACCARD_THRESHOLD", "0.85")
-    monkeypatch.setenv("REFLEXION_DECAY_DAYS", "90")
-    monkeypatch.setenv("REFLEXION_DECAY_AMOUNT", "0.05")
-    monkeypatch.setenv("SKILL_EMA_ALPHA", "0.15")
     monkeypatch.setenv("INJECTION_SUSPICIOUS_THRESHOLD", "0.3")
-    monkeypatch.setenv("REFLEXION_FAILURE_THRESHOLD", "0.6")
-    monkeypatch.setenv("REFLEXION_SUCCESS_THRESHOLD", "0.8")
     monkeypatch.setenv("KG_GRAPH_MAX_FRONTIER", "1000")
     monkeypatch.setenv("AUTH_MAX_TRACKED_IPS", "10000")
 

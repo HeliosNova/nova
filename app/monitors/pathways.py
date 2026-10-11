@@ -143,10 +143,6 @@ PATHWAYS: tuple[Pathway, ...] = (
             describe="a chat turn was stored"),
     Pathway("lessons", 168, "lessons", "created_at", usage_gated=True,
             describe="a correction became a lesson"),
-    Pathway("reflexions", 168, "reflexions", "created_at", usage_gated=True,
-            describe="a response was critiqued"),
-    Pathway("skills", 168, "skills", "created_at", usage_gated=True,
-            describe="a skill was induced"),
     Pathway("tool_actions", 168, "action_log", "created_at", usage_gated=True,
             describe="a tool call was logged"),
 )
@@ -155,12 +151,6 @@ PATHWAYS: tuple[Pathway, ...] = (
 # after 24 of 40 timestamped tables were found unwatched and most of them
 # rightly so):
 #
-#   capability_gaps    Written only when a query matches no skill, uses no
-#                      tools AND scores under 0.5 — a narrow conjunction that is
-#                      SUPPOSED to be rare, and the table has never held a row.
-#                      A liveness probe cannot tell "the writer died" from "the
-#                      condition was never met", so it would read dead forever.
-#                      That is exactly the mistake trust_ledger made.
 #   pending_deliveries An empty table is the HEALTHY state — it is a journal
 #                      that drains. A pathway here would be inverted.
 #   trust_scores       Retired from the database 2026-09-01 on purpose; the

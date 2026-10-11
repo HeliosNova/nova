@@ -31,7 +31,7 @@ _NUMBER_RE = re.compile(r"[\$€£¥]?\s*(-?\d[\d,]*\.?\d*)\s*(%|[KMBTkmbt](?![a
 class Monitor:
     id: int
     name: str
-    check_type: str          # 'url', 'search', 'command', 'system_health', 'query', 'quiz', 'skill_test', 'curiosity', 'auto_monitor', 'maintenance', 'finetune', 'consolidation', 'dream_consolidation'
+    check_type: str          # 'url', 'search', 'command', 'system_health', 'query', 'curiosity', 'auto_monitor', 'maintenance', 'finetune', 'consolidation', 'dream_consolidation'
     check_config: dict       # JSON parsed: {url, query, command, threshold_pct}
     schedule_seconds: int
     enabled: bool
@@ -59,14 +59,12 @@ class Monitor:
 _SYSTEM_CATEGORY_NAMES: frozenset[str] = frozenset({
     "DB Size Monitor",
     "Ollama Latency Monitor",
-    "Skill Quality Monitor",
     "ChromaDB Integrity",
     "KG Health Monitor",
     "Dream Consolidation",
     "Quality Eval Harness",
     "System Health",
     "System Maintenance",
-    "Lesson Quiz",
     "Auto-Monitor Detector",
     "KG Growth Rate",
     "Ollama Model Loaded",
@@ -80,7 +78,6 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "system_health",
     "db_size",
     "ollama_latency",
-    "skill_quality",
     "chromadb_integrity",
     "kg_health",
     "digest_health",
@@ -90,7 +87,6 @@ _SYSTEM_CATEGORY_CHECK_TYPES: frozenset[str] = frozenset({
     "consolidation",
     "dream_consolidation",
     "eval",
-    "quiz",
     "auto_monitor",
     "kg_growth",
     "ollama_model",
@@ -513,7 +509,6 @@ class MonitorStore:
         "DB Size Monitor",
         "Source Health Monitor",
         "Ollama Latency Monitor",
-        "Skill Quality Monitor",
         "ChromaDB Integrity",
         "KG Health Monitor",
         "System Health",
@@ -537,14 +532,6 @@ class MonitorStore:
         # Background loops
         "System Maintenance",
         # Phase-0 ambient restoration (low-cost, broad-signal, proven-stable).
-        # Four are internal-state-only (no network). The fifth is a single
-        # cheap web_search against a curated high-signal source. Collectively
-        # they exercise learning, validate skills, propose new monitors, pulse
-        # training readiness, and give ambient "what's happening" awareness.
-        # See _migrate_existing_monitors V4 for the one-shot re-enable on
-        # existing DBs where these were previously culled.
-        "Lesson Quiz",
-        # "Skill Validation" retired 2026-09-01 (self-certifying / no inputs) — stays in the catalog, disabled
         "Auto-Monitor Detector",
         # ("Fine-Tune Check" removed from core 2026-08-25 — the trainer is
         # archived; the seed stays in the catalog, disabled.)
@@ -680,14 +667,6 @@ class MonitorStore:
                 "notify_condition": "always",
             },
             {
-                "name": "Lesson Quiz",
-                "check_type": "quiz",
-                "check_config": {},
-                "schedule_seconds": 21600,  # 6h
-                "cooldown_minutes": 300,
-                "notify_condition": "on_change",
-            },
-            {
                 "name": "Curiosity Research",
                 "check_type": "curiosity",
                 "check_config": {},
@@ -772,8 +751,6 @@ class MonitorStore:
              "check_config": {}},
             {"name": "Ollama Latency Monitor", "check_type": "ollama_latency", "schedule_seconds": 7200, "cooldown_minutes": 120, "notify_condition": "on_change",
              "check_config": {"threshold_pct": 50}},
-            {"name": "Skill Quality Monitor", "check_type": "skill_quality", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
-             "check_config": {"threshold_pct": 10}},
             {"name": "ChromaDB Integrity", "check_type": "chromadb_integrity", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
              "check_config": {"threshold_pct": 10}},
             {"name": "KG Health Monitor", "check_type": "kg_health", "schedule_seconds": 43200, "cooldown_minutes": 660, "notify_condition": "on_change",
@@ -1003,13 +980,6 @@ class MonitorStore:
             logger.info("[MonitorStore] Fixed System Health check_type: %s -> system_health",
                         health.check_type)
 
-        # Migrate quiz/skill monitors from "always" to "on_change"
-        for name in ("Lesson Quiz", "Skill Validation"):
-            monitor = self.get_by_name(name)
-            if monitor and monitor.notify_condition == "always":
-                self.update(monitor.id, notify_condition="on_change")
-                logger.info("[MonitorStore] Migrated '%s' notify_condition: always -> on_change", name)
-
         # Migrate auto-monitors from search → query type
         for m in self.list_all():
             if m.name.startswith("Auto:") and m.check_type == "search":
@@ -1038,8 +1008,6 @@ class MonitorStore:
         # migration will not flip them back on subsequent startups.
         if current_version < 4:
             _phase_0_restore = (
-                "Lesson Quiz",
-                # "Skill Validation" retired 2026-09-01 (self-certifying test)
                 "Auto-Monitor Detector",
                 "Fine-Tune Check",
                 "Hacker News Top Stories",

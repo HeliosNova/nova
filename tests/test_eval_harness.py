@@ -44,8 +44,7 @@ def _make_result(
     latency=1.0,
     reflexion_score=0.8,
     tools_invoked=None,
-    skill_used=None,
-    response_text="The answer is 42.",
+        response_text="The answer is 42.",
     failed_assertions=None,
     timed_out=False,
     expect_tools=None,
@@ -57,7 +56,6 @@ def _make_result(
         passed=passed,
         response_text=response_text,
         tools_invoked=tools_invoked or [],
-        skill_used=skill_used,
         expect_tools=expect_tools or [],
         reflexion_score=reflexion_score,
         latency_seconds=latency,
@@ -170,75 +168,60 @@ class TestCheckAssertion:
     def test_tool_invoked_passes(self):
         assert check_assertion(
             {"type": "tool_invoked", "value": "calculator"},
-            "", ["calculator", "web_search"], None, None,
+            "", ["calculator", "web_search"], None,
         )
 
     def test_tool_invoked_fails(self):
         assert not check_assertion(
             {"type": "tool_invoked", "value": "calculator"},
-            "", ["web_search"], None, None,
+            "", ["web_search"], None,
         )
 
     def test_no_tool_invoked_passes(self):
-        assert check_assertion({"type": "no_tool_invoked"}, "", [], None, None)
+        assert check_assertion({"type": "no_tool_invoked"}, "", [], None)
 
     def test_no_tool_invoked_fails(self):
-        assert not check_assertion({"type": "no_tool_invoked"}, "", ["calculator"], None, None)
+        assert not check_assertion({"type": "no_tool_invoked"}, "", ["calculator"], None)
 
-    def test_skill_matched_passes(self):
-        assert check_assertion(
-            {"type": "skill_matched"}, "", [], "Eval: Crypto Price Probe", None
-        )
 
-    def test_skill_matched_fails_when_none(self):
-        assert not check_assertion({"type": "skill_matched"}, "", [], None, None)
 
-    def test_skill_name_matches(self):
-        assert check_assertion(
-            {"type": "skill_name_matches", "value": "Crypto"},
-            "", [], "Eval: Crypto Price Probe", None,
-        )
-        assert not check_assertion(
-            {"type": "skill_name_matches", "value": "Weather"},
-            "", [], "Eval: Crypto Price Probe", None,
-        )
 
     def test_reflexion_in_range_passes(self):
         assert check_assertion(
             {"type": "reflexion_in_range", "min": 0.3, "max": 0.8},
-            "", [], None, 0.65,
+            "", [], 0.65,
         )
 
     def test_reflexion_in_range_fails_outside(self):
         assert not check_assertion(
             {"type": "reflexion_in_range", "min": 0.3, "max": 0.8},
-            "", [], None, 0.9,
+            "", [], 0.9,
         )
         assert not check_assertion(
             {"type": "reflexion_in_range", "min": 0.3, "max": 0.8},
-            "", [], None, 0.1,
+            "", [], 0.1,
         )
 
     def test_reflexion_in_range_none_score_fails(self):
         assert not check_assertion(
             {"type": "reflexion_in_range", "min": 0.0, "max": 1.0},
-            "", [], None, None,
+            "", [], None,
         )
 
     def test_reflexion_above(self):
         assert check_assertion(
-            {"type": "reflexion_above", "value": 0.5}, "", [], None, 0.7
+            {"type": "reflexion_above", "value": 0.5}, "", [], 0.7
         )
         assert not check_assertion(
-            {"type": "reflexion_above", "value": 0.5}, "", [], None, 0.4
+            {"type": "reflexion_above", "value": 0.5}, "", [], 0.4
         )
 
     def test_reflexion_below(self):
         assert check_assertion(
-            {"type": "reflexion_below", "value": 0.5}, "", [], None, 0.3
+            {"type": "reflexion_below", "value": 0.5}, "", [], 0.3
         )
         assert not check_assertion(
-            {"type": "reflexion_below", "value": 0.5}, "", [], None, 0.5
+            {"type": "reflexion_below", "value": 0.5}, "", [], 0.5
         )
 
     def test_response_not_empty_passes(self):
@@ -334,25 +317,7 @@ class TestComputeCategoryMetrics:
         assert cm.reflexion_p10 is not None
         assert cm.reflexion_p90 is not None
 
-    def test_skill_match_hit_rate(self):
-        results = [
-            _make_result(task_id="s1", category="skill-match", skill_used="MySkill"),
-            _make_result(task_id="s2", category="skill-match", skill_used=None),
-            _make_result(task_id="s3", category="skill-match", skill_used="MySkill"),
-        ]
-        metrics = compute_category_metrics(results)
-        cm = metrics["skill-match"]
-        assert cm.hit_rate is not None
-        assert abs(cm.hit_rate - 2 / 3) < 0.001
 
-    def test_semantic_match_recall(self):
-        results = [
-            _make_result(task_id="e1", category="semantic-match", skill_used="Skill"),
-            _make_result(task_id="e2", category="semantic-match", skill_used=None),
-        ]
-        metrics = compute_category_metrics(results)
-        cm = metrics["semantic-match"]
-        assert cm.recall_at_threshold == 0.5
 
     def test_autonomous_tool_multi_tool_rate(self):
         # 2026-08-25 semantics: computed over tasks DECLARING >=2
@@ -401,53 +366,40 @@ class TestComputeCategoryMetrics:
 # ===========================================================================
 
 class TestDetectRegressions:
-    def _make_baseline(self, pass_rate=0.9, hit_rate=0.8, recall=0.75) -> dict:
-        return {
-            "categories": {
-                "skill-match": {
-                    "pass_rate": pass_rate,
-                    "hit_rate": hit_rate,
-                    "recall_at_threshold": None,
-                },
-                "semantic-match": {
-                    "pass_rate": 0.8,
-                    "hit_rate": None,
-                    "recall_at_threshold": recall,
-                },
-            }
-        }
+    def _make_baseline(self, pass_rate=0.9) -> dict:
+        return {"categories": {"skill-match": {"pass_rate": pass_rate}}}
 
     def test_no_regression_within_tolerance(self):
-        baseline = self._make_baseline(pass_rate=0.9, hit_rate=0.8)
+        baseline = self._make_baseline(pass_rate=0.9)
         current = {
             "skill-match": CategoryMetrics(
                 category="skill-match", total=5, passed=4, pass_rate=0.85,
-                latency_p50=1.0, latency_p95=2.0, hit_rate=0.75,
+                latency_p50=1.0, latency_p95=2.0,
             ),
         }
         flags = detect_regressions(current, baseline, tolerance=0.10)
         assert all(not f.flagged for f in flags)
 
     def test_regression_detected_on_large_drop(self):
-        baseline = self._make_baseline(pass_rate=0.9, hit_rate=0.8)
+        baseline = self._make_baseline(pass_rate=0.9)
         current = {
             "skill-match": CategoryMetrics(
                 category="skill-match", total=5, passed=2, pass_rate=0.4,
-                latency_p50=1.0, latency_p95=2.0, hit_rate=0.2,
+                latency_p50=1.0, latency_p95=2.0,
             ),
         }
         flags = detect_regressions(current, baseline, tolerance=0.10)
         flagged = [f for f in flags if f.flagged]
         assert len(flagged) >= 1
         metrics_flagged = {f.metric for f in flagged}
-        assert "skill-match.pass_rate" in metrics_flagged or "skill-match.hit_rate" in metrics_flagged
+        assert "skill-match.pass_rate" in metrics_flagged
 
     def test_improvement_not_flagged(self):
-        baseline = self._make_baseline(pass_rate=0.5, hit_rate=0.5)
+        baseline = self._make_baseline(pass_rate=0.5)
         current = {
             "skill-match": CategoryMetrics(
                 category="skill-match", total=5, passed=5, pass_rate=1.0,
-                latency_p50=1.0, latency_p95=2.0, hit_rate=1.0,
+                latency_p50=1.0, latency_p95=2.0,
             ),
         }
         flags = detect_regressions(current, baseline, tolerance=0.10)
@@ -468,23 +420,6 @@ class TestDetectRegressions:
         flags = detect_regressions({}, {}, tolerance=0.10)
         assert flags == []
 
-    def test_semantic_recall_regression(self):
-        """Key regression: SKILL_SEMANTIC_THRESHOLD too high tanks recall."""
-        baseline = {"categories": {
-            "semantic-match": {"pass_rate": 0.8, "hit_rate": None,
-                               "recall_at_threshold": 0.8,
-                               "multi_tool_rate": None, "reflexion_mean": None},
-        }}
-        # After raising threshold to 0.99, recall drops to 0.0
-        current = {
-            "semantic-match": CategoryMetrics(
-                category="semantic-match", total=5, passed=0, pass_rate=0.0,
-                latency_p50=1.0, latency_p95=2.0, recall_at_threshold=0.0,
-            ),
-        }
-        flags = detect_regressions(current, baseline, tolerance=0.10)
-        flagged = [f for f in flags if f.flagged]
-        assert any(f.metric == "semantic-match.recall_at_threshold" for f in flagged)
 
 
 # ===========================================================================
@@ -564,8 +499,7 @@ class TestSuiteLoading:
         tasks = harness.load_suite()
         categories = {t.category for t in tasks}
         required = {
-            "reasoning", "tool-use", "skill-match",
-            "semantic-match", "autonomous-tool", "reflexion-calibration",
+            "reasoning", "tool-use", "autonomous-tool", "reflexion-calibration",
         }
         assert required.issubset(categories), f"Missing categories: {required - categories}"
 
@@ -590,32 +524,6 @@ class TestSuiteLoading:
         assert tasks[0].category == "reasoning"
         assert tasks[0].assertions[0]["type"] == "answer_contains"
 
-    def test_seed_skill_parsed(self, tmp_path):
-        """seed_skill fields are correctly normalized."""
-        suite = tmp_path / "suite.yaml"
-        suite.write_text(textwrap.dedent("""\
-            version: "1"
-            tasks:
-              - id: s1
-                category: skill-match
-                query: "eval-probe: something"
-                timeout: 30
-                seed_skill:
-                  name: "Eval: Test Skill"
-                  trigger_pattern: "(?i)eval-probe"
-                  steps:
-                    - tool: web_search
-                      args_template: {q: "{query}"}
-                      output_key: result
-                  answer_template: "Result: {result}"
-                assertions:
-                  - type: skill_matched
-        """))
-        harness = EvalHarness(suite_path=suite, report_dir=tmp_path / "reports")
-        tasks = harness.load_suite()
-        assert tasks[0].seed_skill is not None
-        assert tasks[0].seed_skill["name"] == "Eval: Test Skill"
-        assert len(tasks[0].seed_skill["steps"]) == 1
 
 
 # ===========================================================================
@@ -786,7 +694,7 @@ class TestEvalHarnessIntegration:
         suite_path = self._make_stub_suite(tmp_path)
         harness = EvalHarness(suite_path=suite_path, report_dir=tmp_path / "reports")
 
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
+        if True:  # (_seed_skills removed 2026-10-10)
             with patch("app.core.brain.think", side_effect=self._good_brain):
                 report = await harness.run_all()
 
@@ -807,13 +715,13 @@ class TestEvalHarnessIntegration:
                               regression_tolerance=0.10)
 
         # Establish baseline with good brain first
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
+        if True:  # (_seed_skills removed 2026-10-10)
             with patch("app.core.brain.think", side_effect=self._good_brain):
                 baseline_report = await harness.run_all()
         harness.write_baseline(baseline_report)
 
         # Now run with bad brain — tool-use fails, regression should be caught
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
+        if True:  # (_seed_skills removed 2026-10-10)
             with patch("app.core.brain.think", side_effect=self._bad_brain):
                 bad_report = await harness.run_all()
 
@@ -836,7 +744,7 @@ class TestEvalHarnessIntegration:
         suite_path = self._make_stub_suite(tmp_path)
         harness = EvalHarness(suite_path=suite_path, report_dir=tmp_path / "reports")
 
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
+        if True:  # (_seed_skills removed 2026-10-10)
             with patch("app.core.brain.think", side_effect=self._good_brain):
                 report, json_path, md_path = await harness.run_and_persist()
 
@@ -851,88 +759,6 @@ class TestEvalHarnessIntegration:
         assert data["total_tasks"] == 4
         assert len(data["task_results"]) == 4
 
-    @pytest.mark.asyncio
-    async def test_regression_evidence_semantic_threshold(self, tmp_path):
-        """Empirical regression proof: simulate SKILL_SEMANTIC_THRESHOLD=0.99.
-
-        Baseline: semantic-match recall = 1.0 (skill matches for all tasks)
-        Broken:   semantic-match recall = 0.0 (threshold too high, no matches)
-        Expected: harness flags semantic-match.recall_at_threshold regression
-        """
-        # Build a suite with 3 semantic-match tasks
-        suite = tmp_path / "semantic_suite.yaml"
-        suite.write_text(textwrap.dedent("""\
-            version: "regression-test"
-            tasks:
-              - id: sem1
-                category: semantic-match
-                query: "how much does BTC cost"
-                timeout: 10
-                assertions:
-                  - type: skill_matched
-              - id: sem2
-                category: semantic-match
-                query: "ethereum price please"
-                timeout: 10
-                assertions:
-                  - type: skill_matched
-              - id: sem3
-                category: semantic-match
-                query: "bitcoin value now"
-                timeout: 10
-                assertions:
-                  - type: skill_matched
-        """))
-
-        harness = EvalHarness(suite_path=suite, report_dir=tmp_path / "reports",
-                              regression_tolerance=0.10)
-
-        async def _brain_with_skill_match(query, ephemeral=True, **_):
-            """Stub: skill always matches (baseline behavior)."""
-            from app.schema import EventType, StreamEvent
-            yield StreamEvent(type=EventType.TOKEN, data={"text": "Price is $X."})
-            yield StreamEvent(type=EventType.DONE, data={
-                "conversation_id": "stub", "intent": "general",
-                "skill_used": "Eval: Crypto Price Probe", "tool_results_count": 0,
-            })
-
-        async def _brain_no_skill_match(query, ephemeral=True, **_):
-            """Stub: threshold too high, no skill matches (broken behavior)."""
-            from app.schema import EventType, StreamEvent
-            yield StreamEvent(type=EventType.TOKEN, data={"text": "Price is $X."})
-            yield StreamEvent(type=EventType.DONE, data={
-                "conversation_id": "stub", "intent": "general",
-                "skill_used": None, "tool_results_count": 0,
-            })
-
-        # Establish baseline with good skill matching
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
-            with patch("app.core.brain.think", side_effect=_brain_with_skill_match):
-                baseline = await harness.run_all()
-        harness.write_baseline(baseline)
-
-        # Simulate broken config: semantic threshold too high → no skill matches
-        with patch("app.monitors.eval_harness.EvalHarness._seed_skills"):
-            with patch("app.core.brain.think", side_effect=_brain_no_skill_match):
-                broken = await harness.run_all()
-
-        # Baseline recall should be 1.0, broken should be 0.0
-        assert baseline.categories["semantic-match"].recall_at_threshold == 1.0
-        assert broken.categories["semantic-match"].recall_at_threshold == 0.0
-
-        # Harness must flag the regression
-        flagged = [r for r in broken.regressions if r.flagged]
-        assert any(r.metric == "semantic-match.recall_at_threshold" for r in flagged), (
-            f"Expected semantic-match.recall_at_threshold to be flagged; got: "
-            f"{[r.metric for r in flagged]}"
-        )
-        # Verify delta magnitude
-        recall_flag = next(
-            r for r in flagged if r.metric == "semantic-match.recall_at_threshold"
-        )
-        assert recall_flag.delta == -1.0
-        assert recall_flag.baseline == 1.0
-        assert recall_flag.current == 0.0
 
 
 # ===========================================================================
@@ -944,31 +770,31 @@ class TestCheckAssertionDecomposition:
 
     def test_decomposition_fired_passes_when_decomposed(self):
         assert check_assertion(
-            {"type": "decomposition_fired"}, "", [], None, None, decomposed=True
+            {"type": "decomposition_fired"}, "", [], None, decomposed=True
         )
 
     def test_decomposition_fired_fails_when_not_decomposed(self):
         assert not check_assertion(
-            {"type": "decomposition_fired"}, "", [], None, None, decomposed=False
+            {"type": "decomposition_fired"}, "", [], None, decomposed=False
         )
 
     def test_decomposition_not_fired_passes_when_not_decomposed(self):
         assert check_assertion(
-            {"type": "decomposition_not_fired"}, "", [], None, None, decomposed=False
+            {"type": "decomposition_not_fired"}, "", [], None, decomposed=False
         )
 
     def test_decomposition_not_fired_fails_when_decomposed(self):
         assert not check_assertion(
-            {"type": "decomposition_not_fired"}, "", [], None, None, decomposed=True
+            {"type": "decomposition_not_fired"}, "", [], None, decomposed=True
         )
 
     def test_default_decomposed_is_false(self):
         """Without passing decomposed, decomposition_fired must fail."""
-        assert not check_assertion({"type": "decomposition_fired"}, "", [], None, None)
+        assert not check_assertion({"type": "decomposition_fired"}, "", [], None)
 
     def test_default_decomposed_not_fired_passes(self):
         """Without passing decomposed, decomposition_not_fired must pass."""
-        assert check_assertion({"type": "decomposition_not_fired"}, "", [], None, None)
+        assert check_assertion({"type": "decomposition_not_fired"}, "", [], None)
 
 
 # (TestComputeCategoryMetricsMultiAgent removed 2026-08-25 — decomposition
@@ -1045,8 +871,9 @@ class TestHeartbeatSeedCount:
         store = MonitorStore(db)
         count = store.seed_defaults()
         all_monitors = store.list_all()
-        # 77 until 2026-09-22, when the owner cut eight inert catalog monitors.
-        assert len(all_monitors) == 69
+        # 77 until 2026-09-22 (eight inert catalog monitors cut); 69 until
+        # 2026-10-10 (Lesson Quiz + Skill Quality Monitor cut).
+        assert len(all_monitors) == 67
 
 
 class TestMemoryLearningEval:
@@ -1062,8 +889,7 @@ class TestMemoryLearningEval:
     def _inv(text, error=None):
         from app.monitors.eval_harness import _Invocation
         return _Invocation(
-            response_text=text, tools_invoked=[], skill_used=None,
-            decomposed=False, max_decomposition_depth=0,
+            response_text=text, tools_invoked=[],             decomposed=False, max_decomposition_depth=0,
             reflexion_score=0.8 if text else None,
             latency_seconds=0.01, error=error,
         )
@@ -1169,8 +995,7 @@ class TestMemoryLearningEval:
         def tr(tid, before, after):
             return TaskResult(
                 task_id=tid, category="memory-learning", query="q", passed=after,
-                response_text="", tools_invoked=[], skill_used=None,
-                reflexion_score=None, latency_seconds=0.0, failed_assertions=[],
+                response_text="", tools_invoked=[], reflexion_score=None, latency_seconds=0.0, failed_assertions=[],
                 memory_before_correct=before, memory_after_correct=after,
                 memory_caused_fix=bool(after and not before),
             )
@@ -1228,21 +1053,13 @@ class TestTimeoutSeparation:
         m = compute_category_metrics(rows)["reasoning"]
         assert m.latency_p95 >= 30.0
 
-    def test_skill_match_hit_rate_over_completed_only(self):
-        rows = [
-            _make_result("a", category="skill-match", passed=True, skill_used="crypto"),
-            _make_result("b", category="skill-match", passed=False, timed_out=True),
-        ]
-        m = compute_category_metrics(rows)["skill-match"]
-        # the timed-out run never got its DONE event — it can't count against hit rate
-        assert m.hit_rate == pytest.approx(1.0)
 
     def test_untestable_memory_pair_excluded_from_causal_rate(self):
         def tr(tid, before, after, timed_out=False):
             return TaskResult(
                 task_id=tid, category="memory-learning", query="q",
                 passed=bool(after), response_text="", tools_invoked=[],
-                skill_used=None, reflexion_score=None, latency_seconds=0.0,
+                reflexion_score=None, latency_seconds=0.0,
                 failed_assertions=[], timed_out=timed_out,
                 memory_before_correct=before, memory_after_correct=after,
                 memory_caused_fix=(bool(after and not before) if before is not None else None),
@@ -1262,8 +1079,7 @@ class TestTimeoutSeparation:
     def _inv(text, timed_out=False):
         from app.monitors.eval_harness import _Invocation
         return _Invocation(
-            response_text=text, tools_invoked=[], skill_used=None,
-            decomposed=False, max_decomposition_depth=0,
+            response_text=text, tools_invoked=[],             decomposed=False, max_decomposition_depth=0,
             reflexion_score=0.8 if text else None,
             latency_seconds=60.0 if timed_out else 0.01,
             error="Timeout after 60s" if timed_out else None,
@@ -1418,8 +1234,7 @@ class TestMultiTurnTasks:
     def _inv(text, error=None, timed_out=False):
         from app.monitors.eval_harness import _Invocation
         return _Invocation(
-            response_text=text, tools_invoked=[], skill_used=None,
-            decomposed=False, max_decomposition_depth=0,
+            response_text=text, tools_invoked=[],             decomposed=False, max_decomposition_depth=0,
             reflexion_score=0.7 if text else None,
             latency_seconds=0.01, error=error, timed_out=timed_out,
         )

@@ -24,8 +24,7 @@ def _result(task_id="t", category="autonomous-tool", passed=True,
 
     return TaskResult(
         task_id=task_id, category=category, query="q", passed=passed,
-        response_text="r", tools_invoked=tools or [], skill_used=None,
-        reflexion_score=0.8, latency_seconds=1.0, failed_assertions=[],
+        response_text="r", tools_invoked=tools or [],         reflexion_score=0.8, latency_seconds=1.0, failed_assertions=[],
         timed_out=timed_out, expect_tools=expect or [],
     )
 

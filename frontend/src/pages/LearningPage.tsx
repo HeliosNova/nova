@@ -3,17 +3,17 @@ import { GraduationCap, RefreshCw } from "lucide-react";
 import { toast } from "sonner";
 import { useLearningStore } from "../lib/store";
 import {
-  getLearningMetrics, getLessons, getSkills, deleteLesson, deleteSkill, toggleSkill,
-  getReflexions, getTrainingData, getFinetuneStatus, getFinetuneHistory,
-  getTrainingDataStatsDetailed, exportTrainingData, getConfigSummary, triggerFinetune,
+  getLearningMetrics, getLessons, deleteLesson,
+  getTrainingData, getFinetuneStatus, getFinetuneHistory,
+  getTrainingDataStatsDetailed, exportTrainingData, triggerFinetune,
   getKGFacts, getCuriosityQueue, bulkDeleteLessons, getKGStats, getDossiers,
 } from "../lib/api";
 import { formatDate } from "../lib/utils";
-import type { ReflexionInfo, TrainingDataEntry, FinetuneStatus, FinetuneHistoryRun, TrainingDataStatsDetailed, KGFact, CuriosityItem } from "../lib/types";
+import type { TrainingDataEntry, FinetuneStatus, FinetuneHistoryRun, TrainingDataStatsDetailed, KGFact, CuriosityItem } from "../lib/types";
 import { PageHeader, Tabs, StatCard, ConfirmDialog, Skeleton } from "../components/ui";
-import { LessonsSection, SkillsSection, ReflexionsSection, TrainingDataSection, KnowledgeGraphSection, CuriositySection } from "./learning";
+import { LessonsSection, TrainingDataSection, KnowledgeGraphSection, CuriositySection } from "./learning";
 
-type Section = "lessons" | "skills" | "reflexions" | "training" | "knowledge" | "curiosity";
+type Section = "lessons" | "training" | "knowledge" | "curiosity";
 type SortField = "confidence" | "times_retrieved" | "created_at";
 type SortDir = "asc" | "desc";
 const PAGE = 50;
@@ -21,10 +21,8 @@ const safe = <T,>(v: unknown): T[] => (Array.isArray(v) ? v : []);
 
 export default function LearningPage() {
   const store = useLearningStore();
-  const [confirm, setConfirm] = useState<{ type: "lesson" | "skill" | "bulk-lessons"; id: number; ids?: number[] } | null>(null);
+  const [confirm, setConfirm] = useState<{ type: "lesson" | "bulk-lessons"; id: number; ids?: number[] } | null>(null);
   const [activeSection, setActiveSection] = useState<Section>("lessons");
-  const [reflexions, setReflexions] = useState<ReflexionInfo[]>([]);
-  const [reflexionsLoading, setReflexionsLoading] = useState(false);
   const [trainingData, setTrainingData] = useState<TrainingDataEntry[]>([]);
   const [finetuneStatus, setFinetuneStatus] = useState<FinetuneStatus | null>(null);
   const [trainingLoading, setTrainingLoading] = useState(false);
@@ -32,7 +30,6 @@ export default function LearningPage() {
   const [trainingOffset, setTrainingOffset] = useState(0);
   const [trainingHasMore, setTrainingHasMore] = useState(true);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const [togglingSkillId, setTogglingSkillId] = useState<number | null>(null);
   const [sortField, setSortField] = useState<SortField>("confidence");
   const [sortDir, setSortDir] = useState<SortDir>("desc");
   const [metricsRefreshing, setMetricsRefreshing] = useState(false);
@@ -49,21 +46,17 @@ export default function LearningPage() {
   const [trainingStats, setTrainingStats] = useState<TrainingDataStatsDetailed | null>(null);
   const [curiosityItems, setCuriosityItems] = useState<CuriosityItem[]>([]);
   const [curiosityLoading, setCuriosityLoading] = useState(false);
-  const [autoSkills, setAutoSkills] = useState(false);
   const [kgFacts, setKgFacts] = useState<KGFact[]>([]);
   const [kgLoading, setKgLoading] = useState(false);
   const [kgSearch, setKgSearch] = useState("");
   const [kgOffset, setKgOffset] = useState(0);
   const [kgHasMore, setKgHasMore] = useState(true);
 
-  useEffect(() => { getConfigSummary().then((c) => setAutoSkills(c.ENABLE_AUTO_SKILL_CREATION)).catch(() => {}); }, []);
-
   useEffect(() => {
     store.setLoading(true);
     Promise.all([
       getLearningMetrics().then(store.setMetrics).catch(() => {}),
       getLessons().then((v) => store.setLessons(safe(v))).catch(() => store.setLessons([])),
-      getSkills().then((v) => store.setSkills(safe(v))).catch(() => store.setSkills([])),
     ]).finally(() => store.setLoading(false));
   }, []);
 
@@ -78,13 +71,6 @@ export default function LearningPage() {
         getLearningMetrics().then(store.setMetrics).catch(() => {}),
         getLessons().then((v) => store.setLessons(safe(v))).catch(() => store.setLessons([])),
       ]).finally(() => store.setLoading(false));
-    }
-    if (activeSection === "skills") {
-      getSkills().then((v) => store.setSkills(safe(v))).catch(() => store.setSkills([]));
-    }
-    if (activeSection === "reflexions") {
-      setReflexionsLoading(true);
-      getReflexions().then((v) => setReflexions(safe(v))).catch(() => setReflexions([])).finally(() => setReflexionsLoading(false));
     }
     if (activeSection === "training") {
       setTrainingLoading(true);
@@ -129,18 +115,13 @@ export default function LearningPage() {
       if (confirm.type === "bulk-lessons" && confirm.ids) {
         await bulkDeleteLessons(confirm.ids); confirm.ids.forEach((id) => store.removeLesson(id));
         setSelectedLessons(new Set()); toast.success(`${confirm.ids.length} lesson${confirm.ids.length !== 1 ? "s" : ""} deleted`);
-      } else if (confirm.type === "lesson") {
+      } else {
         await deleteLesson(confirm.id); store.removeLesson(confirm.id);
         setSelectedLessons((p) => { const n = new Set(p); n.delete(confirm.id); return n; }); toast.success("Lesson deleted");
-      } else { await deleteSkill(confirm.id); store.removeSkill(confirm.id); toast.success("Skill deleted"); }
+      }
       triggerRefresh();
     } catch { toast.error(`Failed to delete ${confirm.type === "bulk-lessons" ? "lessons" : confirm.type}`); }
     setConfirm(null);
-  };
-
-  const handleToggle = async (id: number, enabled: boolean) => {
-    setTogglingSkillId(id);
-    try { await toggleSkill(id, !enabled); store.updateSkillEnabled(id, !enabled); triggerRefresh(); } catch { toast.error("Failed to toggle skill"); } finally { setTogglingSkillId(null); }
   };
 
   const handleExportTraining = async () => {
@@ -191,7 +172,6 @@ export default function LearningPage() {
             </div>
             <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
               <StatCard label="Lessons" value={store.metrics.total_lessons} />
-              <StatCard label="Skills" value={store.metrics.total_skills} />
               <StatCard label="KG Facts (live)" value={kgCurrent ?? "—"} />
               <StatCard label="Dossiers" value={dossierCount ?? "—"} sub="standing understanding" />
             </div>
@@ -199,14 +179,11 @@ export default function LearningPage() {
         )}
         <Tabs tabs={[
           { id: "lessons", label: `Lessons (${store.lessons.length})` },
-          { id: "skills", label: `Skills (${store.skills.length})`, badge: autoSkills },
-          { id: "reflexions", label: "Reflexions" }, { id: "training", label: "Training Data" },
+          { id: "training", label: "Training Data" },
           { id: "knowledge", label: "Knowledge Graph" }, { id: "curiosity", label: "Curiosity" },
         ]} active={activeSection} onChange={(id) => setActiveSection(id as Section)} />
 
         {activeSection === "lessons" && <LessonsSection lessons={store.lessons} sortField={sortField} sortDir={sortDir} selectedLessons={selectedLessons} onSort={handleSort} onToggleSelectAll={toggleSelectAll} onToggleSelect={toggleSelectLesson} onDelete={(id) => setConfirm({ type: "lesson", id })} onBulkDelete={(ids) => setConfirm({ type: "bulk-lessons", id: 0, ids })} />}
-        {activeSection === "skills" && <SkillsSection skills={store.skills} togglingSkillId={togglingSkillId} onToggle={handleToggle} onDelete={(id) => setConfirm({ type: "skill", id })} />}
-        {activeSection === "reflexions" && <ReflexionsSection reflexions={reflexions} loading={reflexionsLoading} />}
         {activeSection === "training" && <TrainingDataSection trainingData={trainingData} trainingStats={trainingStats} finetuneStatus={finetuneStatus} finetuneHistory={finetuneHistory} loading={trainingLoading} finetuneRunning={finetuneRunning} hasMore={trainingHasMore} onLoadMore={handleTrainingLoadMore} onExport={handleExportTraining} onTriggerFinetune={handleTriggerFinetune} />}
         {activeSection === "knowledge" && <KnowledgeGraphSection facts={kgFacts} loading={kgLoading} search={kgSearch} hasMore={kgHasMore} onSearchChange={setKgSearch} onSearch={() => { setKgOffset(0); setKgFacts([]); loadKG(0, kgSearch); }} onLoadMore={() => loadKG(kgOffset, kgSearch)} onFactDeleted={() => { setKgOffset(0); setKgFacts([]); loadKG(0, kgSearch); }} />}
         {activeSection === "curiosity" && <CuriositySection items={curiosityItems} loading={curiosityLoading} />}
