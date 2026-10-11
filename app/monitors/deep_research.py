@@ -548,8 +548,31 @@ _FACT_PROMPT = (
     "daily clearing volume', not '$160 billion') — NEVER a bare date, month, duration, "
     "clock time, or standalone measurement ('July 5', 'eight years', '1:00 AM UTC', "
     "'20 hours daily', '10,000 repetitions' are useless objects; put the thing that happened).\n"
+    "AS OF: {as_of} — read the evidence as of that date.\n"
     "Return JSON array: [{{\"subject\":\"...\",\"predicate\":\"...\",\"object\":\"...\"}}]\n\n{evidence}"
 )
+
+
+def _earliest_pub_date(articles: list | None, findings: list | None) -> str | None:
+    """Earliest known publication date (YYYY-MM-DD) among the digest's cited
+    articles — the world time a fact became knowable. None when no cited URL
+    has a recorded date (G2, 2026-10-10)."""
+    earliest = None
+    for group in (articles or [], findings or []):
+        for item in group:
+            try:
+                u = item[1]
+            except (TypeError, IndexError):
+                continue
+            raw = _PUB_DATES.get(u or "")
+            if not raw:
+                continue
+            d = _pub_dt(raw)
+            if d is None:
+                continue
+            if earliest is None or d < earliest:
+                earliest = d
+    return earliest.strftime("%Y-%m-%d") if earliest else None
 
 
 # Outlet-homepage / feed-channel "headlines" that describe the OUTLET rather than an
@@ -2902,9 +2925,12 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
     if kg is None or not brief or len(findings) < 1:
         return 0
     from app.core.kg import is_garbage_triple
+    # World time (G2): the earliest publication date among the cited articles,
+    # else the digest date — never None, so valid_from stops mirroring created_at.
+    as_of = _earliest_pub_date(articles, findings) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
         raw = await _invoke_bg(
-            [{"role": "user", "content": _FACT_PROMPT.format(topic=topic, evidence=brief[:4500])}],
+            [{"role": "user", "content": _FACT_PROMPT.format(topic=topic, as_of=as_of, evidence=brief[:4500])}],
             json_mode=True, json_schema=_FACT_TRIPLES_SCHEMA, max_tokens=600, num_ctx=8192, model=model)
         cands = json.loads(raw) if isinstance(raw, str) else raw
         if isinstance(cands, dict):
@@ -2958,7 +2984,8 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
         try:
             if await kg.add_fact(s, p, o, confidence=min(0.9, 0.6 + 0.1 * max(1, support)),
                                  source="researched", provenance=f"deep_research:{topic[:60]}",
-                                 trust=0.8 if (support >= 2 or credible) else 0.5):
+                                 trust=0.8 if (support >= 2 or credible) else 0.5,
+                                 valid_from=as_of):
                 stored += 1
         except Exception as e:
             # This is the knowing tier's core write. Swallowed, the summary line
