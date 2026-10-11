@@ -75,6 +75,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_PPR_RETRIEVAL", "ENABLE_GSW_EPISODIC",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
+    "ENABLE_DISTINCT_READINGS",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -139,6 +140,9 @@ class Config:
     ENABLE_PPR_RETRIEVAL: bool = field(default_factory=lambda: _env("ENABLE_PPR_RETRIEVAL", "true").lower() == "true")
     # GSW (Generative Semantic Workspace) — episodic memory layer
     ENABLE_GSW_EPISODIC: bool = field(default_factory=lambda: _env("ENABLE_GSW_EPISODIC", "true").lower() == "true")
+    # X1 (2026-10-10): distinct-readings block in the digest synthesis prompt.
+    # Off until the frozen-topic replay passes rule X1 (plan 2026-10-09).
+    ENABLE_DISTINCT_READINGS: bool = field(default_factory=lambda: _env("ENABLE_DISTINCT_READINGS", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)

@@ -2623,6 +2623,59 @@ def _apply_network_pairs(db, host_clusters: dict) -> dict:
     return host_clusters
 
 
+def distinct_readings(findings: list, articles: list, *, max_lines: int = 24) -> str:
+    """X1 (2026-10-10): one line per INDEPENDENT source per distinctive figure
+    (`host · figure · date`), copies collapsed by the mirror/syndication
+    clusters. Prepended to the synthesis prompt so the model reasons from the
+    readings, not from how many articles repeated them. Empty when the sources
+    carry no distinctive figure."""
+    if not articles:
+        return ""
+    art_cluster, _ = _independence_clusters(articles)
+    corpora = []
+    for i, (_t, url, body) in enumerate(articles):
+        c = (body or "").lower()
+        corpora.append((art_cluster[i], _host(url), url, c, c.replace(",", "")))
+    lines: list[str] = []
+    seen_fig: set[str] = set()
+    for _cid, _h, _u, c, _cnc in corpora:
+        for m in _MAGNITUDE_RE.finditer(c):
+            num, unit, cur = m.group("num"), m.group("unit"), m.group("cur")
+            try:
+                val = float(num.replace(",", ""))
+            except ValueError:
+                continue
+            u = (unit or "").lower()
+            if not (("," in num) or (u in _MULT and "." in num) or val >= 10000):
+                continue
+            raw = m.group(0).strip()
+            key = raw.replace(",", "").lower()
+            if key in seen_fig:
+                continue
+            seen_fig.add(key)
+            variants = _num_variants(num, unit, cur)
+            done: set[int] = set()
+            for cid, h, url, cc, ccnc in corpora:
+                if cid in done:
+                    continue
+                if any(v in cc or v in ccnc for v in variants):
+                    done.add(cid)
+                    raw_date = _PUB_DATES.get(url) or ""
+                    d = _pub_dt(raw_date) if raw_date else None
+                    lines.append(f"{h} \u00b7 {raw} \u00b7 {d.strftime('%Y-%m-%d') if d else 'n/d'}")
+                    if len(lines) >= max_lines:
+                        break
+            if len(lines) >= max_lines:
+                break
+        if len(lines) >= max_lines:
+            break
+    if not lines:
+        return ""
+    return ("DISTINCT READINGS \u2014 one line per independent source per figure (syndicated "
+            "copies collapsed; n/d = date not known):\n" + "\n".join(lines) +
+            "\nReason from the readings, not from the count of articles.\n\n")
+
+
 def _figure_support(text: str, articles: list) -> dict[str, tuple[int, set]]:
     """Deterministic cross-source support: for each magnitude figure in `text`,
     how many INDEPENDENT sources state that exact value (matched with comma/
@@ -4612,10 +4665,17 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "make sure every consequential one is addressed somewhere in the brief IF the "
         "findings support it (do NOT invent detail for one that is only named in "
         f"passing): {', '.join(_cov_anchors)}.\n\n" if _cov_anchors else "")
+    _readings = ""
+    if getattr(_cfg, "ENABLE_DISTINCT_READINGS", False):
+        try:
+            _readings = distinct_readings(findings, articles)
+        except Exception as e:
+            logger.debug("[DeepResearch] distinct readings skipped: %s", e)
     _syn_prompt = (
         common
         + (f"MORE SOURCE FINDINGS (continued):\n{_extra}\n\n" if _extra else "")
         + _checklist
+        + _readings
         + f"You READ {len(findings)} credible {label} sources — the deep analyses and findings "
         f"above are everything you read. Write the overview from THESE ONLY "
         f"(do not add stories you remember but did not read here).\n\n"
