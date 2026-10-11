@@ -512,7 +512,7 @@ the path split :1918), `app/core/curiosity.py` (columns `answerable`, `evidence_
 |------|-------|--------|-----------------|
 | K1 agent tool layer | shipped to tree | f17c2c6 | guard 31 tests; full suite 3510/0 after the access-tier gate tables went too |
 | K2 skills, Lesson Quiz, reflexion store | shipped to tree | 878c7dc | guard 46 tests; full suite 3226/0; migration 39 dumps + deletes the three retired monitors |
-| K3 deploy | final suite 3279/0 on the full tree; quiet-window deploy of nova-app:k2 in progress 2026-10-11 ~05:00 UTC | — | 24 h: throughput_panel + eval harness reading |
+| K3 deploy | DONE 2026-10-11 05:12 UTC: quiet window, drain by log quiescence (10 min), nova-app:k2 live; nova-exec removed, freshness 118/0 stale, 27B 100% GPU, migration 39 dumped 2 monitors + 147 results, Telegram + Discord up, no startup errors; pushed 8a01bc7 | 791f530b5933 | 24 h: throughput_panel + eval harness reading (2026-10-12) |
 | G1 bank once | shipped | 85d9bad | rule: kg_facts/digest ~half, corroboration promotions from the `[kg]` line — read after a day |
 | G2 world time | shipped | 4621ad2 | rule G2: ≥50% new researched facts with valid_from ≠ created_at after a day |
 | G3 revert guard | shipped (rule G1 pre-check: 37 A-B-A chains ≥ 1 → ships) | 59e8c53 | `[kg] revert refused` per day; A-B-A count must stop growing |
