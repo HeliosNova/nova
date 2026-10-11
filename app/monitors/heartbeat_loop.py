@@ -346,6 +346,9 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # The extraction a monitor left running, by monitor id, so the gated
         # check can wait for it before releasing the residency slot (2026-09-23).
         self._kg_task_by_monitor: dict[int, asyncio.Task] = {}
+        # G1: facts the deep-research runner banked per monitor run, so the
+        # post-digest extraction can skip a digest that is already banked.
+        self._runner_banked: dict[int, int] = {}
         # Per-cycle alert batching. When enabled, _send_alert buffers each
         # monitor's alert (after dedup/routing) and the loop flushes ONE digest
         # per channel-group at the end of the tick — so 80 due monitors post a
@@ -748,7 +751,9 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # Python's docs flag that as unsafe). The done_callback logs at
         # WARNING when the extraction raised so failures surface in operator
         # logs instead of vanishing.
-        if monitor.check_type == "query" and monitor.name not in _NO_KG_MONITORS and new_value and len(new_value) > 100:
+        if (monitor.check_type == "query" and monitor.name not in _NO_KG_MONITORS
+                and new_value and len(new_value) > 100
+                and self._should_extract_after_digest(monitor)):
             try:
                 from app.core.brain import get_services, _extract_kg_triples
                 svc = get_services()
@@ -971,6 +976,19 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             return await svc.tool_registry.execute("web_search", {"query": query})
         return "[No tool registry — cannot search]"
 
+    def _should_extract_after_digest(self, monitor: Monitor) -> bool:
+        """G1 (2026-10-10): skip the post-digest KG extraction when the
+        deep-research runner already banked facts for this run — the second
+        pass re-extracted the same text and kg.add_fact read the repeat as
+        independent corroboration. Think-path query monitors (no runner) have
+        no entry and keep the extraction, their only banking path."""
+        banked = getattr(self, "_runner_banked", {}).pop(monitor.id, 0)
+        if banked > 0:
+            logger.info("[KG bg] %r: runner banked %d fact(s); skipping the second extraction",
+                        monitor.name, banked)
+            return False
+        return True
+
     async def _execute_query_monitor(self, monitor: Monitor, cfg: dict) -> str:
         # For Domain Study:* monitors use the direct-fetch runner that
         # gets dates from the search engine (not from the LLM's belief
@@ -990,11 +1008,16 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # thin brain.think() bullet list. (owner: "on every topic and future topics too")
         if monitor.name.startswith(("Domain Study:", "Auto:")) or feeds_for(monitor.name):
             from app.monitors.domain_study_runner import run_domain_study
+            from app.monitors.deep_research import BANKED_THIS_RUN
+            _tok = BANKED_THIS_RUN.set(0)
             try:
                 result = await run_domain_study(monitor.name)
             except Exception as e:
                 logger.exception("[Heartbeat] domain_study_runner failed")
                 result = f"## ⚠️ {monitor.name} — runner error\n\n{e}"
+            finally:
+                self._runner_banked[monitor.id] = BANKED_THIS_RUN.get()
+                BANKED_THIS_RUN.reset(_tok)
             return result
         # Operator/internal queries (Morning Check-in, [Reminder]:* etc)
         # keep the brain.think() path.

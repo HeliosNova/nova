@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import re
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, quote
 
@@ -2878,6 +2879,14 @@ async def _best_synthesis(prompt: str, evidence: str, *, n: int = 2,
     return cands[idx] if 0 <= idx < len(cands) else cands[0]
 
 
+# Facts banked by _learn_facts during the current runner invocation. The
+# heartbeat zeroes it before a Domain Study run and reads it after, so a digest
+# whose runner already banked facts is not extracted a second time by the
+# post-digest pass (G1, 2026-10-10: the second pass re-banked the same text
+# under source='extracted' and kg.add_fact counted it as corroboration).
+BANKED_THIS_RUN: ContextVar[int] = ContextVar("deep_research_banked_this_run", default=0)
+
+
 async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
                        articles: list | None = None, model: str | None = None) -> int:
     """Bank grounded facts from the verified briefing — kept only if they trace to
@@ -2960,6 +2969,7 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
             logger.warning("[DeepResearch] fact banking failed for %r: %r", (s, p, o), e)
     logger.info("[DeepResearch] fact banking (%s): %d candidate(s) → %d stored, %d gate-rejected, %d garbage, %d failed",
                 topic[:40], len(cands) if isinstance(cands, list) else 0, stored, gate_rejected, garbage, banking_errors)
+    BANKED_THIS_RUN.set(BANKED_THIS_RUN.get() + stored)
     return stored
 
 
