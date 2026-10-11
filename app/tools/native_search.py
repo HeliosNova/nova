@@ -46,6 +46,44 @@ def search_health() -> float:
         return 1.0
     return sum(_RECENT_OUTCOMES) / len(_RECENT_OUTCOMES)
 
+
+# Per-engine counters since process start (R1, 2026-10-10). SearXNG reports
+# the engines it suspended on EVERY call (`unresponsive_engines`) and nothing
+# read it — a suspended engine looked exactly like one with no opinion. For
+# SearXNG sub-engines a "call" is one SearXNG query (every configured engine
+# is asked); the ladder arms (wikipedia/bing/brave/ddg) count their own calls.
+_ENGINE_STATS: dict[str, dict[str, int]] = {}
+_LAST_UNRESPONSIVE: list[str] = []
+
+
+def _note_engine(name: str, *, nonempty: bool = False, unresponsive: bool = False) -> None:
+    st = _ENGINE_STATS.setdefault(name, {"calls": 0, "nonempty": 0, "unresponsive": 0})
+    st["calls"] += 1
+    if nonempty:
+        st["nonempty"] += 1
+    if unresponsive:
+        st["unresponsive"] += 1
+
+
+def engine_health() -> dict[str, dict[str, int]]:
+    """{engine: {calls, nonempty, unresponsive}} since process start."""
+    return {k: dict(v) for k, v in _ENGINE_STATS.items()}
+
+
+def engine_health_summary(limit: int = 8) -> str:
+    """One line for the engineering report: non-empty rate per engine (most
+    used first) and the engines SearXNG suspended, with counts."""
+    stats = engine_health()
+    if not stats:
+        return ""
+    used = sorted(((v["calls"], k) for k, v in stats.items() if v["calls"]), reverse=True)
+    rates = [f"{k} {stats[k]['nonempty'] / stats[k]['calls']:.0%}" for _, k in used[:limit]]
+    susp = sorted(((v["unresponsive"], k) for k, v in stats.items() if v["unresponsive"]), reverse=True)
+    out = ", ".join(rates)
+    if susp:
+        out += "; " + ", ".join(f"{k} suspended x{n}" for n, k in susp[:limit])
+    return out
+
 # 12s was too tight for SearXNG: it talks to multiple upstream engines
 # (Bing, Startpage, Yandex, etc.) sequentially, and a single slow upstream
 # made the whole call return "Server disconnected" 5-8% of queries on the
@@ -505,6 +543,24 @@ async def _search_searxng(
         logger.warning("searxng (%s) failed for %r: %r", categories, query[:60], e)
         return []
 
+    # R1: SearXNG names the engines it could not use on every call. Count and
+    # log them so a suspension is a fact, not a guess.
+    unresponsive: list[str] = []
+    for item in data.get("unresponsive_engines") or []:
+        try:
+            name = str(item[0]) if isinstance(item, (list, tuple)) else str(item)
+        except Exception:
+            continue
+        if name:
+            unresponsive.append(name)
+            _note_engine(name, unresponsive=True)
+    _LAST_UNRESPONSIVE[:] = unresponsive
+    if unresponsive:
+        logger.info("searxng (%s) unresponsive=%s for %r", categories, unresponsive, query[:60])
+    answered = {str(r.get("engine") or "") for r in data.get("results", []) if r.get("engine")}
+    for name in answered:
+        _note_engine(name, nonempty=True)
+
     results: list[SearchResult] = []
     seen_urls: set[str] = set()
     for r in data.get("results", []):
@@ -702,12 +758,17 @@ async def search(
     for (fn, name), out in zip(primary, settled):
         if isinstance(out, Exception):
             logger.warning("native_search: %s raised: %s", name, out)
+            if name != "searxng":
+                _note_engine(name, nonempty=False)
             continue
+        if name != "searxng":
+            _note_engine(name, nonempty=bool(out))
         if out:
             logger.info("native_search: %s returned %d for %r", name, len(out), query[:60])
             fan_results.append(out)
         else:
-            logger.info("native_search: %s returned 0 for %r", name, query[:60])
+            logger.info("native_search: %s returned 0 for %r unresponsive=%s", name, query[:60],
+                        _LAST_UNRESPONSIVE if name == "searxng" else [])
 
     merged = _merge_unique(fan_results, max_results=max_results)
 

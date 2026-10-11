@@ -471,6 +471,16 @@ def build_report(db) -> tuple[str, str, dict]:
         fields["narrow_support"] = ", ".join(
             f"{k} {v}%" for k, v in casc["by_site"].items())
 
+    # R1: per-engine non-empty rate and the engines SearXNG suspended
+    # (process-lifetime counters from native_search).
+    try:
+        from app.tools.native_search import engine_health_summary
+        _eng = engine_health_summary()
+        if _eng:
+            fields["search_engines"] = _eng
+    except Exception as e:
+        logger.debug("[EngReport] engine health skipped: %s", e)
+
     cur = _curiosity(db)
     if cur:
         bits = [f"{cur.get('pending', '?')} pending",

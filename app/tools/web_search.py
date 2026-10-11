@@ -79,8 +79,12 @@ class WebSearchTool(BaseTool):
         if not results:
             # (The zero-result auto-curiosity mint was cut 2026-09-22: none of
             # its topics ever resolved, and it queued eval fiction as research.)
+            # R1 (2026-10-10): directive, not descriptive. "No results found."
+            # read as an invitation to answer from memory; the refusal says
+            # what to do instead.
             return ToolResult(
-                output="No results found.",
+                output=(f"SEARCH REFUSED: every engine returned nothing for '{query}'. "
+                        "Do not infer an answer; say the search found nothing."),
                 success=False,
                 error="all engines returned 0 results",
                 error_category=ErrorCategory.NOT_FOUND,
