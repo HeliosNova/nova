@@ -521,7 +521,7 @@ the path split :1918), `app/core/curiosity.py` (columns `answerable`, `evidence_
 | R2 engine list | shipped + searxng restarted | d013852, 7815c29 | first live call after restart: bing + yandex answered; brave/google/mojeek suspended; startpage + duckduckgo CAPTCHA → rule R2 at 48 h likely reverts DDG |
 | X1 distinct readings | function shipped, flag OFF | e6f2e31 | replay A/B on the 16 frozen topics pending (quiet window, GPU); rule X1 |
 | X2 forecast readings arm | not started | — | depends on X1's verdict; k=8 replay, rule X2 Brier ≥ 0.02 |
-| C1 tension resolver | shipped (admission requires verifier agreement) | 8659230 | replay the 31 stored tension lines in a quiet window; rule C1 ≥50% closed, ≤10% third-pass disagreement |
+| C1 tension resolver | shipped; **rule C1 READ 2026-10-11 07:05 UTC: FAIL as measured** — 56 stored tension lines replayed against a DB copy (judge qwen3.8:27b, verifier gemma4:e4b): 9 closed (16%, all 'both' = different quantities), 30 'both' total of which the verifier refused 21 (mostly one side without spans), 26 unresolvable, 30 with NO span on either side (digests aged past the 3-per-domain window), 0 a/b verdicts; third-pass disagreement 0/9. Resolver stays (admission is conservative, no harm) with a no-span short-circuit; the real test is NEW tensions at consolidation where both digests are still stored | 8659230 + follow-up | ≥50% closed NOT met (16%); ≤10% disagreement met (0%) |
 | C2 curiosity triage | shipped | 423c57d | `scripts/curiosity_triage_auroc.py` after 40 probed attempts; rule C2 AUROC > 0.85 |
 | Z close-out | CLAUDE.md program section written (4521b6d); memory + plan numbers after the 24 h readings | — | — |
 
