@@ -116,7 +116,7 @@ _JUDGE_PROMPT = (
     "instrument, region), verdict is \"both\". If they are the same quantity, which "
     "figure is current — by date, and by wording (revised, updated, latest)? Answer "
     "\"a\" or \"b\"; \"unresolvable\" only when the spans cannot tell.\n"
-    "Return JSON: {{\"verdict\": \"a|b|both|unresolvable\", \"reasoning\": \"one or two sentences\", "
+    "Return JSON: {{\"verdict\": \"a|b|both|unresolvable\", \"reasoning\": \"at most 40 words\", "
     "\"winner_date\": \"YYYY-MM-DD or null\"}}"
 )
 
@@ -154,12 +154,20 @@ async def resolve_tension(db, t: Tension, *, judge_model: str | None = None,
     verdict, reasoning, winner_date = "unresolvable", "", None
     verifier_agrees = False
     verifier_reason = ""
+    if not t.spans_a and not t.spans_b:
+        # Replay 2026-10-11 (56 stored tensions): 30 had no digest sentence
+        # carrying either figure — the digests had aged past the 3-per-domain
+        # window — and every one of those cost two judge calls to reach
+        # "unresolvable". No spans means no evidence: answer without asking.
+        reasoning = "no stored digest sentence carries either figure"
+        return _store(db, t, fig_a, fig_b, pack_a, pack_b, verdict, reasoning, None,
+                      judge_model, verifier_model, False, "")
     try:
         raw = await llm.invoke_nothink(
             [{"role": "user", "content": _JUDGE_PROMPT.format(
                 today=today, title_a=t.title_a, title_b=t.title_b, fig_a=fig_a, fig_b=fig_b,
                 head_a=t.head_a, head_b=t.head_b, pack_a=pack_a, pack_b=pack_b)}],
-            json_mode=True, json_schema=_SCHEMA, max_tokens=300, temperature=0.0,
+            json_mode=True, json_schema=_SCHEMA, max_tokens=500, temperature=0.0,
             model=judge_model, num_ctx=8192)
         data = json.loads(raw) if isinstance(raw, str) else (raw or {})
         v = str(data.get("verdict", "")).strip().lower()
@@ -183,6 +191,13 @@ async def resolve_tension(db, t: Tension, *, judge_model: str | None = None,
         except Exception as e:
             logger.warning("[Tensions] verifier failed for %r: %s", t.text[:80], e)
             verifier_reason = f"verifier failed: {e}"[:300]
+    return _store(db, t, fig_a, fig_b, pack_a, pack_b, verdict, reasoning, winner_date,
+                  judge_model, verifier_model, verifier_agrees, verifier_reason)
+
+
+def _store(db, t: Tension, fig_a: str, fig_b: str, pack_a: str, pack_b: str, verdict: str,
+           reasoning: str, winner_date: str | None, judge_model: str | None,
+           verifier_model: str | None, verifier_agrees: bool, verifier_reason: str) -> dict:
     admitted = bool(verifier_agrees and verdict in ("a", "b", "both"))
     try:
         cur = db.execute(

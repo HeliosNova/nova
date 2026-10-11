@@ -113,3 +113,16 @@ def test_structured_tensions_feed_the_formatter(db):
     assert recs[0]["unit"] == "%" and {recs[0]["val_a"], recs[0]["val_b"]} == {3.4, 2.9}
     assert recs[0]["dkey_a"] in ("finance", "economics")
     assert _numeric_tensions(db) == [recs[0]["text"]]
+
+
+@pytest.mark.asyncio
+async def test_no_spans_on_either_side_is_unresolvable_without_a_judge_call(db):
+    _seed(db, "Finance", "finance", ["Headline inflation ran at 3.4% in August (reuters.com)"], [])
+    _seed(db, "Economics", "economics", ["Headline inflation eased to 2.9% in September (bbc.com)"], [])
+    judge = AsyncMock(side_effect=RuntimeError("must not be called"))
+    with patch("app.core.llm.invoke_nothink", judge):
+        res = await tn.resolve_tension(db, _tension(), judge_model="j", verifier_model="v")
+    assert res["verdict"] == "unresolvable" and res["admitted"] is False
+    assert judge.await_count == 0
+    assert "no stored digest sentence" in db.fetchone("SELECT reasoning FROM tension_resolutions")["reasoning"]
+
