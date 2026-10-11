@@ -505,3 +505,26 @@ the path split :1918), `app/core/curiosity.py` (columns `answerable`, `evidence_
 - [ ] Memory: one file for this program with every rule result.
 - [ ] CLAUDE.md: the removed-2026-10-10 section, the world-time note on the KG, the
       gate record, the tension resolver.
+
+## Status 2026-10-11 (execution log)
+
+| Task | State | Commit | Measured / rule |
+|------|-------|--------|-----------------|
+| K1 agent tool layer | shipped to tree | f17c2c6 | guard 31 tests; full suite 3510/0 after the access-tier gate tables went too |
+| K2 skills, Lesson Quiz, reflexion store | shipped to tree | 878c7dc | guard 46 tests; full suite 3226/0; migration 39 dumps + deletes the three retired monitors |
+| K3 deploy | final suite 3279/0 on the full tree; quiet-window deploy of nova-app:k2 in progress 2026-10-11 ~05:00 UTC | — | 24 h: throughput_panel + eval harness reading |
+| G1 bank once | shipped | 85d9bad | rule: kg_facts/digest ~half, corroboration promotions from the `[kg]` line — read after a day |
+| G2 world time | shipped | 4621ad2 | rule G2: ≥50% new researched facts with valid_from ≠ created_at after a day |
+| G3 revert guard | shipped (rule G1 pre-check: 37 A-B-A chains ≥ 1 → ships) | 59e8c53 | `[kg] revert refused` per day; A-B-A count must stop growing |
+| P1 gate record + planting probe | shipped (recorder live on deploy; probe not yet run) | 32c8d98 | run `scripts/planting_probe.py --n 200` once ≥200 rescued records exist; rule P1 5 pp |
+| R1 search visibility | shipped | dd1635f | report field `search_engines`; refusals directive |
+| R2 engine list | shipped + searxng restarted | d013852, 7815c29 | first live call after restart: bing + yandex answered; brave/google/mojeek suspended; startpage + duckduckgo CAPTCHA → rule R2 at 48 h likely reverts DDG |
+| X1 distinct readings | function shipped, flag OFF | e6f2e31 | replay A/B on the 16 frozen topics pending (quiet window, GPU); rule X1 |
+| X2 forecast readings arm | not started | — | depends on X1's verdict; k=8 replay, rule X2 Brier ≥ 0.02 |
+| C1 tension resolver | shipped (admission requires verifier agreement) | 8659230 | replay the 31 stored tension lines in a quiet window; rule C1 ≥50% closed, ≤10% third-pass disagreement |
+| C2 curiosity triage | shipped | 423c57d | `scripts/curiosity_triage_auroc.py` after 40 probed attempts; rule C2 AUROC > 0.85 |
+| Z close-out | CLAUDE.md program section written (4521b6d); memory + plan numbers after the 24 h readings | — | — |
+
+Deviation recorded: C1's `tension_resolutions` pathway row was NOT added — the
+writer is conditional on a tension existing, the same shape as the
+`capability_gaps` false-dead case the pathways file warns about.
