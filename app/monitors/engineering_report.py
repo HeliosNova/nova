@@ -492,6 +492,19 @@ def build_report(db) -> tuple[str, str, dict]:
                     f"curiosity takes {cur['latency_days']} days to answer a question")
         fields["curiosity"] = ", ".join(bits)
 
+    # C2: answerability triage over the last day (probed / yes-yes / deferred).
+    try:
+        _tr = db.fetchone(
+            "SELECT COUNT(*) AS probed, "
+            "SUM(CASE WHEN answerable = 1 AND evidence_ok = 1 THEN 1 ELSE 0 END) AS yes_yes, "
+            "SUM(CASE WHEN status = 'deferred' THEN 1 ELSE 0 END) AS deferred "
+            "FROM curiosity_queue WHERE probe_at > datetime('now', '-1 day')")
+        if _tr and _tr["probed"]:
+            fields["curiosity_triage"] = (f"{_tr['probed']} probed, {_tr['yes_yes'] or 0} yes/yes, "
+                                          f"{_tr['deferred'] or 0} deferred")
+    except Exception as e:
+        logger.debug("[EngReport] curiosity triage skipped: %s", e)
+
     st1 = curiosity_stage1(1)
     if st1:
         fields["curiosity_rejects"] = ", ".join(f"{k} x{v}" for k, v in st1.items())

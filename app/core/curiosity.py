@@ -223,6 +223,8 @@ class CuriosityItem:
     resolution: str | None
     created_at: str
     resolved_at: str | None
+    answerable: int | None = None    # C2 probe: settleable from public sources?
+    evidence_ok: int | None = None   # C2 probe: would a search surface a dated source?
 
 
 # Sources whose topics come from Nova's own dossiers/quizzes — never screened
@@ -275,6 +277,31 @@ class CuriosityQueue:
                 if stmt:
                     self._db.execute(stmt)
             getattr(db, "mark_schema_ensured", lambda _t: None)("curiosity_queue")
+        self._ensure_probe_columns()
+
+    def _ensure_probe_columns(self) -> None:
+        """C2 (2026-10-10): answerability probes recorded before research.
+        Idempotent column adds (PRAGMA check, no swallowed errors)."""
+        cols = {r[1] for r in self._db.fetchall("PRAGMA table_info(curiosity_queue)")}
+        for name, decl in (("answerable", "INTEGER"), ("evidence_ok", "INTEGER"),
+                           ("probe_at", "TIMESTAMP")):
+            if name not in cols:
+                self._db.execute(f"ALTER TABLE curiosity_queue ADD COLUMN {name} {decl}")
+
+    def record_probe(self, item_id: int, *, answerable: bool, evidence_ok: bool) -> None:
+        self._db.execute(
+            "UPDATE curiosity_queue SET answerable = ?, evidence_ok = ?, "
+            "probe_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (1 if answerable else 0, 1 if evidence_ok else 0, item_id),
+        )
+
+    def defer(self, item_id: int, reason: str) -> None:
+        """Park an item without burning an attempt (C2): the probes judged it
+        unanswerable from public sources, so research would only fail it."""
+        self._db.execute(
+            "UPDATE curiosity_queue SET status = 'deferred', resolution = ? WHERE id = ?",
+            (f"deferred: {reason}"[:2000], item_id),
+        )
 
     @staticmethod
     def _bumped_urgency(current: float) -> float:
@@ -567,7 +594,11 @@ class CuriosityQueue:
         row = self._db.fetchone(
             "SELECT * FROM curiosity_queue "
             "WHERE status = 'pending' AND attempts < ?" + not_in + " "
-            "ORDER BY (urgency + MIN(?, MAX(0.0, "
+            # C2 (2026-10-10): a probed yes/yes item outranks aging urgency —
+            # the probes say it can be answered; the rest are ordered as before.
+            "ORDER BY (CASE WHEN COALESCE(answerable, 0) = 1 AND COALESCE(evidence_ok, 0) = 1 "
+            "    THEN 1 ELSE 0 END) DESC, "
+            "(urgency + MIN(?, MAX(0.0, "
             "    julianday('now') - julianday(COALESCE(created_at, 'now'))) * ?)) DESC, "
             "created_at ASC LIMIT 1",
             tuple(params),
@@ -671,6 +702,8 @@ class CuriosityQueue:
             resolution=row["resolution"],
             created_at=row["created_at"],
             resolved_at=row["resolved_at"],
+            answerable=row["answerable"] if "answerable" in row.keys() else None,
+            evidence_ok=row["evidence_ok"] if "evidence_ok" in row.keys() else None,
         )
 
 

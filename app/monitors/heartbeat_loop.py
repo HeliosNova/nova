@@ -1575,6 +1575,47 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         return (f"CURIOSITY BATCH | {done}/{len(lines)} resolved this run\n"
                 + "\n".join(lines))
 
+    _TRIAGE_PROBES = (
+        "Is this question settleable from public sources available now? Answer yes or no.",
+        "Would a web search plausibly surface a dated source for it? Answer yes or no.",
+    )
+
+    async def _triage_curiosity(self, svc, item) -> str | None:
+        """C2 (2026-10-10): record two yes/no answerability probes on the item
+        before research; a no/no item is deferred (reason not_answerable) and
+        returns the result line, else None to proceed. Already-probed items
+        skip the calls. The probes run on the model this item's research path
+        keeps resident (27B for evidence-first, the default otherwise), so the
+        triage never costs a model reload. Any probe failure means proceed."""
+        if getattr(item, "answerable", None) is not None:
+            if item.answerable == 0 and getattr(item, "evidence_ok", 0) == 0:
+                return None   # probed no/no but still picked (manual re-queue): research it
+            return None
+        try:
+            from app.core import llm as _llm
+            model = None
+            if item.source in _EVIDENCE_FIRST_SOURCES:
+                from app.monitors.deep_research import _syn_model
+                model = _syn_model()
+            answers = []
+            for probe in self._TRIAGE_PROBES:
+                raw = await _llm.invoke_nothink(
+                    [{"role": "user", "content": f"Question: {item.topic}\n\n{probe}"}],
+                    max_tokens=5, temperature=0.0, model=model)
+                answers.append((raw or "").strip().lower().startswith("y"))
+            answerable, evidence_ok = answers
+            await asyncio.to_thread(svc.curiosity.record_probe, item.id,
+                                    answerable=answerable, evidence_ok=evidence_ok)
+            logger.info("[Curiosity] triage %s: answerable=%s evidence=%s",
+                        item.topic[:60], answerable, evidence_ok)
+            if not answerable and not evidence_ok:
+                await asyncio.to_thread(svc.curiosity.defer, item.id, "not_answerable")
+                return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                        f"reason=not_answerable")
+        except Exception as e:
+            logger.info("[Curiosity] triage skipped (%s): %s", item.topic[:60], e)
+        return None
+
     async def _research_one_curiosity(self, svc, tried: set[int] | None = None, *,
                                       sources=None, exclude_sources=None) -> str:
         """Take the top queued question, research it, store what it found.
@@ -1601,6 +1642,12 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         if tried is not None:
             tried.add(item.id)
         self._last_curiosity_source = item.source
+
+        # C2 (2026-10-10): two yes/no probes before any research. A question no
+        # public source can settle is deferred here, not failed three times.
+        _deferred = await self._triage_curiosity(svc, item)
+        if _deferred:
+            return _deferred
 
         # Research via think() — memory-first, web only for public/external facts.
         research_query = (
