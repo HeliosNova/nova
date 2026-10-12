@@ -75,7 +75,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_PPR_RETRIEVAL", "ENABLE_GSW_EPISODIC",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
-    "ENABLE_DISTINCT_READINGS",
+    "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -143,6 +143,10 @@ class Config:
     # X1 (2026-10-10): distinct-readings block in the digest synthesis prompt.
     # Off until the frozen-topic replay passes rule X1 (plan 2026-10-09).
     ENABLE_DISTINCT_READINGS: bool = field(default_factory=lambda: _env("ENABLE_DISTINCT_READINGS", "false").lower() == "true")
+    # C2 (2026-10-12): defer no/no curiosity items. Off while the probes are
+    # measured (rule C2: AUROC > 0.85 over 40 probed attempts) — deferral would
+    # erase the outcomes the measurement needs.
+    ENABLE_CURIOSITY_TRIAGE_DEFER: bool = field(default_factory=lambda: _env("ENABLE_CURIOSITY_TRIAGE_DEFER", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)

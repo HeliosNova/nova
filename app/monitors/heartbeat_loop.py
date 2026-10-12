@@ -1619,7 +1619,10 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                                     answerable=answerable, evidence_ok=evidence_ok)
             logger.info("[Curiosity] triage %s: answerable=%s evidence=%s",
                         item.topic[:60], answerable, evidence_ok)
-            if not answerable and not evidence_ok:
+            if not answerable and not evidence_ok and config.ENABLE_CURIOSITY_TRIAGE_DEFER:
+                # Off until rule C2 is read: a deferred item never resolves or
+                # fails, so deferring during the measurement would erase the
+                # outcomes the AUROC needs (first day live: 18 of 18 deferred).
                 await asyncio.to_thread(svc.curiosity.defer, item.id, "not_answerable")
                 return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
                         f"reason=not_answerable")

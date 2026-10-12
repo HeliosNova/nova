@@ -57,7 +57,9 @@ def _loop():
 
 
 @pytest.mark.asyncio
-async def test_no_no_is_deferred_without_an_attempt(q):
+async def test_no_no_is_deferred_without_an_attempt(q, monkeypatch):
+    from app.config import config
+    monkeypatch.setattr(config, "ENABLE_CURIOSITY_TRIAGE_DEFER", True)
     iid = q.add("Who leads the Aetherion Guild?", source="dossier_open_question", urgency=0.6)
     item = q.get_next()
     svc = MagicMock(); svc.curiosity = q
@@ -98,3 +100,19 @@ async def test_probe_failure_never_blocks_research(q):
 def test_triage_runs_before_the_path_split():
     src = inspect.getsource(HeartbeatLoop._research_one_curiosity)
     assert src.index("_triage_curiosity(") < src.index("_EVIDENCE_FIRST_SOURCES")
+
+
+@pytest.mark.asyncio
+async def test_no_no_is_recorded_but_researched_while_deferral_is_off(q, monkeypatch):
+    """Rule C2 needs outcomes: with the flag off (default) a no/no item is probed,
+    recorded, and still researched."""
+    from app.config import config
+    monkeypatch.setattr(config, "ENABLE_CURIOSITY_TRIAGE_DEFER", False)
+    iid = q.add("Who leads the Aetherion Guild?", source="dossier_open_question", urgency=0.6)
+    item = q.get_next()
+    svc = MagicMock(); svc.curiosity = q
+    with patch("app.core.llm.invoke_nothink", AsyncMock(side_effect=["No.", "no"])):
+        assert await _loop()._triage_curiosity(svc, item) is None
+    row = q._db.fetchone("SELECT status, answerable, evidence_ok FROM curiosity_queue WHERE id = ?", (iid,))
+    assert row["status"] == "pending" and (row["answerable"], row["evidence_ok"]) == (0, 0)
+
