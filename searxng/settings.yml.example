@@ -104,6 +104,33 @@ engines:
     disabled: true   # Some Reuters layouts block scrapers; keep off until verified
     timeout: 12.0
   # ---------- Wiki / encyclopedic ----------
+  # Phase 2 (2026-10-12): engines that still answer a residential IP while the
+  # majors suspend/CAPTCHA (probed live: encyclosearch 13, openalex 10, seznam 10,
+  # 360search 6 results for 'copper tariffs 2026'; baidu CAPTCHA). Rule R from
+  # the plan: at 48 h each must be >50% non-empty in the R1 counters, none regresses.
+  - name: encyclosearch
+    engine: json_engine
+    shortcut: es
+    categories: general
+    disabled: false
+    timeout: 10.0
+  - name: openalex
+    engine: openalex
+    shortcut: oa
+    disabled: false
+    timeout: 10.0
+  - name: seznam
+    engine: seznam
+    shortcut: szn
+    categories: general
+    disabled: false
+    timeout: 10.0
+  - name: 360search
+    engine: 360search
+    shortcut: 360so
+    categories: general
+    disabled: false
+    timeout: 10.0
   - name: wikidata
     engine: wikidata
     shortcut: wd
