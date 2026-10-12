@@ -539,3 +539,47 @@ writer is conditional on a tension existing, the same shape as the
 | 4 Gate drop rate | measured; rule staged | 6a1eec1, e19db9b | `scripts/gate_miss_classes.py` over 3,557 primary pairs: 80% rejected at the primary pass (54% after rescue); 34% low overlap, 25% analytical, 15% number absent, 7% possible false negatives, 3% borderline; evidence quality equal across accepted/rejected; median rejection p=0.03 → the gate is right, the synthesis mis-attributes. Citation-discipline rule staged behind ENABLE_CITATION_DISCIPLINE (off). Rule: same-evidence replay, primary rejection share (baseline 0.798 on the x1off window) down ≥10 pp with support within 0.02 and coverage within 0.03 |
 
 Items 1, 2 and 4 deployed 2026-10-12 ~18:55 UTC as nova-app:k5 (full suite 3302/0; quiet-window recipe; freshness 118/0; 27B 100% GPU). The citation-discipline replay arm (`cite_on`, flag on, same frozen evidence as `x1off`) was launched inside the new container right after; its rule is read with `/data/ceiling/cite_ab.py cite_on <start> <end>`.
+
+## Forward program (written 2026-10-12, after the four-item follow-up)
+
+One change class per deploy; every step has its rule before it ships; nothing
+flips on a hunch. Phases run in order; a phase's read gates the next code.
+
+0. **Read what is in flight (no new code until read).** cite_on replay rule
+   (tonight); clean eval harness run (2026-10-13 ~22:42 UTC, the 10-12 run
+   deferred behind the replay); R2 DuckDuckGo at 48 h (2026-10-13 ~04:40,
+   expect revert); feed breadth at 48 h (`sources_per_digest` median vs 5.8);
+   C2 AUROC at 40 probed attempts; G3 A-B-A recount and C1 on NEW tensions
+   after a week.
+1. **Attribution.** If cite_on passes: flag on, deploy, re-read the live
+   drop rate after 24 h. If it fails: second arm = structured synthesis
+   (sentences emitted with finding ids, citations mapped deterministically),
+   same rule (primary rejection −10 pp, support within 0.02, coverage 0.03).
+2. **Breadth beyond feeds.** Enable the engines that still answer
+   residential IPs (openalex, encyclosearch; yandex news) in SearXNG; rule from
+   R1 counters: a new engine >50% non-empty, none regresses; digest rule:
+   median distinct hosts +2. Primary-source direct feeds per domain
+   (regulators, courts, central banks) where a domain stays thin.
+3. **Curiosity yield.** Read C2's AUROC; flip ENABLE_CURIOSITY_TRIAGE_DEFER
+   only on >0.85. Read item 2's resolve share over 40 attempts; if still ≤33%,
+   the template demands a named entity AND a date per question and the mint
+   cap drops to one per dossier per cycle.
+4. **Status at write time (STALE/TOKI).** Keep the sentences that carry each
+   Key-fact figure (a fact_spans table written at consolidation) so tensions
+   can be judged after digests age; mark Key-facts active/superseded at write
+   time and constrain chat injection to active ones. Rule: C1 closed share
+   ≥50% on new tensions; long-memory temporal-previous task passes.
+5. **Embedding bake-off.** Qwen3-Embedding-0.6B vs bge-m3 on a copied Chroma:
+   harness retrieval + long-memory tasks; rule: retrieval pass rate ≥ baseline
+   and long-memory ≥ 4/5; only then re-embed the 25k facts.
+6. **Entailment model.** When ThinknCheck weights ship (Apache-2.0 promised):
+   score the gate record's pairs on both models (CPU); rule: fewer
+   high-overlap misses at equal planting migration. Until then the sidecar
+   stays.
+7. **Throughput.** Recover 6.5 runs/active-hour once the replays stop; the
+   entail sidecar's serialized queue is the shared cost. Read the panel for
+   three clean days before touching it.
+8. **Runtime.** Re-open the Ollama question only for 0.34.x with the prompt
+   cache capped, or when Qwen 4 27B ships and needs it. Same probe, same rule.
+9. **Frontend** last, by the owner's rule: the cosmos direction, once 1-4
+   have read.
