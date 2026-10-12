@@ -1575,14 +1575,25 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         return (f"CURIOSITY BATCH | {done}/{len(lines)} resolved this run\n"
                 + "\n".join(lines))
 
+    # Wording measured 2026-10-12 on the resident 27B: "settleable from public
+    # sources available now" / "would a search surface a dated source" answered
+    # NO to the Fed's September decision and to the price of Bitcoin — the model
+    # will not vouch for documents dated past its training. Asking whether
+    # public reporting NORMALLY COVERS the kind of question separates them
+    # (yes: Fed decision, Bitcoin price, sanctions terms; no: a vendor's edge
+    # market share, a protocol's internal status, unicorn counts).
     _TRIAGE_PROBES = (
-        "Is this question settleable from public sources available now? Answer yes or no.",
-        "Would a web search plausibly surface a dated source for it? Answer yes or no.",
+        "Is this a question about the real world that public reporting (news, official "
+        "releases, documentation) would normally cover, as opposed to something private, "
+        "hypothetical, or unknowable? Answer yes or no.",
+        "Is the question specific enough that a single dated source could settle it (it names "
+        "a concrete entity, event, figure, or decision), rather than open-ended? Answer yes or no.",
     )
 
     async def _triage_curiosity(self, svc, item) -> str | None:
-        """C2 (2026-10-10): record two yes/no answerability probes on the item
-        before research; a no/no item is deferred (reason not_answerable) and
+        """C2 (2026-10-10): record two yes/no probes on the item before research
+        (answerable = public reporting would cover it; evidence_ok = specific
+        enough for one dated source); a no/no item is deferred (reason not_answerable) and
         returns the result line, else None to proceed. Already-probed items
         skip the calls. The probes run on the model this item's research path
         keeps resident (27B for evidence-first, the default otherwise), so the
