@@ -207,7 +207,7 @@ _FUTURE_MARKER_RE = re.compile(
 _UNPUBLISHED_RE = re.compile(
     r"(?i)\b(undisclosed|confidential|non-?public|internal(?:ly)?|proprietary|private)\b"
     r"|\bspecific (?:technical )?(?:mechanisms?|metrics|protocols?|methodolog|specifications?)\b"
-    r"|\b(?:patch|rollout|deployment|integration) (?:status|plan)\b"
+    r"|\bpatch (?:deployment|rollout|status)\b|\b(?:rollout|deployment|integration) (?:status|plan)\b"
     r"|\byield rate\b|\bcost-per-kilogram\b"
 )
 
