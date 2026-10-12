@@ -528,3 +528,12 @@ the path split :1918), `app/core/curiosity.py` (columns `answerable`, `evidence_
 Deviation recorded: C1's `tension_resolutions` pathway row was NOT added — the
 writer is conditional on a tension existing, the same shape as the
 `capability_gaps` false-dead case the pathways file warns about.
+
+## Follow-up program 2026-10-12 (owner: "do all 4 in order")
+
+| Item | State | Commit | Measured / rule |
+|------|-------|--------|-----------------|
+| 1 Search coverage via feeds | shipped | 5b731cd | Probed all 232 curated feeds from inside nova-app: 6 dead + 12 blocked (403) replaced with outlets that answered, Barron's dropped, 7 in-domain duplicates removed; Macroeconomics + Microeconomics (search-only, 2 sources/digest) given 12 + 7 feeds. New overview log line carries distinct-host count; report field `sources_per_digest`. Baseline 10-09..10-12: 18.8 sources/digest, 5.8 distinct hosts (first six), 8 digests ≤3 sources in 3 days. Read after 48 h: median hosts and the thin list |
+| 2 Curiosity question quality | shipped | ad51712, 5595843 | 40 failed vs 20 resolved dossier questions: failures ask for the unpublished (undisclosed conditions, specific mechanisms, patch rollout, yield). Prompts now demand a PUBLIC settleable object; `_is_unpublished_question` skips those shapes at minting (logged). Rule: dossier_open_question resolve share over the next 40 attempts > the 33% lifetime (20/60) |
+| 3 Ollama runtime bake-off | in progress | — | Baseline 0.32.15 on the 27B: 0 think leaks, thinking field empty 5/5, JSON schema object 5/5, array 5/5, prefix path 5/5, 52.5 tok/s, 113 s cold load, 100% GPU. Candidate 0.35.1 with our entrypoint: GPU discovery OK on first start; probe pending |
+| 4 Gate drop rate | measured; rule staged | 6a1eec1, e19db9b | `scripts/gate_miss_classes.py` over 3,557 primary pairs: 80% rejected at the primary pass (54% after rescue); 34% low overlap, 25% analytical, 15% number absent, 7% possible false negatives, 3% borderline; evidence quality equal across accepted/rejected; median rejection p=0.03 → the gate is right, the synthesis mis-attributes. Citation-discipline rule staged behind ENABLE_CITATION_DISCIPLINE (off). Rule: same-evidence replay, primary rejection share (baseline 0.798 on the x1off window) down ≥10 pp with support within 0.02 and coverage within 0.03 |
