@@ -119,7 +119,12 @@ _UPDATE_PROMPT = (
     "(bullets, each with its citation)\n"
     "## Open questions\n"
     "(3-6 questions answerable TODAY by research, in the present tense — what is "
-    "X's current…, who holds…, how much…; NOT future events)\n"
+    "X's current…, who holds…, how much…; NOT future events). Each must be settleable "
+    "by something PUBLIC a search can return: a ruling, filing, vote, release, "
+    "published statistic, or a named body's statement. Never ask for what is "
+    "undisclosed, confidential, internal, or a vendor's private technical detail "
+    "(patch rollout, yield, integration plan, 'specific mechanisms') — nobody "
+    "publishes those and the question will fail.\n"
     "- Then one line 'Watch for: <expected future events, comma-separated>' "
     "(or 'Watch for: none') — futures live there, not among the questions.\n"
     "- End with exactly one line 'CHANGED: <what moved in this consolidation>' "
@@ -160,7 +165,9 @@ _WORLD_PROMPT = (
     "(only the cross-cutting ones, each with its citation)\n"
     "## Open questions\n"
     "(3-6 macro unknowns with real stakes, phrased as questions answerable TODAY by "
-    "research — present tense, NOT future events)\n"
+    "research — present tense, NOT future events, and settleable by something PUBLIC: "
+    "a ruling, filing, vote, release, published statistic or official statement; never "
+    "what is undisclosed, confidential or internal)\n"
     "- Then one line 'Watch for: <expected future events, comma-separated>' "
     "(or 'Watch for: none').\n"
     "- End with exactly one line 'CHANGED: <what moved at the macro level>'.\n"
@@ -189,6 +196,25 @@ _FUTURE_LEAD_RE = re.compile(
 _FUTURE_MARKER_RE = re.compile(
     r"(?i)\b(?:will|won'?t|by 20\d\d|next (?:year|month|quarter|week)|"
     r"in the (?:coming|next)|going to)\b")
+
+
+# Questions no public source can settle (2026-10-12): of 40 failed dossier
+# questions, the recurring shapes asked for what is literally not published —
+# "undisclosed conditions", "specific technical mechanisms", a vendor's patch
+# rollout or integration plan, "what specific metrics does X use". The 20 that
+# resolved asked after PUBLIC processes: an investigation, a vote, a proposal
+# under review, a refinery's status. Minting skips the first shape.
+_UNPUBLISHED_RE = re.compile(
+    r"(?i)\b(undisclosed|confidential|non-?public|internal(?:ly)?|proprietary|private)\b"
+    r"|\bspecific (?:technical )?(?:mechanisms?|metrics|protocols?|methodolog|specifications?)\b"
+    r"|\b(?:patch|rollout|deployment|integration) (?:status|plan)\b"
+    r"|\byield rate\b|\bcost-per-kilogram\b"
+)
+
+
+def _is_unpublished_question(q: str) -> bool:
+    """True when the question asks for something nobody publishes."""
+    return bool(_UNPUBLISHED_RE.search(q or ""))
 
 
 def _is_future_question(q: str) -> bool:
@@ -973,7 +999,12 @@ async def consolidate_dossiers(db) -> str:
                 try:
                     row = await asyncio.to_thread(get_dossier, db, cand["kind"], cand["dkey"])
                     qs = _extract_open_questions(row["body"] if row else "", limit=3)
+                    _unpub = [q for q in qs if _is_unpublished_question(q)]
+                    if _unpub:
+                        logger.info("[Knowing] %r: %d open question(s) skipped as unpublished: %s",
+                                    cand["title"], len(_unpub), _unpub[0][:100])
                     qs = [q for q in qs if not _is_future_question(q)
+                          and not _is_unpublished_question(q)
                           and not q.lower().startswith("watch for")][:1]
                     if qs:
                         from app.core.curiosity import CuriosityQueue
