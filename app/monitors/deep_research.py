@@ -4773,8 +4773,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
                         label, _kvn.get("new"), _kvn.get("updates"), _kvn.get("contradictions"))
 
     learned = await _learn_facts(label, final, findings, kg, articles=articles, model=syn_model)
-    logger.info("[DeepResearch] %s overview: read %d sources (%s), learned %d facts",
-                label, len(findings), ", ".join(hosts[:6]), learned)
+    logger.info("[DeepResearch] %s overview: read %d sources from %d distinct hosts (%s), learned %d facts",
+                label, len(findings), len(hosts), ", ".join(hosts[:6]), learned)
     # Recall/coverage signal (task #65): of the distinct entity anchors surfaced
     # during gather, what fraction reached the digest? pool_anchors = gather
     # breadth; coverage = synthesis recall. The before/after metric for the

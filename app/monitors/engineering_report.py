@@ -94,6 +94,29 @@ _PLAN_OK_RE = re.compile(r"Query planned: \d+ steps")
 _PLAN_SECS_RE = re.compile(r"\[planning\] plan ready in ([0-9.]+)s")
 
 
+def sources_per_digest(days: int = 1, log_glob: str = "/data/logs/nova-app.log*",
+                       today: str | None = None) -> dict | None:
+    """Distinct hosts each overview digest read, from the '[DeepResearch] <label>
+    overview: read N sources from M distinct hosts' line (2026-10-12). The
+    search layer is down to two general engines, so the per-domain feeds are
+    the breadth; this is the number that says whether a feed change widened
+    the digests. Returns {"digests", "median_hosts", "min_hosts", "thin"}."""
+    import statistics
+    pat = re.compile(r"\[DeepResearch\] (.+?) overview: read (\d+) sources from (\d+) distinct hosts")
+    rows: list[tuple[str, int, int]] = []
+
+    def _h(line: str) -> None:
+        m = pat.search(line)
+        if m:
+            rows.append((m.group(1), int(m.group(2)), int(m.group(3))))
+    _scan(days, log_glob, today, _h)
+    if not rows:
+        return None
+    hosts = [r[2] for r in rows]
+    return {"digests": len(rows), "median_hosts": statistics.median(hosts),
+            "min_hosts": min(hosts), "thin": sorted({r[0] for r in rows if r[2] <= 3})}
+
+
 def _scan(days: int, log_glob: str, today: str | None, handler) -> None:
     """Walk the persisted logs inside a window, feeding lines to `handler`.
 
@@ -470,6 +493,12 @@ def build_report(db) -> tuple[str, str, dict]:
     if casc:
         fields["narrow_support"] = ", ".join(
             f"{k} {v}%" for k, v in casc["by_site"].items())
+
+    spd = sources_per_digest(1)
+    if spd:
+        fields["sources_per_digest"] = (f"{spd['digests']} digests, median {spd['median_hosts']:g} hosts, "
+                                        f"min {spd['min_hosts']}"
+                                        + (f"; thin: {', '.join(spd['thin'][:4])}" if spd["thin"] else ""))
 
     # R1: per-engine non-empty rate and the engines SearXNG suspended
     # (process-lifetime counters from native_search).
