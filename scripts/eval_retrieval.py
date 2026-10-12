@@ -585,7 +585,14 @@ async def main():
     db.init_schema()
 
     chroma_client = chromadb.EphemeralClient()
-    collection = chroma_client.create_collection("eval_300", metadata={"hnsw:space": "cosine"})
+    # The CONFIGURED embedder (2026-10-12): without this the collection used
+    # Chroma's bundled all-MiniLM, so an embedding bake-off measured nothing.
+    from app.core.embedding import get_embedding_function
+    _ef = get_embedding_function()
+    print(f"Embedder: {getattr(_ef, 'model', None) or 'chroma-default (all-MiniLM-L6-v2)'}")
+    collection = chroma_client.create_collection(
+        "eval_300", metadata={"hnsw:space": "cosine"},
+        **({"embedding_function": _ef} if _ef is not None else {}))
 
     print("Seeding FTS5 + ChromaDB ... ", end="", flush=True)
     for cid, content in corpus:
