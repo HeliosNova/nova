@@ -583,3 +583,10 @@ flips on a hunch. Phases run in order; a phase's read gates the next code.
    cache capped, or when Qwen 4 27B ships and needs it. Same probe, same rule.
 9. **Frontend** last, by the owner's rule: the cosmos direction, once 1-4
    have read.
+
+### Forward program — execution log
+
+- Phase 2 (2026-10-12 20:30 UTC, 521f55b): encyclosearch, openalex, seznam, 360search enabled after a live probe; a general query now returns from 5 engines (bing 10, encyclosearch 13, yandex 14, seznam 10, 360search 6) and science from 7. Rule R reads at 48 h from the R1 counters.
+- Phase 4 (33cc657): `fact_spans` table (migration 41) written at consolidation; resolver falls back to it; superseded Key facts dropped from chat excerpts and digest priming; pathway row. Rule: C1 closed share ≥50% on new tensions; long-memory temporal-previous passes.
+- Phase 5 prep (85ba2ec): `scripts/eval_retrieval.py` had measured Chroma's bundled embedder, not the configured one — fixed; bge-m3 vs qwen3-embedding:0.6b arms running on the 300-doc corpus (CPU); the long-memory leg waits for the GPU.
+- Phase 1 blocked on the cite_on replay (running since 17:52 UTC).
