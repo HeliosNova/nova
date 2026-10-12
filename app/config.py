@@ -75,7 +75,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_PPR_RETRIEVAL", "ENABLE_GSW_EPISODIC",
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
-    "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER",
+    "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER", "ENABLE_CITATION_DISCIPLINE",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -147,6 +147,10 @@ class Config:
     # measured (rule C2: AUROC > 0.85 over 40 probed attempts) — deferral would
     # erase the outcomes the measurement needs.
     ENABLE_CURIOSITY_TRIAGE_DEFER: bool = field(default_factory=lambda: _env("ENABLE_CURIOSITY_TRIAGE_DEFER", "false").lower() == "true")
+    # Item 4 (2026-10-12): citation-discipline rule in the synthesis prompt. Off
+    # until the same-evidence replay reads it (primary-gate rejection share down
+    # >= 10 pp with support within 0.02 and coverage within 0.03 of the baseline).
+    ENABLE_CITATION_DISCIPLINE: bool = field(default_factory=lambda: _env("ENABLE_CITATION_DISCIPLINE", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)

@@ -4565,6 +4565,24 @@ async def _count_known_vs_new(prior_text: str, final: str, *, model: str | None,
         return None
 
 
+def _citation_discipline_rule() -> str:
+    """Item 4 (2026-10-12), behind ENABLE_CITATION_DISCIPLINE (default off until the
+    same-evidence replay reads it). The gate record showed 34% of rejected cited
+    sentences carry names and figures the cited outlet's own text does not —
+    the synthesis attributes a blended analysis to one outlet. The rule asks for
+    the attribution the gate will check."""
+    from app.config import config as _c
+    if not getattr(_c, "ENABLE_CITATION_DISCIPLINE", False):
+        return ""
+    return (
+        " CITATION DISCIPLINE: the outlet you cite for a sentence must be the one whose "
+        "own finding states that sentence's names and figures — a figure reported by "
+        "one outlet is never cited to another, and a sentence that blends several "
+        "findings cites the outlet of its central fact only, keeping that outlet's "
+        "wording for the names and numbers."
+    )
+
+
 async def _synthesize_from_evidence(label: str, findings: list, articles: list, today: str, *, kg=None, syn_model: str | None = None, dossier_key: str | None = None) -> str:
     """Deep analysis -> best-of-N synthesis -> grounding stack -> fact-banking -> bound.
     Split out of domain_overview (2026-07-10) so the ceiling harness replays the EXACT
@@ -4710,7 +4728,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "the analyses themselves as if they were a source — they are your own thinking, not "
         "evidence. If you cannot cite a factual claim from the findings, OMIT it. "
         "Use ONLY information present in the analyses/findings "
-        "above — never invent a company, number, person, or event.")
+        "above — never invent a company, number, person, or event."
+        + _citation_discipline_rule())
     try:
         # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
         # (owner directive: maximize the best output; extra generations are fine.)
