@@ -12,7 +12,7 @@ Pre-registered rule P1: rescued minus first-pass migration > 5 pp disables the
 clause/alt rescue (`_CLAUSE_TOTAL = 0`, `_ALT_TOTAL = 0`) pending redesign.
 
 Usage (inside a quiet window — the sidecar is CPU-only):
-    python scripts/planting_probe.py --n 200 [--url http://minicheck:8001]
+    python scripts/planting_probe.py --n 200   (inside nova-app, PYTHONPATH=/app)
 """
 
 from __future__ import annotations
@@ -110,10 +110,13 @@ def _sidecar_scorer(url: str):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--n", type=int, default=200)
-    ap.add_argument("--url", default="http://minicheck:8001")
+    ap.add_argument("--url", default=None, help="sidecar URL (default: config.MINICHECK_URL)")
     ap.add_argument("--days", type=int, default=14)
     args = ap.parse_args(argv)
     from app.monitors.gate_record import read
+    if not args.url:
+        from app.config import config
+        args.url = (getattr(config, "MINICHECK_URL", "") or "").rstrip("/")
     records = list(read(days=args.days))
     report = run(records, args.n, _sidecar_scorer(args.url))
     print(json.dumps(report, indent=2))
