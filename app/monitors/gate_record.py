@@ -26,7 +26,7 @@ from typing import Iterable, Iterator
 logger = logging.getLogger(__name__)
 
 RECORD_DIR = Path(os.environ.get("ENTAIL_RECORD_DIR", "/data/entail"))
-KEEP_DAYS = 14
+KEEP_DAYS = 7   # ~45 MB/day measured 2026-10-11; a week is ~300 MB and more than the probe needs
 FIELDS = ("ts", "label", "site", "claim", "hosts", "doc", "prob", "supported", "narrow")
 
 
