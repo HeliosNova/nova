@@ -143,6 +143,9 @@ PATHWAYS: tuple[Pathway, ...] = (
             describe="a chat turn was stored"),
     Pathway("lessons", 168, "lessons", "created_at", usage_gated=True,
             describe="a correction became a lesson"),
+    Pathway("fact_spans", 48, "fact_spans", "created_at",
+            flag="ENABLE_DOSSIERS", monitor="Knowledge Consolidation",
+            describe="a consolidation kept the sentences behind its Key facts"),
     Pathway("tool_actions", 168, "action_log", "created_at", usage_gated=True,
             describe="a tool call was logged"),
 )

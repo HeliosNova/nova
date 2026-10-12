@@ -1246,6 +1246,32 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # --- Migration 41 (2026-10-12): fact_spans (forward program phase 4) ---
+        # The source sentence(s) carrying each Key-fact figure, kept at
+        # consolidation so a tension stays judgeable after the digests age out.
+        if 41 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS fact_spans ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  kind TEXT NOT NULL,"
+                    "  dkey TEXT NOT NULL,"
+                    "  figure TEXT NOT NULL,"
+                    "  bullet_head TEXT,"
+                    "  sentence TEXT NOT NULL,"
+                    "  source_date TEXT,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  UNIQUE(dkey, figure, sentence)"
+                    ")"
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_spans_dkey ON fact_spans (dkey, source_date)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (41,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

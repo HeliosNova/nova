@@ -148,6 +148,16 @@ async def resolve_tension(db, t: Tension, *, judge_model: str | None = None,
 
     t.spans_a = locate_spans(domain_digests(db, t.title_a), t.val_a, t.unit)
     t.spans_b = locate_spans(domain_digests(db, t.title_b), t.val_b, t.unit)
+    # Phase 4: when the digests have aged out, the spans kept at consolidation
+    # (fact_spans) still carry the sentence and its date.
+    try:
+        from app.core.fact_spans import spans_for
+        if not t.spans_a:
+            t.spans_a = spans_for(db, t.dkey_a, t.val_a, t.unit)
+        if not t.spans_b:
+            t.spans_b = spans_for(db, t.dkey_b, t.val_b, t.unit)
+    except Exception as e:
+        logger.debug("[Tensions] fact_spans fallback skipped: %s", e)
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     fig_a, fig_b = _fmt_qty(t.val_a, t.unit), _fmt_qty(t.val_b, t.unit)
     pack_a, pack_b = _span_pack(t.title_a, t.spans_a), _span_pack(t.title_b, t.spans_b)

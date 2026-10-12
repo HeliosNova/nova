@@ -479,7 +479,8 @@ def priming_excerpt(body: str, *, cu_cap: int = 2500, oq_cap: int = 1200) -> str
     body = body or ""
     m = _CU_SECTION_RE.search(body)
     cu = m.group(1).strip() if m else body.strip()
-    out = "## Current understanding\n" + _bound(cu, cu_cap)
+    from app.core.fact_spans import drop_superseded
+    out = "## Current understanding\n" + _bound(drop_superseded(cu), cu_cap)
     m2 = _OPEN_Q_SECTION_RE.search(body)
     if m2 and m2.group(1).strip():
         out += "\n\n## Open questions\n" + _bound(m2.group(1).strip(), oq_cap)
@@ -539,6 +540,10 @@ def get_relevant_dossiers(db, query: str, *, limit: int = 1, open_questions: boo
         m = re.search(r"(?is)## Current understanding\s*(.+?)(?=\n## |\Z)", body)
         # 2,000 chars (was 900: ~71% of a median 3,141-char section was cut).
         excerpt = _bound((m.group(1) if m else body).strip(), 2000)
+        # Phase 4: a fact the resolver marked superseded must not reach the
+        # model as current (STALE: recognition is not application).
+        from app.core.fact_spans import drop_superseded
+        excerpt = drop_superseded(excerpt)
         if want_gaps:
             m2 = _OPEN_Q_SECTION_RE.search(body)
             if m2 and m2.group(1).strip():
@@ -885,6 +890,13 @@ async def _update_dossier(db, cand: dict, sources: str, syn_model: str | None,
             "VALUES (?, ?, ?, ?, ?, 1)",
             (cand["kind"], cand["dkey"], cand["title"], body, changed),
         )
+    # Phase 4 (2026-10-12): keep the source sentences carrying each Key-fact
+    # figure, so a later tension is judgeable after these digests age out.
+    try:
+        from app.core.fact_spans import record_fact_spans
+        await asyncio.to_thread(record_fact_spans, db, cand["kind"], cand["dkey"], body, sources)
+    except Exception as e:
+        logger.warning("[FactSpans] record failed for %r: %s", cand["dkey"], e)
     logger.info("[Knowing] %s dossier %r consolidated (%s)",
                 cand["kind"], cand["title"], changed[:100])
     return {"title": cand["title"], "changed": changed}

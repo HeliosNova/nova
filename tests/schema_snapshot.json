@@ -135,6 +135,16 @@
   "created_at",
   "processed_at"
  ],
+ "fact_spans": [
+  "id",
+  "kind",
+  "dkey",
+  "figure",
+  "bullet_head",
+  "sentence",
+  "source_date",
+  "created_at"
+ ],
  "forecasts": [
   "id",
   "claim",
