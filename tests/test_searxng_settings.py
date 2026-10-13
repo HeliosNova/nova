@@ -39,8 +39,10 @@ def test_no_engine_is_listed_twice_and_none_that_fail_to_load():
     assert DISABLED <= set(names)
 
 
-def test_language_and_the_ddg_trial():
+def test_language_and_the_ddg_trial_outcome():
+    """Rule R2 read 2026-10-13: DuckDuckGo answered 0 of 4,963 general searches
+    in the 48 h trial (CAPTCHA every call) — it stays disabled."""
     doc = yaml.safe_load(LIVE.read_text(encoding="utf-8"))
     assert doc["search"]["default_lang"] == "en-US"
     ddg = next(e for e in doc["engines"] if e["name"] == "duckduckgo")
-    assert ddg.get("disabled") is False
+    assert ddg.get("disabled") is True

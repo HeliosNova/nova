@@ -60,7 +60,7 @@ engines:
   - name: duckduckgo
     engine: duckduckgo
     shortcut: ddg
-    disabled: false   # R2 trial (2026-10-10): rule R2 reverts this line if the 48 h non-empty rate stays at 0
+    disabled: true   # rule R2 READ 2026-10-13: CAPTCHA on 4,963/4,963 general searches in the 48 h trial (0% non-empty) — reverted
     timeout: 6.0
   - name: duckduckgo news
     engine: duckduckgo_extra
