@@ -597,3 +597,20 @@ flips on a hunch. Phases run in order; a phase's read gates the next code.
 - 2026-10-13: WSL crashed between 06:15 and 14:31 UTC (owner: "wsl crashed btw"); Docker Desktop down, all containers off. cite2 replay was at 9/16 topics; rows persisted on the volume. On return: verify GPU placement (entrypoint guard), finish the 7 remaining topics with `--only`, read the phase 1b rule on the 16 pairs.
 - Phase 1b rule READ 2026-10-13 14:40 UTC: **REFUSED.** cite2 (structured [Fn] ids → hosts) vs x1off on the 16 frozen topics: support 0.672 → 0.642, coverage 0.724 → 0.710, overall 0.827 → 0.819, primary-gate rejection share 0.798 → 0.824 (worse). Flag stays off. **Phase 1 closed as refused:** the citation-discipline rule bought support (+0.081) at a coverage cost and left rejections flat; structured ids lost support and raised rejections. The gate's 80% primary rejection is sentence shape (analytical framing, blended sentences, figures restated in the digest's own words), not which outlet is named. A third arm (single-source sentences + analysis confined to its own paragraph) is possible but not registered: two 7-hour GPU replays in two days already cost a throughput day, and phase 7 needs three clean days first.
 - 2026-10-13 14:35 UTC: Docker restarted on the owner's explicit ask after the WSL crash (one-off; no autostart). Ollama's entrypoint logged the 11:50 GPU-discovery failure and recovered on GPU at 14:35; all containers healthy, freshness 119/0, Telegram + Discord up. Phase 7's three-clean-day clock starts now.
+
+### Pre-registered (2026-10-13, before any further data): phase 1c and the read order
+
+Order, each read gating the next action: (1) clean harness 2026-10-13 22:42 UTC — reasoning
+8/8 and tool-use 6/6 clear the two flags, else bisect the cuts before anything else;
+(2) breadth 2026-10-14 20:30 — median distinct hosts ≥ 7.8 (5.8 + 2) and each new engine
+>50% non-empty, failing engines come out; (3) C2 AUROC at 40 outcomes — >0.85 flips
+ENABLE_CURIOSITY_TRIAGE_DEFER, else revert the ORDER BY CASE; (4) week-out 2026-10-20 —
+revived-pair count ≤ 37, C1 admitted share ≥ 50% of new tensions, item-2 resolve share > 33%;
+(5) throughput 2026-10-16 — runs/active-hour ≥ 6.5 over three clean days, else measure the
+sidecar queue before touching it.
+
+Phase 1c (registered now, built and run ONLY after 1-5 have read): single-source sentences —
+the synthesis prompt requires every factual sentence to draw on ONE finding and confines
+analysis (connections, implications) to a final paragraph with no citations; same frozen
+16 topics vs x1off; rule: primary-gate rejection share ≤ 0.70 (−10 pp) AND support ≥ 0.672
+AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days.
