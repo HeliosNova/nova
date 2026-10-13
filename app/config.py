@@ -76,6 +76,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
     "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER", "ENABLE_CITATION_DISCIPLINE",
+    "ENABLE_STRUCTURED_CITATIONS",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -151,6 +152,10 @@ class Config:
     # until the same-evidence replay reads it (primary-gate rejection share down
     # >= 10 pp with support within 0.02 and coverage within 0.03 of the baseline).
     ENABLE_CITATION_DISCIPLINE: bool = field(default_factory=lambda: _env("ENABLE_CITATION_DISCIPLINE", "false").lower() == "true")
+    # Phase 1b (2026-10-13): findings carry [Fn] ids, the model cites ids, the
+    # citation is mapped to the finding's host deterministically. Off until the
+    # replay reads: primary rejection -10 pp AND support >= x1off AND coverage within 0.03.
+    ENABLE_STRUCTURED_CITATIONS: bool = field(default_factory=lambda: _env("ENABLE_STRUCTURED_CITATIONS", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)

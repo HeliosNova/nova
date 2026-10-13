@@ -443,13 +443,54 @@ def _annotated_evidence(findings: list, host_clusters: dict | None = None) -> st
     toks = [{w for w in _key_terms(t) if w not in _HEADLINE_STOP and len(w) >= 3}
             for t, _u, _f in findings]
     hc = host_clusters or {}
+    from app.config import config as _cfg
+    structured = bool(getattr(_cfg, "ENABLE_STRUCTURED_CITATIONS", False))
     blocks = []
     for i, (t, u, f) in enumerate(findings):
         hosts = {_host(findings[j][1]) for j in range(len(findings)) if len(toks[i] & toks[j]) >= 2}
         n_indep = len({hc.get(h, h) for h in hosts})
         corro = f"{n_indep} sources" if n_indep >= 2 else "1 source"
-        blocks.append(f"[{t}] ({_host(u)} · {_tier_label(u)} · {corro})\n{f}")
+        # Phase 1b (2026-10-13): a finding id the model cites as [Fn]; mapped
+        # back to this host by _resolve_structured_citations before the gate.
+        fid = f"[F{i + 1}] " if structured else ""
+        blocks.append(f"{fid}[{t}] ({_host(u)} · {_tier_label(u)} · {corro})\n{f}")
     return "\n\n".join(blocks)
+
+
+_FID_RE = re.compile(r"\s*\[F(\d{1,3})\]")
+
+
+def _structured_citation_rule() -> str:
+    """Phase 1b: replaces the free-form outlet citation instruction when on."""
+    from app.config import config as _cfg
+    if not getattr(_cfg, "ENABLE_STRUCTURED_CITATIONS", False):
+        return ""
+    return (" CITATION FORMAT: every factual sentence cites the finding it comes from by "
+            "its id, like [F3], placed at the end of the sentence; cite the ONE finding "
+            "whose text states the sentence's names and figures. Never write an outlet "
+            "name in parentheses; never cite an id that is not in SOURCE FINDINGS.")
+
+
+def _resolve_structured_citations(text: str, findings: list) -> tuple[str, int]:
+    """Map every [Fn] to ' (host)' of finding n (1-based); unknown ids are
+    removed. Deterministic, so the entailment gate checks the article the
+    model actually read. Returns (text, n_mapped)."""
+    if not text or "[F" not in text:
+        return text, 0
+    hosts = [_host(u) for _t, u, _f in findings]
+    n = 0
+
+    def _sub(m):
+        nonlocal n
+        i = int(m.group(1)) - 1
+        if 0 <= i < len(hosts) and hosts[i]:
+            n += 1
+            return f" ({hosts[i]})"
+        return ""
+    out = _FID_RE.sub(_sub, text)
+    # "(host) ." -> "(host)." so the sentence keeps its terminal punctuation shape
+    out = re.sub(r"\((?P<h>[a-z0-9.\-]+)\)\s+([.!?])", r"(\g<h>)\2", out)
+    return out, n
 
 
 _CSS_TOKENS = re.compile(
@@ -4729,7 +4770,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
         "evidence. If you cannot cite a factual claim from the findings, OMIT it. "
         "Use ONLY information present in the analyses/findings "
         "above — never invent a company, number, person, or event."
-        + _citation_discipline_rule())
+        + _citation_discipline_rule()
+        + _structured_citation_rule())
     try:
         # best-of-N: FOUR diverse framings, external grounded judge picks the sharpest.
         # (owner directive: maximize the best output; extra generations are fine.)
@@ -4742,6 +4784,9 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
     draft = (draft or "").strip()
     if not draft:
         return f"## 🌐 {label} — domain overview\n_{today}_\n\n(synthesis unavailable)"
+    if getattr(_cfg, "ENABLE_STRUCTURED_CITATIONS", False):
+        draft, _nmap = _resolve_structured_citations(draft, findings)
+        logger.info("[DeepResearch] %s: %d structured citation(s) resolved to hosts", label, _nmap)
 
     # Knowing instrumentation: log how today's reading scored against prior
     # understanding, then strip the marker line from the digest body.
