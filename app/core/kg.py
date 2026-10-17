@@ -140,6 +140,12 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "used for": "used_for", "used in": "used_for",
     "known for": "known_for", "famous for": "known_for",
     "related to": "related_to",
+    # 2026-10-17: a common extraction shape that degraded to related_to and
+    # now would be refused; headquarters is a location.
+    "headquartered in": "located_in",
+    "headquartered_in": "located_in",
+    "based in": "located_in",
+    "based_in": "located_in",
     "belongs to": "belongs_to",
     "has property": "has_property", "has": "has_property",
     "born in": "born_in",

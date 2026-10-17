@@ -34,7 +34,7 @@ async def test_learn_facts_grounds_against_article_bodies(monkeypatch):
         return json.dumps([
             # terms appear ONLY in the article body, not in the findings text —
             # the old findings-only gate rejected exactly this shape
-            {"subject": "European Union", "predicate": "coordinates", "object": "sanctions framework"},
+            {"subject": "European Union", "predicate": "regulates", "object": "sanctions framework"},
         ])
 
     monkeypatch.setattr(dr.llm, "invoke_nothink", fake_invoke)

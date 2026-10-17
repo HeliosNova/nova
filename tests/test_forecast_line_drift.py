@@ -51,8 +51,8 @@ RUN_TOGETHER = (
     "The Treasury has begun buybacks.\n"
     "CHANGED: intervention started\n"
     "STATE: U.S. Sovereign Debt Crisis | Active intervention initiated FORECAST: "
-    "Market yields for 30-year Treasuries remain below 5% by October 15, 2026 "
-    "| resolves 2026-10-15 | 0.7"
+    "Market yields for 30-year Treasuries remain below 5% by October 15, 2027 "
+    "| resolves 2027-10-15 | 0.7"
 )
 
 
@@ -60,7 +60,7 @@ def test_a_forecast_written_after_the_state_on_the_same_line_is_stored(db):
     fid = forecasts.parse_and_store_forecast(db, RUN_TOGETHER)
     assert fid, "the replayed line was dropped"
     assert _claim(db, fid).startswith("Market yields for 30-year Treasuries")
-    assert _resolves(db, fid).date() == datetime(2026, 10, 15).date()
+    assert _resolves(db, fid).date() == datetime(2027, 10, 15).date()
 
 
 def test_the_state_parser_does_not_swallow_the_forecast():
