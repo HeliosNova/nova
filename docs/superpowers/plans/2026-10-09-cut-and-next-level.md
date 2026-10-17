@@ -614,3 +614,4 @@ the synthesis prompt requires every factual sentence to draw on ONE finding and 
 analysis (connections, implications) to a final paragraph with no citations; same frozen
 16 topics vs x1off; rule: primary-gate rejection share ≤ 0.70 (−10 pp) AND support ≥ 0.672
 AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days.
+- 2026-10-17 04:25 UTC: Nova found down since a Windows-update reboot on 2026-10-15 18:35 local (~34 h; owner: "my computer restarted from an update and never noticed"). F: unlocked, Docker Desktop not running; relaunched on the owner's ask. The 10-13 → 10-15 reads that were due (clean harness, 48 h breadth/engines, throughput's three clean days) are read from whatever the logs hold once the containers are back; the three-clean-day clock restarts.
