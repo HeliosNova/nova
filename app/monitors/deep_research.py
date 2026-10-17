@@ -432,7 +432,8 @@ def _tier_label(url: str) -> str:
     return "single/unverified"
 
 
-def _annotated_evidence(findings: list, host_clusters: dict | None = None) -> str:
+def _annotated_evidence(findings: list, host_clusters: dict | None = None, *,
+                        with_dates: bool = False) -> str:
     """Each finding tagged '(outlet · reliability · corroboration)' so the synthesizer
     weights by evidence strength instead of treating every claim as equal fact.
     Corroboration = distinct hosts among findings sharing ≥2 significant title tokens
@@ -453,7 +454,16 @@ def _annotated_evidence(findings: list, host_clusters: dict | None = None) -> st
         # Phase 1b (2026-10-13): a finding id the model cites as [Fn]; mapped
         # back to this host by _resolve_structured_citations before the gate.
         fid = f"[F{i + 1}] " if structured else ""
-        blocks.append(f"{fid}[{t}] ({_host(u)} · {_tier_label(u)} · {corro})\n{f}")
+        # Curiosity only (2026-10-17): a resolved answer presented a Diet session
+        # "scheduled to end July 17, 2026" as current in October. The tag carries
+        # the article's publication date so the model can place the event; the
+        # digest chain keeps its undated tags (prior-context there measured as a
+        # grounding cost, and its read is the entail gate's).
+        when = ""
+        if with_dates:
+            d = _pub_dt(_PUB_DATES.get(u or "") or "")
+            when = f" · published {d.strftime('%Y-%m-%d')}" if d else " · publication date unknown"
+        blocks.append(f"{fid}[{t}] ({_host(u)} · {_tier_label(u)} · {corro}{when})\n{f}")
     return "\n\n".join(blocks)
 
 
@@ -1256,7 +1266,7 @@ async def research_question(question: str, *, read_target: int = 6,
     if not findings:
         stats["reason"] = "no_findings"
         return "", stats
-    evidence = _annotated_evidence(findings)
+    evidence = _annotated_evidence(findings, with_dates=True)
     today = today or _NOW().strftime("%B %d, %Y")
     hosts = sorted({_host(u) for _, u, _ in findings})
     prompt = (
@@ -1264,6 +1274,10 @@ async def research_question(question: str, *, read_target: int = 6,
         f"QUESTION: {question}\n\n"
         "Rules:\n"
         "- 3 to 6 sentences, no preamble, no bullet list.\n"
+        "- Each finding's tag ends with its publication date. Give every event its date as "
+        "the evidence states it; a date before today has already happened and is not "
+        "upcoming, scheduled, or the current state. When the newest evidence is more than "
+        "30 days old, say so ('as of <month> <year>').\n"
         "- Every factual sentence ends with a citation in parentheses naming one of "
         f"these hosts exactly: {', '.join(hosts)}.\n"
         "- Give dates and figures as the evidence states them; invent nothing.\n"
