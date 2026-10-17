@@ -1,7 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from "react";
-import { ImagePlus, Send, Square, X, ArrowUp, Mic, MicOff } from "lucide-react";
+import { ImagePlus, Square, X, ArrowUp } from "lucide-react";
 import { toast } from "sonner";
-import { transcribeVoice, getConfigSummary } from "@/lib/api";
 
 interface Props {
   onSend: (text: string, imageBase64?: string) => void;
@@ -20,25 +19,8 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // ── Voice recording state ──
-  const [recording, setRecording] = useState(false);
-  const [voiceEnabled, setVoiceEnabled] = useState(false);
-  const [transcribing, setTranscribing] = useState(false);
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
-
-  // Check if voice is enabled on mount (via config-summary with auth headers)
-  useEffect(() => {
-    const checkVoice = async () => {
-      try {
-        const data = await getConfigSummary();
-        setVoiceEnabled(!!data.ENABLE_VOICE);
-      } catch {
-        setVoiceEnabled(false);
-      }
-    };
-    checkVoice();
-  }, []);
+  // Voice input was removed with the voice backend (2026-10-10 cut); the mic
+  // button and its /api/voice/transcribe caller are gone.
 
   useEffect(() => {
     if (!streaming) textareaRef.current?.focus();
@@ -110,69 +92,6 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
     clearImage();
   };
 
-  // ── Voice recording handlers ──
-
-  const startRecording = async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      const recorder = new MediaRecorder(stream);
-      chunksRef.current = [];
-
-      recorder.ondataavailable = (e) => {
-        if (e.data.size > 0) chunksRef.current.push(e.data);
-      };
-
-      recorder.onstop = async () => {
-        stream.getTracks().forEach((t) => t.stop());
-        const blob = new Blob(chunksRef.current, { type: "audio/webm" });
-
-        if (blob.size === 0) return;
-
-        setTranscribing(true);
-        try {
-          const data = await transcribeVoice(blob, "recording.webm");
-          if (data.text) {
-            setText((prev) => (prev ? prev + " " + data.text : data.text));
-            textareaRef.current?.focus();
-          }
-        } catch (err) {
-          const error = err as Error;
-          if (error.name === "AbortError") {
-            toast.error("Transcription timed out — try a shorter recording");
-          } else if (error.message.includes("Failed to fetch") || error.message.includes("NetworkError")) {
-            toast.error("Network error — check your connection and try again");
-          } else {
-            toast.error(`Voice transcription failed: ${error.message}`);
-          }
-        } finally {
-          setTranscribing(false);
-        }
-      };
-
-      recorder.start();
-      mediaRecorderRef.current = recorder;
-      setRecording(true);
-    } catch (err) {
-      const error = err as Error;
-      if (error.name === "NotAllowedError") {
-        toast.error("Microphone permission denied — allow access in browser settings");
-      } else if (error.name === "NotFoundError") {
-        toast.error("No microphone found — connect a microphone and try again");
-      } else if (error.name === "NotReadableError") {
-        toast.error("Microphone is in use by another application");
-      } else {
-        toast.error(`Microphone error: ${error.message}`);
-      }
-    }
-  };
-
-  const stopRecording = () => {
-    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
-      mediaRecorderRef.current.stop();
-    }
-    setRecording(false);
-  };
-
   const canSend = (text.trim() || imageBase64) && !disabled;
 
   return (
@@ -235,7 +154,7 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
           onPaste={handlePaste}
           onFocus={() => setFocused(true)}
           onBlur={() => setFocused(false)}
-          placeholder={transcribing ? "Transcribing..." : imageBase64 ? "Describe what you want to know..." : "Message Nova..."}
+          placeholder={imageBase64 ? "Describe what you want to know..." : "Message Nova..."}
           rows={1}
           className="flex-1 resize-none bg-transparent px-1 py-2 text-sm text-nova-text placeholder:text-nova-text-dim/60 outline-none"
           style={{ maxHeight: 150 }}
@@ -245,27 +164,6 @@ export default function ChatInput({ onSend, onStop, streaming, disabled }: Props
             el.style.height = Math.min(el.scrollHeight, 150) + "px";
           }}
         />
-
-        {/* Mic button (only shown when voice is enabled) */}
-        {voiceEnabled && (
-          <button
-            onClick={recording ? stopRecording : startRecording}
-            disabled={streaming || disabled || transcribing}
-            className={`rounded-lg p-2 transition-all disabled:opacity-40 ${
-              recording
-                ? "bg-nova-error/20 text-nova-error animate-pulse"
-                : "text-nova-text-dim hover:bg-nova-surface-elevated hover:text-nova-text"
-            }`}
-            title={recording ? "Stop recording" : transcribing ? "Transcribing..." : "Start voice recording"}
-            aria-label={recording ? "Stop recording" : "Start voice recording"}
-          >
-            {recording ? (
-              <MicOff size={18} />
-            ) : (
-              <Mic size={18} />
-            )}
-          </button>
-        )}
 
         {streaming ? (
           <button

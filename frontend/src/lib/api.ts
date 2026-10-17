@@ -128,23 +128,6 @@ export async function importData(file: File): Promise<{ status: string; stats: R
   return res.json();
 }
 
-// ── Voice ──
-
-export async function transcribeVoice(audioBlob: Blob, filename = "recording.webm"): Promise<{ text: string; language?: string; duration?: number }> {
-  const form = new FormData();
-  form.append("file", audioBlob, filename);
-  const headers: Record<string, string> = {};
-  const apiKey = localStorage.getItem("nova_api_key");
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  const res = await fetch(`${getBaseUrl()}/api/voice/transcribe`, {
-    method: "POST",
-    headers,
-    body: form,
-  });
-  if (!res.ok) throw new Error(`Transcription failed: ${res.status}`);
-  return res.json();
-}
-
 // ── Conversations ──
 
 export async function getConversations(limit = 50): Promise<ConversationSummary[]> {
@@ -524,23 +507,6 @@ export async function getAction(id: number): Promise<ActionInfo> {
 
 export async function getDocument(id: number): Promise<DocumentInfo> {
   return request(`/api/documents/${id}`);
-}
-
-// ── Voice Chat ──
-
-export async function voiceChat(blob: Blob, filename = "recording.webm"): Promise<Response> {
-  const form = new FormData();
-  form.append("file", blob, filename);
-  const headers: Record<string, string> = {};
-  const apiKey = localStorage.getItem("nova_api_key");
-  if (apiKey) headers["Authorization"] = `Bearer ${apiKey}`;
-  const res = await fetch(`${getBaseUrl()}/api/voice/chat`, {
-    method: "POST",
-    headers,
-    body: form,
-  });
-  if (!res.ok) throw new Error(`Voice chat failed: ${res.status}`);
-  return res;
 }
 
 // ── Knowing tier: dossiers (2026-08-12) ──
