@@ -120,7 +120,7 @@ async def test_a_deflection_counts_as_unsettled():
 # --- c3: the evidence-first path parks instead of requeueing -----------------------
 def test_the_evidence_first_path_parks_an_unsettled_question_before_the_requeue():
     src = inspect.getsource(hb.HeartbeatLoop._research_one_curiosity)
-    i_park = src.index("reason=unsettled")
+    i_park = src.index('reason=unsettled"')          # the c3 block, not reason=unsettled_no_findings
     i_requeue = src.index("closure check failed — requeued")
     assert i_park < i_requeue
     block = src[:i_park]

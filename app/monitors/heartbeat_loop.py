@@ -1697,6 +1697,24 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                                     search_health(), item.topic[:80])
                         return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
                                 f"reason=search_degraded")
+                # Sources read, nothing extractable (2026-10-17): 23 of 79 attempts
+                # last week gathered >=3 articles and _findings returned none —
+                # the articles exist but do not carry the datum the question asks
+                # for. That is the same "the public record does not settle it"
+                # signal as a closure 'unsettled', one step earlier, and it was
+                # burning three research passes per question (closure of ""
+                # reads as too-short -> fail -> requeue). Park it; the dossier
+                # keeps asking. <3 sources is gather thinness, left to requeue.
+                if (not result and grounding.get("reason") == "no_findings"
+                        and int(grounding.get("sources", 0) or 0) >= 3):
+                    await asyncio.to_thread(
+                        svc.curiosity.defer, item.id,
+                        "unsettled: %d sources read, none carried the answer"
+                        % int(grounding.get("sources", 0) or 0))
+                    logger.info("[Curiosity] %d sources read, no extractable finding — parked: %s",
+                                int(grounding.get("sources", 0) or 0), item.topic[:80])
+                    return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
+                            f"reason=unsettled_no_findings")
             else:
                 result, grounding = await self._think_query_meta(research_query)
 

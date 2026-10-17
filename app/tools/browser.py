@@ -357,7 +357,18 @@ class BrowserTool(BaseTool):
             BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
                 headless=True,
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled"],
+                      "--disable-blink-features=AutomationControlled",
+                      # Chromium's HTTP/2 negotiation fails outright against a
+                      # cluster of major news/wire servers — net::ERR_HTTP2_
+                      # PROTOCOL_ERROR, 43-73x/day in the live log (usnews.com
+                      # 226, washingtonpost.com 52, businesswire.com 25,
+                      # miamiherald.com 12, sacbee.com, star-telegram.com,
+                      # cbc.ca, newsobserver.com...). Each is an article the
+                      # digest and curiosity evidence pool loses. Forcing HTTP/1.1
+                      # clears the whole class (the servers serve 1.1 fine); the
+                      # cost is marginal on HTTP/2-only hosts, of which these
+                      # read targets have none (2026-10-17).
+                      "--disable-http2"],
                 # Minimal env (2026-09-01): the renderer used to inherit the whole
                 # process environment — API and bot tokens included — while
                 # rendering attacker-controlled pages.
