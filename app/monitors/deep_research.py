@@ -2010,7 +2010,13 @@ _DANGLING_PREP_RE = re.compile(
 )
 # A possessive "'s" with no owner in front (start of line/clause) — the entity
 # name was stripped, leaving "'s small-molecule agonist" (2026-07-08).
-_ORPHAN_POSSESSIVE_RE = re.compile(r"(^|[.!?]\s+|[:;]\s+|\(\s*)'s\s+", re.IGNORECASE)
+# Measured 2026-10-17 over 227 delivered digests: 5% carried an orphan "’s"
+# ("the Department of ’s system", "**Lead Development: ’s Record Q3") — the
+# model writes the CURLY apostrophe and the possessor sits mid-clause after
+# "of"/"the"/a header, so the old clause-start ASCII pattern never matched.
+# Any "’s"/"'s" not attached to a word (or a closing quote/paren/italic
+# marker) is an orphan: drop it and the space after it.
+_ORPHAN_POSSESSIVE_RE = re.compile(r"(?<![\w)\]*\"”’'])[’']s\b\s*", re.IGNORECASE)
 
 
 def _repair_dangling_fragments(text: str) -> str:
@@ -2024,7 +2030,7 @@ def _repair_dangling_fragments(text: str) -> str:
     if not text:
         return text
     out = _DANGLING_PREP_RE.sub(",", text)     # "implications for, requiring" → "implications, requiring"
-    out = _ORPHAN_POSSESSIVE_RE.sub(r"\1", out)  # "'s small-molecule" → "small-molecule"
+    out = _ORPHAN_POSSESSIVE_RE.sub("", out)  # "of ’s system" → "of system"
     # tidy the double punctuation / spacing the excision can leave
     out = re.sub(r",\s*,", ",", out)
     out = re.sub(r"\s+,", ",", out)
@@ -3018,7 +3024,7 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
     forced a 27B→9B swap mid-chain (VRAM can't hold both), costing a reload."""
     if kg is None or not brief or len(findings) < 1:
         return 0
-    from app.core.kg import is_garbage_triple
+    from app.core.kg import is_garbage_triple, is_vague_or_misfit
     # World time (G2): the earliest publication date among the cited articles,
     # else the digest date — never None, so valid_from stops mirroring created_at.
     as_of = _earliest_pub_date(articles, findings) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
@@ -3050,6 +3056,9 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
                    str(c.get("object", "")).strip())
         if not (s and p and o) or is_garbage_triple(s, p, o):
             garbage += 1
+            continue
+        if is_vague_or_misfit(s, p, o):
+            garbage += 1    # 2026-10-17: related_to and predicate/object misfits
             continue
         st, ot = _key_terms(s), _key_terms(o)
         if not st or not ot:
@@ -3209,6 +3218,15 @@ _ANALYTICAL_RE = re.compile(
     r"raises? the (?:question|prospect|risk|stakes)|sets? the stage|points? to a|"
     r"what to watch|signals? that|underscores? (?:the|a|how)|highlights? (?:the|a|how)|"
     r"the (?:throughline|takeaway) )")
+
+
+# A section body's first sentence that cannot stand without the sentence the
+# gate just removed (2026-10-17). Demonstratives, pronouns and consequence
+# adverbs only — "Meanwhile", "Simultaneously" stand on their own.
+_DANGLING_OPENER_RE = re.compile(
+    r"^(?:This|These|That|Those|Such|It|They|Consequently|Hence|Thus|As a result|In turn)\b")
+# The bullet marker + bold header a digest line opens with ("* **Headline:** ").
+_LINE_HEAD_RE = re.compile(r"^\s*[*\-•]?\s*(?:\*\*[^*]{1,160}\*\*:?\s*)?")
 
 
 def _is_analytical(claim: str) -> bool:
@@ -3797,6 +3815,21 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
             lines[li] = lines[li].replace(st, "").rstrip()
             n_changed += 1
             logger.info("[entail-drop] claim=%r", _claim_of(st)[:140])
+    # Phase 3 (2026-10-17): a dropped sentence often leaves its follower
+    # opening on a referent with nothing to refer to ("This fiscal burden is
+    # compounded by…", "Such a shift…"). Measured over 135 delivered digests:
+    # 38% of sections opened that way. When a line lost a sentence and its
+    # new first body sentence is pure anaphora, drop that sentence too (once).
+    dangling = 0
+    for li in sorted({li for li, _st in drop}):
+        line = lines[li]
+        body = _LINE_HEAD_RE.sub("", line, count=1)
+        segs = [s for s in _SENT_SPLIT_RE.split(body) if s.strip()]
+        if len(segs) >= 2 and _DANGLING_OPENER_RE.match(segs[0].strip()):
+            lines[li] = line.replace(segs[0], "", 1).replace("  ", " ")
+            dangling += 1
+            n_changed += 1
+            logger.info("[entail-drop] dangling follower=%r", segs[0].strip()[:120])
     # One greppable line per digest so drop-rate TRENDS are a metric, not
     # log archaeology (audit 2026-08-24: ~51%/day attrition went unnoticed
     # because only per-claim misses were logged).

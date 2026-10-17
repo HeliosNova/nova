@@ -73,7 +73,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
     event-relations (direction reversals, spurious competes_with); the CURRENT prompt
     on the 27B both extracts MORE and keeps relations clean, so the prompt is unchanged.
     """
-    from app.core.kg import CANONICAL_PREDICATES, is_garbage_triple
+    from app.core.kg import CANONICAL_PREDICATES, is_garbage_triple, is_vague_or_misfit
     from app.core.prompt_optimizer import get_active_module
 
     predicates_str = ", ".join(sorted(CANONICAL_PREDICATES))
@@ -143,7 +143,7 @@ async def _extract_kg_triples(kg, query: str, answer: str, source_name: str = ""
             if not s or not p or not o or len(s) > 100 or len(o) > 100:
                 continue
 
-            if is_garbage_triple(s, p, o):
+            if is_garbage_triple(s, p, o) or is_vague_or_misfit(s, p, o):
                 logger.debug("KG quality gate rejected: %s %s %s", s, p, o)
                 continue
 

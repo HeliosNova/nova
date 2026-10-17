@@ -17,7 +17,7 @@ import pytest
 
 from app.monitors import deep_research as dr
 
-RAW = '{"facts": [{"subject": "Reuters", "predicate": "reports_on", "object": "copper tariffs"}]}'
+RAW = '{"facts": [{"subject": "Reuters", "predicate": "launched", "object": "copper tariffs"}]}'
 FINDINGS = [
     ("t1", "https://reuters.com/a", "Reuters reports on copper tariffs."),
     ("t2", "https://apnews.com/b", "AP: copper tariffs reported by Reuters."),

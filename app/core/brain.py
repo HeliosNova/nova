@@ -368,6 +368,28 @@ def _fix_calculator_transcriptions(answer: str, tool_results: list[dict]) -> str
 # Conservative: only matches queries that EXPLICITLY use a time-sensitive
 # qualifier ("current", "now", "today", "latest", "right now") with a target
 # (price, weather, news, score, headline, value, rate, level).
+# What-is-new questions: the facts-first / knowing-first gates must not answer
+# these from the stores alone (2026-10-17).
+_RECENCY_QUERY_RE = re.compile(
+    r"(?i)\b(?:what(?:'s| is| has)?\s+(?:changed|new|happened|developed)|latest|recent(?:ly)?|"
+    r"this\s+(?:week|month)|today|past\s+(?:few\s+)?(?:days|weeks)|update\s+on|since\s+(?:yesterday|last\s+week))\b")
+
+_TOOL_LESS_NOTE = (
+    "\n\nANSWER SOURCE: no tools were run for this reply; it comes entirely from your stored "
+    "knowledge (dossiers, known facts, lessons). Do not say you searched, looked up, or "
+    "cross-referenced anything. State what you know and as of when it was recorded."
+)
+
+
+def _with_tool_less_note(messages: list[dict]) -> list[dict]:
+    """Copy of `messages` with the tool-less note appended to the system turn."""
+    if not messages or messages[0].get("role") != "system":
+        return [{"role": "system", "content": _TOOL_LESS_NOTE.strip()}] + list(messages)
+    out = [dict(messages[0])] + list(messages[1:])
+    out[0]["content"] = (out[0].get("content") or "") + _TOOL_LESS_NOTE
+    return out
+
+
 _TIME_SENSITIVE_RE = re.compile(
     r"\b(?:current|currently|right\s+now|now|today(?:'s)?|latest|this\s+(?:week|month|hour)|"
     r"as\s+of\s+(?:today|now)|live|real-time)\b"
@@ -3385,7 +3407,14 @@ async def think(
         # generate WITHOUT tools so the model reads its facts instead of
         # searching the web for an entity it thinks it doesn't know.
         _gen_tools = tools
-        if intent == "general" and _kg_answers_query(query, ctx.kg_facts_text or ""):
+        # Recency bypass (2026-10-17): "what changed … this week" went tool-less
+        # because a dossier matched, and the answer presented three-week-old
+        # talks as this week's news. A query that asks what is new or current
+        # keeps its tools whatever the stores already say.
+        _recency = bool(_RECENCY_QUERY_RE.search(query)) or bool(_TIME_SENSITIVE_RE.search(query))
+        if _recency and intent == "general":
+            logger.info("[facts-first] recency query — tools kept")
+        elif intent == "general" and _kg_answers_query(query, ctx.kg_facts_text or ""):
             logger.info("[facts-first] KG subject matches query — tool-less generation")
             _gen_tools = []
         elif intent == "general" and _knowing_answers_query(
@@ -3393,6 +3422,11 @@ async def think(
                 dossiers=ctx.dossiers):
             logger.info("[knowing-first] dossier/lesson covers the query — tool-less generation")
             _gen_tools = []
+        if _gen_tools is not tools:
+            # The model must not narrate a search it did not run (live
+            # 2026-10-17: "I searched for recent developments" with zero tool
+            # calls). Tell it where the answer comes from.
+            messages = _with_tool_less_note(messages)
 
         gen = _GenerationResult()
         async for event in _run_generation_loop(

@@ -483,6 +483,44 @@ _GENERIC_ENTITY = frozenset({
 })
 
 
+# Predicate/object fit (2026-10-17). A sample of 400 researched facts: 34% were
+# banked as `related_to` although the extraction prompt forbids it (the
+# normalizer's degrade target), and relational predicates carried objects that
+# cannot fill them — "owns 23.0% market share", "acquired $3.6 billion in
+# borrowings", "owns CVE-2026-39919", "leads ultra-high-energy neutrinos",
+# "partnered_with tokenized stocks as loan collateral". These reach every chat
+# prompt (kg_facts=20). The checks are deterministic and conservative.
+_QTY_ONLY_RE = re.compile(r"^\$?[\d.,]+\s*(?:%|percent|million|billion|trillion|bn|mn|[kKmMbB])?\s*$")
+_QTY_IN_RE = re.compile(r"(?i)^\$?[\d.,]+\s*(?:million|billion|trillion|bn|mn)?\s+(?:in|of)\s+")
+_MISFIT_OBJECT_RE = re.compile(r"(?i)\bmarket share\b|\bborrowings?\b|\bdebt\b|\blosses\b|\bCVE-\d|\bper ?cent\b")
+_ENTITY_PREDICATES = frozenset({"leads", "partnered_with", "sanctioned", "acquired", "owns", "launched"})
+_ASSET_PREDICATES = frozenset({"owns", "acquired", "launched"})
+_ENTITY_OBJECT_PREDICATES = frozenset({"leads", "partnered_with", "sanctioned"})
+
+
+def predicate_fits_object(predicate: str, object_: str) -> bool:
+    """False when the object cannot fill the predicate's slot."""
+    p = (predicate or "").strip().lower()
+    o = (object_ or "").strip()
+    if p not in _ENTITY_PREDICATES:
+        return True
+    if _QTY_ONLY_RE.match(o) or _QTY_IN_RE.match(o) or _MISFIT_OBJECT_RE.search(o):
+        return False
+    if p in _ENTITY_OBJECT_PREDICATES and not re.search(r"[A-Z]", o):
+        return False   # an org, person or state has a name; "ultra-high-energy neutrinos" does not
+    return True
+
+
+def is_vague_or_misfit(subject: str, predicate: str, object_: str) -> bool:
+    """A triple the extraction should not have produced: a predicate that
+    degrades to `related_to`, or a relational predicate with an object that
+    cannot fill it. Checked at the two research/chat banking sites, after
+    is_garbage_triple."""
+    if normalize_predicate(predicate) == "related_to":
+        return True
+    return not predicate_fits_object(normalize_predicate(predicate), object_)
+
+
 def is_garbage_triple(subject: str, predicate: str, object_: str) -> bool:
     """Return True if a triple is obvious garbage that should not be stored."""
     s, o = subject.strip().lower(), object_.strip().lower()
