@@ -2191,6 +2191,14 @@ _COMMON_ACRONYMS = frozenset({
     "CVE", "SQL", "HTTP", "URL", "VPN", "LLM", "LLMS", "WHO", "IMF", "ECB", "RBI", "NIH",
     "Q1", "Q2", "Q3", "Q4", "H1", "H2", "FY", "YOY", "CO2", "5G", "6G", "EU", "AWS",
     "GB", "TB", "MB", "KW", "MW", "GW", "RMB", "USD", "EUR", "GBP", "NASA", "EVS",
+    # Measured 2026-10-17 (live log since 08-21): acronyms the passes stripped most
+    # that are vocabulary, not coinages — AUM 16x, LNG 15x, ROI 16x, B2B 32x, KYC 15x.
+    "ROI", "AUM", "KYC", "AML", "YTD", "FOMO", "B2B", "B2C", "LNG", "WTI", "HBM",
+    "TVL", "VC", "GAAP", "PII", "SEO", "PCE", "PQC", "OPSEC", "SWIFT", "WWI", "WWII",
+    "IRGC", "GCC", "ASEAN", "WTO", "ICC", "ICJ", "IDF", "UNDP", "NOAA", "JWST", "FCC",
+    "GAO", "CBO", "CFTC", "NYSE", "CME", "BTC", "ETH", "USDC", "GPS", "CUDA", "IBM",
+    "AMD", "TSMC", "NVIDIA", "UAE", "G7", "G20", "BRICS", "OSCE", "USMCA", "SADC",
+    "NASDAQ", "FTSE", "DAX", "CAC", "NFT", "DEFI", "DAO", "ESG", "CBDC", "SPAC",
 })
 # A real acronym embedded in a normal sentence (LSD, GLUT5, PURL, IBIT) — distinctive
 # and hard to paraphrase, so absence from the sources is a strong fabrication signal.
@@ -2218,6 +2226,141 @@ def _split_compound(tok: str) -> list[str]:
     return re.findall(r"[A-Z]+(?![a-z])|[A-Z][a-z]+", tok)
 
 
+# Precision of the two orphan-term passes (2026-10-17). Measured over the live
+# log since 2026-08-21 (1,487 contamination-guard lines, 1,404 claim-grounding
+# lines): the terms removed most often were ordinary vocabulary the cited source
+# spelled differently, not grafts — "United States" 61x, "President Trump" 33x,
+# "Federal Reserve" 32x, "White House" 30x, "Treasury Secretary Scott Bessent"
+# 20x, "AUM" 16x, "II" 14x, "The September" 11x, "KKIA" 10x (the sources wrote
+# "King Khalid International Airport"). Each excision left the sentence without
+# its subject ("the ’s September cut", " jobs report showed"). Four deterministic
+# reprieves, each pinned by a measured case in tests/test_grounding_precision.py;
+# a real graft ("Muse Glimmer", "Imphal Valley", "Mirum Pharmaceuticals") matches
+# none of them and still fails.
+_ROMAN_RE = re.compile(r"^[IVXLC]{1,6}$")
+_INITIALISM_FILLERS = ("of", "and", "the", "for", "in", "to", "at", "&", "de", "du", "del", "la", "le")
+_INITIALISM_GAP = r"(?:[\s\-]+(?:" + "|".join(re.escape(f) for f in _INITIALISM_FILLERS) + r"))*[\s\-]+"
+# Words that may not stand as an initial of an expansion ("the semiconductor
+# market could" must not spell out TSMC).
+_INITIAL_STOP = frozenset(_INITIALISM_FILLERS) | frozenset({
+    "but", "not", "are", "was", "has", "had", "its", "his", "her", "our", "you", "who",
+    "how", "why", "all", "any", "can", "may", "per", "via", "this", "that", "with",
+    "from", "than", "then", "they", "them", "will", "would", "could", "should", "into",
+    "over", "more", "most", "also", "been", "were", "have", "does", "did", "is", "it",
+    "by", "as", "an", "or", "so", "if", "up", "out", "said", "says", "one", "two",
+})
+# A title/role/nationality word that opens a name the model wrote long-form where
+# the source used the surname ("Treasury Secretary Scott Bessent" vs "Bessent").
+_TITLE_WORDS = frozenset({
+    "president", "vice", "prime", "minister", "secretary", "treasury", "state", "defense",
+    "defence", "foreign", "interior", "finance", "chancellor", "governor", "chairman",
+    "chairwoman", "chair", "director", "managing", "executive", "chief", "general",
+    "senator", "senate", "representative", "congressman", "congresswoman", "speaker",
+    "leader", "majority", "minority", "justice", "judge", "ambassador", "envoy", "envoys",
+    "special", "commissioner", "mayor", "king", "queen", "crown", "prince", "princess",
+    "sheikh", "emir", "admiral", "commander", "colonel", "captain", "premier", "deputy",
+    "assistant", "attorney", "solicitor", "counsel", "professor", "dr", "mr", "mrs", "ms",
+    "sir", "lord", "lady", "ceo", "cfo", "founder", "former", "acting", "interim",
+    "incoming", "outgoing", "ukrainian", "russian", "american", "chinese", "israeli",
+    "iranian", "french", "german", "british", "indian", "japanese", "korean", "saudi",
+    "turkish", "egyptian", "european", "canadian", "mexican", "brazilian", "australian",
+    "italian", "spanish", "dutch", "polish", "taiwanese", "pakistani", "nigerian",
+    "kenyan", "ethiopian", "palestinian", "syrian", "iraqi", "lebanese", "qatari",
+    "emirati", "south", "north", "east", "west", "central",
+})
+# A sentence-initial function word the phrase regex glues to the next capital
+# ("The September", "While Anthropic", "Between October"): not part of a name.
+_LEAD_WORDS = frozenset({
+    "the", "a", "an", "this", "that", "these", "those", "while", "after", "before",
+    "beyond", "between", "starting", "since", "during", "although", "though", "when",
+    "where", "because", "despite", "under", "over", "among", "across", "within",
+    "without", "following", "amid", "amidst", "unlike", "like", "meanwhile", "however",
+    "both", "either", "neither", "and", "but", "or", "nor", "for", "from", "into", "onto",
+    "with", "about", "against", "through", "throughout", "toward", "towards", "until",
+    "upon", "via", "per", "yet", "even", "only", "just", "also", "still", "then", "there",
+    "here", "now", "today", "yesterday", "tomorrow", "last", "next", "early", "late",
+    "later", "earlier", "recently", "as", "at", "by", "in", "on", "of", "to", "if", "so",
+    "what", "which", "who", "whom", "whose", "how", "why", "whether", "once", "instead",
+    "rather", "notably", "separately", "elsewhere", "overall", "finally", "first",
+    "second", "third", "additionally", "moreover", "further", "furthermore",
+    "nonetheless", "nevertheless", "consequently", "thus", "hence", "indeed",
+    "importantly", "crucially", "critically", "specifically", "particularly", "perhaps",
+    "yes", "no", "its", "their", "his", "her", "our", "your",
+})
+# Regions, institutions and brands any sentence may name without the cited
+# source spelling them out (the multi-word analogue of _COMMON_COMPOUNDS).
+_COMMON_PHRASES = frozenset({
+    "united states", "federal reserve", "white house", "capitol hill", "wall street",
+    "silicon valley", "supreme court", "state department", "treasury department",
+    "justice department", "defense department", "pentagon press", "national security council",
+    "senate banking committee", "house of representatives", "general assembly",
+    "security council", "united nations", "european union", "european commission",
+    "european central bank", "european parliament", "international monetary fund",
+    "world bank", "world trade organization", "world health organization",
+    "united kingdom", "united arab emirates", "saudi arabia", "south korea", "north korea",
+    "south africa", "new zealand", "hong kong", "new york", "new delhi", "tel aviv",
+    "the hague", "middle east", "middle eastern", "north america", "north american",
+    "south america", "south american", "latin america", "latin american", "global south",
+    "southeast asia", "southeast asian", "east asia", "east asian", "south asia",
+    "south asian", "central asia", "east africa", "east african", "west africa",
+    "west african", "north africa", "north african", "western hemisphere",
+    "eastern europe", "eastern european", "western europe", "western european",
+    "eastern mediterranean", "red sea", "black sea", "south china sea", "persian gulf",
+    "arabian gulf", "suez canal", "cold war", "world war", "good hope", "truth social",
+    "hugging face", "dow jones", "dow jones industrial average", "wall street journal",
+    "new york times", "financial times", "washington post", "associated press",
+    "downing street", "islamic revolutionary guard corps", "large language model",
+    "large language models", "artificial intelligence", "machine learning",
+    "high bandwidth memory", "factor authentication", "new keynesian",
+    "monetary policy committee", "secretary general", "attorney general",
+})
+
+
+def _initialism_in_corpus(acr: str, corpus: str) -> bool:
+    """True when the corpus spells out a phrase whose initials form `acr`
+    (AUM ↔ "assets under management", KKIA ↔ "King Khalid International
+    Airport", OFAC ↔ "Office of Foreign Assets Control"). Filler words may sit
+    between the initials; no initial may be a function word."""
+    letters = [c for c in acr.lower() if c.isalpha()]
+    if not 2 <= len(letters) <= 6:
+        return False
+    pat = r"\b" + _INITIALISM_GAP.join(re.escape(c) + r"[a-z0-9]+" for c in letters) + r"\b"
+    for m in re.finditer(pat, corpus):
+        words = [w for w in re.split(r"[\s\-]+", m.group(0)) if w not in _INITIALISM_FILLERS]
+        if len(words) == len(letters) and not any(w in _INITIAL_STOP for w in words):
+            return True
+    return False
+
+
+def _phrase_initials_in_corpus(phrase: str, corpus: str) -> bool:
+    """The reverse: a spelled-out phrase whose acronym the corpus carries
+    ("High Bandwidth Memory" ↔ "HBM", "Foreign Assets Control" ↔ "OFAC")."""
+    words = [w for w in re.findall(r"[A-Za-z]+", phrase) if w.lower() not in _INITIALISM_FILLERS]
+    if len(words) < 3:
+        return False
+    acr = "".join(w[0].lower() for w in words)
+    return re.search(r"\b[a-z]{0,2}" + acr + r"s?\b", corpus) is not None
+
+
+def _titled_name_in_corpus(phrase: str, corpus: str) -> bool:
+    """A title-led name whose bearer the corpus names ("President Donald Trump"
+    where the source wrote "Trump"); the title is the model's framing."""
+    words = phrase.split()
+    if len(words) < 2 or words[0].lower() not in _TITLE_WORDS:
+        return False
+    names = [w.lower() for w in words if w.lower() not in _TITLE_WORDS]
+    return any(len(w) >= 3 and w in corpus for w in names)
+
+
+def _strip_lead_word(phrase: str) -> str:
+    """Drop sentence-initial function words the phrase regex captured; a single
+    remaining word is a plain name, which the passes skip by design."""
+    words = phrase.split()
+    while words and words[0].lower() in _LEAD_WORDS:
+        words.pop(0)
+    return " ".join(words) if len(words) >= 2 else ""
+
+
 def _orphan_terms(text: str, corpus: str) -> list[str]:
     """Distinctive CHECKABLE terms in `text` that appear NOWHERE in the source corpus
     — the qualitative analogue of `_unverified_numbers`. Catches fabricated specifics
@@ -2240,17 +2383,30 @@ def _orphan_terms(text: str, corpus: str) -> list[str]:
             tok = m.group(1)
             if tok in _COMMON_ACRONYMS or tok.rstrip("S") in _COMMON_ACRONYMS:
                 continue
+            if _ROMAN_RE.match(tok):
+                continue   # "World War II", "Phase III": a numeral, not a coinage
+            alpha = tok.rstrip("0123456789")
+            digits = tok[len(alpha):]
+            if digits and alpha in _COMMON_ACRONYMS and digits in corpus:
+                continue   # "FY2027" where the sources write "fiscal 2027"
             low = tok.lower()
             if low not in corpus and low.rstrip("s") not in corpus:
+                if _initialism_in_corpus(tok, corpus):
+                    continue   # the sources spell it out ("assets under management")
                 orphans.append(tok)
         for m in _PROPER_PHRASE_RE.finditer(line):
-            phrase = m.group(1)
-            if phrase.lower() in corpus:
+            phrase = _strip_lead_word(m.group(1))
+            if not phrase:
+                continue   # "The September", "While Anthropic": a lead word + one name
+            low = phrase.lower()
+            if low in corpus or low in _COMMON_PHRASES:
                 continue
             # If every content word (≥4 chars) already appears in the sources, this is
             # a reorder/paraphrase of a real entity, not a fabrication — leave it.
             words = [w.lower() for w in re.findall(r"[A-Za-z]{4,}", phrase)]
             if words and all(w in corpus for w in words):
+                continue
+            if _titled_name_in_corpus(phrase, corpus) or _phrase_initials_in_corpus(phrase, corpus):
                 continue
             orphans.append(phrase)
         for m in _COMPOUND_RE.finditer(line):
@@ -2384,7 +2540,11 @@ async def _check_contamination(text: str, articles: list, *, model: str | None =
             if not cited_orphans:
                 continue
             full_orphans = set(_orphan_terms(sent, full_corpus))
-            grafts.extend(t for t in cited_orphans if t not in full_orphans)
+            # A term two or more OTHER sources carry is the topic's vocabulary,
+            # not a detail grafted from one other story (2026-10-17); the
+            # entailment gate still checks the cited source for the claim itself.
+            grafts.extend(t for t in cited_orphans if t not in full_orphans
+                          and sum(1 for c in host_corpus.values() if t.lower() in c) < 2)
     grafts = list(dict.fromkeys(grafts))
     if not grafts:
         return text, 0

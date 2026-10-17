@@ -1598,6 +1598,18 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         skip the calls. The probes run on the model this item's research path
         keeps resident (27B for evidence-first, the default otherwise), so the
         triage never costs a model reload. Any probe failure means proceed."""
+        # Unpublished-shaped questions (2026-10-17): the mint has refused these
+        # since 10-12, but the backlog still carried six (patch status, yield
+        # rate, internal allocation, confidential rulemaking), each worth three
+        # research passes that cannot succeed. Parked with the reason — no
+        # probe, no attempt.
+        from app.core.dossiers import _is_unpublished_question
+        if _is_unpublished_question(getattr(item, "topic", "") or ""):
+            await asyncio.to_thread(svc.curiosity.defer, item.id,
+                                    "unpublished: asks for what nobody publishes")
+            logger.info("[Curiosity] unpublished-shaped question deferred without research: %s",
+                        item.topic[:80])
+            return f"CURIOSITY DEFERRED | topic={item.topic[:80]} | reason=unpublished"
         if getattr(item, "answerable", None) is not None:
             if item.answerable == 0 and getattr(item, "evidence_ok", 0) == 0:
                 return None   # probed no/no but still picked (manual re-queue): research it
@@ -1806,6 +1818,22 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                                     search_health(), item.topic[:80])
                         return (f"CURIOSITY DEFERRED | topic={item.topic[:80]} | "
                                 f"reason=search_degraded")
+                    # The public record does not settle it (2026-10-17). The
+                    # evidence-first answer was read, cited and entail-gated,
+                    # and the objection is that the specific datum is absent;
+                    # a second and third search of the same web return the
+                    # same absence (10-09..10-14: 40 closure failures on 18
+                    # questions, three passes each, against 9 resolutions).
+                    # Park the question with the answer attached instead of
+                    # burning the remaining attempts; nothing is banked.
+                    if (grounding.get("evidence_first") and int(grounding.get("findings", 0) or 0) >= 1
+                            and getattr(self, "_last_closure_unsettled", False)):
+                        await asyncio.to_thread(
+                            svc.curiosity.defer, item.id,
+                            "unsettled: the public record does not settle it | " + result[:1500])
+                        logger.info("[Curiosity] unsettled by the public record — parked: %s",
+                                    item.topic[:80])
+                        return f"CURIOSITY DEFERRED | topic={item.topic[:80]} | reason=unsettled"
                     await asyncio.to_thread(svc.curiosity.fail, item.id)
                     logger.info("[Curiosity] closure check failed — requeued: %s", item.topic[:80])
                     return f"CURIOSITY UNRESOLVED | topic={item.topic[:80]} | reason=closure_check_failed"
@@ -1886,6 +1914,16 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             await asyncio.to_thread(svc.curiosity.fail, item.id)
             return f"CURIOSITY ERROR | topic={item.topic[:80]} | error={e}"
 
+    # The judge objecting that the specific datum is absent from the answer —
+    # as opposed to an off-topic or malformed answer (2026-10-17; the three
+    # live reasons: "does not provide the specific number", "lacks the
+    # necessary data", "does not contain information regarding").
+    _UNSETTLED_REASON_RE = re.compile(
+        r"(?i)\b(?:does not|doesn'?t|did not|didn'?t|lacks?|lacking|without|no|not)\b"
+        r"(?:\W+\w+){0,6}?\W+(?:provide|contain|include|state|specify|mention|give|offer|"
+        r"identify|detail|quantify|report|cite|name|data|information|figures?|numbers?|"
+        r"evidence|details|specifics)")
+
     async def _curiosity_closure_check(self, topic: str, result: str,
                                        model: str | None = None) -> bool:
         """Return True if `result` plausibly answers the curiosity `topic`.
@@ -1893,6 +1931,12 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         Two-stage: cheap heuristic (length + deflection patterns) → LLM judge.
         The LLM judge runs on FAST_MODEL with strict json output, single call.
         """
+        # What the verdict was about (2026-10-17): True when the answer itself
+        # says the public record lacks the datum — a stage-1 deflection phrase,
+        # or the judge objecting that the specific figure/status is absent.
+        # The evidence-first caller parks such a question instead of searching
+        # the same web twice more.
+        self._last_closure_unsettled = False
         # Stage 1: cheap heuristics.
         #
         # These reject before the judge ever runs, and until 2026-09-06 they did
@@ -1920,6 +1964,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         if hit:
             logger.info("[Curiosity] stage-1 reject (deflection %r at %d chars): %s",
                         hit, len(result), topic[:70])
+            self._last_closure_unsettled = True
             return False
 
         # Stage 2: LLM judge — does this answer the question?
@@ -1953,7 +1998,9 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
             obj = llm_mod.extract_json_object(raw) or {}
             answered = bool(obj.get("answers"))
             if not answered:
-                logger.info("[Curiosity] judge says no: %s", str(obj.get("reason", ""))[:120])
+                reason = str(obj.get("reason", ""))
+                logger.info("[Curiosity] judge says no: %s", reason[:120])
+                self._last_closure_unsettled = bool(self._UNSETTLED_REASON_RE.search(reason))
             return answered
         except Exception as e:
             # A judge that could not answer has not said yes. This used to
