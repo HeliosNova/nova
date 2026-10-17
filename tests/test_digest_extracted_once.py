@@ -38,7 +38,7 @@ class _Mon:
 async def test_learn_facts_counts_what_it_banked():
     kg = AsyncMock()
     kg.add_fact = AsyncMock(return_value=True)
-    raw = '{"facts": [{"subject": "Reuters", "predicate": "reports_on", "object": "copper tariffs"}]}'
+    raw = '{"facts": [{"subject": "Reuters", "predicate": "launched", "object": "copper tariffs"}]}'
     findings = [("t", "https://reuters.com/x", "Reuters reports on copper tariffs today.")]
     token = dr.BANKED_THIS_RUN.set(0)
     try:
