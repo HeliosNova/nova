@@ -109,6 +109,8 @@ def test_gate_wiring_in_think():
     ("Arch Lending", "partnered_with", "tokenized stocks as loan collateral"),
     ("Gaza olive oil presses", "related_to", "7 units"),
     ("Strait of Hormuz", "connected with", "one-fifth of global oil supply"),   # degrades to related_to
+    ("Modal", "acquired", "$16 billion Series D valuation"),                    # k8-era eyeball 2026-10-17
+    ("Narendra Modi", "owns", "Prime Minister position in India"),
 ])
 def test_vague_or_misfit_triples_are_refused(s, p, o):
     from app.core.kg import is_vague_or_misfit
@@ -123,6 +125,8 @@ def test_vague_or_misfit_triples_are_refused(s, p, o):
     ("China", "sanctioned", "Paraguay officials"),
     ("Brent Crude", "price_of", "$105.56 per barrel"),
     ("Quantedge Global", "located_in", "Singapore"),
+    ("MARA Holdings", "owns", "35,577 BTC treasury balance"),
+    ("BlackRock", "owns", "5% position in Nvidia"),
 ])
 def test_well_formed_triples_pass(s, p, o):
     from app.core.kg import is_vague_or_misfit

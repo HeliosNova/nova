@@ -665,3 +665,16 @@ Deploy plan: k9 = (a) + (c) — orthogonal instruments (digest guard log lines v
 
 **k8 VERIFIED 2026-10-17 07:08 UTC** (image c94af55a0790; the drain hit its 60-min cap behind an 8-digest batch dispatched 11 min before the quiet window; freshness 119/0; 27B 100% GPU; 0 startup errors; quiet cleared). Chat probes on k8: Hormuz — `[facts-first] recency query — tools kept`, tools `['web_search','web_search']`, 133 s, content dated Oct 13-17, narrated search = False (RULE 3 PASS; the first two runs hit the client's 420 s timeout under the post-restart digest wave, the log shows both called web_search); inflation — knowing-first tool-less, "Based on my stored knowledge (as of October 2026)…", no narration, 219 s under load; Nvidia — tool-less, provenance-named, 18.9 s. **New, noted (item 6):** the Hormuz answer opened with a tool-loop preamble leaked into the reply — "The search results now provide concrete recent developments (Oct 13-17). I can synthesize an answer:" — measure the share of chat/eval answers opening with a scaffold line before adding a sanitizer pattern.
 Suite on the (a)+(c) tree: **3399 passed, 1 skipped, 0 failed** (21.5 min); `scripts/sanity_scan.py` 0 findings.
+**k9 DEPLOYED 2026-10-17 18:58 UTC** (commit ac162df, image add51c6160a4; the session idled 07:35→18:55 so k8 ran alone for twelve hours; drain found 0 active lines, swap immediate, healthy in 20 s, freshness 119/0, 27B 100% GPU, 0 startup errors, quiet cleared). k8's twelve hours as the pre-k9 baseline for rule (a): 45 digests, contamination 22 lines (0.49/digest), claim grounding 18 (0.40/digest), removed terms still the reprieved classes ("While President Trump", "The European Union", "Senator Thom Tillis", "Suez Canal", "Southeast Asia", "Total Addressable Market", OTC, VP, B2B). Rule (a) therefore reads on the TERM LIST and the entail-drop band as much as on the per-digest rate.
+
+### Quality-rule reads on k8's twelve hours (2026-10-17 19:05 UTC, 45 digests; the 07:00 10-18 read repeats them on a full day)
+
+| rule | baseline (10-10..10-14) | k8 era | verdict |
+|---|---|---|---|
+| 1 orphan ’s | 5% of digests | 0 of 45 | PASS |
+| 2 dangling opener (digests with ≥1 anaphoric section opener; 3.3% of content lines before) | 80 of 278 digests = 29% | 2 of 45 = 4% (0.4% of lines); gate phase 3 fired 4× | PASS (< 10%) |
+| 3 recency chat | narrated a search, tool-less | Hormuz: tools kept, web_search ×2, no narration | PASS |
+| 4 KG related_to share of new facts | 34% | 0 of 112 (73 researched) | PASS |
+| 4 KG eyeball, 50 random k8-era facts wrong/empty | ~33% | 5 of 50 = 10% (Modal "acquired $16B valuation", Modi "owns Prime Minister position", MSCI "regulates" a classification, ImageNet "caused_by AI winter revival", Milei "partnered_with" Rubio); 6 more vague storyline/synthesis statuses | PASS (< 15%); two shapes added to `_MISFIT_OBJECT_RE` (valuation, role position), staged for k10 |
+| digest length | median 7,141 | 7,059 (−1%) | PASS (within 10%) |
+| item 6 scaffold preamble in chat answers | — | 1 of 1,232 assistant messages since 09-01 (today's Hormuz probe) | measured, CLOSED — no sanitizer warranted |

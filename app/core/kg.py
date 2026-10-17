@@ -498,7 +498,12 @@ _GENERIC_ENTITY = frozenset({
 # prompt (kg_facts=20). The checks are deterministic and conservative.
 _QTY_ONLY_RE = re.compile(r"^\$?[\d.,]+\s*(?:%|percent|million|billion|trillion|bn|mn|[kKmMbB])?\s*$")
 _QTY_IN_RE = re.compile(r"(?i)^\$?[\d.,]+\s*(?:million|billion|trillion|bn|mn)?\s+(?:in|of)\s+")
-_MISFIT_OBJECT_RE = re.compile(r"(?i)\bmarket share\b|\bborrowings?\b|\bdebt\b|\blosses\b|\bCVE-\d|\bper ?cent\b")
+_MISFIT_OBJECT_RE = re.compile(
+    r"(?i)\bmarket share\b|\bborrowings?\b|\bdebt\b|\blosses\b|\bCVE-\d|\bper ?cent\b"
+    # 2026-10-17 eyeball of 50 k8-era facts (5 wrong): "Modal acquired '$16 billion
+    # Series D valuation'", "Narendra Modi owns 'Prime Minister position in India'".
+    r"|\bvaluation\b|\b(?:prime minister|president|ceo|chair(?:man|woman)?|minister|governor|director)\s+position\b"
+    r"|\bposition (?:of|as)\b")
 _ENTITY_PREDICATES = frozenset({"leads", "partnered_with", "sanctioned", "acquired", "owns", "launched"})
 _ASSET_PREDICATES = frozenset({"owns", "acquired", "launched"})
 _ENTITY_OBJECT_PREDICATES = frozenset({"leads", "partnered_with", "sanctioned"})
