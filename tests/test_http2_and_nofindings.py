@@ -15,11 +15,15 @@ import app.tools.browser as browser
 import app.monitors.heartbeat_loop as hb
 
 
-def test_chromium_is_launched_without_http2():
+def test_http2_flag_was_reverted_as_measured():
+    """--disable-http2 was tried and reverted the same hour (2026-10-17): a live
+    probe showed the ERR_HTTP2 hosts are bot-blocked, not HTTP/2-broken — with
+    the flag they hung to the 60 s timeout instead of failing in ~1 s, recovering
+    nothing. The flag must not sit in the launch args; the note explaining why
+    stays in the source."""
     src = inspect.getsource(browser.BrowserTool._launch)
-    assert "--disable-http2" in src
-    # and it sits inside the launch args list, not only a comment
-    assert '"--disable-http2"' in src
+    assert '"--disable-http2"' not in src          # not an active launch arg
+    assert "BOT-BLOCKING" in src                    # the measured reason is recorded
 
 
 def test_no_findings_with_sources_is_parked_before_the_requeue():

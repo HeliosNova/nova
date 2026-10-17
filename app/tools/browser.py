@@ -356,19 +356,18 @@ class BrowserTool(BaseTool):
         if not cdp_url:
             BrowserTool._browser = await BrowserTool._playwright.chromium.launch(
                 headless=True,
+                # NOTE (2026-10-17): `--disable-http2` was tried and REVERTED the
+                # same hour. The ERR_HTTP2_PROTOCOL_ERROR cluster (usnews.com 226,
+                # washingtonpost.com 52, businesswire.com 25, miamiherald.com...)
+                # is BOT-BLOCKING, not an HTTP/2 incompatibility: with HTTP/2 off,
+                # a live probe of those exact article URLs did not recover a single
+                # one — every host hung to the 60 s goto timeout instead of failing
+                # in ~1 s. The flag only converted a fast failure into a slow one,
+                # a throughput regression. The real lever is not attempting hosts
+                # that never yield a body (a measured skip/deprioritize in the
+                # gather layer), not a transport flag. Baseline fast-fail restored.
                 args=["--no-sandbox", "--disable-gpu", "--disable-dev-shm-usage",
-                      "--disable-blink-features=AutomationControlled",
-                      # Chromium's HTTP/2 negotiation fails outright against a
-                      # cluster of major news/wire servers — net::ERR_HTTP2_
-                      # PROTOCOL_ERROR, 43-73x/day in the live log (usnews.com
-                      # 226, washingtonpost.com 52, businesswire.com 25,
-                      # miamiherald.com 12, sacbee.com, star-telegram.com,
-                      # cbc.ca, newsobserver.com...). Each is an article the
-                      # digest and curiosity evidence pool loses. Forcing HTTP/1.1
-                      # clears the whole class (the servers serve 1.1 fine); the
-                      # cost is marginal on HTTP/2-only hosts, of which these
-                      # read targets have none (2026-10-17).
-                      "--disable-http2"],
+                      "--disable-blink-features=AutomationControlled"],
                 # Minimal env (2026-09-01): the renderer used to inherit the whole
                 # process environment — API and bot tokens included — while
                 # rendering attacker-controlled pages.
