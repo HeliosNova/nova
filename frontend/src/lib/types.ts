@@ -209,6 +209,11 @@ export interface StatusResponse {
   documents: number;
   training_examples: number;
   kg_facts: number;
+  // Non-scalar fields the backend also returns (2026-09-02); the status grid
+  // filters these out so they are never rendered as a React child.
+  quiet_until?: string | null;
+  schedule?: { demanded: number; delivered: number; ratio: number; starved: unknown };
+  pathways?: unknown[];
 }
 
 // ── Tool Call (UI state) ──

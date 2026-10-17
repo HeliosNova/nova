@@ -767,13 +767,20 @@ export default function SettingsPage() {
           <Card>
             <h2 className="mb-3 text-sm font-medium text-nova-text-dim">System Status</h2>
             <div className="grid grid-cols-2 md:grid-cols-3 gap-2">
-              {Object.entries(status).map(([k, v]) => (
-                <StatCard
-                  key={k}
-                  label={k.replace(/_/g, " ")}
-                  value={v}
-                />
-              ))}
+              {/* This grid is entity counts only. /api/status also carries
+                  non-scalar fields (schedule {demanded,delivered,ratio,starved},
+                  the pathways array) that must not be rendered as React children
+                  — doing so threw "Objects are not valid as a React child". Show
+                  scalars; render null as a dash. */}
+              {Object.entries(status)
+                .filter(([, v]) => v === null || typeof v !== "object")
+                .map(([k, v]) => (
+                  <StatCard
+                    key={k}
+                    label={k.replace(/_/g, " ")}
+                    value={v === null ? "—" : (v as string | number)}
+                  />
+                ))}
             </div>
           </Card>
         )}
