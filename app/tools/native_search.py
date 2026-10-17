@@ -70,7 +70,7 @@ def engine_health() -> dict[str, dict[str, int]]:
     return {k: dict(v) for k, v in _ENGINE_STATS.items()}
 
 
-def engine_health_summary(limit: int = 8) -> str:
+def engine_health_summary(limit: int = 12) -> str:
     """One line for the engineering report: non-empty rate per engine (most
     used first) and the engines SearXNG suspended, with counts."""
     stats = engine_health()

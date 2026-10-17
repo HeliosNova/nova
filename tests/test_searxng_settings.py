@@ -16,7 +16,7 @@ import yaml
 ROOT = Path(__file__).resolve().parent.parent
 LIVE = ROOT / "searxng" / "settings.yml"
 EXAMPLE = ROOT / "searxng" / "settings.yml.example"
-NEVER = {"ecosia", "presearch", "reddit"}
+NEVER = {"ecosia", "presearch", "reddit", "encyclosearch"}
 DISABLED = {"wikidata"}   # a DEFAULT engine: only an explicit disabled entry stops it loading
 
 
