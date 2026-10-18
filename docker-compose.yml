@@ -157,6 +157,15 @@ services:
       # run a bit slower than the bare 9B). Raise to 2.5 only when a 27B base
       # is loaded — at 2.5 a runaway task can burn 300s before failing.
       EVAL_TIMEOUT_MULTIPLIER: "1.5"
+      # Entailment gate (2026-10-18): keep (de-cite) cross-source synthesis
+      # instead of deleting it. Flipped ON after the pre-registered A/B
+      # (deterministic replay over the P1 gate record, 13,350 digest sentences):
+      # the narrow classifier rescued only 1% of failed sentences as analysis;
+      # the wide one rescues 3% (+247 sentences, mean 197 chars), with ZERO
+      # figure-bearing leaks and every sampled delta a genuine "so what" line.
+      # Code default stays false (opt-in); this override is the production flip
+      # and is reversible by removing the line.
+      ENABLE_WIDE_ANALYSIS_KEEP: "true"
     volumes:
       - nova_data:/data
       # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
