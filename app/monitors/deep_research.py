@@ -3376,6 +3376,25 @@ _COPULA_TAIL_RE = re.compile(
 )
 
 
+# Widened analysis shapes (2026-10-18) — matched only when ENABLE_WIDE_ANALYSIS_KEEP
+# is on. Every alternative is implication/synthesis framing, not a bare fact; the
+# number-scrub in _is_analytical still drops anything figure-bearing.
+_ANALYTICAL_WIDE_RE = re.compile(r"(?i)"
+    r"\bthis (?:transforms|positions|creates|clears|enables|undermines|triggers|"
+    r"institutionalizes|redefines|reinforces|frees|removes|blurs|coincides|contrasts|"
+    r"introduces|represents|demonstrates|validates|addresses|cements|accelerates|"
+    r"compounds|entrenches|illustrates|signals|underscores)\b"
+    r"|\bthe (?:overarching|broader|central|key|dominant|underlying|larger|net|real|"
+    r"deeper|strategic|wider|core) (?:narrative|picture|takeaway|story|theme|trend|"
+    r"dynamic|pattern|tension|question|risk|significance|implication|lesson|point|"
+    r"concern|story|throughline|paradox)\b"
+    r"|\bclears the path\b|\bpositions \w+ as\b|\btransforms \w+ (?:from|into)\b"
+    r"|\bcreates a (?:risk|feedback loop|dependency|vulnerability|precedent|bifurcat)"
+    r"|\bhighlights a (?:bifurcat|critical|broader|fundamental|growing|structural|stark)"
+    r"|\b(?:reinforc|redefin|reshap)(?:es|ing) (?:the|a|an)\b"
+    r"|\bthe (?:window for action|overarching narrative)\b")
+
+
 _ANALYTICAL_RE = re.compile(
     r"(?i)\b(?:second-order implication|the (?:broader|deeper|real|second-order) "
     r"(?:implication|question|risk|significance|lesson)|the implication is|"
@@ -3417,7 +3436,18 @@ def _is_analytical(claim: str) -> bool:
     scrub = re.sub(r"\b[A-Za-z]+\d+\w*\b|\b\d+[A-Za-z]+\b", "", scrub)
     if re.search(r"\d", scrub):
         return False
-    return bool(_ANALYTICAL_RE.search(claim))
+    if _ANALYTICAL_RE.search(claim):
+        return True
+    # Widened synthesis shapes (2026-10-18, flag-gated). The narrow regex needs
+    # "This <noun> <verb>"; the drop-corpus audit showed the most-deleted analysis
+    # is "This <verb>" directly ("This transforms/positions/creates/clears…") and
+    # "The <adj> narrative/picture/takeaway … is". Keep these as Nova's reasoning
+    # (de-cited) instead of deleting them. Figure-bearing sentences already
+    # returned False above, so a bare unsupported NUMBER still drops.
+    from app.config import config as _cfg
+    if getattr(_cfg, "ENABLE_WIDE_ANALYSIS_KEEP", False) and _ANALYTICAL_WIDE_RE.search(claim):
+        return True
+    return False
 
 
 # How often the NARROW document alone entails a claim, per (monitor, call site).
