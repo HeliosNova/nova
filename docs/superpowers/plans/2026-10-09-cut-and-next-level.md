@@ -703,7 +703,24 @@ Measured on REAL stored digests (gate record `/data/entail/*.jsonl` + `[entail-d
 Suite on the (a)+(c) tree: **3399 passed, 1 skipped, 0 failed** (21.5 min); `scripts/sanity_scan.py` 0 findings.
 **k9 DEPLOYED 2026-10-17 18:58 UTC** (commit ac162df, image add51c6160a4; the session idled 07:35→18:55 so k8 ran alone for twelve hours; drain found 0 active lines, swap immediate, healthy in 20 s, freshness 119/0, 27B 100% GPU, 0 startup errors, quiet cleared). k8's twelve hours as the pre-k9 baseline for rule (a): 45 digests, contamination 22 lines (0.49/digest), claim grounding 18 (0.40/digest), removed terms still the reprieved classes ("While President Trump", "The European Union", "Senator Thom Tillis", "Suez Canal", "Southeast Asia", "Total Addressable Market", OTC, VP, B2B). Rule (a) therefore reads on the TERM LIST and the entail-drop band as much as on the per-digest rate.
 
-### Quality-rule reads on k8's twelve hours (2026-10-17 19:05 UTC, 45 digests; the 07:00 10-18 read repeats them on a full day)
+### 07:00 UTC 2026-10-18 full-day read (k9→k12 live; 82 digests since k9, 15 since k12)
+
+| rule | result | verdict |
+|---|---|---|
+| 1 orphan ’s | base 20/278 → k9+ 0/82 → k12 0/15 | PASS |
+| 2 dangling opener (% of content lines) | base 3.3% → k9+ 0.6% → k12 0.0% | PASS |
+| 4 related_to share of new researched facts | base 34% → k9+ 0 of 198 | PASS |
+| 4 KG 50-fact eyeball wrong/empty | 1/50 = 2% | PASS (<15%) |
+| length (median) | base 7,141 → k9+ 7,127 → **k12 7,689 (+8%)** | PASS — k12 longer = kept analysis |
+| **k12 wide-analysis-keep live** | confirmed `=True`; digests +8% vs base | WIN confirmed on delivered output |
+| **(a) grounding precision** | contamination **0.73/dig** (rule ≤0.5), claim-grounding **0.44/dig** (rule ≤0.4); entail-drop 30% (in band) | **MISS on the bar** |
+| **(c) curiosity accounting** | 15 attempted since k9 (<40 — not yet readable); resolve 1/15=7%; **10 parked** (4 unpublished + 5 no-findings + 1 unsettled) | parking works; yield still low; re-read at 40 |
+
+**(a) diagnosed honestly, not chased further.** The reprieves work — the headline deletions are fixed (`_orphan_terms` now returns [] for "B2B", "The European Union", "President Trump", initialisms-with-expansion). But the residual 0.73/dig is a long tail of common acronyms I didn't enumerate (OTC, VP, TAM), named bodies ("Congressional Budget Office", "European Medicines Agency"), generic business phrases ("Total Addressable Market"), AND genuine graft/entity removals (Paul Edmondson, James Heckman, PAAI, RTB — correct drops indistinguishable from false ones without reading each against its cited source). Enumeration is whack-a-mole with diminishing returns; the big-name harm that motivated (a) is resolved, so I am NOT spinning a 5th deploy tonight to chase the tail. The 0.5 bar was too aggressive for a rate that includes correct graft removals. **Status: partial win, accepted; the lever if revisited is the guard's LOGIC (a single-other-source term is still flagged), not a longer wordlist.**
+
+**(c) curiosity: the accounting works, the yield doesn't.** The parking is firing exactly as designed — 10 items parked on first pass that would each have burned 3 research passes. But only 1 of 15 attempted resolved; the research path itself still yields almost nothing (13 closure-check fails). Too few attempts (15/40) to read the rule; the real problem is mint/research yield, a larger effort. Re-read at 40 attempted.
+
+### Quality-rule reads on k8's twelve hours (2026-10-17 19:05 UTC, 45 digests; superseded by the 07:00 read above)
 
 | rule | baseline (10-10..10-14) | k8 era | verdict |
 |---|---|---|---|
