@@ -3962,6 +3962,54 @@ async def _entailment_gate(text: str, arts: list, *, max_checks: int = 48,
     for (li, st, h), res in zip(alt_meta, alt_results):
         if res.get("supported") and (li, st) not in entailed_by:
             entailed_by[(li, st)] = h
+
+    # Union-of-sources rescue (E1, 2026-10-18, ENABLE_UNION_GROUNDING, default off).
+    # The alt step above checks each OTHER host separately, so a cross-source
+    # conclusion whose support is SPREAD (one fact in host A's window, another in
+    # host B's) — entailed by the SET but by no single source — still drops. Here
+    # the claim is scored ONCE against a document built from the best IDF windows
+    # across ALL read articles; if the union entails it, keep it, re-cited to the
+    # single best-overlap host. Bounded and fail-CLOSED (a figure-bearing claim
+    # still had to pass the primary/clause passes to get here; the union only
+    # rescues from the drop pile). This is ALCE's union-of-cited-passages idea.
+    if getattr(_cfg, "ENABLE_UNION_GROUNDING", False) and still:
+        _UNION_TOTAL = 32
+
+        def _union_doc_and_host(claim: str):
+            wts = _weights(claim)
+            scored = sorted(((sum(wt for t, wt in wts.items() if t in art_lowers[i]), i)
+                             for i in range(len(articles))), reverse=True)
+            picks = [i for sc, i in scored[:4] if sc > 0]
+            if not picks:
+                return "", None
+            doc = " … ".join(_windows(wts, i) for i in picks)[:7000]
+            return doc, articles[picks[0]][0]
+
+        union_specs: list[dict] = []
+        union_meta: list[tuple[int, str, str]] = []
+        for li, st, hosts in still:
+            if (li, st) in entailed_by:
+                continue
+            if len(union_specs) >= _UNION_TOTAL:
+                break
+            _c = _claim_of(st)
+            _doc, _best = _union_doc_and_host(_c)
+            if not _doc or _best is None:
+                continue
+            union_specs.append({"doc": _doc, "claim": _c})
+            union_meta.append((li, st, _best))
+        if union_specs:
+            u_res = await _check_pairs(union_specs, fail_open=False) or []
+            n_union = 0
+            for (li, st, best_host), res in zip(union_meta, u_res):
+                if res.get("supported") and (li, st) not in entailed_by:
+                    entailed_by[(li, st)] = best_host
+                    n_union += 1
+            if n_union:
+                logger.info("[entail-union] %s: %d sentence(s) kept by union-of-sources "
+                            "(no single source entailed the whole claim; the source SET did)",
+                            label, n_union)
+
     n_changed = 0
     decited = 0
     drop: list[tuple[int, str]] = []

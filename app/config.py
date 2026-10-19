@@ -76,7 +76,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_PROCEDURAL_CONSOLIDATION",
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
     "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER", "ENABLE_CITATION_DISCIPLINE",
-    "ENABLE_STRUCTURED_CITATIONS", "ENABLE_WIDE_ANALYSIS_KEEP",
+    "ENABLE_STRUCTURED_CITATIONS", "ENABLE_WIDE_ANALYSIS_KEEP", "ENABLE_UNION_GROUNDING",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -162,6 +162,11 @@ class Config:
     # what" lines AND fabrication rate does not rise (orphan-term/contamination
     # guards still run) AND length recovers toward the un-gated draft.
     ENABLE_WIDE_ANALYSIS_KEEP: bool = field(default_factory=lambda: _env("ENABLE_WIDE_ANALYSIS_KEEP", "false").lower() == "true")
+    # Entailment gate (E1, 2026-10-18): a sentence no single source entails but
+    # the SET of read sources does is kept (re-cited to the best-overlap host)
+    # instead of dropped. Off until the A/B replay reads: entail-drop falls AND
+    # false-keep (a sentence NO source in the set supports) does not rise.
+    ENABLE_UNION_GROUNDING: bool = field(default_factory=lambda: _env("ENABLE_UNION_GROUNDING", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)

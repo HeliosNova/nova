@@ -732,7 +732,22 @@ Suite on the (a)+(c) tree: **3399 passed, 1 skipped, 0 failed** (21.5 min); `scr
 - **E3 — delete-only-on-contradiction + corpus-set attestation + first-class "analysis" label.** Change the delete trigger from "absent from source" to "contradicted by source"; a term attested by any corpus source is vocabulary; synthesis sentences checked against the union, not token-copied.
 - **E4 — molecular-claim decomposition + graded labels (keep+cite / keep+trim / drop / keep+de-cite).** Structural but +2-3× CPU-NLI (MiniCheck is serialized = the bottleneck, not GPU) and the ONE real danger: trading safe false-DROPS for unsafe false-KEEPS (router mislabels an unsupported FACT as analysis). Only after E1-E3; router biased verify-when-unsure; MiniCheck stays the factual backstop; measure false-keep on P1 first. Molecular (decontextualized), not raw atomic, claims.
 
-Disqualified as published (cloud/GPT-4/search): SAFE, FacTool, Factcheck-GPT, RARR, VeriScore/Loki verification halves. Full sources + model table in memory [[research-grounding-precision-2026-10-18]]. **Starting with E2 (directly fixes the rule-(a) miss the owner flagged) — flag-gated, offline-measured on the gate record + real digests, nothing deployed until the rule reads.**
+Disqualified as published (cloud/GPT-4/search): SAFE, FacTool, Factcheck-GPT, RARR, VeriScore/Loki verification halves. Full sources + model table in memory [[research-grounding-precision-2026-10-18]].
+
+### E1 — union-of-sources BUILT + A/B MEASURED (2026-10-18), flag off, PASSES its rule
+
+`ENABLE_UNION_GROUNDING` (default false): after the gate's existing single-other-host re-cite, a bounded pass (≤32 CPU pairs) scores each still-dropped claim against a document built from the best IDF windows across ALL read sources; if the SET entails it, keep it re-cited to the best-overlap host. `app/monitors/deep_research.py` `_entailment_gate`; `tests/test_union_grounding.py` (3 pass — a spread-support sentence drops OFF, survives ON). Fail-closed; code default false.
+
+**A/B (6 frozen topics, synthesize once gate-off → gate OFF vs ON, union is the only delta):**
+| metric | OFF | ON |
+|---|---|---|
+| gated chars/topic | 6,519 | 6,755 (**+236, +3.6%**) |
+| surviving sentences/topic | 24.7 | 25.7 |
+| union-rescued total | — | **7 (1.2/topic)** |
+
+**Rule PASS, cleanly but modestly.** All 7 rescued sentences read as real, specific, SOURCED facts the single-source gate was deleting because the one cited source didn't carry the whole sentence but the set did — "A1 robot set a Guinness World Record assembling 105 sub-mm wire harnesses", "Xpeng robotics secured $900M at a $6.3B valuation", "Space Force awarded $60M for the Space Data Network (5 fixed-price contracts at $10M each)". Zero visible false-keeps (figure-bearing, union-entailed by real windows, not vague). entail-drop falls, false-keep does not rise → rule met. (The read-only /data in the harness made gate-record writes fail-safe = no pollution, confirming that fail-path.)
+
+**Honest size:** +3.6% is modest because union only catches the narrow spread-FACTUAL case; the big losses were analytical (handled by wide-analysis-keep k12) and the ENTITY excisions, which live in the `_orphan_terms` guards (a DIFFERENT code path), not the gate. So E1 is a clean low-risk win but NOT the precision lever — **E2 (alias/acronym normalization in the two guards) is what addresses the rule-(a) 0.73/dig entity-excision miss the owner flagged as key.** Decision: hold E1 committed/flag-off and BUNDLE it with E2 into one grounding-precision deploy once E2's own A/B passes (avoids a deploy for +3.6% alone; same change class, separate instruments). **Next: build E2, A/B it, then ship E1+E2 together.**
 
 ### (c) curiosity: the accounting works, the yield doesn't. The parking is firing exactly as designed — 10 items parked on first pass that would each have burned 3 research passes. But only 1 of 15 attempted resolved; the research path itself still yields almost nothing (13 closure-check fails). Too few attempts (15/40) to read the rule; the real problem is mint/research yield, a larger effort. Re-read at 40 attempted.
 
