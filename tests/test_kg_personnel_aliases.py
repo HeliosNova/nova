@@ -23,7 +23,6 @@ from app.core.kg import normalize_predicate, is_vague_or_misfit
     ("took over from", "successor_of"),
     ("plays for", "member_of"),
     ("plays_for", "member_of"),
-    ("joined", "member_of"),
     ("appointed to", "member_of"),
     ("elected to", "member_of"),
     ("named to", "member_of"),
@@ -43,8 +42,11 @@ def test_recovered_facts_pass_the_vague_gate(s, p, o):
     assert not is_vague_or_misfit(s, p, o)
 
 
-@pytest.mark.parametrize("p", ["transferred", "estimated", "reported", "sold", "urges", "targets"])
-def test_transaction_and_attribution_verbs_still_degrade(p):
-    # These stay OUT: their objects are quantities/statements, not entities, so
-    # they do not form clean triples — an alias would only bank junk.
+@pytest.mark.parametrize("p", ["transferred", "estimated", "reported", "sold", "urges", "targets",
+                               "joined", "joins"])
+def test_ambiguous_and_transaction_verbs_still_degrade(p):
+    # Transaction/attribution verbs stay OUT: their objects are quantities/
+    # statements, not entities. Bare "joined"/"joins" stay OUT too: polysemous
+    # ("joined the race/forces/call"), so aliasing them would bank noise the
+    # gates can't catch.
     assert normalize_predicate(p) == "related_to"

@@ -178,7 +178,9 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "succeeds": "successor_of", "succeeded": "successor_of",
     "took over from": "successor_of",
     "plays for": "member_of", "plays_for": "member_of",
-    "joined": "member_of", "joins": "member_of",
+    # bare "joined"/"joins" deliberately OMITTED — polysemous ("joined the race /
+    # forces / call") would bank noise the gates can't catch; only the specific
+    # membership forms are aliased.
     "appointed to": "member_of", "elected to": "member_of", "named to": "member_of",
     "merged with": "partnered_with", "merges with": "partnered_with",
     "price of": "price_of", "cost of": "price_of", "costs": "price_of",
