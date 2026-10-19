@@ -153,6 +153,40 @@ _SUSPICIOUS_DECODED_RE = re.compile(
 # Unicode control chars (excluding common whitespace \t \n \r)
 _CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 
+# Invisible / zero-width / bidi / tag-smuggling code points (2026-10-19,
+# indirect-prompt-injection sanitizer). These render to NOTHING, so removing
+# them strips the attack *vector* (a payload split by zero-width chars so
+# phrase-matching misses it, or ASCII instructions hidden in the Unicode Tags
+# block that reach the model invisibly) WITHOUT touching any character a reader
+# sees. Built from explicit code points so the SOURCE stays pure ASCII (no
+# literal invisible bytes). Variation selectors (emoji) and combining accents
+# are EXCLUDED on purpose -- they modify visible glyphs.
+_INVISIBLE_CODEPOINTS = (
+    (0x00ad, 0x00ad),      # soft hyphen
+    (0x061c, 0x061c),      # arabic letter mark
+    (0x200b, 0x200f),      # ZWSP ZWNJ ZWJ LRM RLM
+    (0x202a, 0x202e),      # bidi embeddings / overrides
+    (0x2060, 0x2064),      # word joiner + invisible math operators
+    (0x2066, 0x2069),      # bidi isolates
+    (0xfeff, 0xfeff),      # BOM / zero-width no-break space
+    (0xfff9, 0xfffb),      # interlinear annotation anchors
+    (0xe0000, 0xe007f),    # Unicode TAG block -- ASCII-smuggling vector
+)
+_INVISIBLE_RE = re.compile(
+    "[" + "".join(f"\\U{a:08x}-\\U{b:08x}" for a, b in _INVISIBLE_CODEPOINTS) + "]"
+)
+
+
+def strip_invisible(text: str) -> tuple[str, int]:
+    """Remove invisible/zero-width/bidi/tag-smuggling code points. Returns
+    (clean_text, n_removed). Non-destructive by construction: only code points
+    that render to nothing are removed, so every visible character -- and all
+    legitimate whitespace -- is preserved."""
+    if not text:
+        return text, 0
+    clean = _INVISIBLE_RE.sub("", text)
+    return clean, len(text) - len(clean)
+
 
 # Homoglyph translation (added 2026-05-13, task #45). Cyrillic and Greek
 # lookalikes for common Latin letters used in role-override patterns.
@@ -429,10 +463,27 @@ def _has_homoglyphs(text: str) -> bool:
 def sanitize_content(text: str, context: str = "ingested") -> str:
     """Run injection detection; wrap suspicious content with a warning prefix.
 
-    Does NOT strip content — the LLM should see it but be warned.
+    Does NOT censor content — every visible character is preserved; suspicious
+    text is LABELLED (wrapped) so the model treats it as data, not instructions.
+    The one removal is invisible/zero-width/bidi/tag code points
+    (strip_invisible), which carry no visible content — stripping them de-cloaks
+    payloads that were hidden from both the reader and the phrase detector.
+    Gated by ENABLE_INGEST_SANITIZER (2026-10-19).
     """
     if not text:
         return text
+    try:
+        from app.config import config as _cfg
+        if getattr(_cfg, "ENABLE_INGEST_SANITIZER", False):
+            cleaned, n_inv = strip_invisible(text)
+            if n_inv:
+                import logging
+                logging.getLogger(__name__).info(
+                    "[ingest-sanitizer] stripped %d invisible/zero-width/tag char(s) from %s",
+                    n_inv, context)
+            text = cleaned
+    except Exception:
+        pass
 
     result = detect_injection(text)
     if result.is_suspicious:

@@ -988,6 +988,14 @@ async def _fetch_body(url: str, *, browser_budget: list[int] | None = None,
         res = await asyncio.wait_for(HttpFetchTool().execute(url=url), timeout=15)
         body = (res.output or "") if getattr(res, "success", False) else ""
         if not _junk_body(body):
+            # Durable-path sanitizer (2026-10-19): the browser + paywall fetch
+            # paths already run sanitize_content; the HTTP fast-path (the most
+            # common) did NOT, so article bodies feeding synthesis + the KG were
+            # the least-protected ingress. Route it through too (flag-gated).
+            from app.config import config as _cfg
+            if getattr(_cfg, "ENABLE_INGEST_SANITIZER", False):
+                from app.core.injection import sanitize_content
+                body = sanitize_content(body, context="article body")
             return body[:max_len]
     except Exception:
         pass
