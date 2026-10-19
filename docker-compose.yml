@@ -166,6 +166,12 @@ services:
       # Code default stays false (opt-in); this override is the production flip
       # and is reversible by removing the line.
       ENABLE_WIDE_ANALYSIS_KEEP: "true"
+      # Indirect-prompt-injection sanitizer (2026-10-19): strip invisible/
+      # zero-width/bidi/tag-smuggling vectors from ingested web content + route
+      # the HTTP article-body path through sanitize_content. Non-destructive by
+      # construction (removes only code points that render to nothing); the live
+      # "[ingest-sanitizer] stripped N" counter is the post-deploy read.
+      ENABLE_INGEST_SANITIZER: "true"
     volumes:
       - nova_data:/data
       # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
