@@ -3332,10 +3332,26 @@ async def _learn_observations(topic: str, brief: str, findings: list, *,
         return 0
     as_of = _earliest_pub_date(articles, findings) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
     try:
+        # 1200 (was 700): 12 observation objects × 6 fields overflowed 700 on a
+        # dense finance brief, truncating the JSON mid-string → parse fail → 0
+        # banked (caught by the A/B 2026-10-19). And parse TOLERANTLY: if the
+        # array is still truncated, salvage every complete {...} object rather
+        # than drop the whole digest's figures.
         raw = await _invoke_bg(
             [{"role": "user", "content": _OBS_PROMPT.format(topic=topic, as_of=as_of, evidence=brief[:4500])}],
-            json_mode=True, json_schema=_OBS_SCHEMA, max_tokens=700, num_ctx=8192, model=model)
-        cands = json.loads(raw) if isinstance(raw, str) else raw
+            json_mode=True, json_schema=_OBS_SCHEMA, max_tokens=1200, num_ctx=8192, model=model)
+        if isinstance(raw, str):
+            try:
+                cands = json.loads(raw)
+            except Exception:
+                cands = []
+                for _m in re.finditer(r"\{[^{}]*\}", raw):   # salvage complete objects from a truncated array
+                    try:
+                        cands.append(json.loads(_m.group(0)))
+                    except Exception:
+                        pass
+        else:
+            cands = raw
         if isinstance(cands, dict):
             cands = cands.get("observations") or cands.get("facts") or []
     except Exception as e:
