@@ -3285,6 +3285,110 @@ async def _learn_facts(topic: str, brief: str, findings: list, kg, *,
     return stored
 
 
+# Typed numeric observations (2026-10-19). Finance/markets/macro news is
+# quantities ("Brent 105.56 USD/bbl", "Fed held at 4.5%") the (s,p,o) KG can't
+# hold — they degraded to related_to and were discarded ("0 facts learned").
+# These land in the flat `observations` table instead, so the knowing tier can
+# track levels/deltas with SQL. The triple KG is untouched. Every number is
+# verified VERBATIM against a source body at write time — the single real risk
+# of generative extraction is invented figures.
+_OBS_SCHEMA = {
+    "type": "array",
+    "items": {
+        "type": "object",
+        "properties": {
+            "entity": {"type": "string"}, "metric": {"type": "string"},
+            "value": {"type": "string"}, "unit": {"type": "string"},
+            "direction": {"type": "string"}, "asof": {"type": "string"},
+        },
+        "required": ["entity", "metric", "value"],
+    },
+}
+_OBS_PROMPT = (
+    "From the briefing below on '{topic}', extract NUMERIC OBSERVATIONS — a measured "
+    "value for a named entity. Examples: (Brent crude, price, 105.56, USD/bbl, level); "
+    "(Federal Reserve, policy rate, 4.5, %, level); (US GDP, growth, 2.3, %, pct_change); "
+    "(MARA Holdings, BTC holdings, 35577, BTC, level).\n"
+    "ENTITY = the named thing measured. METRIC = what is measured (price/rate/revenue/"
+    "holdings/market share/yield/volume...). VALUE = the NUMBER ONLY, no unit, exactly as "
+    "written in the text. UNIT = %, USD, USD/bbl, BTC, shares, bps, bn, m... DIRECTION = "
+    "level | change | pct_change.\n"
+    "Only values STATED in the briefing; invent NOTHING. Max 12.\n"
+    "AS OF: {as_of}.\n"
+    "Return JSON array: [{{\"entity\":\"..\",\"metric\":\"..\",\"value\":\"..\",\"unit\":\"..\","
+    "\"direction\":\"..\",\"asof\":\"..\"}}]\n\n{evidence}"
+)
+_OBS_DIGITS_RE = re.compile(r"[^\d.]")
+
+
+async def _learn_observations(topic: str, brief: str, findings: list, *,
+                              articles: list | None = None, model: str | None = None) -> int:
+    """Bank typed numeric observations (entity|metric|value|unit|asof) from the
+    briefing. Flag-gated (ENABLE_OBSERVATIONS). Every value's digit-core must
+    appear VERBATIM in a source body (comma-insensitive) or it is dropped as an
+    invented number. Returns the count stored."""
+    from app.config import config as _cfg
+    if not getattr(_cfg, "ENABLE_OBSERVATIONS", False) or not brief or not (articles or findings):
+        return 0
+    as_of = _earliest_pub_date(articles, findings) or datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    try:
+        raw = await _invoke_bg(
+            [{"role": "user", "content": _OBS_PROMPT.format(topic=topic, as_of=as_of, evidence=brief[:4500])}],
+            json_mode=True, json_schema=_OBS_SCHEMA, max_tokens=700, num_ctx=8192, model=model)
+        cands = json.loads(raw) if isinstance(raw, str) else raw
+        if isinstance(cands, dict):
+            cands = cands.get("observations") or cands.get("facts") or []
+    except Exception as e:
+        logger.warning("[DeepResearch] observation extraction failed (topic=%r): %s", topic, e)
+        return 0
+    if not isinstance(cands, list):
+        return 0
+    bodies_nc = (" ".join((b or "") for _, _, b in (articles or []))
+                 + " " + " ".join((f or "") for _, _, f in findings)).replace(",", "")
+    from app.database import get_db
+    db = get_db()
+    stored = unverified = dropped = 0
+    for c in cands[:12]:
+        if not isinstance(c, dict):
+            continue
+        entity = str(c.get("entity", "")).strip()
+        metric = str(c.get("metric", "")).strip()
+        value = str(c.get("value", "")).strip()
+        unit = str(c.get("unit", "")).strip()[:40]
+        direction = (str(c.get("direction", "level")).strip().lower() or "level")
+        if direction not in ("level", "change", "pct_change"):
+            direction = "level"
+        asof = (str(c.get("asof", "")).strip()[:20]) or as_of
+        if not (entity and metric and value):
+            dropped += 1
+            continue
+        digits = _OBS_DIGITS_RE.sub("", value.replace(",", "")).strip(".")
+        if not digits:
+            dropped += 1
+            continue
+        if digits not in bodies_nc:          # the number is not in any source → invented
+            unverified += 1
+            continue
+        try:
+            value_num = float(digits)
+        except Exception:
+            value_num = None
+        try:
+            db.execute(
+                "INSERT OR IGNORE INTO observations "
+                "(entity, metric, value_num, value_text, unit, direction, asof, source, topic, confidence) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (entity[:120], metric[:80], value_num, value[:80], unit, direction, asof,
+                 "researched", topic[:60], 0.75))
+            stored += 1
+        except Exception as e:
+            logger.warning("[DeepResearch] observation banking failed for %r: %r", (entity, metric, value), e)
+    logger.info("[DeepResearch] observations (%s): %d candidate(s) -> %d stored, "
+                "%d unverified (number absent from sources), %d dropped",
+                topic[:40], len(cands), stored, unverified, dropped)
+    return stored
+
+
 async def _ensure_citations(text: str, findings: list, *, model: str | None = None) -> tuple[str, int]:
     """Deterministic citation-coverage backstop. The synthesis + verify prompts ASK
     for an inline (outlet.tld) citation on every claim, but the 9B sometimes ignores
@@ -4638,8 +4742,9 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final = _repair_broken_sentences(final)   # drop sentences left grammatically broken by the strip passes
     final, _ = _drop_artifact_sentences(final)   # never ship "the launched a …" (2026-09-01)
     learned = await _learn_facts(subject, final, findings, kg, articles=articles, model=syn_model)
-    logger.info("[DeepResearch] %s: read %d sources (%s), learned %d facts",
-                label, len(findings), ", ".join(hosts[:6]), learned)
+    figures = await _learn_observations(subject, final, findings, articles=articles, model=syn_model)
+    logger.info("[DeepResearch] %s: read %d sources (%s), learned %d facts, %d figures",
+                label, len(findings), ", ".join(hosts[:6]), learned, figures)
 
     # Lever A: fresh independent verification of the lead's top claims (gated, bounded).
     try:
@@ -4658,7 +4763,8 @@ async def research_and_brief(label: str, topic: str | None = None, kg=None) -> s
     final = _bound_and_clean(final, max_chars=10800)
     header = (f"## 🔬 {label} — researched briefing\n"
               f"_subject: {subject}\nread {len(findings)} sources: {', '.join(hosts[:6])}"
-              f"{' +more' if len(hosts) > 6 else ''} · {learned} facts learned · {today}_\n\n")
+              f"{' +more' if len(hosts) > 6 else ''} · {learned} facts"
+              f"{f', {figures} figures' if figures else ''} learned · {today}_\n\n")
     return header + final
 
 
@@ -5130,8 +5236,9 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
                         label, _kvn.get("new"), _kvn.get("updates"), _kvn.get("contradictions"))
 
     learned = await _learn_facts(label, final, findings, kg, articles=articles, model=syn_model)
-    logger.info("[DeepResearch] %s overview: read %d sources from %d distinct hosts (%s), learned %d facts",
-                label, len(findings), len(hosts), ", ".join(hosts[:6]), learned)
+    figures = await _learn_observations(label, final, findings, articles=articles, model=syn_model)
+    logger.info("[DeepResearch] %s overview: read %d sources from %d distinct hosts (%s), learned %d facts, %d figures",
+                label, len(findings), len(hosts), ", ".join(hosts[:6]), learned, figures)
     # Recall/coverage signal (task #65): of the distinct entity anchors surfaced
     # during gather, what fraction reached the digest? pool_anchors = gather
     # breadth; coverage = synthesis recall. The before/after metric for the
@@ -5179,7 +5286,8 @@ async def _synthesize_from_evidence(label: str, findings: list, articles: list, 
 
     header = (f"## 🌐 {label} — domain overview\n"
               f"_read {len(findings)} sources: {', '.join(hosts[:7])}"
-              f"{' +more' if len(hosts) > 7 else ''} · {learned} facts learned · {today}_\n\n")
+              f"{' +more' if len(hosts) > 7 else ''} · {learned} facts"
+              f"{f', {figures} figures' if figures else ''} learned · {today}_\n\n")
     return header + final
 
 

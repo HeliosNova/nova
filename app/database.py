@@ -1272,6 +1272,42 @@ class SafeDB:
                 conn.rollback()
                 raise
 
+        # Migration 42 (2026-10-19): typed numeric OBSERVATIONS. Finance/markets/
+        # macro news is quantities ("Brent 105.56 USD/bbl", "Fed held at 4.5%")
+        # that the (s,p,o) KG can't hold — it degraded them to the vague
+        # related_to and discarded them ("0 facts learned" on those digests). A
+        # flat observations table captures entity|metric|value|unit|asof so the
+        # knowing tier can track levels/deltas over time with plain SQL — the one
+        # thing prose retrieval can't do. The triple KG is unchanged. Gated by
+        # ENABLE_OBSERVATIONS; every value is verified verbatim against a source
+        # at write time (anti-hallucination).
+        if 42 not in applied:
+            conn.execute("BEGIN")
+            try:
+                conn.execute(
+                    "CREATE TABLE IF NOT EXISTS observations ("
+                    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                    "  entity TEXT NOT NULL,"
+                    "  metric TEXT NOT NULL,"
+                    "  value_num REAL,"
+                    "  value_text TEXT NOT NULL,"
+                    "  unit TEXT,"
+                    "  direction TEXT DEFAULT 'level',"   # level | change | pct_change
+                    "  asof TEXT,"
+                    "  source TEXT,"
+                    "  topic TEXT,"
+                    "  confidence REAL DEFAULT 0.7,"
+                    "  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,"
+                    "  UNIQUE(entity, metric, value_text, asof)"
+                    ")"
+                )
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_observations_em ON observations (entity, metric, asof)")
+                conn.execute("INSERT INTO schema_version (version) VALUES (?)", (42,))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
     # Statements already reported by _warn_if_event_loop — warn once per
     # statement, capped so a pathological caller can't grow this unbounded.
     _loop_thread_warned: set[str] = set()

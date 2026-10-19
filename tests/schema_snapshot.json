@@ -250,6 +250,20 @@
   "trigger_mode",
   "channels"
  ],
+ "observations": [
+  "id",
+  "entity",
+  "metric",
+  "value_num",
+  "value_text",
+  "unit",
+  "direction",
+  "asof",
+  "source",
+  "topic",
+  "confidence",
+  "created_at"
+ ],
  "pending_deliveries": [
   "id",
   "targets",

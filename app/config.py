@@ -77,7 +77,7 @@ _MUTABLE_FIELDS = {
     "ENABLE_DEEP_RESEARCH", "ENABLE_CLAIM_VERIFICATION", "ENABLE_DEEP_ANALYSIS",
     "ENABLE_DISTINCT_READINGS", "ENABLE_CURIOSITY_TRIAGE_DEFER", "ENABLE_CITATION_DISCIPLINE",
     "ENABLE_STRUCTURED_CITATIONS", "ENABLE_WIDE_ANALYSIS_KEEP", "ENABLE_UNION_GROUNDING",
-    "ENABLE_INGEST_SANITIZER",
+    "ENABLE_INGEST_SANITIZER", "ENABLE_OBSERVATIONS",
     "ENABLE_PAYWALL_BYPASS", "ENABLE_ITERATIVE_GATHER", "ENABLE_RARR",
     "ENABLE_MINICHECK",
     "MONITOR_SYNTHESIS_MODEL",
@@ -175,6 +175,11 @@ class Config:
     # only invisible attack vectors; never censors visible content. Off until a
     # day's live read confirms it fires on real pages without altering visible text.
     ENABLE_INGEST_SANITIZER: bool = field(default_factory=lambda: _env("ENABLE_INGEST_SANITIZER", "false").lower() == "true")
+    # Typed numeric observations (2026-10-19): capture entity|metric|value|unit|
+    # asof from finance/markets/macro digests into the observations table (the
+    # "0 facts learned" gap). Verbatim-number-verified at write time. Off until
+    # the A/B reads: figures captured per finance digest AND zero invented numbers.
+    ENABLE_OBSERVATIONS: bool = field(default_factory=lambda: _env("ENABLE_OBSERVATIONS", "false").lower() == "true")
     # (ENABLE_LORA_CONTINUAL_MERGE / LORA_MERGE_ALPHA / ENABLE_SFT_BOOTSTRAP
     # dropped 2026-09-02: inert since the training stack was archived — no
     # runtime reader. The archive keeps its own settings.)
