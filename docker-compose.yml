@@ -172,6 +172,12 @@ services:
       # construction (removes only code points that render to nothing); the live
       # "[ingest-sanitizer] stripped N" counter is the post-deploy read.
       ENABLE_INGEST_SANITIZER: "true"
+      # Typed numeric observations (2026-10-19): capture entity|metric|value|unit|
+      # asof from finance/markets/macro digests into the observations table — the
+      # quantities the triple KG can't hold ("0 facts learned"). A/B: ~12 verified
+      # figures/finance digest, every value verbatim-verified (invented numbers
+      # dropped). The footer "N facts, M figures learned" is the live cross-domain read.
+      ENABLE_OBSERVATIONS: "true"
     volumes:
       - nova_data:/data
       # /backups and /offsite moved to the `backup` sidecar (2026-09-01): the
