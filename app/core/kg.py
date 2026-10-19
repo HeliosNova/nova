@@ -167,6 +167,20 @@ _PREDICATE_ALIASES: dict[str, str] = {
     "member of": "member_of",
     "invented by": "invented_by", "discovered by": "invented_by",
     "successor of": "successor_of", "succeeded by": "succeeded_by", "replaced by": "succeeded_by",
+    # 2026-10-19: clean entity->entity relations that were degrading to related_to
+    # and being DISCARDED — personnel changes and memberships the monitors report
+    # constantly (diagnostic over delivered digests: "X replaced Y", "A plays for
+    # B", "official joined/appointed to body"). Map to EXISTING canonicals; the
+    # garbage/vague gates still filter. (Transaction verbs — sold/bought/
+    # transferred — stay OUT: their objects are quantities, not entities, so they
+    # don't form clean triples and need a value-fact model, not an alias.)
+    "replaced": "successor_of", "replaces": "successor_of",
+    "succeeds": "successor_of", "succeeded": "successor_of",
+    "took over from": "successor_of",
+    "plays for": "member_of", "plays_for": "member_of",
+    "joined": "member_of", "joins": "member_of",
+    "appointed to": "member_of", "elected to": "member_of", "named to": "member_of",
+    "merged with": "partnered_with", "merges with": "partnered_with",
     "price of": "price_of", "cost of": "price_of", "costs": "price_of",
     "version of": "version_of", "variant of": "version_of",
     "has status": "has_status", "status of": "has_status", "status": "has_status",
