@@ -631,7 +631,12 @@ AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days
 - **C1 tension resolver on NEW tensions: (n=42, admitted=12=29%, a/b=4).** No longer inert (the original read FAILed at 0 admitted on aged history); on fresh consolidation-minted tensions it admits ~a third and produces a/b adjudications. PASS (working, conservative).
 - **Item 2 (dossier open-questions PUBLIC-settleable): (n=47, resolved=6, failed=4) → 60% resolve of ATTEMPTED** (6/10), vs the >33% rule. PASS; the 37 unattempted are pending/parked (curiosity accounting parking the unanswerable).
 
-All four 10-10/follow-up program rules are now READ and passing a week+ out. **k15 observations confirmed banking live: 294 verified figures already (SMIC Q2 2026 revenue 3.01bn USD, AMEC 2024 revenue 9.065bn CNY, Beijing 70% wafer-sourcing target) — the "0 facts learned" finance/macro gap is closed in production.**
+**Curiosity reads (companion monitor) — the two that MISS, honestly:**
+- **Rule (c) at 40 attempted: 18% resolve (7/40), below the >33% bar.** The accounting WORKS — 31 items parked (4 unpublished, 11 no-findings, 16 unsettled) ≈ ~90 wasted passes avoided — but yield of attempted items stays low. As predicted (thread C): parking stops waste, it does NOT raise yield.
+- **C2 triage AUROC 0.636 at n=31** (below 0.85, <40 outcomes). Answerability probes not predictive; deferral stays OFF.
+- **Implication:** the curiosity/knowing loop is the standing weak spot, and the fix is the researched-but-UNBUILT yield changes (scan 2026-10-19 #3): mint a candidate POOL + keep the specific answerable ones (reject descriptive), a PRE-SEARCH answerability probe, and SLOT-based closure that recycles near-misses. That is what moves 18% up. Next warranted build.
+
+All four of the FIRST monitor's 10-10/follow-up program rules are READ and passing a week+ out. **k15 observations confirmed banking live: 294 verified figures already (SMIC Q2 2026 revenue 3.01bn USD, AMEC 2024 revenue 9.065bn CNY, Beijing 70% wafer-sourcing target) — the "0 facts learned" finance/macro gap is closed in production.**
 
 ## Whole-system quality read 2026-10-17 (the delivered output, not the instruments)
 
