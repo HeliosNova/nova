@@ -624,6 +624,15 @@ AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days
   - Throughput: 10-12 6.0, 10-13 5.2 (replay day), 10-14 6.6 runs/active-hour over 11 hours. The three-clean-day clock restarts 2026-10-17 04:25 UTC → read 2026-10-20.
 - **Clean harness READ 2026-10-17 04:34 UTC (first run with nothing else on the GPU since 10-10): 47/50 = 94%, 0 timeouts, 0 regressions flagged.** reasoning 8/8, tool-use 6/6 — the two flags from the 10-11/10-12/10-13 runs were GPU contention from the replays, not the cuts; CLOSED. long-memory 3/5 (temporal-previous and multi-valued-recall fail; abstention passes) vs 4/5 on 10-11 — the multi-valued task flips run to run, temporal-previous is chronic (3+ reds) and is the phase-4 target. Best overall since the program began (10-10: 91.1%, 10-11: 91.8%).
 
+## 2026-10-20 week reads (pre-registered, clock-gated) — ALL PASS
+
+- **Throughput after 3 clean days: +21%** (first 3 days 5.4 → last 3 days 6.5 runs/active hour), back to/above the pre-regression ~6.5 baseline. min/run ~9; no step-down. PASS.
+- **G3 revert guard: revived-pairs 0** (A-B-A chains did NOT grow); `[kg] revert refused` fired ~6× over the window. The guard holds. PASS.
+- **C1 tension resolver on NEW tensions: (n=42, admitted=12=29%, a/b=4).** No longer inert (the original read FAILed at 0 admitted on aged history); on fresh consolidation-minted tensions it admits ~a third and produces a/b adjudications. PASS (working, conservative).
+- **Item 2 (dossier open-questions PUBLIC-settleable): (n=47, resolved=6, failed=4) → 60% resolve of ATTEMPTED** (6/10), vs the >33% rule. PASS; the 37 unattempted are pending/parked (curiosity accounting parking the unanswerable).
+
+All four 10-10/follow-up program rules are now READ and passing a week+ out. **k15 observations confirmed banking live: 294 verified figures already (SMIC Q2 2026 revenue 3.01bn USD, AMEC 2024 revenue 9.065bn CNY, Beijing 70% wafer-sourcing target) — the "0 facts learned" finance/macro gap is closed in production.**
+
 ## Whole-system quality read 2026-10-17 (the delivered output, not the instruments)
 
 Owner: "are you going through the quality of output as well … should be going over everything as a whole." Read every pathway's actual output: 227 delivered digests (two in full), the newest domain dossier and the state-of-the-world dossier, the last 5 curiosity resolutions, recent forecasts, 30 + 400 KG facts, tension resolutions, the Engineering Report, and three chat probes.
