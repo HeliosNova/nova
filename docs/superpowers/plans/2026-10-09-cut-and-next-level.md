@@ -636,6 +636,16 @@ AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days
 - **C2 triage AUROC 0.636 at n=31** (below 0.85, <40 outcomes). Answerability probes not predictive; deferral stays OFF.
 - **Implication:** the curiosity/knowing loop is the standing weak spot, and the fix is the researched-but-UNBUILT yield changes (scan 2026-10-19 #3): mint a candidate POOL + keep the specific answerable ones (reject descriptive), a PRE-SEARCH answerability probe, and SLOT-based closure that recycles near-misses. That is what moves 18% up. Next warranted build.
 
+### Curiosity yield — DIAGNOSED FROM NOVA'S OWN FAILURES, not more literature (2026-10-21)
+
+Owner asked "should we research more?" Answer: no — reading the closure judge's own rejection reasons gave a sharper, cheaper plan than the literature. The real failure distribution (last 7d):
+- **False-premise questions** (the biggest surprise): the mint encodes hallucinated digest/dossier claims — "Anthropic has not filed for a $2 trillion IPO" (queued since 10-11, burned 3 attempts), "OpenAI has not submitted a Navier-Stokes proof", "Iran does not have 'control' over…". A false premise can NEVER resolve on any path.
+- **Two outright bugs:** minted question text cut mid-sentence (judge: "truncated and incomplete ('What is the exact')"; 2 of 85 queue rows), and research answers cut by the 500-token cap (judge: "cuts off mid-sentence").
+- **The slot miss** ("fails to provide a specific duration", "does not provide the current status") — the thread-C slot-closure fix.
+- **Minted questions are already specific and slot-shaped** (the 10-13 public-settleable mint fix took) — "mint a pool" drops in priority below these.
+
+**Shipped (k16, commit above):** (1) curiosity.add refuses a long question with no sentence terminator; (2) `_FALSE_PREMISE_RE` on the judge's reason → TERMINAL park `reason=false_premise` before the unsettled/requeue branches (no attempt burn); (3) research_question max_tokens 500→800. `tests/test_curiosity_failure_classes.py` 13/0. **Rule (k16): resolve share of ATTEMPTED items over the next 40 > 25% (from 18%), false_premise parks > 0 and those items never requeue, zero "cuts off mid-sentence" / "truncated question" judge reasons.** Then the thread-C pre-search probe + slot closure as the next increment.
+
 All four of the FIRST monitor's 10-10/follow-up program rules are READ and passing a week+ out. **k15 observations confirmed banking live: 294 verified figures already (SMIC Q2 2026 revenue 3.01bn USD, AMEC 2024 revenue 9.065bn CNY, Beijing 70% wafer-sourcing target) — the "0 facts learned" finance/macro gap is closed in production.**
 
 ## Whole-system quality read 2026-10-17 (the delivered output, not the instruments)
