@@ -1844,6 +1844,17 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                     # questions, three passes each, against 9 resolutions).
                     # Park the question with the answer attached instead of
                     # burning the remaining attempts; nothing is banked.
+                    # False premise (2026-10-21): the research CONTRADICTS the
+                    # question's own premise — it came from a hallucinated
+                    # digest/dossier line and can never resolve on any path.
+                    # Park terminally; do not burn the remaining attempts.
+                    if getattr(self, "_last_closure_false_premise", False):
+                        await asyncio.to_thread(
+                            svc.curiosity.defer, item.id,
+                            "false_premise: the research contradicts the question's premise | " + result[:800])
+                        logger.info("[Curiosity] false-premise question — parked terminally: %s",
+                                    item.topic[:80])
+                        return f"CURIOSITY DEFERRED | topic={item.topic[:80]} | reason=false_premise"
                     if (grounding.get("evidence_first") and int(grounding.get("findings", 0) or 0) >= 1
                             and getattr(self, "_last_closure_unsettled", False)):
                         await asyncio.to_thread(
@@ -1941,6 +1952,15 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         r"(?:\W+\w+){0,6}?\W+(?:provide|contain|include|state|specify|mention|give|offer|"
         r"identify|detail|quantify|report|cite|name|data|information|figures?|numbers?|"
         r"evidence|details|specifics)")
+    # A question built on a FABRICATED premise (2026-10-21 diagnostic of the
+    # judge's reasons: "OpenAI has not submitted a Navier-Stokes…", "Anthropic
+    # has not filed for a $2 trillion IPO", "Iran does not have 'control' over…")
+    # can never resolve — the premise came from a hallucinated digest/dossier
+    # line. The judge names it; park TERMINALLY instead of burning three passes.
+    _FALSE_PREMISE_RE = re.compile(
+        r"(?i)premise[^.]{0,40}(?:incorrect|false|wrong|inaccurate|unfounded|mistaken)"
+        r"|\b(?:has|have) not (?:filed|submitted|announced|launched|acquired|signed|proposed)\b"
+        r"|\bdoes not (?:have|hold|exercise) (?:'|\")?control\b|\bno such (?:filing|submission|event|program|proposal)\b")
 
     async def _curiosity_closure_check(self, topic: str, result: str,
                                        model: str | None = None) -> bool:
@@ -1955,6 +1975,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
         # The evidence-first caller parks such a question instead of searching
         # the same web twice more.
         self._last_closure_unsettled = False
+        self._last_closure_false_premise = False
         # Stage 1: cheap heuristics.
         #
         # These reject before the judge ever runs, and until 2026-09-06 they did
@@ -2019,6 +2040,7 @@ class HeartbeatLoop(DeliveryMixin, MaintenanceMixin, HealthChecksMixin):
                 reason = str(obj.get("reason", ""))
                 logger.info("[Curiosity] judge says no: %s", reason[:120])
                 self._last_closure_unsettled = bool(self._UNSETTLED_REASON_RE.search(reason))
+                self._last_closure_false_premise = bool(self._FALSE_PREMISE_RE.search(reason))
             return answered
         except Exception as e:
             # A judge that could not answer has not said yes. This used to

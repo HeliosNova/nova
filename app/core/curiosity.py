@@ -426,6 +426,15 @@ class CuriosityQueue:
             logger.debug("Curiosity topic rejected (validation): '%s'", topic[:80])
             return -1
 
+        # Truncated-question guard (2026-10-21): a minted question whose text was
+        # cut mid-sentence ("...What is the exact breakdown of") can never be
+        # answered — the closure judge rejected two as "truncated and incomplete".
+        # A long question that does not end in a sentence terminator is cut.
+        _t = topic.rstrip()
+        if len(_t) > 100 and not _t.endswith(("?", ".", ")", '"', "”", "'")):
+            logger.debug("Curiosity topic rejected (truncated): '...%s'", topic[-60:])
+            return -1
+
         # Dedup: exact match
         existing = self._db.fetchone(
             "SELECT id, urgency FROM curiosity_queue "

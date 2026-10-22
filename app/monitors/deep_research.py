@@ -1293,8 +1293,11 @@ async def research_question(question: str, *, read_target: int = 6,
         "known and what is not, still cited.\n\n"
         f"EVIDENCE:\n{evidence}"
     )
+    # 800 (was 500), 2026-10-21: the closure judge rejected answers as "cuts off
+    # mid-sentence" — a 3-6 sentence cited answer overran 500 tokens on long
+    # questions. max_tokens only caps; short answers pay nothing.
     text = await _invoke_bg([{"role": "user", "content": prompt}],
-                            max_tokens=500, temperature=0.2, num_ctx=8192, model=_syn_model())
+                            max_tokens=800, temperature=0.2, num_ctx=8192, model=_syn_model())
     text = (text or "").strip()
     if not text:
         stats["reason"] = "empty_synthesis"
