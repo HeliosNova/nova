@@ -636,6 +636,10 @@ AND core coverage ≥ 0.694. One 7-hour quiet window, after the three clean days
 - **C2 triage AUROC 0.636 at n=31** (below 0.85, <40 outcomes). Answerability probes not predictive; deferral stays OFF.
 - **Implication:** the curiosity/knowing loop is the standing weak spot, and the fix is the researched-but-UNBUILT yield changes (scan 2026-10-19 #3): mint a candidate POOL + keep the specific answerable ones (reject descriptive), a PRE-SEARCH answerability probe, and SLOT-based closure that recycles near-misses. That is what moves 18% up. Next warranted build.
 
+### C2 REFUSED at the pre-registered threshold (2026-10-22, n=40)
+
+Rule C2 said: AUROC > 0.85 on ≥40 probed outcomes keeps the yes/yes pick order and justifies turning deferral on. **Read: AUROC 0.653 at n=40 (15 resolved).** Barely above chance — the model's yes/no self-estimate of answerability does not predict whether a question resolves. Deferral stays OFF permanently; the yes/yes pick preference is unjustified. This CONFIRMS the 2026-10-19 research (thread C): self-estimated answerability is miscalibrated; the predictive instrument is a real PRE-SEARCH probe (search, then check whether the required answer type — a figure/date/name — actually appears). **Action: retire the two C2 probe calls per item (dead weight, 2 LLM calls for no signal) by SWAPPING them for the pre-search probe in the next curiosity increment — one change, no dedicated retirement deploy.** Measured, refused, replaced.
+
 ### Curiosity yield — DIAGNOSED FROM NOVA'S OWN FAILURES, not more literature (2026-10-21)
 
 Owner asked "should we research more?" Answer: no — reading the closure judge's own rejection reasons gave a sharper, cheaper plan than the literature. The real failure distribution (last 7d):
